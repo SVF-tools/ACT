@@ -611,14 +611,6 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
-    """
-    支持几种前端写法：
-      - meta["size"] = [...]
-      - meta["scale_factor"] = 2 或 [2,2] 或 [1,2,2]
-      - meta["mode"] = "nearest" / "bilinear" / "trilinear"
-      - meta["align_corners"] 只在 *linear 模式下有用
-      - meta["input_shape"] 必须给
-    """
     in_shape = tuple(L.meta["input_shape"])
     x_lb = Bin.lb.view(*in_shape)
     x_ub = Bin.ub.view(*in_shape)

@@ -126,11 +126,6 @@ def tf_div(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
-    """
-    Interval matmul: (m,k) @ (k,n) -> (m,n)
-    假设输入的 lb/ub 都已经是 2D 展平到 out_vars 对应的顺序了，
-    从 meta 里拿 input/output 形状来还原。
-    """
     x_shape = L.meta["x_shape"]      # (m, k)
     y_shape = L.meta["y_shape"]      # (k, n)
     out_shape = L.meta["output_shape"]  # (m, n)
@@ -389,7 +384,6 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
         s = starts[i]
         e = ends[i]
         st = steps[i]
-        # ONNX 里 end 可以比真实长度大，这里裁一下
         if e > inp_shape[axis]:
             e = inp_shape[axis]
         slices[axis] = slice(s, e, st)
@@ -413,30 +407,18 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_gather(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Interval TF for GATHER (ONNX-like):
-      y = gather(x, indices, axis)
-    meta:
-      - input_shape
-      - indices  (list or tensor of ints)
-      - axis (int), default=0
-      - output_shape  (前端算好最好，否则我们根据 gather 结果infer)
-    """
+
     inp_shape = tuple(L.meta["input_shape"])
     axis = int(L.meta.get("axis", 0))
     x_lb = Bin.lb.view(*inp_shape)
     x_ub = Bin.ub.view(*inp_shape)
 
-    # indices 可以是 python list / tuple / tensor
     raw_idx = L.meta["indices"]
     if isinstance(raw_idx, (list, tuple)):
         indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
     else:
         indices = raw_idx.to(x_lb.device).long()
 
-    # 我们要把 indices 的 shape 插到 axis 的那个位置
-    # PyTorch: torch.index_select 只能 1D index，但只能选一条轴 → 可以直接用
-    # 但是 index_select 会把结果拼到那个轴上，其它轴不变
     out_lb = torch.index_select(x_lb, dim=axis, index=indices)
     out_ub = torch.index_select(x_ub, dim=axis, index=indices)
 
@@ -454,14 +436,7 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Interval TF for INDEX_SELECT (torch-like):
-      y = x.index_select(dim, indices)
-    meta:
-      - input_shape
-      - dim
-      - indices
-    """
+
     inp_shape = tuple(L.meta["input_shape"])
     dim = int(L.meta["dim"])
     x_lb = Bin.lb.view(*inp_shape)
