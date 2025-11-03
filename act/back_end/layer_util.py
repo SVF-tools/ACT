@@ -225,6 +225,7 @@ def create_layer(id: int, kind: str, params: Dict[str, Any], meta: Dict[str, Any
         from act.back_end.core import Layer
     
     ly = Layer(id=id, kind=kind, params=params, meta=meta, in_vars=in_vars, out_vars=out_vars)
+    validate_layer(ly)
     return ly
 
 # ---------------------

@@ -87,6 +87,38 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
 
+def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
+    dilation = L.meta.get("dilation", 1)
+
+    input_shape = L.meta["input_shape"]   # [batch, channels, width]
+    output_shape = L.meta["output_shape"] # [batch, channels, out_w]
+
+    b, c, w = input_shape
+    _, _, out_w = output_shape
+
+    lb_in = Bin.lb.view(b, c, w)
+    ub_in = Bin.ub.view(b, c, w)
+
+    lb_out = F.max_pool1d(lb_in, kernel_size, stride, padding, dilation)
+    ub_out = F.max_pool1d(ub_in, kernel_size, stride, padding, dilation)
+
+    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    C = ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"maxpool1d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
 
 def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     """
@@ -137,6 +169,94 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
+
+def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
+
+    input_shape = L.meta["input_shape"]   # [b, c, w]
+    output_shape = L.meta["output_shape"]
+
+    b, c, w = input_shape
+    lb_in = Bin.lb.view(b, c, w)
+    ub_in = Bin.ub.view(b, c, w)
+
+    lb_out = F.avg_pool1d(lb_in, kernel_size, stride, padding)
+    ub_out = F.avg_pool1d(ub_in, kernel_size, stride, padding)
+
+    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    C = ConSet()
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"avgpool1d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+
+
+def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
+    dilation = L.meta.get("dilation", 1)
+
+    input_shape = L.meta["input_shape"]   # [b, c, d, h, w]
+    output_shape = L.meta["output_shape"] # [b, c, od, oh, ow]
+
+    b, c, d, h, w = input_shape
+    lb_in = Bin.lb.view(b, c, d, h, w)
+    ub_in = Bin.ub.view(b, c, d, h, w)
+
+    lb_out = F.max_pool3d(lb_in, kernel_size, stride, padding, dilation)
+    ub_out = F.max_pool3d(ub_in, kernel_size, stride, padding, dilation)
+
+    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    C = ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"maxpool3d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+def tf_pad(L: Layer, Bin: Bounds) -> Fact:
+    pads = L.meta.get("pad", None)
+    if pads is None:
+        pads = L.meta.get("pads", None)
+    if pads is None:
+        raise KeyError(f"pad/pads not found in meta for PAD layer {L.id}")
+
+    mode = L.meta.get("mode", "constant")
+    value = float(L.meta.get("value", 0.0))
+
+    in_shape = tuple(L.meta["input_shape"])
+    lb_in = Bin.lb.view(*in_shape)
+    ub_in = Bin.ub.view(*in_shape)
+
+    lb_out = F.pad(lb_in, pads, mode=mode, value=value)
+    ub_out = F.pad(ub_in, pads, mode=mode, value=value)
+
+    B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
+    C = ConSet()
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"pad:{L.id}",
+        "pads": list(pads),
+        "mode": mode,
+        "value": value,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
 
 
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
@@ -489,6 +609,53 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
+
+def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
+    """
+    支持几种前端写法：
+      - meta["size"] = [...]
+      - meta["scale_factor"] = 2 或 [2,2] 或 [1,2,2]
+      - meta["mode"] = "nearest" / "bilinear" / "trilinear"
+      - meta["align_corners"] 只在 *linear 模式下有用
+      - meta["input_shape"] 必须给
+    """
+    in_shape = tuple(L.meta["input_shape"])
+    x_lb = Bin.lb.view(*in_shape)
+    x_ub = Bin.ub.view(*in_shape)
+
+    size = L.meta.get("size", None)
+    scale_factor = L.meta.get("scale_factor", None)
+    mode = L.meta.get("mode", "nearest")
+    align_corners = bool(L.meta.get("align_corners", False))
+
+    # F.interpolate 的 scale_factor 必须是 float 或 tuple of float
+    y_lb = F.interpolate(
+        x_lb,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners if "linear" in mode else None,
+    )
+    y_ub = F.interpolate(
+        x_ub,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners if "linear" in mode else None,
+    )
+
+    B = Bounds(y_lb.reshape(-1), y_ub.reshape(-1))
+    C = ConSet()
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"upsample:{L.id}",
+        "mode": mode,
+        "size": list(size) if size is not None else None,
+        "scale_factor": scale_factor,
+        "input_shape": in_shape,
+        "output_shape": list(y_lb.shape),
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
 
 
 # -------- Helper functions for new conv layers --------
