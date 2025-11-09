@@ -17,7 +17,7 @@
 for different layer types during the analysis phase.
 
 The interface supports multiple implementations:
-- IntervalTF: Interval-based bounds propagation  
+- IntervalTF: Interval-based bounds propagation 
 - HybridzTF: HybridZ zonotope-based analysis with enhanced precision
 """
 
