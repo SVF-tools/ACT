@@ -21,14 +21,7 @@
         },
         "in_vars": [],
         "out_vars": [
-          0,
-          1,
-          2,
-          3,
-          4,
-          5,
-          6,
-          7
+          1
         ],
         "cache": {}
       },
@@ -63,24 +56,10 @@
           "ub_val": 1.0
         },
         "in_vars": [
-          0,
-          1,
-          2,
-          3,
-          4,
-          5,
-          6,
-          7
+          1
         ],
         "out_vars": [
-          0,
-          1,
-          2,
-          3,
-          4,
-          5,
-          6,
-          7
+          2
         ],
         "cache": {}
       },
@@ -89,7 +68,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDgsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo3LqEDhIilP3reRbxFGMO/rf7KaYDhgz8ugJuA+U3Bvy+O4bi9pLe/eruF15hOjb+BkZN9OdZIP6dApQtLkMu/FWPAAWvwbr9NTg3Kl5uuv81d62a3T66/4AlEqjeywD98cLcAxR2rP+SHOZtasZw/+V/fXEGaxT81iAB+2lSvvxoeoS6wRb6/JA/Voq0oij9xM6JpnlzHv0Wy0fU1U8s/xO3h+dO1k780IpL/emCmP1jgtE9dc8M/5Io9UwEflD+ZBjaf4nm4v/JLKD+Mxbq/TB3eQ9Kfyr8V7qyK3uqcvyeXnRzQ8am/kHMCOuZRxb+9F35TFLG/v3K8K0U/Abg/5FnebklJw7+a9FBu4ZCfP5h/1+E1N6W/b1uYkouvoD+6RYoZFvW0P5N69669Bqe/R/a42tVojz8ugGcqZCJzv91Zwev0E8g/KpywboV5sb97pN4CTOywP36j15TdoqM/JMNinWssyr84/mNLoZO1vzeczr3pwW0/MbUo/X2ytL+bG0nY4xvBv6RE58FxU6w/P8g9WWNThL9HCcvjoF45P0v2329tTMU/FXkUbMHwnD96FxgCmqOwv+jOagZK1YU/xrulzXzPpj+feJYR7P9iv59F0oVyqrw/i/CwU8OhwT9iT3rUTkm6Py3mxFTgqpm/Y31GlNPamL/4j/x965O3Pw==",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDgsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo5+MXALefEv4plKv7ENJo/F3PcvLwOsT9v7dp/p5+9v9MZh07pRdA/0Yc3zC2Rcr/M6lyJueq5vyrv6rxAR4Q/nG9xBp+ysT/wmMzxZBLFvy1eXddkuq4/LML/n8H2nz8tbfoaUYVNP3JPkhMaNcA/R7GoxSt7oD/UREi84aeZv/2wUP+gvXi/JuVzZ+J0wL+EKcfutLmZv9qCC7Jz4cU/KLbmdrA6ub+9c3JdxfadPyNMezTCdom/eFWhqgoRlL/NJqCkj+iwv9gFpa7Z6Ma//LtDIDshsb9c2NE5dFu4PyjAfQx/3Ke/eYiGN7ChxT9WKjycjQ+Zv1mtwLO/CGO/L7j/B3z/rz8/2HmveFOwv49eYVjNxL+/JUbfNkSIaz8Ie0ugrWOlv23usg+D172/voxTF0jjsb9IV0K91zW1v5Od+LHD+5C/kpVAhm6Wxj8p/YqI1vGzv1LPxXkA5JC/rwT4ChRZzD8a/pvfo96yPw9z3+uO/Jq/ZJU7FX9upj/yoJSAdch6vzNR3QXgR7m/swAL5sObcL/vBBG4lkjJP710IufCS7m/mJjIRWrFt78MfRzJvCqpP07b00PXjpG/VBVbN5x1jj9g/nHUwZuzP1LH6ZRrLce/HMeBvgCPob9STqKcBJzHPyD2TA6bc58/OLSpPi1HrD9yCrJXLujOvw==",
             "dtype": "torch.float64",
             "shape": [
               8,
@@ -114,24 +93,10 @@
           "bias_enabled": true
         },
         "in_vars": [
-          0,
-          1,
-          2,
-          3,
-          4,
-          5,
-          6,
-          7
+          2
         ],
         "out_vars": [
-          8,
-          9,
-          10,
-          11,
-          12,
-          13,
-          14,
-          15
+          3
         ],
         "cache": {}
       },
@@ -141,24 +106,10 @@
         "params": {},
         "meta": {},
         "in_vars": [
-          8,
-          9,
-          10,
-          11,
-          12,
-          13,
-          14,
-          15
+          3
         ],
         "out_vars": [
-          8,
-          9,
-          10,
-          11,
-          12,
-          13,
-          14,
-          15
+          4
         ],
         "cache": {}
       },
@@ -167,7 +118,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqoZhp9IsuQv04vdopq8sM/4E2cRzqdxj9YliZsfLiqv01R+5dyqz2/QZ10PZ+msj9BOQRCDd6xv71VeAncLqu/oCU3EpjAsz+/NYiXMG+1vw/sPuQhSaw/OTwTfZUTpz99QRrr+9qmP+sl2ogqkrc/WE2RaYgBwz8l2MDuEiGpv5Ta6iBWjl6/w9aWtoPUsD+AlUmS9KybvyKfnIrdyMO/5hwsrUQyoD/rZwhwZ3DHvw/svRF+LW4/im0lmvjYnL905QG0M6uzPy94bc1vpp6/1C2n1T2oqb93re3OtsjCv+jI/Vl93qU/AjQ7PgSRsz8jvTaY0XrCvwDDgVfRTbW/",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApi/GqAwnN7P28j8scyWqS/MYmxI6hnpD80cP6iAmmQvzxWKcFF6J0/MKVDCz54kz/nE8GnondLP0pRU/v73cK/Ay7VnTGllb8eb4Y5JtbCP3sZkGCVHoW/0OSqcqmPqr/cN9rqPhudv9qiK5HvC8S/APn7UGigsT+kY3goyXKsP0/vPvTXdqi/vCxAsn8s0b9STzVf3wbBv49afZNkNLK/149YZn2Bwj8PVNoYbuvAvz51JW4bYLK/VlNNinozqL/ZOFe4oybCv8KVLoQUULy/jJP5uMAyvr+FuU7yn8WtvyjWWwPt1rS/B2HVr3zrdj9L1L4qpHeQv3pDnT601Xq/",
             "dtype": "torch.float64",
             "shape": [
               4,
@@ -192,20 +143,10 @@
           "bias_enabled": true
         },
         "in_vars": [
-          8,
-          9,
-          10,
-          11,
-          12,
-          13,
-          14,
-          15
+          4
         ],
         "out_vars": [
-          16,
-          17,
-          18,
-          19
+          5
         ],
         "cache": {}
       },
@@ -228,16 +169,10 @@
           "d": 1.0
         },
         "in_vars": [
-          16,
-          17,
-          18,
-          19
+          5
         ],
         "out_vars": [
-          16,
-          17,
-          18,
-          19
+          6
         ],
         "cache": {}
       }
@@ -281,7 +216,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-12-05T15:05:57.041743",
+      "creation_time": "2025-11-18T13:34:08.373773",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [

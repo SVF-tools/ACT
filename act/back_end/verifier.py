@@ -130,7 +130,9 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     if any(L.meta.get("kind") == InKind.LIN_POLY for L in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
     
-    raise ValueError("No valid input specification found for seeding.")
+        raise ValueError("No valid input specification found for seeding.")
+    # Flatten bounds to match flat input_ids
+    return Bounds(seed.lb.flatten(), seed.ub.flatten())
 
 def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> None:
     """
@@ -147,25 +149,119 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
     for L in spec_layers:
         k = L.meta.get("kind")
         if k == InKind.BOX:
-            globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
+            lb = L.params["lb"].flatten()
+            ub = L.params["ub"].flatten()
+            globalC.add_box(-1, input_ids, Bounds(lb, ub))
         elif k == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
-                globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
+                lb = L.params["lb"].flatten()
+                ub = L.params["ub"].flatten()
+                globalC.add_box(-1, input_ids, Bounds(lb, ub))
             else:
                 center = L.params["center"]
                 eps = L.meta["eps"]
                 e = torch.tensor(eps, dtype=center.dtype, device=center.device)
-                globalC.add_box(-1, input_ids, Bounds(center - e, center + e))
+                lb = (center - e).flatten()
+                ub = (center + e).flatten()
+                globalC.add_box(-1, input_ids, Bounds(lb, ub))
         elif k == InKind.LIN_POLY:
             A, b = L.params["A"], L.params["b"]
             globalC.replace(Con("INEQ", tuple(input_ids), {"tag": "in:linpoly", "A": A, "b": b}))
         else:
             raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
 
-def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer) -> None:
-    """Add the negation of ASSERT property as constraints to solver."""
+
+def input_satisfies_specs(x_np: np.ndarray, spec_layers, tol: float = 1e-7) -> bool:
+    """
+    Check whether a candidate input satisfies all INPUT_SPEC layers.
+    Supports BOX, LINF_BALL, and LIN_POLY.
+    """
+    x = torch.from_numpy(x_np).reshape(-1)
+
+    for L in spec_layers:
+        k = L.meta.get("kind")
+        if k == InKind.BOX:
+            lb = L.params["lb"].flatten()
+            ub = L.params["ub"].flatten()
+            if torch.any(x < lb - tol) or torch.any(x > ub + tol):
+                return False
+
+        elif k == InKind.LINF_BALL:
+            if "lb" in L.params and "ub" in L.params:
+                lb = L.params["lb"].flatten()
+                ub = L.params["ub"].flatten()
+            else:
+                center = L.params["center"].flatten()
+                eps = torch.tensor(L.meta["eps"], dtype=center.dtype, device=center.device)
+                lb = center - eps
+                ub = center + eps
+            if torch.any(x < lb - tol) or torch.any(x > ub + tol):
+                return False
+
+        elif k == InKind.LIN_POLY:
+            A, b = L.params["A"], L.params["b"]
+            x_flat = x.to(dtype=A.dtype, device=A.device, non_blocking=True)
+            lhs = torch.mv(A, x_flat)
+            if torch.any(lhs > b + tol):
+                return False
+
+        else:
+            raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
+
+    return True
+
+
+def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
+    """
+    Evaluate the ACT Net at a point and check if the ASSERT property is violated.
+    Used to filter spurious counterexamples after solver returns SAT.
+    """
+    from act.back_end.analyze import analyze
+
+    x_tensor = torch.from_numpy(x_np)
+    point_bounds = Bounds(x_tensor, x_tensor)
+    entry_fact = Fact(bounds=point_bounds, cons=ConSet())
+
+    entry_id = find_entry_layer_id(net)
+    _, after, _ = analyze(net, entry_id, entry_fact)
+
+    output_layer_id = net.layers[-2].id  # Layer before ASSERT
+    y_bounds = after[output_layer_id].bounds
+    y_mid = ((y_bounds.lb + y_bounds.ub) / 2).cpu().numpy()
+
+    k = assert_layer.meta.get("kind")
+    if k == OutKind.TOP1_ROBUST:
+        t = int(assert_layer.meta["y_true"])
+        others = [i for i in range(len(y_mid)) if i != t]
+        return (y_mid[others] - y_mid[t]).max() >= 0.0
+    elif k == OutKind.MARGIN_ROBUST:
+        t = int(assert_layer.meta["y_true"])
+        margin = float(assert_layer.meta["margin"])
+        others = [i for i in range(len(y_mid)) if i != t]
+        return (y_mid[others] - y_mid[t]).max() >= margin
+    elif k == OutKind.LINEAR_LE:
+        c = np.asarray(assert_layer.params["c"], dtype=float)
+        d = float(assert_layer.meta["d"])
+        return float(np.dot(c, y_mid)) >= d + 1e-8
+    elif k == OutKind.RANGE:
+        lb = assert_layer.params.get("lb")
+        ub = assert_layer.params.get("ub")
+        if lb is not None and np.any(y_mid < np.asarray(lb, dtype=float) - 1e-8):
+            return True
+        if ub is not None and np.any(y_mid > np.asarray(ub, dtype=float) + 1e-8):
+            return True
+        return False
+    else:
+        raise NotImplementedError(f"ASSERT kind not supported: {k}")
+
+def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer):
+    """
+    Add the negation of ASSERT property as constraints to solver.
+    Returns optional objective info for disjunctive properties.
+    """
     from act.back_end.cons_exportor import to_numpy
     k = assert_layer.meta.get("kind")
+    objective = None
     
     if k == OutKind.LINEAR_LE:
         # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
@@ -181,7 +277,8 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
         for j, oj in enumerate(out_ids):
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
-        solver.add_lin_ge([v], [1.0], 0.0)
+        solver.add_lin_ge([v], [1.0], 0.0)  # v >= 0 to witness violation
+        objective = {"var": v, "sense": "max"}
         
     elif k == OutKind.MARGIN_ROBUST:
         # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
@@ -193,6 +290,7 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], -margin)
         solver.add_lin_ge([v], [1.0], 0.0)
+        objective = {"var": v, "sense": "max"}
         
     elif k == OutKind.RANGE:
         # Property: lb ≤ y ≤ ub  →  Negation: y > ub (or y < lb)
@@ -202,6 +300,8 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
                 solver.add_lin_ge([yi], [1.0], float(ub[i].item()) + 1e-6)
     else:
         raise NotImplementedError(f"Unsupported ASSERT kind: {k}")
+
+    return objective
 
 
 # -----------------------------------------------------------------------------
@@ -254,16 +354,48 @@ def setup_and_solve(
     
     # Analyze with full input specification (propagates constraints)
     before, after, globalC = analyze(net, entry_id, entry_fact)
+
+    # Add output box from last hidden layer to bound objective
+    try:
+        assert_preds = net.preds.get(assert_layer.id, [])
+        if assert_preds:
+            last_hid = assert_preds[0]
+            out_bounds = after[last_hid].bounds
+            globalC.add_box(last_hid, output_ids, out_bounds.copy())
+    except Exception:
+        pass
+
+    # Debug: report constraint sizes and bounds stats
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        box_cons = [c for c in globalC if c.meta.get("tag", "").startswith("box:")]
+        logger.info(
+            "    [DEBUG] constraints total=%d boxes=%d input_ids=%d "
+            "seed_lb[min,max]=[%.4f, %.4f] seed_ub[min,max]=[%.4f, %.4f]",
+            len(globalC),
+            len(box_cons),
+            len(input_ids),
+            input_bounds.lb.min().item(),
+            input_bounds.lb.max().item(),
+            input_bounds.ub.min().item(),
+            input_bounds.ub.max().item(),
+        )
+    except Exception:
+        pass
     
     # Validate constraints (validation runs if enabled, logging only if debug_tf also enabled)
     validate_constraints(globalC, after, net)
     
     # Export all constraints to solver (including LIN_POLY)
     export_to_solver(globalC, solver, objective=None, sense="min")
-    add_negated_assert_to_solver(solver, output_ids, assert_layer)
+    obj_info = add_negated_assert_to_solver(solver, output_ids, assert_layer)
     
     # Solve (feasibility check only)
-    solver.set_objective_linear([], [], 0.0, sense="min")
+    if obj_info:
+        solver.set_objective_linear([obj_info["var"]], [1.0], 0.0, sense=obj_info.get("sense", "max"))
+    else:
+        solver.set_objective_linear([], [], 0.0, sense="min")
     solver.optimize(timelimit)
     
     # Extract result
@@ -287,10 +419,26 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     Returns CERTIFIED/FALSIFIED/UNKNOWN with optional counterexample input.
     """
     spec_layers = gather_input_spec_layers(net)
+    assert_layer = get_assert_layer(net)
     seed_bounds = seed_from_input_specs(spec_layers)
+    
+    # Sanity check: seed width matches input vars
+    input_ids = get_input_ids(net)
+    if seed_bounds.lb.numel() != len(input_ids) or seed_bounds.ub.numel() != len(input_ids):
+        raise ValueError(
+            f"Seed bounds/input_ids mismatch: lb={seed_bounds.lb.numel()}, "
+            f"ub={seed_bounds.ub.numel()}, input_ids={len(input_ids)}"
+        )
     
     # Core solver workflow
     status, ce_input, stats = setup_and_solve(net, seed_bounds, solver, timelimit)
+
+    # Filter out spurious counterexamples using input specs and point evaluation
+    if status == SolveStatus.SAT and ce_input is not None:
+        if (not input_satisfies_specs(ce_input, spec_layers)) or \
+           (not check_violation_at_point(net, ce_input, assert_layer)):
+            status = SolveStatus.UNKNOWN
+            ce_input = None
     
     # Interpret result
     if status == SolveStatus.SAT and ce_input is not None:
@@ -301,5 +449,3 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
     
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)
-
-

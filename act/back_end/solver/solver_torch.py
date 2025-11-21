@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import math, time
 from typing import List, Optional, Tuple
@@ -53,7 +52,7 @@ class TorchLPSolver(Solver):
         if device is not None:
             self._device = torch.device(device)
         # else keep the device_manager default from __init__
-        
+
         self._n = 0
         self._x = None
         self._lb = None
@@ -76,8 +75,14 @@ class TorchLPSolver(Solver):
             old_n = self._n
             self._n += n
             # Extend tensors on the correct device and dtype
-            self._lb = torch.cat([self._lb, torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)])
-            self._ub = torch.cat([self._ub, torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)])
+            self._lb = torch.cat([
+                self._lb,
+                torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)
+            ])
+            self._ub = torch.cat([
+                self._ub,
+                torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)
+            ])
 
     def add_binary_vars(self, n: int) -> List[int]:
         start = self._n
@@ -118,126 +123,150 @@ class TorchLPSolver(Solver):
     def add_sos2(self, var_ids: List[int], weights: Optional[List[float]] = None) -> None:
         return  # no-op
 
-    def set_objective_linear(self, vids: List[int], coeffs: List[float], const: float = 0.0, sense: str = "min") -> None:
+    def set_objective_linear(self, vids: List[int], coeffs: List[float],
+                             const: float = 0.0, sense: str = "min") -> None:
         self._objective = (vids, coeffs, float(const), "min" if sense != "max" else "max")
 
     def optimize(self, timelimit: Optional[float] = None) -> None:
         self._timelimit = timelimit
 
-        # initialize x at box center (or zeros where infinite)
+        # === 1) 初始化变量到 box 中点（或 0） ===
         if self._x is None:
-            lb = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
-            ub = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
+            lb = torch.where(torch.isfinite(self._lb),
+                             self._lb,
+                             torch.zeros_like(self._lb))
+            ub = torch.where(torch.isfinite(self._ub),
+                             self._ub,
+                             torch.zeros_like(self._ub))
             mid = 0.5 * (lb + ub)
             both_inf = (~torch.isfinite(self._lb)) & (~torch.isfinite(self._ub))
             mid = torch.where(both_inf, torch.zeros_like(mid), mid)
-            self._x = torch.nn.Parameter(mid.clone().to(device=self._device, dtype=self._dtype), requires_grad=True)
+            self._x = torch.nn.Parameter(
+                mid.clone().to(device=self._device, dtype=self._dtype),
+                requires_grad=True
+            )
 
         # CRITICAL: Re-enable gradients after any potential parameter manipulation
         self._x.requires_grad_(True)
 
-        opt = torch.optim.Adam([self._x], lr=self.lr, betas=(self.beta1, self.beta2), weight_decay=self.weight_decay)
+        opt = torch.optim.Adam(
+            [self._x],
+            lr=self.lr,
+            betas=(self.beta1, self.beta2),
+            weight_decay=self.weight_decay
+        )
 
+        # === 2) 将约束一次性转为稠密矩阵（O(mn)，只做一次） ===
         def rows_to_dense(rows):
             if not rows:
-                return torch.zeros((0, self._n), device=self._device, dtype=self._dtype), \
-                       torch.zeros((0,), device=self._device, dtype=self._dtype)
+                return (
+                    torch.zeros((0, self._n), device=self._device, dtype=self._dtype),
+                    torch.zeros((0,), device=self._device, dtype=self._dtype),
+                )
             A = torch.zeros((len(rows), self._n), device=self._device, dtype=self._dtype)
             b = torch.zeros((len(rows),), device=self._device, dtype=self._dtype)
             for r, (vids, coeffs, rhs) in enumerate(rows):
-                A[r, torch.as_tensor(vids, device=self._device)] = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
+                idx_t = torch.as_tensor(vids, device=self._device, dtype=torch.long)
+                coeff_t = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
+                A[r, idx_t] = coeff_t
                 b[r] = float(rhs)
             return A, b
 
         Aeq, beq = rows_to_dense(self._eq)
         Ale, ble = rows_to_dense(self._le)
 
+        # 约束矩阵在优化过程中不会再变动，提前对齐 device/dtype
+        Aeq = Aeq.to(device=self._x.device, dtype=self._x.dtype)
+        beq = beq.to(device=self._x.device, dtype=self._x.dtype)
+        Ale = Ale.to(device=self._x.device, dtype=self._x.dtype)
+        ble = ble.to(device=self._x.device, dtype=self._x.dtype)
+
+        # === 3) 目标函数向量化处理 ===
         vids, coeffs, c0, sense = self._objective
-        c = torch.zeros((self._n,), device=self._device, dtype=self._dtype, requires_grad=False)
         if vids:
-            c[torch.as_tensor(vids, device=self._device)] = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
+            vids_t = torch.as_tensor(vids, device=self._x.device, dtype=torch.long)
+            coeffs_t = torch.as_tensor(coeffs, device=self._x.device, dtype=self._x.dtype)
+        else:
+            vids_t = None
+            coeffs_t = None
+        const_term = float(c0)
 
         t_end = None if timelimit is None else (time.time() + float(timelimit))
         self._status = SolveStatus.UNKNOWN
         self._has_solution = False
 
+        # === 4) 主循环：Adam + 罚项 + box projection ===
         for it in range(self.max_iter):
             opt.zero_grad()
 
             # SOLUTION: Force gradient computation context
             with torch.enable_grad():
-                # Create objective function components
-                obj = 0.001 * torch.sum(self._x**2)  # Small regularizer
-                
-                # Add linear objective
-                if vids and len(coeffs) > 0:
-                    for vid, coeff in zip(vids, coeffs):
-                        obj = obj + float(coeff) * self._x[vid]
-                
-                # Add constant term
-                obj = obj + float(c0)
-                
+                # Small regularizer to keep x bounded / well-conditioned
+                obj = 0.001 * torch.sum(self._x ** 2)
+
+                # Linear objective: c^T x
+                if vids_t is not None and coeffs_t is not None:
+                    obj = obj + torch.dot(self._x[vids_t], coeffs_t)
+
+                # Constant term
+                obj = obj + const_term
+
+                # Sense: max -> minimize -obj
                 if sense == "max":
                     obj = -obj
 
-                # Add constraint penalties
+                # Equality penalties: rho_eq * ||Aeq x - beq||^2
                 if Aeq.shape[0] > 0:
-                    # Ensure constraint matrices are on same device
-                    Aeq_device = Aeq.to(device=self._x.device, dtype=self._x.dtype)
-                    beq_device = beq.to(device=self._x.device, dtype=self._x.dtype)
-                    for i in range(Aeq.shape[0]):
-                        violation = torch.sum(Aeq_device[i] * self._x) - beq_device[i]
-                        obj = obj + self.rho_eq * violation * violation
+                    viol_eq = Aeq @ self._x - beq
+                    obj = obj + self.rho_eq * torch.sum(viol_eq ** 2)
 
+                # Inequality penalties: rho_ineq * ||relu(Ale x - ble)||^2
                 if Ale.shape[0] > 0:
-                    # Ensure constraint matrices are on same device
-                    Ale_device = Ale.to(device=self._x.device, dtype=self._x.dtype)
-                    ble_device = ble.to(device=self._x.device, dtype=self._x.dtype)
-                    for i in range(Ale.shape[0]):
-                        violation = torch.sum(Ale_device[i] * self._x) - ble_device[i]
-                        obj = obj + self.rho_ineq * torch.relu(violation)**2
+                    viol_le = Ale @ self._x - ble
+                    obj = obj + self.rho_ineq * torch.sum(torch.relu(viol_le) ** 2)
 
-                # Perform backward pass within gradient context
+                # Backward
                 obj.backward()
-            
+
             opt.step()
 
             # Project to box constraints while preserving Parameter status
             with torch.no_grad():
-                # Ensure bounds are on the same device as _x
                 lb_device = self._lb.to(device=self._x.device, dtype=self._x.dtype)
                 ub_device = self._ub.to(device=self._x.device, dtype=self._x.dtype)
                 x_clamped = torch.minimum(torch.maximum(self._x, lb_device), ub_device)
-                self._x.data.copy_(x_clamped)  # Use .data.copy_ to preserve Parameter wrapper
+                # Use .data.copy_ to preserve Parameter wrapper
+                self._x.data.copy_(x_clamped)
                 # Ensure gradients are still enabled after projection
                 if not self._x.requires_grad:
                     self._x.requires_grad_(True)
 
+            # === 5) 约束违背度检测（向量化） ===
             max_viol = 0.0
             with torch.no_grad():
                 if Aeq.shape[0] > 0:
-                    # Ensure matrix operations are on same device
-                    Aeq_device = Aeq.to(device=self._x.device, dtype=self._x.dtype)
-                    beq_device = beq.to(device=self._x.device, dtype=self._x.dtype)
-                    max_viol = max(max_viol, float(torch.max(torch.abs(Aeq_device @ self._x - beq_device)).item()))
+                    eq_viol = torch.abs(Aeq @ self._x - beq)
+                    max_viol = max(max_viol, float(eq_viol.max().item()))
                 if Ale.shape[0] > 0:
-                    # Ensure matrix operations are on same device
-                    Ale_device = Ale.to(device=self._x.device, dtype=self._x.dtype)
-                    ble_device = ble.to(device=self._x.device, dtype=self._x.dtype)
-                    max_viol = max(max_viol, float(torch.max(torch.relu(Ale_device @ self._x - ble_device)).item()))
+                    le_viol = torch.relu(Ale @ self._x - ble)
+                    max_viol = max(max_viol, float(le_viol.max().item()))
 
+            # Feasibility reached
             if max_viol <= self.tol_feas:
                 self._status = SolveStatus.SAT
                 self._has_solution = True
                 self._sol = self._x.detach().clone()
                 break
 
+            # Time limit reached
             if t_end is not None and time.time() >= t_end:
+                # 对 “找 CE” 的场景，只要有一个可行/近似可行点就够用
                 self._status = SolveStatus.SAT if math.isfinite(max_viol) else SolveStatus.UNKNOWN
                 self._has_solution = True
                 self._sol = self._x.detach().clone()
                 break
         else:
+            # Max iter reached: treat as "we have a candidate", not UNSAT
             self._status = SolveStatus.SAT
             self._has_solution = True
             self._sol = self._x.detach().clone()

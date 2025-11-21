@@ -56,11 +56,66 @@ def export_to_solver(globalC: ConSet, solver: Solver,
     for con in templates:
         all_ids.update(con.var_ids)
         tag = con.meta.get("tag","")
+
         if tag.startswith("box:"):
-            lb = to_numpy(con.meta["lb"]); ub = to_numpy(con.meta["ub"])
-            for i, vid in enumerate(con.var_ids):
-                cur=boxes.get(vid, (-np.inf, +np.inf))
-                boxes[vid]=(max(cur[0], float(lb[i])), min(cur[1], float(ub[i])))
+            lb = to_numpy(con.meta["lb"])
+            ub = to_numpy(con.meta["ub"])
+
+            # 统一成一维向量
+            lb = lb.reshape(-1)
+            ub = ub.reshape(-1)
+
+            n_box = lb.shape[0]
+            n_ids = len(con.var_ids)
+
+            if n_box == n_ids:
+                # 原来的“每个 var_id 一个 bound”模式
+                for i, vid in enumerate(con.var_ids):
+                    cur = boxes.get(vid, (-np.inf, +np.inf))
+                    boxes[vid] = (
+                        max(cur[0], float(lb[i])),
+                        min(cur[1], float(ub[i])),
+                    )
+
+            elif n_ids == 1 and n_box > 1:
+                base = con.var_ids[0]
+                for offset in range(n_box):
+                    vid = base + offset
+                    # 这些变量是真实存在的，必须参与 all_ids 统计
+                    all_ids.add(vid)
+
+                    cur = boxes.get(vid, (-np.inf, +np.inf))
+                    boxes[vid] = (
+                        max(cur[0], float(lb[offset])),
+                        min(cur[1], float(ub[offset])),
+                    )
+
+            elif n_box == 1 and n_ids > 1:
+                # 兼容“标量 lb/ub 广播到一组 var_ids”
+                for vid in con.var_ids:
+                    cur = boxes.get(vid, (-np.inf, +np.inf))
+                    boxes[vid] = (
+                        max(cur[0], float(lb[0])),
+                        min(cur[1], float(ub[0])),
+                    )
+
+            else:
+                raise AssertionError(
+                    f"box shape mismatch: lb len={n_box}, var_ids len={n_ids}"
+                )
+
+        # 非 box 约束在这一步只是参与 all_ids 统计，box 逻辑之外不用动
+
+
+        # if tag.startswith("box:"):
+        #     lb = to_numpy(con.meta["lb"]); ub = to_numpy(con.meta["ub"])
+        #     assert lb.shape[0] == len(con.var_ids), \
+        #     f"box lb length mismatch: {lb.shape[0]} vs {len(con.var_ids)}"
+        #     assert ub.shape[0] == len(con.var_ids), \
+        #     f"box ub length mismatch: {ub.shape[0]} vs {len(con.var_ids)}"
+        #     for i, vid in enumerate(con.var_ids):
+        #         cur=boxes.get(vid, (-np.inf, +np.inf))
+        #         boxes[vid]=(max(cur[0], float(lb[i])), min(cur[1], float(ub[i])))
 
     nvars = max(all_ids)+1 if all_ids else 0
     solver.add_vars(nvars)
@@ -77,8 +132,12 @@ def export_to_solver(globalC: ConSet, solver: Solver,
 
         if tag.startswith("dense:"):
             W = to_numpy(con.meta["W"]); b = to_numpy(con.meta["b"])
+            assert W.ndim == 2, f"dense: W must be 2D, got {W.shape}"
             # W has shape (n_out, n_in), so we know the dimensions
             n_out, n_in = W.shape
+            assert b.shape[0] == n_out, f"dense: b len {b.shape[0]} != n_out {n_out}"
+            assert len(con.var_ids) == n_out + n_in, \
+            f"dense: expected {n_out + n_in} var_ids, got {len(con.var_ids)}"
             # Take the first n_out variables as outputs, the rest as inputs
             y = list(con.var_ids[:n_out])
             x = list(con.var_ids[n_out:])
@@ -86,8 +145,11 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                 solver.add_lin_eq([yi]+x, [1.0]+[-float(W[i,j]) for j in range(W.shape[1])], float(b[i]))
 
         elif tag.startswith("bias:"):
-            n=len(con.var_ids)//2; y=list(con.var_ids[:n]); x=list(con.var_ids[n:])
-            c=to_numpy(con.meta["c"])
+            n = len(con.var_ids) // 2
+            assert 2 * n == len(con.var_ids), f"bias: var_ids length not even: {len(con.var_ids)}"
+            y = list(con.var_ids[:n]); x = list(con.var_ids[n:])
+            c = to_numpy(con.meta["c"])
+            assert c.shape[0] == n, f"bias: c length {c.shape[0]} != {n}"
             for i, yi in enumerate(y): solver.add_lin_eq([yi,x[i]],[1.0,-1.0], float(c[i]))
 
         elif tag.startswith("scale:"):

@@ -31,13 +31,11 @@ from act.back_end.verifier import (
     VerifResult,
     find_entry_layer_id,
     gather_input_spec_layers,
+    check_violation_at_point,
     get_assert_layer,
     seed_from_input_specs,
     setup_and_solve,
 )
-
-# Front-end enums
-from act.front_end.specs import OutKind
 
 
 # -----------------------------------------------------------------------------
@@ -149,57 +147,3 @@ def verify_bab(net, solver: Solver,
         heapq.heappush(pq, BabNode(Rbox, node.depth + 1, width_sum(Rbox)))
 
     return VerifResult(VerifStatus.CERTIFIED, stats={"nodes": processed})
-
-# -----------------------------------------------------------------------------
-# Counterexample validation (lightweight, used internally by BaB)
-# -----------------------------------------------------------------------------
-
-def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
-    """
-    Lightweight validation: evaluate ACT Net at a point and check property violation.
-    Used internally by BaB to filter spurious counterexamples.
-    For external validation, caller should use full model inference.
-    """
-    from act.back_end.analyze import analyze
-    
-    # Create tight bounds around point
-    x_tensor = torch.from_numpy(x_np)
-    point_bounds = Bounds(x_tensor, x_tensor)
-    
-    # Create entry_fact with point bounds (no additional constraints for point eval)
-    entry_fact = Fact(bounds=point_bounds, cons=ConSet())
-    
-    # Analyze through network
-    entry_id = find_entry_layer_id(net)
-    _, after, _ = analyze(net, entry_id, entry_fact)
-    
-    # Get output bounds (should be tight for point evaluation)
-    output_layer_id = net.layers[-2].id  # Layer before ASSERT
-    y_bounds = after[output_layer_id].bounds
-    y_mid = ((y_bounds.lb + y_bounds.ub) / 2).cpu().numpy()
-    
-    # Check violation
-    k = assert_layer.meta.get("kind")
-    if k == OutKind.TOP1_ROBUST:
-        t = int(assert_layer.meta["y_true"])
-        others = [i for i in range(len(y_mid)) if i != t]
-        return (y_mid[others] - y_mid[t]).max() >= 0.0
-    elif k == OutKind.MARGIN_ROBUST:
-        t = int(assert_layer.meta["y_true"])
-        margin = float(assert_layer.meta["margin"])
-        others = [i for i in range(len(y_mid)) if i != t]
-        return (y_mid[others] - y_mid[t]).max() >= margin
-    elif k == OutKind.LINEAR_LE:
-        c = np.asarray(assert_layer.params["c"], dtype=float)
-        d = float(assert_layer.meta["d"])
-        return float(np.dot(c, y_mid)) >= d + 1e-8
-    elif k == OutKind.RANGE:
-        lb = assert_layer.params.get("lb")
-        ub = assert_layer.params.get("ub")
-        if lb is not None and np.any(y_mid < np.asarray(lb, dtype=float) - 1e-8):
-            return True
-        if ub is not None and np.any(y_mid > np.asarray(ub, dtype=float) + 1e-8):
-            return True
-        return False
-    else:
-        raise NotImplementedError(f"ASSERT kind not supported: {k}")

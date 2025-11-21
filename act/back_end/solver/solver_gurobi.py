@@ -112,16 +112,44 @@ class GurobiSolver(Solver):
         self.m.optimize()
 
     def status(self) -> str:
-        if self.m.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-            return SolveStatus.SAT
-        if self.m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+        """
+        Map Gurobi status to {SAT, UNSAT, UNKNOWN}.
+
+        Semantics:
+          - SAT    : a feasible solution exists (can be used as counterexample)
+          - UNSAT  : Gurobi proved the model infeasible
+          - UNKNOWN: all other cases (unbounded / interrupted / numeric issues)
+        """
+        if self.m is None:
+            return SolveStatus.UNKNOWN
+
+        st = self.m.Status
+
+        # Explicit infeasible = UNSAT
+        if st == GRB.INFEASIBLE:
             return SolveStatus.UNSAT
-        if self.m.SolCount > 0:
+
+        # OPTIMAL / SUBOPTIMAL: a solution exists
+        if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
             return SolveStatus.SAT
+
+        # If Gurobi produced any incumbent (SolCount>0), treat as SAT
+        # (covers TIME_LIMIT / INTERRUPTED / NODE_LIMIT with an incumbent)
+        try:
+            if getattr(self.m, 'SolCount', 0) > 0:
+                return SolveStatus.SAT
+        except Exception:
+            pass
+
+        # UNBOUNDED / INF_OR_UNBD: cannot conclude feasibility reliably
+        if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
+            return SolveStatus.UNKNOWN
+
+        # Fallback to UNKNOWN for all other states
         return SolveStatus.UNKNOWN
 
     def has_solution(self) -> bool:
-        return self.m.SolCount > 0
+        return self.m is not None and getattr(self.m, 'SolCount', 0) > 0
 
     def get_values(self, vids: List[int]) -> np.ndarray:
         return np.array([self._x[i].X for i in vids], dtype=float)

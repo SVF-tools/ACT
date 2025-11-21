@@ -268,12 +268,13 @@ class ACTToTorch:
             padding = meta.get("padding", 0)
             dilation = meta.get("dilation", 1)
             groups = meta.get("groups", 1)
-            
+            bias_enabled = meta.get("bias_enabled", True)  # 新增
+
             if in_channels is None:
                 raise ValueError("CONV2D layer requires 'in_channels' in meta")
             if out_channels is None:
                 raise ValueError("CONV2D layer requires 'out_channels' in meta")
-            
+
             layer = nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -281,14 +282,44 @@ class ACTToTorch:
                 stride=stride,
                 padding=padding,
                 dilation=dilation,
-                groups=groups
+                groups=groups,
+                bias=bias_enabled  # 用 meta 里的 flag
             )
-            
-            # Transfer weights and bias from ACT layer
+
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
-            
+
             return layer
+
+    # elif kind == "CONV2D":
+    #     in_channels = meta.get("in_channels")
+    #     out_channels = meta.get("out_channels")
+    #     kernel_size = meta.get("kernel_size", 3)
+    #     stride = meta.get("stride", 1)
+    #     padding = meta.get("padding", 0)
+    #     dilation = meta.get("dilation", 1)
+    #     groups = meta.get("groups", 1)
+        
+    #     if in_channels is None:
+    #         raise ValueError("CONV2D layer requires 'in_channels' in meta")
+    #     if out_channels is None:
+    #         raise ValueError("CONV2D layer requires 'out_channels' in meta")
+        
+    #     layer = nn.Conv2d(
+    #         in_channels=in_channels,
+    #         out_channels=out_channels,
+    #         kernel_size=kernel_size,
+    #         stride=stride,
+    #         padding=padding,
+    #         dilation=dilation,
+    #         groups=groups
+    #     )
+        
+    #     # Transfer weights and bias from ACT layer
+    #     if act_layer is not None:
+    #         self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
+        
+    #     return layer
         
         elif kind == "CONV1D":
             in_channels = meta.get("in_channels")
@@ -454,13 +485,21 @@ class ACTToTorch:
         elif kind == "EMBEDDING":
             num_embeddings = meta.get("num_embeddings")
             embedding_dim = meta.get("embedding_dim")
-            
+
             if num_embeddings is None:
                 raise ValueError("EMBEDDING requires 'num_embeddings' in meta")
             if embedding_dim is None:
                 raise ValueError("EMBEDDING requires 'embedding_dim' in meta")
-            
-            return nn.Embedding(num_embeddings, embedding_dim)
+
+            layer = nn.Embedding(num_embeddings, embedding_dim)
+
+            if act_layer is not None:
+                with torch.no_grad():
+                    p = act_layer.params
+                    if "weight" in p:
+                        layer.weight.copy_(p["weight"])
+            return layer
+
         
         elif kind == "RNN":
             input_size = meta.get("input_size")

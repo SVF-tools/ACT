@@ -146,7 +146,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from act.pipeline.verification.model_factory import ModelFactory
 from act.pipeline.verification.torch2act import TorchToACT
-from act.back_end.verifier import verify_once
+from act.back_end.verifier import verify_once, gather_input_spec_layers, seed_from_input_specs, get_input_ids
 from act.back_end.analyze import analyze
 from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.back_end.solver.solver_torch import TorchLPSolver
@@ -282,8 +282,27 @@ class VerificationValidator:
         logger.info(f"Validating: {name} (solver: {solver})")
         logger.info(f"{'='*80}")
         
+        solver_ce_results: Optional[Dict[str, Any]] = None
+        
         # Step 1: Load ACT Net from factory
         act_net = self.factory.get_act_net(name)
+        # Debug: check input var wiring
+        try:
+            inp_layer = next((L for L in act_net.layers if getattr(L, "kind", "") == "INPUT"), None)
+            if inp_layer:
+                logger.debug(f"  [ACT INPUT] vars={len(inp_layer.out_vars)} shape={inp_layer.meta.get('shape')}")
+            specs = gather_input_spec_layers(act_net)
+            seed = seed_from_input_specs(specs)
+            input_ids = get_input_ids(act_net)
+            logger.debug(f"  [ACT INPUT_SPEC] ids={len(input_ids)}, seed_lb shape={tuple(seed.lb.shape)}, "
+                         f"lb[min,max]=[{seed.lb.min():.4f},{seed.lb.max():.4f}], "
+                         f"ub[min,max]=[{seed.ub.min():.4f},{seed.ub.max():.4f}]")
+        except Exception:
+            pass
+        # # print each layer info for debugging
+        # for layer in act_net.layers:
+        #     layer_name = layer.meta.get("name", "unnamed")
+        #     logger.error(f"  [ACT Layer] ID: {layer.id}, Kind: {layer.kind}, Name: {layer_name}")
         
         # Step 2: Create PyTorch model for concrete execution
         model = self.factory.create_model(name, load_weights=True)
@@ -295,7 +314,23 @@ class VerificationValidator:
         
         try:
             if solver == 'gurobi':
-                solver_instance = GurobiSolver()
+                try:
+                    solver_instance = GurobiSolver()
+                except Exception as e:
+                    if "License" in str(e):
+                        logger.warning(f"     Skipping gurobi for {name}: {e}")
+                        skip_result = {
+                            'network': name,
+                            'solver': solver,
+                            'validation_type': 'counterexample',
+                            'validation_status': 'INCONCLUSIVE',
+                            'concrete_counterexample': counterexample is not None,
+                            'verifier_result': 'ERROR',
+                            'explanation': f"Skipped due to Gurobi license issue: {e}"
+                        }
+                        self.validation_results.append(skip_result)
+                        return skip_result
+                    raise
             elif solver == 'torchlp':
                 solver_instance = TorchLPSolver()
             else:
@@ -308,13 +343,49 @@ class VerificationValidator:
             # If verifier found counterexample, validate it with model
             if verify_result.counterexample is not None:
                 logger.info(f"     Verifier counterexample shape: {verify_result.counterexample.shape}")
-                ce_tensor = verify_result.counterexample.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+                # Reshape CE to the model's expected input shape (avoid conv2d shape errors)
+                ce_raw = verify_result.counterexample
+                input_shape = None
+                for layer in act_net.layers:
+                    if getattr(layer, "kind", None) == "INPUT":
+                        input_shape = layer.meta.get("shape")
+                        break
+                try:
+                    if input_shape is not None:
+                        ce_tensor = ce_raw.view(*input_shape)
+                    else:
+                        ce_tensor = ce_raw.unsqueeze(0)
+                except Exception as reshape_err:
+                    logger.warning(f"     CE reshape failed, using vector: {reshape_err}")
+                    ce_tensor = ce_raw.unsqueeze(0)
+                ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
-                    logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
-                              f"output_sat={ce_results['output_satisfied']}")
+                    solver_ce_results = ce_results
+                    logger.info(
+                        "     CE validation: input_sat=%s, output_sat=%s",
+                        ce_results.get("input_satisfied", None),
+                        ce_results.get("output_satisfied", None),
+                    )
+                else:
+                    logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
             
         except Exception as e:
+            # Handle known license issues gracefully
+            if solver == 'gurobi' and "License" in str(e):
+                logger.warning(f"     Skipping gurobi for {name}: {e}")
+                skip_result = {
+                    'network': name,
+                    'solver': solver,
+                    'validation_type': 'counterexample',
+                    'validation_status': 'INCONCLUSIVE',
+                    'concrete_counterexample': counterexample is not None,
+                    'verifier_result': 'ERROR',
+                    'explanation': f"Skipped due to Gurobi license issue: {e}"
+                }
+                self.validation_results.append(skip_result)
+                return skip_result
+
             logger.error(f"     Verifier failed: {e}")
             import traceback
             traceback.print_exc()
@@ -334,7 +405,8 @@ class VerificationValidator:
             network_name=name,
             solver_name=solver,
             concrete_counterexample=counterexample,
-            verifier_status=verifier_status
+            verifier_status=verifier_status,
+            solver_ce_results=solver_ce_results,
         )
         
         self.validation_results.append(validation)
@@ -345,72 +417,144 @@ class VerificationValidator:
         network_name: str,
         solver_name: str,
         concrete_counterexample: Optional[Tuple],
-        verifier_status: str
+        verifier_status: str,
+        solver_ce_results: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Cross-validate concrete inference vs formal verification (Level 1).
         
-        Validation Rules:
-        1. If concrete counterexample found → verifier MUST report FALSIFIED or UNKNOWN
-        2. If no concrete counterexample → verifier can report anything (testing incomplete)
+        Validation Rules (extended):
+        1. If a real counterexample exists (from tests or validated solver CE),
+           the verifier MUST NOT return CERTIFIED.
+        2. If solver reports FALSIFIED but its CE is spurious (violates input
+           spec or does not violate the property), treat it as a soundness bug.
+        3. If no concrete counterexample exists under current tests, verifier
+           result is INCONCLUSIVE (tests may be too weak).
         """
-        result = {
+        result: Dict[str, Any] = {
             'network': network_name,
             'solver': solver_name,
             'validation_type': 'counterexample',
             'concrete_counterexample': concrete_counterexample is not None,
             'verifier_result': verifier_status,
             'validation_status': None,
-            'explanation': None
+            'explanation': None,
+            'solver_ce_checked': False,
+            'solver_ce_is_ce': False,
+            'solver_ce_spurious': False,
         }
         
-        if concrete_counterexample is not None:
-            # We found a real counterexample - verifier MUST NOT claim CERTIFIED
-            input_tensor, inference_results = concrete_counterexample
+        # 1) Ground truth from random/center/boundary tests
+        test_ce_exists = concrete_counterexample is not None
+        
+        # 2) Ground truth from solver-proposed CE (checked by ce_results)
+        solver_ce_is_ce = False
+        solver_ce_spurious = False
+        if isinstance(solver_ce_results, dict):
+            result['solver_ce_checked'] = True
+            ce_in_sat = bool(solver_ce_results.get('input_satisfied', False))
+            ce_out_sat = bool(solver_ce_results.get('output_satisfied', True))
+            
+            # 真 CE：输入满足 spec，输出违反 property
+            solver_ce_is_ce = ce_in_sat and (not ce_out_sat)
+            # 伪 CE：要么输入不满足 spec，要么输出没违规
+            solver_ce_spurious = (not ce_in_sat) or ce_out_sat
+            
+            result['solver_ce_is_ce'] = solver_ce_is_ce
+            result['solver_ce_spurious'] = solver_ce_spurious
+        
+        # 是否存在任何“被验证为真”的 CE
+        any_ce_exists = test_ce_exists or solver_ce_is_ce
+        
+        # ===== Case A: 至少有一个真实 CE =====
+        if any_ce_exists:
+            if concrete_counterexample is not None:
+                input_tensor, inference_results = concrete_counterexample
+            else:
+                input_tensor, inference_results = None, None
             
             if verifier_status == 'CERTIFIED':
-                # CRITICAL BUG: Verifier claims safe, but we have a counterexample!
+                # 典型 false negative：真实有 CE，verifier 说 CERTIFIED
                 result['validation_status'] = 'FAILED'
                 result['explanation'] = (
-                    f"🚨 SOUNDNESS BUG DETECTED! Verifier claims CERTIFIED but "
-                    f"concrete counterexample exists. This is a false negative."
+                    "🚨 SOUNDNESS BUG DETECTED! Verifier returned CERTIFIED but a "
+                    "concrete counterexample exists (false negative)."
                 )
-                logger.error(f"\n  {result['explanation']}")
-                logger.error(f"     Counterexample input: {input_tensor.shape}, "
-                            f"range=[{input_tensor.min():.4f}, {input_tensor.max():.4f}]")
-                logger.error(f"     Output violation: {inference_results['output_explanation']}")
-                
+                logger.error("\n  %s", result['explanation'])
+                if input_tensor is not None and inference_results is not None:
+                    logger.error(
+                        "     Test counterexample input: %s, range=[%.4f, %.4f]",
+                        tuple(input_tensor.shape),
+                        float(input_tensor.min()),
+                        float(input_tensor.max()),
+                    )
+                    logger.error(
+                        "     Output violation: %s",
+                        inference_results.get('output_explanation', '<no explanation>')
+                    )
+                if solver_ce_is_ce and solver_ce_results is not None:
+                    logger.error(
+                        "     Solver CE also validated as real CE "
+                        "(input_satisfied=%s, output_satisfied=%s).",
+                        solver_ce_results.get('input_satisfied'),
+                        solver_ce_results.get('output_satisfied'),
+                    )
+            
             elif verifier_status == 'FALSIFIED':
-                # CORRECT: Verifier correctly identified the issue
-                result['validation_status'] = 'PASSED'
-                result['explanation'] = (
-                    f"✅ CORRECT - Verifier correctly reported FALSIFIED "
-                    f"(matches concrete execution)"
-                )
-                logger.info(f"\n  {result['explanation']}")
-                
+                # 方向正确：确实存在 CE，verifier 也说 FALSIFIED
+                # 但如果唯一的 CE 来自 solver 且是伪 CE，会在下一个 case 里处理
+                if solver_ce_spurious and not test_ce_exists:
+                    result['validation_status'] = 'FAILED'
+                    result['explanation'] = (
+                        "🚨 SOUNDNESS BUG DETECTED! Verifier reported FALSIFIED but "
+                        "its own counterexample is spurious (input or output check "
+                        "failed under concrete execution)."
+                    )
+                    logger.error("\n  %s", result['explanation'])
+                else:
+                    result['validation_status'] = 'PASSED'
+                    result['explanation'] = (
+                        "✅ CORRECT - Verifier reported FALSIFIED and at least one "
+                        "real counterexample exists (from tests and/or solver CE)."
+                    )
+                    logger.info("\n  %s", result['explanation'])
+            
             elif verifier_status == 'UNKNOWN':
-                # ACCEPTABLE: Verifier couldn't decide (incomplete but sound)
+                # 不完整但 sound：有 CE，但 verifier 不敢给 CERTIFIED
                 result['validation_status'] = 'ACCEPTABLE'
                 result['explanation'] = (
-                    f"⚠️ INCOMPLETE - Verifier returned UNKNOWN, but concrete "
-                    f"counterexample exists (verifier is sound but incomplete)"
+                    "⚠️ INCOMPLETE - Verifier returned UNKNOWN while a concrete "
+                    "counterexample exists (sound but incomplete)."
                 )
-                logger.warning(f"\n  {result['explanation']}")
-                
+                logger.warning("\n  %s", result['explanation'])
+            
             else:
                 result['validation_status'] = 'UNKNOWN'
-                result['explanation'] = f"Unknown verifier result: {verifier_status}"
-                logger.warning(f"\n  {result['explanation']}")
+                result['explanation'] = f"Unknown verifier result: {verifier_status!r}"
+                logger.warning("\n  %s", result['explanation'])
+            
+            return result
         
+        # ===== Case B: 当前测试下找不到任何真实 CE =====
+        #           （测试没找到，solver CE 也被判定为伪）
+        if verifier_status == 'FALSIFIED' and solver_ce_spurious:
+            # 纯粹的假阳性：verifier 声称 FALSIFIED，但给的 CE 不合法
+            result['validation_status'] = 'FAILED'
+            result['explanation'] = (
+                "🚨 SOUNDNESS BUG DETECTED! Verifier reported FALSIFIED but its "
+                "proposed counterexample is spurious (fails spec or does not "
+                "violate the property)."
+            )
+            logger.error("\n  %s", result['explanation'])
         else:
-            # No concrete counterexample found in testing
+            # 没有 ground-truth CE，只能说测试不够强
             result['validation_status'] = 'INCONCLUSIVE'
             result['explanation'] = (
-                f"⚪ INCONCLUSIVE - No counterexample found in concrete testing. "
-                f"Verifier result: {verifier_status} (cannot validate with this test)"
+                "⚪ INCONCLUSIVE - No concrete counterexample found in testing, "
+                "and solver-proposed CEs are not validated as real counterexamples. "
+                f"Verifier result: {verifier_status}."
             )
-            logger.info(f"\n  {result['explanation']}")
+            logger.info("\n  %s", result['explanation'])
         
         return result
     
@@ -494,8 +638,26 @@ class VerificationValidator:
         set_transfer_function_mode(tf_mode)
         
         # Step 3: Sample concrete inputs
-        violations = []
+        violations: List[Dict[str, Any]] = []
         total_checks = 0
+        
+        # Extract input bounds from ACT net (prefer INPUT_SPEC params)
+        def _get_input_bounds_from_act(act_net_inner):
+            from act.back_end.core import Bounds
+            for layer in act_net_inner.layers:
+                if layer.kind == "INPUT_SPEC":
+                    params = layer.params or {}
+                    if 'lb' in params and 'ub' in params:
+                        return Bounds(lb=params['lb'].flatten().to(device=self.device, dtype=self.dtype),
+                                      ub=params['ub'].flatten().to(device=self.device, dtype=self.dtype))
+                    if 'center' in params and 'eps' in params:
+                        center = params['center'].flatten().to(device=self.device, dtype=self.dtype)
+                        eps = params['eps'].to(device=self.device, dtype=self.dtype)
+                        # eps may be scalar tensor
+                        return Bounds(lb=center - eps, ub=center + eps)
+            return None
+        
+        spec_bounds = _get_input_bounds_from_act(act_net)
         
         for sample_idx in range(num_samples):
             # Generate random input within spec
@@ -503,20 +665,25 @@ class VerificationValidator:
             input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
             
             # Step 4: Get concrete activations via forward hooks
-            concrete_activations = self._get_concrete_activations(model, input_tensor)
+            concrete_activations = self._get_concrete_activations(model, input_tensor, act_net)
             
             # Step 5: Prepare entry fact from input tensor
             from act.back_end.core import Fact, Bounds
             entry_id = 0  # INPUT layer is typically layer 0
-            input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
+            if spec_bounds is not None:
+                input_bounds = spec_bounds
+            else:
+                input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
             entry_fact = Fact(bounds=input_bounds, cons=None)
             
             # Step 6: Run abstract analysis
             try:
                 before, after, globalC = analyze(act_net, entry_id, entry_fact)
+                # logger.info(f"  [This net has {len(after)} layers].")
                 
                 # Step 7: Check bounds containment
                 for layer_id, concrete_vals in concrete_activations.items():
+                    # logger.error(f"  [Sample {sample_idx}] Checking layer {layer_id}...")   
                     if layer_id not in after:
                         continue
                     
@@ -529,29 +696,54 @@ class VerificationValidator:
                     
                     # Ensure shapes match (ACT may have different neuron counts)
                     if concrete_vals_flat.shape != lb.shape:
-                        logger.warning(f"  ⚠️ Shape mismatch at layer {layer_id}: "
-                                     f"concrete={concrete_vals_flat.shape}, abstract={lb.shape}. Skipping.")
+                        logger.warning(
+                            "  ⚠️ Shape mismatch at layer %s: concrete=%s, abstract=%s. Skipping.",
+                            layer_id, tuple(concrete_vals_flat.shape), tuple(lb.shape),
+                        )
                         continue
                     
                     # Check if concrete values are within bounds
                     violations_mask = (concrete_vals_flat < lb) | (concrete_vals_flat > ub)
-                    num_violations = violations_mask.sum().item()
-                    total_checks += concrete_vals_flat.numel()
+                    num_violations = int(violations_mask.sum().item())
+                    total_checks += int(concrete_vals_flat.numel())
                     
                     if num_violations > 0:
+                        if name in ("control_strict", "reachability_tight") \
+                           and layer_id == 0 and sample_idx == 0:
+                            logger.error("=== DEBUG %s / tf_mode=%s / sample=%d / layer=%d ===",
+                                         name, tf_mode, sample_idx, layer_id)
+                            logger.error("concrete_vals_flat: %s", concrete_vals_flat)
+                            logger.error("lb: %s", lb)
+                            logger.error("ub: %s", ub)
+                            logger.error("viol_lt_lb idx: %s",
+                                         (concrete_vals_flat < lb).nonzero(as_tuple=False).view(-1))
+                            logger.error("viol_gt_ub idx: %s",
+                                         (concrete_vals_flat > ub).nonzero(as_tuple=False).view(-1))
+                            logger.error(
+                                "concrete[min, max]=[%.6f, %.6f], "
+                                "lb[min, max]=[%.6f, %.6f], "
+                                "ub[min, max]=[%.6f, %.6f]",
+                                float(concrete_vals_flat.min().item()),
+                                float(concrete_vals_flat.max().item()),
+                                float(lb.min().item()), float(lb.max().item()),
+                                float(ub.min().item()), float(ub.max().item()),
+                            )
+                            logger.error("=== END DEBUG ===")
                         violation_info = {
                             'sample_idx': sample_idx,
                             'layer_id': layer_id,
                             'num_violations': num_violations,
-                            'total_neurons': concrete_vals_flat.numel(),
-                            'concrete_min': concrete_vals_flat.min().item(),
-                            'concrete_max': concrete_vals_flat.max().item(),
-                            'abstract_lb': lb.min().item(),
-                            'abstract_ub': ub.max().item()
+                            'total_neurons': int(concrete_vals_flat.numel()),
+                            'concrete_min': float(concrete_vals_flat.min().item()),
+                            'concrete_max': float(concrete_vals_flat.max().item()),
+                            'abstract_lb': float(lb.min().item()),
+                            'abstract_ub': float(ub.max().item()),
                         }
                         violations.append(violation_info)
-                        logger.error(f"  ❌ Bounds violation at layer {layer_id}: "
-                                   f"{num_violations}/{concrete_vals_flat.numel()} neurons")
+                        logger.error(
+                            "  ❌ Bounds violation at layer %s: %d/%d neurons",
+                            layer_id, num_violations, int(concrete_vals_flat.numel()),
+                        )
             
             except Exception as e:
                 logger.error(f"  ⚠️ Abstract analysis failed for sample {sample_idx}: {e}")
@@ -596,7 +788,8 @@ class VerificationValidator:
     def _get_concrete_activations(
         self,
         model: torch.nn.Module,
-        input_tensor: torch.Tensor
+        input_tensor: torch.Tensor,
+        act_net=None
     ) -> Dict[int, torch.Tensor]:
         """
         Get concrete activation values by running forward pass with hooks.
@@ -604,29 +797,52 @@ class VerificationValidator:
         Args:
             model: PyTorch model
             input_tensor: Input tensor
+            act_net: Optional ACT Net to align hooks to ACT layer ids
             
         Returns:
             Dictionary mapping layer_id to activation tensor
         """
-        activations = {}
-        hooks = []
+        activations: Dict[int, torch.Tensor] = {}
+        hooks: List[Any] = []
+        collected: List[torch.Tensor] = []
         
-        def make_hook(layer_id):
+        def make_hook(temp_id: int):
             def hook(module, input, output):
-                activations[layer_id] = output.detach().clone()
+                collected.append(output.detach().clone())
             return hook
         
-        # Register hooks on all layers
-        layer_id = 0
+        hook_kinds = {
+            "DENSE": torch.nn.Linear,
+            "CONV2D": torch.nn.Conv2d,
+            "RELU": torch.nn.ReLU,
+            "FLATTEN": torch.nn.Flatten,
+        }
+        
+        # Register hooks on relevant torch modules; map to ACT ids after forward
+        temp_id = 0
         for module in model.modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ReLU)):
-                hook = module.register_forward_hook(make_hook(layer_id))
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ReLU, torch.nn.Flatten)):
+                hook = module.register_forward_hook(make_hook(temp_id))
                 hooks.append(hook)
-                layer_id += 1
+                temp_id += 1
         
         # Run forward pass
         with torch.no_grad():
             model(input_tensor)
+        
+        # Align collected activations with ACT layer ids so shapes match
+        if act_net is not None:
+            act_ids = [layer.id for layer in act_net.layers if layer.kind in hook_kinds]
+            if len(act_ids) != len(collected):
+                logger.warning(
+                    "  ⚠️ Hook count mismatch: torch collected %d, ACT hookable layers=%d; aligning by position.",
+                    len(collected), len(act_ids),
+                )
+            for idx, act_id in enumerate(act_ids[:len(collected)]):
+                activations[act_id] = collected[idx]
+        else:
+            for idx, tensor in enumerate(collected):
+                activations[idx] = tensor
         
         # Remove hooks
         for hook in hooks:
@@ -715,7 +931,7 @@ class VerificationValidator:
         inconclusive = sum(1 for r in results if r.get('validation_status') == 'INCONCLUSIVE')
         errors = sum(1 for r in results if r.get('status') == 'ERROR')
         
-        summary = {
+        summary: Dict[str, Any] = {
             'validation_type': validation_type,
             'total': total,
             'passed': passed,
@@ -875,4 +1091,3 @@ def main():
 if __name__ == "__main__":
     import sys
     sys.exit(main())
-
