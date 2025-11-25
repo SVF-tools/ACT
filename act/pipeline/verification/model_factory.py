@@ -297,6 +297,7 @@ class ModelFactory:
         """
         next_var = 0
         prev_out: List[int] = []
+        current_shape: Optional[Tuple[int, ...]] = None
         net.by_id = {L.id: L for L in net.layers}  # initialize mapping
 
         def prod(shape_list):
@@ -307,44 +308,72 @@ class ModelFactory:
 
         for layer in net.layers:
             kind = layer.kind
+
             if kind == "INPUT":
-                shape = layer.meta.get("shape") or []
-                w = prod(shape) if shape else 1
+                shape = tuple(layer.meta.get("shape") or [])
+                # Drop batch dim when counting vars
+                flat = prod(shape[1:]) if len(shape) > 1 else prod(shape) if shape else 1
                 layer.in_vars = []
-                layer.out_vars = list(range(next_var, next_var + w))
-                next_var += w
+                layer.out_vars = list(range(next_var, next_var + flat))
+                next_var += flat
+                current_shape = shape
+
             elif kind == "INPUT_SPEC":
                 layer.in_vars = prev_out
                 layer.out_vars = prev_out
+
             elif kind == "CONV2D":
-                out_shape = layer.meta.get("output_shape") or []
+                out_shape = layer.meta.get("output_shape") or ()
                 if out_shape:
-                    w = prod(out_shape)
+                    flat = prod(out_shape[1:]) if len(out_shape) > 1 else prod(out_shape)
                 else:
                     weight = layer.params.get("weight")
-                    # fallback to out_channels if no shape metadata
-                    w = weight.shape[0] if weight is not None else len(prev_out)
+                    flat = weight.shape[0] if weight is not None else len(prev_out)
                 layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + w))
-                next_var += w
+                layer.out_vars = list(range(next_var, next_var + flat))
+                next_var += flat
+                current_shape = tuple(out_shape) if out_shape else current_shape
+
+            elif kind == "FLATTEN":
+                start_dim = int(layer.meta.get("start_dim", 1))
+                shape_list = list(current_shape) if current_shape is not None else []
+                if not shape_list:
+                    flat = len(prev_out)
+                    new_shape = (flat,)
+                else:
+                    tail = prod(shape_list[start_dim:]) if start_dim < len(shape_list) else 1
+                    new_shape = tuple(shape_list[:start_dim] + [tail])
+                    flat = tail
+                layer.in_vars = prev_out
+                layer.out_vars = list(range(next_var, next_var + flat))
+                next_var += flat
+                current_shape = new_shape
+
             elif kind == "DENSE":
-                # W shape: (out_features, in_features)
-                out_features = layer.params["W"].shape[0]
+                out_features = int(layer.params["W"].shape[0])
                 layer.in_vars = prev_out
                 layer.out_vars = list(range(next_var, next_var + out_features))
                 next_var += out_features
-            elif kind in ("RELU", "TANH", "SIGMOID", "GELU", "SILU", "LRELU", "PRELU", "SOFTPLUS", "ABS", "CLIP", "FLATTEN"):
+                current_shape = (1, out_features)
+
+            elif kind in ("RELU", "TANH", "SIGMOID", "GELU", "SILU", "LRELU", "PRELU", "SOFTPLUS", "ABS", "CLIP"):
                 layer.in_vars = prev_out
-                layer.out_vars = prev_out
+                layer.out_vars = list(range(next_var, next_var + len(prev_out)))
+                next_var += len(layer.out_vars)
+                # shape unchanged
+
             elif kind == "ASSERT":
                 layer.in_vars = prev_out
-                layer.out_vars = prev_out
+                layer.out_vars = []
+
             else:
-                # Fallback: keep previous wiring
+                # Fallback: treat as shape-preserving elementwise
                 layer.in_vars = prev_out
-                layer.out_vars = prev_out
+                layer.out_vars = list(range(next_var, next_var + len(prev_out)))
+                next_var += len(layer.out_vars)
 
             prev_out = layer.out_vars
+
         # Refresh lookup dict with updated vars
         net.by_id = {L.id: L for L in net.layers}
     

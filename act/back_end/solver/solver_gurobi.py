@@ -59,6 +59,7 @@ class GurobiSolver(Solver):
         # device hint ignored (CPU solver)
         self.m = gp.Model(name)
         self.m.Params.OutputFlag = 0
+        self.m.Params.DualReductions = 0
         self._x = []
 
     def add_vars(self, n: int) -> None:
@@ -110,6 +111,17 @@ class GurobiSolver(Solver):
             self.m.Params.TimeLimit = float(timelimit)
         self.m.update()
         self.m.optimize()
+        print("Gurobi m.Status :", self.m.Status)
+        print("Gurobi SolCount :", self.m.SolCount)
+
+        if self.m.Status in [3, 4, 5, 12]:  # infeasible, inf_or_unbd, unbounded, numeric
+            self.m.write("debug_model.lp")
+            print("[DEBUG] wrote LP model to debug_model.lp")
+        # ★ 如果仍然拿到了 INF_OR_UNBD，再关掉 DualReductions 重跑一遍
+        if self.m.Status == GRB.INF_OR_UNBD:
+            # 仅在第一次遇到时处理即可
+            self.m.Params.DualReductions = 0
+            self.m.optimize()
 
     def status(self) -> str:
         """

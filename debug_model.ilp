@@ -1,0 +1,10 @@
+\ Model _copy
+\ LP format - for model browsing. Use MPS format to capture full model detail.
+\ Signature: 0xd8241660b71a54ef
+Minimize
+ 
+Subject To
+ R9: x[18] >= 0.500001
+Bounds
+ -infinity <= x[18] <= 0.0497617781464668
+End

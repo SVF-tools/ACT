@@ -1,0 +1,642 @@
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 12:34:00 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.02 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0x31524ca6
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 12:42:12 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 12:43:46 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 12:46:20 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0x31524ca6
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 13:00:53 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0x31524ca6
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 13:42:57 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0xc89b8f7d
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 18:35:46 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.02 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0xc89b8f7d
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 21:45:16 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0xc89b8f7d
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 22:23:08 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.03 seconds
+: 194 rows, 858 columns, 50991 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 194 rows, 858 columns and 50991 nonzeros (Max)
+Model fingerprint: 0x220051f5
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e-01]
+Presolve removed 111 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 22:32:40 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 194 rows, 858 columns, 50991 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 194 rows, 858 columns and 50991 nonzeros (Max)
+Model fingerprint: 0x220051f5
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e-01]
+Presolve removed 111 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 22:33:42 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 195 rows, 858 columns, 50992 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 195 rows, 858 columns and 50992 nonzeros (Max)
+Model fingerprint: 0xc89b8f7d
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-03, 3e+00]
+  RHS range        [5e-02, 3e+00]
+Presolve removed 112 rows and 27 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 22:57:00 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.01 seconds
+: 199 rows, 858 columns, 50991 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 199 rows, 858 columns and 50991 nonzeros (Max)
+Model fingerprint: 0x143869f9
+Model has 1 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [1e-06, 1e+00]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [7e-02, 3e+00]
+  RHS range        [4e-02, 4e+00]
+Presolve removed 116 rows and 22 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 785 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Mon Nov 24 23:21:53 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.00 seconds
+: 12 rows, 21 columns, 66 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 12 rows, 21 columns and 66 nonzeros (Min)
+Model fingerprint: 0x210f97d7
+Model has 0 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-04, 1e+00]
+  Objective range  [0e+00, 0e+00]
+  Bounds range     [2e-02, 1e+00]
+  RHS range        [5e-01, 5e-01]
+Presolve removed 6 rows and 6 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 1 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Tue Nov 25 11:24:13 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.00 seconds
+: 12 rows, 21 columns, 66 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 12 rows, 21 columns and 66 nonzeros (Min)
+Model fingerprint: 0x210f97d7
+Model has 0 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-04, 1e+00]
+  Objective range  [0e+00, 0e+00]
+  Bounds range     [2e-02, 1e+00]
+  RHS range        [5e-01, 5e-01]
+Presolve removed 6 rows and 6 columns
+Presolve time: 0.67s
+
+Solved in 0 iterations and 0.67 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 1 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+
+
+Gurobi 13.0.0 (mac64[arm], gurobi_cl) logging started Tue Nov 25 12:14:21 2025
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2542227
+Set parameter LogFile to value "gurobi.log"
+Using license file /Users/z5524562/gurobi.lic
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (mac64[arm] - Darwin 24.6.0 24G325)
+Copyright (c) 2025, Gurobi Optimization, LLC
+
+Read LP format model from file debug_model.lp
+Reading time = 0.00 seconds
+: 12 rows, 21 columns, 66 nonzeros
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+Optimize a model with 12 rows, 21 columns and 66 nonzeros (Min)
+Model fingerprint: 0x210f97d7
+Model has 0 linear objective coefficients
+Coefficient statistics:
+  Matrix range     [2e-04, 1e+00]
+  Objective range  [0e+00, 0e+00]
+  Bounds range     [2e-02, 1e+00]
+  RHS range        [5e-01, 5e-01]
+Presolve removed 6 rows and 6 columns
+Presolve time: 0.00s
+
+Solved in 0 iterations and 0.00 seconds (0.00 work units)
+Infeasible model
+Academic license 2542227 - for non-commercial use only - registered to ka___@unsw.edu.au
+
+Using Gurobi shared library /opt/anaconda3/envs/act-py312/lib/libgurobi130.dylib
+
+CPU model: Apple M3 Pro
+Thread count: 11 physical cores, 11 logical processors, using up to 11 threads
+
+
+IIS computed: 1 constraints and 1 bounds
+IIS runtime: 0.00 seconds (0.00 work units)
+
+Wrote result file 'debug_model.ilp'
+

@@ -157,8 +157,26 @@ class ConSet:
     def replace(self, c: Con): 
         self.S[c.signature()] = c
     
+    # def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
+    #     self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "lb": B.lb.clone(), "ub": B.ub.clone()}))
+    
     def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
-        self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "lb": B.lb.clone(), "ub": B.ub.clone()}))
+        """
+        Attach a box (interval) constraint for the given vars at a specific layer.
+
+        约定：对于同一个 var_id，真正应该导出给 solver 的，是
+        “最后一个写这个 var 的 layer” 的 box；中间层的 box 只是局部信息。
+        """
+        self.replace(Con(
+            "INEQ",
+            tuple(var_ids),
+            {
+                "tag":      f"box:{layer_id}",
+                "layer_id": int(layer_id),
+                "lb":       B.lb.clone(),
+                "ub":       B.ub.clone(),
+            }
+        ))
     
     def __iter__(self):
         """Iterate over constraints (Con objects). Makes ConSet iterable."""

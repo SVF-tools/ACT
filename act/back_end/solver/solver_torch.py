@@ -157,19 +157,37 @@ class TorchLPSolver(Solver):
         )
 
         # === 2) 将约束一次性转为稠密矩阵（O(mn)，只做一次） ===
+        # The original per-row dense assignment can get slow on wide problems
+        # (e.g., CIFAR) because of repeated advanced indexing. We instead
+        # collect all nonzeros and scatter once to keep assembly O(nnz).
         def rows_to_dense(rows):
             if not rows:
                 return (
                     torch.zeros((0, self._n), device=self._device, dtype=self._dtype),
                     torch.zeros((0,), device=self._device, dtype=self._dtype),
                 )
-            A = torch.zeros((len(rows), self._n), device=self._device, dtype=self._dtype)
-            b = torch.zeros((len(rows),), device=self._device, dtype=self._dtype)
+            m = len(rows)
+            b = torch.empty((m,), device=self._device, dtype=self._dtype)
+            # Pre-compute total nnz to allocate once.
+            total_nnz = sum(len(vids) for vids, _, _ in rows)
+            idx_rows = torch.empty((total_nnz,), device=self._device, dtype=torch.long)
+            idx_cols = torch.empty((total_nnz,), device=self._device, dtype=torch.long)
+            vals = torch.empty((total_nnz,), device=self._device, dtype=self._dtype)
+            cursor = 0
             for r, (vids, coeffs, rhs) in enumerate(rows):
-                idx_t = torch.as_tensor(vids, device=self._device, dtype=torch.long)
-                coeff_t = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
-                A[r, idx_t] = coeff_t
+                k = len(vids)
+                if k == 0:
+                    b[r] = float(rhs)
+                    continue
+                idx_rows[cursor:cursor + k] = r
+                idx_cols[cursor:cursor + k] = torch.as_tensor(vids, device=self._device, dtype=torch.long)
+                vals[cursor:cursor + k] = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
+                cursor += k
                 b[r] = float(rhs)
+            # Build dense A with a single scatter; accumulate handles repeated cols.
+            A = torch.zeros((m, self._n), device=self._device, dtype=self._dtype)
+            if total_nnz > 0:
+                A.index_put_((idx_rows[:cursor], idx_cols[:cursor]), vals[:cursor], accumulate=True)
             return A, b
 
         Aeq, beq = rows_to_dense(self._eq)

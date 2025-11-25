@@ -38,6 +38,13 @@ Example:
     act_net = converter.convert(model, input_shape=(1, 784))
 """
 
+import os
+
+# Avoid OpenMP aborts during torch import on macOS by forcing single runtime
+# and permitting duplicate OMP libraries.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 # Core imports
 from act.pipeline.verification.model_factory import ModelFactory
 from act.pipeline.verification.torch2act import TorchToACT
