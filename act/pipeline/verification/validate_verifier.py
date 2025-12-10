@@ -316,6 +316,8 @@ class VerificationValidator:
             
         except Exception as e:
             logger.error(f"     Verifier failed: {e}")
+            import traceback
+            traceback.print_exc()
             error_result = {
                 'network': name,
                 'solver': solver,

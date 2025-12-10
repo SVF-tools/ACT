@@ -134,7 +134,7 @@ import json
 import yaml
 import torch
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from act.back_end.core import Layer, Net
 from act.back_end.serialization.serialization import NetSerializer
@@ -253,23 +253,107 @@ class NetFactory:
             # Validate both are present
             if "lb" not in params or "ub" not in params:
                 raise ValueError("RANGE requires both 'lb' and 'ub' in params")
-    
+
+    def _generate_layer_variables(self, kind: str,
+                                  layer_index: int,
+                                  var_counter: int,
+                                  meta: Dict[str, Any],
+                                  layers: List[Layer]) -> Tuple[List[int], List[int], int]:
+        """generate vars based on layer shape"""
+        if kind == "INPUT":
+            shape = meta.get("shape", [])
+            if shape:
+                out_num_vars = torch.Size(shape).numel()
+            else:
+                out_num_vars = 1
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            var_counter += out_num_vars
+            return [], out_vars, var_counter
+
+        elif kind == "DENSE":
+            in_features = meta.get("in_features", 1)
+            out_features = meta.get("out_features", 1)
+            if layers and layer_index > 0:
+                prev_out_vars = layers[layer_index - 1].out_vars
+                if len(prev_out_vars) != in_features:
+                    raise ValueError(f"DENSE layer expects {in_features} inputs but got {len(prev_out_vars)}")
+                in_vars = prev_out_vars
+            else:
+                in_vars = []
+            out_vars = list(range(var_counter, var_counter + out_features))
+            var_counter += out_features
+            return in_vars, out_vars, var_counter
+
+        elif kind in ["RELU", "SIGMOID", "TANH"]:
+            if layers and layer_index > 0:
+                in_vars = layers[layer_index - 1].out_vars
+                # Allocate new variable IDs for activation output
+                out_vars = list(range(var_counter, var_counter + len(in_vars)))
+                var_counter += len(in_vars)
+                return in_vars, out_vars, var_counter
+            else:
+                raise ValueError(f"Activation layer '{kind}' cannot be the first layer in network")
+
+        elif kind.startswith("CONV"):
+            if layers and layer_index > 0:
+                in_vars = layers[layer_index - 1].out_vars
+            else:
+                raise ValueError(f"Convolutional layer '{kind}' cannot be the first layer in network")
+
+            output_shape = meta.get("output_shape")
+            if output_shape:
+                out_num_vars = torch.Size(output_shape).numel()
+            else:
+                raise ValueError(
+                    f"Convolutional layer '{kind}' requires 'output_shape' in meta for variable generation")
+
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            var_counter += out_num_vars
+            return in_vars, out_vars, var_counter
+
+        elif kind == "FLATTEN":
+            if layers and layer_index > 0:
+                in_vars = layers[layer_index - 1].out_vars
+                out_vars = list(range(var_counter, var_counter + len(in_vars)))
+                var_counter += len(in_vars)
+                return in_vars, out_vars, var_counter
+            else:
+                raise ValueError(f"Flatten layer cannot be the first layer in network")
+
+
+        elif kind in ["INPUT_SPEC", "ASSERT"]:
+            if layers and layer_index > 0:
+                prev_vars = layers[layer_index - 1].out_vars
+                return prev_vars, prev_vars.copy(), var_counter
+            else:
+                raise ValueError(f"Layer '{kind}' cannot be the first layer in network")
+
+        else:
+            supported_types = ["INPUT", "DENSE", "RELU", "SIGMOID", "TANH",
+                               "CONV1D", "CONV2D", "CONV3D", "FLATTEN",
+                               "INPUT_SPEC", "ASSERT"]
+            raise NotImplementedError(
+                f"Layer type '{kind}' is not supported for variable generation. "
+                f"Supported types: {supported_types}. "
+                f"Please implement _generate_layer_variables logic for '{kind}' layer."
+            )
+
     def create_network(self, name: str, spec: Dict[str, Any]) -> Net:
         """Create network from YAML spec."""
         # Get current device_manager dtype for INPUT layer consistency
         current_dtype = str(get_default_dtype())
         
         layers = []
-        
+        var_counter = 0  # init in/out var counter
+
         for i, layer_spec in enumerate(spec['layers']):
-            # Simple sequential variable assignment
-            in_vars = [i] if i > 0 else []
-            out_vars = [i + 1]
-            
             # Copy params and add required weight tensors if needed
             params = layer_spec.get('params', {}).copy()
             meta = layer_spec.get('meta', {}).copy()  # Use copy() to avoid modifying YAML
             kind = layer_spec['kind']
+
+            # Simple sequential variable assignment
+            in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
             
             # Update INPUT layer dtype to match current device_manager
             if kind == "INPUT" and 'dtype' in meta:

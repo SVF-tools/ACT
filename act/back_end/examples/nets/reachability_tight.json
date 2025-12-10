@@ -21,7 +21,12 @@
         },
         "in_vars": [],
         "out_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "cache": {}
       },
@@ -56,10 +61,20 @@
           "ub_val": 1.0
         },
         "in_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "out_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "cache": {}
       },
@@ -68,7 +83,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApMSTQ/jQ+4vy7SIotIhbQ/XHDRe5a3zT/CnafjGAe6P5ICnZDgxLw/38eVqrPrrL880BdLNxRqv9x04HqZCJQ/ba5O0lUwr7/c+amt0K9nP/QBm2rZDKS/LUdy0o5qvb9U+thxWEmmv5C2M6FE0pY/7A1QhrgWsz8C+mI3Qzm6P7zBb4DUFr0/Jwa7+U5ysz+GQvZ2g3epv+xL1xqb8aw/WDz7vD+woj+8yIOWsLqwv6nYnMbSlse/nZpdTYSPvT+vZ/+gPL+wv9cpVllKwrk/3xSKr21Ap79ndzfieVbBv5M4aPP9SYU/d0rOoFk2VT+sHu6h/34nv7hgCLb6lLg/XDUAsKMzvj/iJ4yaOAu+v4i/RQOZVsg/c1/TY4r7wD8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApCZuMiaqDEvzRsTmViWni/UIddczqyo79E+/s1wNWpPyQtM/lbtcS/5yk/2VR7uz9P9nl6JYudPwRhqZlj/Jm/uJR0Rz6KrT8lU2TGZT+zP9/Q7aeLmNK/tlkpROBnxL8K9tUkVfXDPwWHUfbLr56/5cRt9ZZUrT9MWRptyV2lvyTO4yic5Ly/f3QAlVHTyb/E9L2MB0CZv/M32qPnL7Y/hZ4wmO7sr7/0pklXKoi6PzJ/Ldd4j4s/XD+e04Z4t78AF5u5ROHBP85/3rnMysO/NDbugbX4jr+8O9cOmj2zv8qUnvAdK6i/Os9JgInEwT9anZadIyybPxIKc131/r6/qrOikzt0uL+ImYri2vbBv0zKC9T5C5g/S2wOP/tglD8=",
             "dtype": "torch.float64",
             "shape": [
               6,
@@ -93,10 +108,20 @@
           "bias_enabled": true
         },
         "in_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "out_vars": [
-          3
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "cache": {}
       },
@@ -106,10 +131,20 @@
         "params": {},
         "meta": {},
         "in_vars": [
-          3
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "out_vars": [
-          4
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "cache": {}
       },
@@ -118,7 +153,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo02R/intiuP2IZKEB2/rQ/LKT0OWfcr78hcvgurR2xPzUwzGajSHK/JixKrHQWh79aFamXa4i+vxigM/tpo8w/5OMZ5InQkD9I3LrmUjytP+LNwpcZS6+/1PZaeHFotL/4rkL+DvizP99T4liCHrM/5nUMtCdLsT+cSIAVyO28PzY6BC04pbY/kIZj7r0hrT8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApTDP/Ca/STvxilvlT8S70/lOFDye90xL9qnF9XhHysP4CjLoHsXbQ/kk/0BU4Vwb9YDZFBuMSVvwwvvdt4JHu/EPKGrz6Drb/t/X4LSma6v9HtUIpNzJA/dX3dI9p5pz+HSJl74wqXPwVVGo20iqy/Z7/zhtCRsb8/5Tkeq8idP5IsBQXDGay/OqfBsjmizT8=",
             "dtype": "torch.float64",
             "shape": [
               3,
@@ -143,10 +178,17 @@
           "bias_enabled": true
         },
         "in_vars": [
-          4
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "out_vars": [
-          5
+          12,
+          13,
+          14
         ],
         "cache": {}
       },
@@ -177,10 +219,14 @@
           "kind": "RANGE"
         },
         "in_vars": [
-          5
+          12,
+          13,
+          14
         ],
         "out_vars": [
-          6
+          12,
+          13,
+          14
         ],
         "cache": {}
       }
@@ -224,7 +270,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-11-04T20:27:43.231687",
+      "creation_time": "2025-12-05T15:05:57.042889",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [
