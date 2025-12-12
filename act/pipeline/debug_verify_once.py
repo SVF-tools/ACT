@@ -40,7 +40,7 @@ import numpy as np
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    net_name = "mnist_robust_easy"
+    net_name = "control_conservative"
 
     factory = ModelFactory()
     net = factory.get_act_net(net_name)

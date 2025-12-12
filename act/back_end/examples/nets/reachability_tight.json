@@ -21,7 +21,12 @@
         },
         "in_vars": [],
         "out_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "cache": {}
       },
@@ -56,10 +61,20 @@
           "ub_val": 1.0
         },
         "in_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "out_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "cache": {}
       },
@@ -68,7 +83,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApMSTQ/jQ+4vy7SIotIhbQ/XHDRe5a3zT/CnafjGAe6P5ICnZDgxLw/38eVqrPrrL880BdLNxRqv9x04HqZCJQ/ba5O0lUwr7/c+amt0K9nP/QBm2rZDKS/LUdy0o5qvb9U+thxWEmmv5C2M6FE0pY/7A1QhrgWsz8C+mI3Qzm6P7zBb4DUFr0/Jwa7+U5ysz+GQvZ2g3epv+xL1xqb8aw/WDz7vD+woj+8yIOWsLqwv6nYnMbSlse/nZpdTYSPvT+vZ/+gPL+wv9cpVllKwrk/3xSKr21Ap79ndzfieVbBv5M4aPP9SYU/d0rOoFk2VT+sHu6h/34nv7hgCLb6lLg/XDUAsKMzvj/iJ4yaOAu+v4i/RQOZVsg/c1/TY4r7wD8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArFCKaqxpCwvwBbHnYe/Lu/2luslrTFvr+8cW33I9+Lv1/i3OSEXr4/pzHd3m9Gxj+pBKSXkj6oP+hSBQnuC6w/tJ9xCouVtb9kBZk86a2gP5TtIfImva8/j4Rm6ue3uL95itn58Ka2PwnGCp3gd8i/8jSqgSS6vj9/C7ZyMXXEvzJ0UdyGcLy/NH4fo6neuT8dAZmCnU2nv5/JdYP6oKq/YGINntQfmz+9ri7qdZS2v6gEPMfED7a/1MXJzmYFvT+6icPihqKiv6ybHtq/7Jg/z2Ew5JpDQD8PUfef06yIP2epTEfZdbu/1xIsbPJWwj+PIu+1jpbBv+oH48dXnrw/V6yceE1tqz+bGa58SAiyv8wLTAHRVMS/Rz6KcQFPpz8=",
             "dtype": "torch.float64",
             "shape": [
               6,
@@ -93,10 +108,20 @@
           "bias_enabled": true
         },
         "in_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
         ],
         "out_vars": [
-          3
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "cache": {}
       },
@@ -106,10 +131,20 @@
         "params": {},
         "meta": {},
         "in_vars": [
-          3
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
         ],
         "out_vars": [
-          4
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
         ],
         "cache": {}
       },
@@ -118,7 +153,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo02R/intiuP2IZKEB2/rQ/LKT0OWfcr78hcvgurR2xPzUwzGajSHK/JixKrHQWh79aFamXa4i+vxigM/tpo8w/5OMZ5InQkD9I3LrmUjytP+LNwpcZS6+/1PZaeHFotL/4rkL+DvizP99T4liCHrM/5nUMtCdLsT+cSIAVyO28PzY6BC04pbY/kIZj7r0hrT8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqQQ0Mh6Um2P3uzBoCDD7k/f2IggDwZrb/4zyrL9ceev0VdwSGxnLU/MKkehH7FuL9phP9I3APEP7AHWNjNF8k/n7IRks5/gr/l97Ehxc15P5QxUJFq4sQ/STDG9ziusD/NYojZ7ZvGv0k2MKSSTsO/DniLe0+Jab/E1JtTMkW7P/USaaEIVcA/tQ4/iTG0yj8=",
             "dtype": "torch.float64",
             "shape": [
               3,
@@ -143,10 +178,17 @@
           "bias_enabled": true
         },
         "in_vars": [
-          4
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
         ],
         "out_vars": [
-          5
+          18,
+          19,
+          20
         ],
         "cache": {}
       },
@@ -155,7 +197,7 @@
         "kind": "ASSERT",
         "params": {
           "lb": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAC/AAAAvwAAAL8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArNzMw9zczMPc3MzD0=",
             "dtype": "torch.float32",
             "shape": [
               3
@@ -177,11 +219,11 @@
           "kind": "RANGE"
         },
         "in_vars": [
-          5
+          18,
+          19,
+          20
         ],
-        "out_vars": [
-          6
-        ],
+        "out_vars": [],
         "cache": {}
       }
     ],
@@ -224,7 +266,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-11-04T20:27:43.231687",
+      "creation_time": "2025-12-12T11:36:26.877363",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [

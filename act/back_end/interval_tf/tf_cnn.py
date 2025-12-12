@@ -258,58 +258,122 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
+# def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
+#     """
+#     Transfer function for Flatten / View-like layers.
+
+#     Semantically, flatten is just a reshaping operation: it does not change
+#     the value of any scalar variable, only how they are grouped into tensors.
+#     For interval analysis, this means the bounds are preserved as-is; only the
+#     shape metadata changes.
+
+#     We therefore:
+#       - keep Bounds as a 1D vector (identity on intervals),
+#       - record input/output shapes in the constraint meta,
+#       - avoid introducing strong equalities between in_vars and out_vars that
+#         could interfere with ConSet's constraint management.
+#     """
+#     lb = Bin.lb
+#     ub = Bin.ub
+
+#     # 1) Determine shapes for metadata (best-effort, but do not enforce)
+#     if "input_shape" in L.meta:
+#         input_shape = tuple(L.meta["input_shape"])
+#     else:
+#         # fall back to "unknown", but still record something
+#         input_shape = (int(lb.numel()),)
+
+#     if "output_shape" in L.meta:
+#         output_shape = tuple(L.meta["output_shape"])
+#     else:
+#         # most conservative: assume it's just a flat vector
+#         output_shape = (int(lb.numel()),)
+
+#     # 2) For intervals, flatten is just identity (we already use 1D vectors)
+#     lb_flat = lb.view(-1)
+#     ub_flat = ub.view(-1)
+#     B_out = Bounds(lb_flat, ub_flat)
+
+#     # 3) Build a very lightweight constraint:
+#     #    - only attach to out_vars (no cross-layer var tuple out+in),
+#     #    - store in_vars info in meta for possible debugging / reconstruction.
+#     C = ConSet()
+#     C.replace(Con(
+#         "EQ",
+#         tuple(L.out_vars),
+#         {
+#             "tag":          f"flatten:{L.id}",
+#             "input_shape":  input_shape,
+#             "output_shape": output_shape,
+#             "in_vars":      tuple(L.in_vars),
+#         },
+#     ))
+
+#     # 4) As usual, attach the box on out_vars
+#     C.add_box(L.id, L.out_vars, B_out)
+#     return Fact(B_out, C)
+
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     """
-    Transfer function for Flatten / View-like layers.
+    Transfer function for Flatten / View / Reshape-like layers.
 
-    Semantically, flatten is just a reshaping operation: it does not change
-    the value of any scalar variable, only how they are grouped into tensors.
-    For interval analysis, this means the bounds are preserved as-is; only the
-    shape metadata changes.
+    Semantics:
+      - Flatten is a pure reshaping: it does not change any scalar value,
+        only how they are grouped into tensors.
+      - In the interval domain we already store bounds as 1D vectors, so the
+        operation is effectively the identity on (lb, ub); only the logical
+        shape metadata changes.
 
-    We therefore:
-      - keep Bounds as a 1D vector (identity on intervals),
-      - record input/output shapes in the constraint meta,
-      - avoid introducing strong equalities between in_vars and out_vars that
-        could interfere with ConSet's constraint management.
+    Design choices:
+      - We keep Bounds as a flat 1D vector (identity on intervals).
+      - We record input/output shapes (and optional axis/start_dim/end_dim)
+        in the constraint metadata for debugging / reconstruction.
+      - We do NOT build an explicit W matrix (which would be a permutation),
+        to avoid quadratic blow-up; instead we just register an EQ constraint
+        tagged as "flatten".
     """
     lb = Bin.lb
     ub = Bin.ub
 
-    # 1) Determine shapes for metadata (best-effort, but do not enforce)
+    # 1) Best-effort recovery of shapes from meta
+    #    (these are only for bookkeeping; we don't enforce them on the data)
     if "input_shape" in L.meta:
         input_shape = tuple(L.meta["input_shape"])
     else:
-        # fall back to "unknown", but still record something
         input_shape = (int(lb.numel()),)
 
     if "output_shape" in L.meta:
         output_shape = tuple(L.meta["output_shape"])
     else:
-        # most conservative: assume it's just a flat vector
         output_shape = (int(lb.numel()),)
+
+    # Optional extra info from different front-ends (PyTorch / ONNX style)
+    axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
+    start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
+    end_dim   = L.meta.get("end_dim", None)
 
     # 2) For intervals, flatten is just identity (we already use 1D vectors)
     lb_flat = lb.view(-1)
     ub_flat = ub.view(-1)
     B_out = Bounds(lb_flat, ub_flat)
 
-    # 3) Build a very lightweight constraint:
-    #    - only attach to out_vars (no cross-layer var tuple out+in),
-    #    - store in_vars info in meta for possible debugging / reconstruction.
+    # 3) Lightweight constraint: we don't encode the full permutation matrix,
+    #    just tag the relation between in_vars and out_vars.
     C = ConSet()
     C.replace(Con(
         "EQ",
-        tuple(L.out_vars),
+        tuple(L.out_vars + L.in_vars),
         {
             "tag":          f"flatten:{L.id}",
             "input_shape":  input_shape,
             "output_shape": output_shape,
-            "in_vars":      tuple(L.in_vars),
+            "axis":         axis,
+            "start_dim":    start_dim,
+            "end_dim":      end_dim,
         },
     ))
 
-    # 4) As usual, attach the box on out_vars
+    # 4) Attach the interval box on out_vars as usual
     C.add_box(L.id, L.out_vars, B_out)
     return Fact(B_out, C)
 

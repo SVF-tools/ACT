@@ -194,7 +194,7 @@ networks:
         meta: {in_features: 16, out_features: 4, bias_enabled: true}
       - kind: ASSERT
         params: {c: [1.0, 1.0, 1.0, 1.0]}
-        meta: {kind: "LINEAR_LE", d: 2.0}  # Verify sum of outputs <= 2.0
+        meta: {kind: "LINEAR_LE", d: -0.10}  # Now 0 is a counterexample (sum=0 > -0.1)
 
   control_balanced:
     description: "Control system with balanced constraint"
@@ -218,7 +218,7 @@ networks:
         meta: {in_features: 12, out_features: 4, bias_enabled: true}
       - kind: ASSERT
         params: {c: [0.5, 1.0, 1.0, 0.5]}
-        meta: {kind: "LINEAR_LE", d: 3.0}  # Verify weighted sum <= 3.0
+        meta: {kind: "LINEAR_LE", d: -0.10}  # 0 violates: 0 > -0.1
 
   control_strict:
     description: "Control system with strict constraint"
@@ -242,7 +242,7 @@ networks:
         meta: {in_features: 8, out_features: 4, bias_enabled: true}
       - kind: ASSERT
         params: {c: [2.0, 2.0, 2.0, 2.0]}
-        meta: {kind: "LINEAR_LE", d: 1.0}  # Verify 2*sum <= 1.0
+        meta: {kind: "LINEAR_LE", d: -0.10}  # 0 violates: 0 > -0.1
 
   # ========================================================================
   # Scenario 4: RANGE - Reachability Analysis
@@ -269,8 +269,8 @@ networks:
         params: {}
         meta: {in_features: 12, out_features: 3, bias_enabled: true}
       - kind: ASSERT
-        params: {lb: [-5.0, -5.0, -5.0], ub: [5.0, 5.0, 5.0]}
-        meta: {kind: "RANGE"}  # Verify outputs in [-5, 5]
+        params: {lb: [0.10, 0.10, 0.10], ub: [5.0, 5.0, 5.0]}
+        meta: {kind: "RANGE"}  # 0 is outside [0.1, 5.0], so x=0 is CE
 
   reachability_moderate:
     description: "Reachability with moderate bounds"
@@ -293,8 +293,8 @@ networks:
         params: {}
         meta: {in_features: 8, out_features: 3, bias_enabled: true}
       - kind: ASSERT
-        params: {lb: [-2.0, -2.0, -2.0], ub: [2.0, 2.0, 2.0]}
-        meta: {kind: "RANGE"}  # Verify outputs in [-2, 2]
+        params: {lb: [0.10, 0.10, 0.10], ub: [2.0, 2.0, 2.0]}
+        meta: {kind: "RANGE"}  # 0 violates lower bound
 
   reachability_tight:
     description: "Reachability with tight bounds"
@@ -317,5 +317,22 @@ networks:
         params: {}
         meta: {in_features: 6, out_features: 3, bias_enabled: true}
       - kind: ASSERT
-        params: {lb: [-0.5, -0.5, -0.5], ub: [0.5, 0.5, 0.5]}
-        meta: {kind: "RANGE"}  # Verify outputs in [-0.5, 0.5]
+        params: {lb: [0.10, 0.10, 0.10], ub: [0.5, 0.5, 0.5]}
+        meta: {kind: "RANGE"}  # 0 violates lower bound
+
+
+toy_le:
+  input_shape: [1, 1]
+  layers:
+    - kind: INPUT
+      params: {}
+      meta: {shape: [1, 1], dtype: "torch.float64"}
+    - kind: INPUT_SPEC
+      params: {}
+      meta: {kind: "BOX", lb_val: 0.0, ub_val: 0.0}  # 只包含 x=0
+    - kind: DENSE
+      params: {}
+      meta: {in_features: 1, out_features: 1, bias_enabled: true}
+    - kind: ASSERT
+      params: {c: [1.0]}
+      meta: {kind: "LINEAR_LE", d: -0.10}

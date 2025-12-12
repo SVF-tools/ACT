@@ -287,6 +287,9 @@ def export_to_solver(globalC: ConSet, solver: Solver,
     #     tag = con.meta.get("tag","")
     #     print(f"[{idx}] tag={tag}, var_ids={con.var_ids}, meta_keys={list(con.meta.keys())}")
     # print("========================================")
+    # Debug: print all constraint tags to trace what is being exported
+    for con in templates:
+        print("[DEBUG TAG]", con.meta.get("tag", ""))
 
 
     # 这些是为了 debug 统计用
@@ -417,19 +420,10 @@ def export_to_solver(globalC: ConSet, solver: Solver,
 
         bad = lb > ub
         if np.any(bad):
-            print("🚨 [WARN] In export_to_solver: found inconsistent box bounds!")
-            for vid, lo, hi, flag in zip(idxs, lb, ub, bad):
-                if flag:
-                    print(f"    var {vid}: lb={lo}, ub={hi}  -> DROPPED from box bounds")
-
-            # 直接丢弃这些自相矛盾的 box（保留变量、约束，不设 box）
-            valid_mask = ~bad
-            idxs_valid = [vid for vid, flag in zip(idxs, bad) if not flag]
-            lb_valid = lb[valid_mask]
-            ub_valid = ub[valid_mask]
-
-            if len(idxs_valid) > 0:
-                solver.set_bounds(idxs_valid, lb_valid, ub_valid)
+            print("🚨 [WARN] In export_to_solver: found inconsistent box bounds! Relaxing to wide interval.")
+            lb_relaxed = np.minimum(lb, ub) - 1e-3
+            ub_relaxed = np.maximum(lb, ub) + 1e-3
+            solver.set_bounds(idxs, lb_relaxed, ub_relaxed)
         else:
             solver.set_bounds(idxs, lb, ub)
 
@@ -498,57 +492,83 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             for i, zi in enumerate(z):
                 solver.add_lin_eq([zi, x[i], y[i]], [1.0, -1.0, -1.0], 0.0)
 
+
         elif tag.startswith("relu:"):
+            """
+            ReLU encoding (ACT 原版语义):
+
+            var_ids = [z | y]
+              - z: post-activation (output), z = ReLU(y), z >= 0
+              - y: pre-activation (input)
+
+            meta:
+              - idx_on  : indices where y_lb >= 0  → z = y
+              - idx_off : indices where y_ub <= 0  → z = 0
+              - idx_amb : ambiguous indices where y_lb < 0 < y_ub
+                          use standard triangular relaxation:
+                              z >= 0
+                              z >= y
+                              z <= slope * y + shift
+            """
             meta = con.meta
             n = len(con.var_ids) // 2
-            # var_ids are [out_vars | in_vars]
-            y = list(con.var_ids[:n])   # post-ReLU
-            z = list(con.var_ids[n:])   # pre-ReLU
+            assert 2 * n == len(con.var_ids), \
+                f"relu: var_ids length not even: {len(con.var_ids)}"
 
-            idx_on = to_numpy(meta["idx_on"]).astype(int)
+            # 注意：这里沿用 ACT 原来的语义：
+            #   z = ReLU 输出（post-activation）
+            #   y = ReLU 输入（pre-activation）
+            z = list(con.var_ids[:n])
+            y = list(con.var_ids[n:])
+
+            idx_on  = to_numpy(meta["idx_on"]).astype(int)
             idx_off = to_numpy(meta["idx_off"]).astype(int)
             idx_amb = to_numpy(meta["idx_amb"]).astype(int)
-            amb_list = idx_amb.tolist()
-            amb_pos = {v: k for k, v in enumerate(amb_list)}
-            slope_all = to_numpy(meta["slope"])
-            shift_all = to_numpy(meta["shift"])
 
-            # Stable phases
+            slope = to_numpy(meta["slope"])
+            shift = to_numpy(meta["shift"])
+
+            # 1) 稳定 ON：y_lb >= 0 → z_i = y_i
             for i in idx_on:
-                solver.add_lin_eq([y[i], z[i]], [1.0, -1.0], 0.0)
+                solver.add_lin_eq(
+                    [z[i], y[i]],
+                    [1.0, -1.0],
+                    0.0,
+                )
+
+            # 2) 稳定 OFF：y_ub <= 0 → z_i = 0（y 不再约束）
             for i in idx_off:
-                solver.add_lin_eq([y[i]], [1.0], 0.0)
+                solver.add_lin_eq(
+                    [z[i]],
+                    [1.0],
+                    0.0,
+                )
 
-            # Ambiguous neurons -> Big-M MILP with a binary activation flag
-            for i in idx_amb:
-                lb_i, ub_i = boxes.get(z[i], (-np.inf, np.inf))
-                if not (np.isfinite(lb_i) and np.isfinite(ub_i)):
-                    # Fallback to linear relaxation if bounds are missing
-                    k = amb_pos[i]
-                    solver.add_lin_le([y[i]], [-1.0], 0.0)  # y >= 0 -> -y <= 0
-                    solver.add_lin_le([y[i], z[i]], [1.0, -1.0], 0.0)  # y <= z
-                    solver.add_lin_le(
-                        [z[i], y[i]],
-                        [1.0, -float(slope_all[k])],
-                        float(shift_all[k]),
-                    )
-                    continue
+            # 3) ambiguous：三角松弛
+            for k, i in enumerate(idx_amb):
+                # (a) z >= 0   →  -z <= 0
+                solver.add_lin_le(
+                    [z[i]],
+                    [-1.0],
+                    0.0,
+                )
 
-                a_idx = solver.add_binary_vars(1)[0]
-                used_in_cons.add(a_idx)
+                # (b) z >= y   →  y - z <= 0
+                solver.add_lin_le(
+                    [y[i], z[i]],
+                    [1.0, -1.0],
+                    0.0,
+                )
 
-                # y >= 0
-                solver.add_lin_ge([y[i]], [1.0], 0.0)
-                # y >= z
-                solver.add_lin_ge([y[i], z[i]], [1.0, -1.0], 0.0)
-                # y <= z - lb_i * (1 - a)
-                solver.add_lin_le([y[i], z[i], a_idx], [1.0, -1.0, -float(lb_i)], -float(lb_i))
-                # y <= ub_i * a
-                solver.add_lin_le([y[i], a_idx], [1.0, -float(ub_i)], 0.0)
-                # z >= lb_i * (1 - a)
-                solver.add_lin_ge([z[i], a_idx], [1.0, float(lb_i)], float(lb_i))
-                # z <= ub_i * a
-                solver.add_lin_le([z[i], a_idx], [1.0, -float(ub_i)], 0.0)
+                # (c) z <= slope * y + shift
+                #     → z - slope*y <= shift
+                solver.add_lin_le(
+                    [z[i], y[i]],
+                    [1.0, -float(slope[k])],
+                    float(shift[k]),
+                )
+
+
 
         elif tag.startswith("lrelu:"):
             meta = con.meta
@@ -571,6 +591,63 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                     [1.0, -float(slope[k])],
                     float(shift[k]),
                 )
+                
+        elif tag.startswith("top1:"):
+            meta = con.meta
+
+            # 所有 logit 的变量 id
+            y_vars = list(con.var_ids)
+
+            # 目标类别 t（假设是单个 index）
+            t_idx  = int(to_numpy(meta["t_index"]).item())
+            v_id   = int(meta["v_id"])
+            margin = float(meta.get("margin", 0.0))
+
+            # 语义：v >= y_j - y_t - margin,  对所有 j != t
+            for j, yj in enumerate(y_vars):
+                if j == t_idx:
+                    continue
+
+                # v >= y_j - y_t - margin
+                # => v - yj + y_t >= -margin
+                solver.add_lin_ge(
+                    [v_id, yj, y_vars[t_idx]],
+                    [1.0, -1.0, 1.0],
+                    -margin,
+                )
+                
+        elif tag.startswith("range:"):
+            meta = con.meta
+
+            # 约定：var_ids[0] 是 violation 变量 v，其余是输出 y_j
+            v_id = con.var_ids[0]
+            y    = list(con.var_ids[1:])
+
+            lb = to_numpy(meta["lb"]).reshape(-1)
+            ub = to_numpy(meta["ub"]).reshape(-1)
+
+            assert len(y) == lb.shape[0] == ub.shape[0], \
+                f"range: len(y)={len(y)}, lb={lb.shape}, ub={ub.shape}"
+
+            # v >= 0  ->  v >= 0
+            solver.add_lin_ge([v_id], [1.0], 0.0)
+
+            # 对每个维度 j：
+            #   v >= lb_j - y_j      <=>  v + y_j >= lb_j
+            #   v >= y_j - ub_j      <=>  v - y_j >= -ub_j
+            for j, yj in enumerate(y):
+                solver.add_lin_ge(
+                    [v_id, yj],
+                    [1.0, 1.0],
+                    float(lb[j]),
+                )
+                solver.add_lin_ge(
+                    [v_id, yj],
+                    [1.0, -1.0],
+                    float(-ub[j]),
+                )
+
+
 
         elif tag.startswith("abs:"):
             meta = con.meta

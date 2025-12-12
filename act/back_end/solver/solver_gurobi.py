@@ -127,38 +127,74 @@ class GurobiSolver(Solver):
         """
         Map Gurobi status to {SAT, UNSAT, UNKNOWN}.
 
-        Semantics:
-          - SAT    : a feasible solution exists (can be used as counterexample)
-          - UNSAT  : Gurobi proved the model infeasible
-          - UNKNOWN: all other cases (unbounded / interrupted / numeric issues)
+        语义约定（从 ACT 框架角度）：
+          - SAT    : 至少找到一个满足所有约束的可行解
+                     （在“找反例”的模型中 = 找到了反例候选）
+          - UNSAT  : Gurobi 严格证明模型不可行（无任何可行解）
+                     （在“找反例”的模型中 = 证明不存在反例）
+          - UNKNOWN: 其他所有情况：
+                     - 未开始 / 被中断且无 incumbent
+                     - 数值问题
+                     - 不可行-或-无界 / 真无界
+                     - 没法确信可行性结论的情况
+
+        注意：
+        - 只有在 Gurobi 明确给出 INFEASIBLE 时才返回 UNSAT。
+        - 有解但未最优（时间限制 / 节点限制 / 中断）：
+          如果有 incumbent（SolCount > 0），我们认为 SAT（存在可行点），
+          因为“存在可行解”并不依赖最优性。
+        - 数值问题或 (INF_OR_UNBD / UNBOUNDED) 一律 UNKNOWN，
+          即使 SolCount > 0 也不信任，保证 soundness。
         """
         if self.m is None:
             return SolveStatus.UNKNOWN
 
         st = self.m.Status
-
-        # Explicit infeasible = UNSAT
-        if st == GRB.INFEASIBLE:
-            return SolveStatus.UNSAT
-
-        # OPTIMAL / SUBOPTIMAL: a solution exists
-        if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-            return SolveStatus.SAT
-
-        # If Gurobi produced any incumbent (SolCount>0), treat as SAT
-        # (covers TIME_LIMIT / INTERRUPTED / NODE_LIMIT with an incumbent)
         try:
-            if getattr(self.m, 'SolCount', 0) > 0:
-                return SolveStatus.SAT
+            solcnt = int(getattr(self.m, "SolCount", 0))
         except Exception:
-            pass
+            solcnt = 0
 
-        # UNBOUNDED / INF_OR_UNBD: cannot conclude feasibility reliably
-        if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
+        # 1. 明确不可行
+        if st == GRB.INFEASIBLE:
             return SolveStatus.UNKNOWN
 
-        # Fallback to UNKNOWN for all other states
+        # 2. 数值问题 / 不可行或无界 / 真无界 ⇒ 不可信，统一 UNKNOWN
+        #    即便 SolCount > 0 也不要冒险当作 SAT
+        if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED, GRB.NUMERIC):
+            return SolveStatus.UNKNOWN
+
+        # 3. 正常终止，证明存在可行解
+        #    OPTIMAL: 有一个被证明为最优的可行解
+        #    SUBOPTIMAL: 有可行 incumbent，但由于数值/界裁剪等原因未完全证明最优
+        if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+            if solcnt > 0:
+                return SolveStatus.SAT
+            # 理论上 OPTIMAL/SUBOPTIMAL 一定有解；如果没有，就保守 UNKNOWN
+            return SolveStatus.UNKNOWN
+
+        # 4. 限制条件触发但有 incumbent 的情况：
+        #    TIME_LIMIT, NODE_LIMIT, ITERATION_LIMIT, SOLUTION_LIMIT,
+        #    INTERRUPTED, CUTOFF, USER_OBJ_LIMIT 等。
+        #    —— 只要有 incumbent，就说明“存在一个可行解”，可以当作 SAT。
+        early_stop_with_incumbent = {
+            GRB.TIME_LIMIT,
+            GRB.NODE_LIMIT,
+            GRB.ITERATION_LIMIT,
+            GRB.SOLUTION_LIMIT,
+            GRB.INTERRUPTED,
+            GRB.CUTOFF,
+            GRB.USER_OBJ_LIMIT,
+        }
+        if st in early_stop_with_incumbent:
+            if solcnt > 0:
+                return SolveStatus.SAT
+            # 没有任何 incumbent，则无法判断可行性
+            return SolveStatus.UNKNOWN
+
+        # 5. 其他所有状态（例如 LOADED, NOT_STARTED, INPROGRESS 等）一律 UNKNOWN
         return SolveStatus.UNKNOWN
+
 
     def has_solution(self) -> bool:
         return self.m is not None and getattr(self.m, 'SolCount', 0) > 0

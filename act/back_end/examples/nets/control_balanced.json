@@ -21,7 +21,14 @@
         },
         "in_vars": [],
         "out_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
         ],
         "cache": {}
       },
@@ -56,10 +63,24 @@
           "ub_val": 1.0
         },
         "in_vars": [
-          1
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
         ],
         "out_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
         ],
         "cache": {}
       },
@@ -68,7 +89,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEyLCA4KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAquZmQFaRC2v5J1rdM/xa4/nxCtAaJElj9rA4zz4S7AP6XS5K+DtrU//NLPvivcyL+cyNqhg2bDPxAw8EK3Vaw/5DJ0tDddf78vAFrn0Zm8vzjmxRw/x8S/vSXFYigWvr+dgVsddEygP4DgiGtZsI6/O1L1NNp1wr+q0PROXbOgv38r+t7zHsM/PRirFPXJrr93SMVbEIHFv0TJ3bfhz7+/IvXxuUuutz8nTSNBkG+QP+fD73ADO7q/Y6g5HfO+wL//7f/3FhurPwum+Nc40aM/lIUmca5Ou7+O49iAQn6YP/I9xJ5vlas/NNJtyi8Llj8X2GmvPR66P4ocjEzjBZA/xYK5tLs0yj/NdQr+5ta+P/y/roy/bYO/I9RIzTxvwr84nqy+gp7DP2xmLYH+V6e/qJ9P2y/UyL+cChqIhay/Pxkf2gVD7bO/z/kGHGyfdj9NpvE88nW9PySitqugD8G/F8Dc8BLXwj9TxHScFKagv6QV2sjwPqU/ES7g0MA0k7+3ZFIt9NPAP3dYEGHRwXo/Z1iUJwX7kL8yiAzVV8rAv91yKZFers2/90yg3JwrrD+enVJx/KCyP1AKXR9YNLc/unx5LwXJg79Zuy3oy5LJP9cBd7gOTKu/aCroPtYEqb+HYcltX1h5v1cDQ4eB/bG/VxW/9XmSuL81sDBzTHyyv44XUGZSr8I/6tOp5Uwjgb+TDKFFdulwvxwvtsdJvcW/IhzOMaX7tz//XTSqkgiwP8DihvtCiqI/EMOiPwR6jT8zYD6Gb2elv7+PnWimupO/zkSa1zo3sT+K7ux2LRJuP4yRvUKxnDo/Z26Nn0Mtkj8AE8SbldO2P5TZIxU3O8o/T53JxdiIwT8wVnUtTX2eP4sNapU2LYA/ZzAAcMebZb/sBhf3mPC7v035jjL8z8K/N1ihPClitz/gzwdHF560vz2Gas56AMq/4ddtfPvZpj/NR2KhwrC9P5Yk9f9uYdE/WKPawjKlyz93Te5roqeRv6JUZEyL+bC/PHBQF3+Gpj8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEyLCA4KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoemU9KDAW3P2p7kzRXJ7o/ui1hUjm/vL9cmMOBN2mrv+WMG69GIYu/tH2CaKNNqj8fcegSpwxCP8x3jxLC2Z4/6EyLcaJttr96ZYozmLO7Pw5I5QPbvqW/O0CdpH3NoT//eNxuD1ywP9xvwFo9gLU/N2gj5YoZn78FlMre0Ci2P0Q1eSEeZri/UhsFsg+lpD/Iqsq+jqmFPxKYIJ5OFag/ly8AoNfnlr9NZgDh3Vuov7LXZf/5R8E/qiYpqTEXwL/g6EQKBdbAv3/Ao0wgb5q/tB2R9YqXvD+81shHF4Civ4VqEIPrsr0/StGDatcssr+MjCDi/eOHP/8QDLVdmLA/nZRdEfzxQD98+ET6kxi3P4Bhdyjorb4/Rlsw149IuL8KhPAUlfawP3QUVLZpC6U/MrTdAz2UnT//Gu1KZK2yv7whaixFuM4/nJPhAxb7cz/K+5EU4ViLvx8hWmHv2Lm/mdRZVyaBw78Xphqb9eGvP9Tg51NPtam/4+UN6fFvpD/PIdCXsUu8P7DgvBAIPIc/QzYpj4v2kb90vLPdXjGdvwdYR5448NG/3BqDVq4pyr9wAAg20u/Ev2cHnYJ5prM/WQ4z4+Aap79qun+9QoHPPwoifK3f8b+/F35lOGtYvr80utQy3zKtv7LHI+p9oMe/cxv1O0MywT9l5qrmO+3Gv2L+LIA75pM/2zW9jPHotr+yBk7JGSKIv4ddwptpT6U/xrc4pWxBxz+8+DUuJ7e6v6KGyOiLc7u/HSyoxrI6fz9CyfadgcOnv2VkSiSWXpw/ruZ0Qc8Rxj/lc4we5bmUvyR+xMXLv56/rAbB8V9Ehj/F6FgToMWZv1AKsyeJBbw/Nvh4c70oob/rl4vv067Fv12JMIaNPpW/+LiFjrYUx79cPBpeUPvAv5TRDAPU650/nKqO6y0vvb+4BUJ9TsDGP6IlOsM7urW/ZX6RJQ2ivj8gWXkDjtmIv9QPyHVoncy/MO4h56jWt78sAC6BAYvHv0XL3gP0CGo/mGcE5FUrwz8=",
             "dtype": "torch.float64",
             "shape": [
               12,
@@ -93,10 +114,28 @@
           "bias_enabled": true
         },
         "in_vars": [
-          2
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
         ],
         "out_vars": [
-          3
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
         ],
         "cache": {}
       },
@@ -106,10 +145,32 @@
         "params": {},
         "meta": {},
         "in_vars": [
-          3
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
         ],
         "out_vars": [
-          4
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
         ],
         "cache": {}
       },
@@ -118,7 +179,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDEyKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAq9ZV+ztbaJv58gTSBxfsO/3c8Y737ftj8SjCTlTs/Cv7zx0uXlSb4/6sFd9rLCyb+8RIEJc5S7v2pMgQh5Qpc/R+um7xYYrL/wIdGh8WCGv0tyAoWn7MC/mB7agrmGtb8AQzHjrKy4v6yng6xnmYU/xHeJPb4+tb9kT/qusWq9v3JaPiqxpb8/UBdB6WLru78OCLLD1X/Fv1fVN1ctLZi/WiiXA2o7yj/3qnaDFgfBv2h4a77otpY/9g6q+Qzso7+C5ZiI5GqqP4Ji38WXso4/CLDo4Ok7v79dQ+P2G1HBP944C2kaIbW/eFl8RkKywT/MNKn5WBq2vzNfSpIUKcM/KKqj2pgamj84Y9c0Fwu2P0Q60lnT064//afEYCJ4v7+5M6xd4QSlv/Bsr4aWjs4/dkDZjFI3ub+yuGY4rFqLPxDtIG8xj6W/TF9h0AErwr+GyZ4YoeaxP42xqTc1ebg/gNSwG+9Ucz+FqZT4DZ7Mv8xNEx1UIcI/B6B7UlDJjr8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDEyKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArtW0E0A0K9v3K58q9Exbk/TKuNZWXJy78Ome4OMYmwvwMer8aQgaI/uEWClFhcsL9NRfyo4JTDP7wn6VeTxp8/5NlLc90jlz8X1yCy4i6xP8qmN5bHx74/0FwtlWt9nr/qMLL3Fq61v58g2uLmbr6/O63ECMYPkb/M63/WJ7vGv0/UizcqW7a/rzxpXkRkur+B/3byhXOFv1RyE5fbFbg/SdQZjVCGlb/iOGTsHqO9v8g1ZJaBR7i/IgSMP/mxrj/GvXNsdhqxP9wZoHyiqK6/Mh39Uj2nvD85RyXaO+GXv7QppbyU48O/C4qWKNVBwL+/XMuW6Ceov8fZyqg40MC/MMjkRk9coz+wnSNvExmtv/7FvDEqF5Y/f6Zkb0K/oT9GoiLNPQnBPxulAIfEOXe/Xf81j+HCnD+yyEi2cFXBv+yxN196P5g/nG5UccCntL8Ct6l2Hoq6P3/wBjcSKL+/Qs0dE7fOrj88mwswZIWzPyaIrZcwxne/qiqME/JumT8=",
             "dtype": "torch.float64",
             "shape": [
               4,
@@ -143,10 +204,24 @@
           "bias_enabled": true
         },
         "in_vars": [
-          4
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
         ],
         "out_vars": [
-          5
+          32,
+          33,
+          34,
+          35
         ],
         "cache": {}
       },
@@ -166,14 +241,15 @@
         },
         "meta": {
           "kind": "LINEAR_LE",
-          "d": 3.0
+          "d": -0.1
         },
         "in_vars": [
-          5
+          32,
+          33,
+          34,
+          35
         ],
-        "out_vars": [
-          6
-        ],
+        "out_vars": [],
         "cache": {}
       }
     ],
@@ -216,7 +292,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-11-04T20:27:43.228965",
+      "creation_time": "2025-12-12T11:36:26.873426",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [
