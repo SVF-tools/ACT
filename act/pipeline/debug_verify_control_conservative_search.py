@@ -12,8 +12,8 @@ from act.pipeline.verification.model_factory import ModelFactory
 
 def extract_two_linears(torch_model: torch.nn.Module):
     """
-    从 VerifiableModel 里自动提取前两个 nn.Linear 层：
-    control_conservative 是:  Linear(8->16) -> ReLU -> Linear(16->4)
+    Automatically extract the first two nn.Linear layers from a VerifiableModel.
+    control_conservative is: Linear(8->16) -> ReLU -> Linear(16->4)
     """
     linears = []
     for m in torch_model.modules():
@@ -26,7 +26,7 @@ def extract_two_linears(torch_model: torch.nn.Module):
 
 def compute_pre_bounds(W1: np.ndarray, b1: np.ndarray):
     """
-    对于 x ∈ [-1,1]^8，计算 a1 = W1 x + b1 的简单区间上下界。
+    Compute simple interval bounds for a1 = W1 x + b1 given x ∈ [-1,1]^8.
 
     l_i = b_i + sum_j W_ij * ( -1 if W_ij > 0 else 1 )
     u_i = b_i + sum_j W_ij * (  1 if W_ij > 0 else -1 )
@@ -40,7 +40,7 @@ def compute_pre_bounds(W1: np.ndarray, b1: np.ndarray):
     for i in range(W1.shape[0]):
         row = W1[i, :]
         # x_j ∈ [-1,1]
-        # 对每个 j 取能让 W_ij * x_j 最小/最大的位置
+        # For each j pick the x_j that minimizes/maximizes W_ij * x_j
         contrib_lb = 0.0
         contrib_ub = 0.0
         for j in range(in_dim):
@@ -59,12 +59,12 @@ def compute_pre_bounds(W1: np.ndarray, b1: np.ndarray):
 
 def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
     """
-    使用 Gurobi 建 MILP：
-      - 变量: x ∈ [-1,1]^8, a1 ∈ [lb_a1, ub_a1], h1 >=0, z ∈ {0,1}^16, y ∈ R^4
-      - 约束: a1 = W1 x + b1
-              ReLU 约束 (big-M)
-              y = W2 h1 + b2
-      - 目标: maximize sum(y_k)  (margin = sum(y_k) - d)
+    Build a MILP with Gurobi:
+      - Variables: x ∈ [-1,1]^8, a1 ∈ [lb_a1, ub_a1], h1 >=0, z ∈ {0,1}^16, y ∈ R^4
+      - Constraints: a1 = W1 x + b1
+                     ReLU constraints (big-M)
+                     y = W2 h1 + b2
+      - Objective: maximize sum(y_k)  (margin = sum(y_k) - d)
     """
     n_in = W1.shape[1]   # 8
     n_hid = W1.shape[0]  # 16
@@ -72,19 +72,19 @@ def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
 
     m = gp.Model("control_conservative_milp")
 
-    # 1. 输入变量 x ∈ [-1,1]^8
+    # 1. Input variables x ∈ [-1,1]^8
     x = m.addVars(n_in, lb=-1.0, ub=1.0, name="x")
 
-    # 2. 第一层 pre-activation a1, post-activation h1, ReLU 二进制变量 z
+    # 2. First-layer pre-activation a1, post-activation h1, ReLU binaries z
     a1 = m.addVars(n_hid, lb=lb_a1, ub=ub_a1, name="a1")
     h1 = m.addVars(n_hid, lb=0.0, name="h1")
     z = m.addVars(n_hid, vtype=GRB.BINARY, name="z")
 
-    # 3. 第二层输出 y ∈ R^4
+    # 3. Second-layer output y ∈ R^4
     y = m.addVars(n_out, lb=-GRB.INFINITY, name="y")
 
     # -------------------------------
-    # 约束 1: a1 = W1 x + b1
+    # Constraint 1: a1 = W1 x + b1
     # -------------------------------
     for i in range(n_hid):
         expr = gp.LinExpr()
@@ -94,9 +94,9 @@ def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
         m.addConstr(a1[i] == expr, name=f"a1_def_{i}")
 
     # -------------------------------
-    # 约束 2: ReLU 线性化
+    # Constraint 2: ReLU linearization
     #   h_i = max(0, a_i)
-    #   使用 big-M:
+    #   Using big-M:
     #     h_i ≥ 0
     #     h_i ≥ a_i
     #     h_i ≤ a_i - lb_a1[i]*(1 - z_i)
@@ -106,15 +106,15 @@ def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
         li = float(lb_a1[i])
         ui = float(ub_a1[i])
 
-        # ReLU 基本约束
+        # ReLU base constraints
         m.addConstr(h1[i] >= 0.0, name=f"relu_ge0_{i}")
         m.addConstr(h1[i] >= a1[i], name=f"relu_gea_{i}")
-        # big-M 上界
+        # big-M upper bounds
         m.addConstr(h1[i] <= a1[i] - li * (1 - z[i]), name=f"relu_ub1_{i}")
         m.addConstr(h1[i] <= ui * z[i],               name=f"relu_ub2_{i}")
 
     # -------------------------------
-    # 约束 3: y = W2 h1 + b2
+    # Constraint 3: y = W2 h1 + b2
     # -------------------------------
     for k in range(n_out):
         expr = gp.LinExpr()
@@ -124,8 +124,8 @@ def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
         m.addConstr(y[k] == expr, name=f"y_def_{k}")
 
     # -------------------------------
-    # 目标: maximize sum(y_k)
-    # spec: sum(y_k) <= d  (这里 d=2.0)
+    # Objective: maximize sum(y_k)
+    # spec: sum(y_k) <= d  (here d=2.0)
     # margin = sum(y_k) - d
     # -------------------------------
     sum_y = gp.quicksum(y[k] for k in range(n_out))
@@ -141,14 +141,14 @@ def build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0):
         print("=== MILP OPTIMAL ===")
         print(f"max sum(y)  = {obj:.6f}")
         print(f"margin      = sum(y) - {d} = {margin:.6f}")
-        print("=> 如果 margin <= 0，则在线性约束下不存在违反 sum(y)<=2 的 CE。")
+        print("=> If margin <= 0, there is no CE violating sum(y)<=2 under linear constraints.")
     elif status == GRB.INFEASIBLE:
         print("=== MILP INFEASIBLE ===")
-        print("这说明在 [-1,1]^8 下居然没有任何可行点（一般不会发生，如果发生说明模型/约束写崩了）")
+        print("This means there is no feasible point in [-1,1]^8 (unlikely; if it happens the model/constraints are broken).")
     else:
         print(f"=== MILP status = {status} ===")
 
-    # 把最优解 x*, y* 打印出来（如果存在）
+    # Print the optimal x*, y* if they exist
     if status == GRB.OPTIMAL:
         x_star = np.array([x[j].X for j in range(n_in)], dtype=float)
         y_star = np.array([y[k].X for k in range(n_out)], dtype=float)
@@ -170,7 +170,7 @@ def main():
     torch_model = factory.create_model(net_name, load_weights=True)
     torch_model.eval()
 
-    # 提取两层全连接
+    # Extract two dense layers
     lin1, lin2 = extract_two_linears(torch_model)
 
     W1 = lin1.weight.detach().cpu().numpy()  # [16, 8]
@@ -181,20 +181,20 @@ def main():
     print("[INFO] W1.shape =", W1.shape, "b1.shape =", b1.shape)
     print("[INFO] W2.shape =", W2.shape, "b2.shape =", b2.shape)
 
-    # 对第一层 pre-activation 做一个简单的区间 bound，用于 big-M
+    # Compute simple pre-activation bounds for layer 1 for big-M
     lb_a1, ub_a1 = compute_pre_bounds(W1, b1)
     print("[INFO] pre-activation bounds (a1):")
     print("       lb_a1[min,max] =", float(lb_a1.min()), float(lb_a1.max()))
     print("       ub_a1[min,max] =", float(ub_a1.min()), float(ub_a1.max()))
 
-    # 用 Gurobi 建 MILP 并求解 max sum(y)
+    # Build MILP with Gurobi and solve max sum(y)
     x_star, y_star, margin = build_and_solve_milp(W1, b1, W2, b2, lb_a1, ub_a1, d=2.0)
 
-    # # 再把 x_star 用 PyTorch 模型跑一遍，做 sanity check
+    # # Optionally evaluate x_star with the PyTorch model for a sanity check
     # if x_star is not None:
-    #     print("\n[CHECK] Evaluate x* with PyTorch VerifiableModel (包含 INPUT_SPEC 等模块)")
+    #     print("\n[CHECK] Evaluate x* with PyTorch VerifiableModel (includes INPUT_SPEC, etc.)")
 
-    #     # 根据你的 config: INPUT 的 meta.shape = [1, 8]
+    #     # Based on your config: INPUT meta.shape = [1, 8]
     #     shape = (1, 8)
     #     x_torch = torch.tensor(x_star, dtype=torch.float32).view(1, *shape)
 
@@ -209,16 +209,16 @@ def main():
     #     print("[CHECK] sum(y(PyTorch)) =", float(y_np.sum()))
     #     print("[CHECK] margin(PyTorch) =", float(y_np.sum() - 2.0))
     
-        # 再把 x_star 用 PyTorch 模型跑一遍，做 sanity check
+        # Evaluate x_star with the PyTorch model for a sanity check
     if x_star is not None:
-        print("\n[CHECK] Evaluate x* with PyTorch VerifiableModel (包含 INPUT_SPEC 等模块)")
+        print("\n[CHECK] Evaluate x* with PyTorch VerifiableModel (includes INPUT_SPEC, etc.)")
 
-        # 用模型本身的 dtype / device，避免 Float vs Double 冲突
+        # Use the model's dtype/device to avoid float/double mismatches
         first_param = next(torch_model.parameters())
         model_dtype = first_param.dtype
         model_device = first_param.device
 
-        # 根据 config: INPUT meta.shape = [1, 8]
+        # Per config: INPUT meta.shape = [1, 8]
         shape = (1, 8)
         x_torch = torch.tensor(
             x_star,

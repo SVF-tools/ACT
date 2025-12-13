@@ -164,8 +164,8 @@ class ConSet:
         """
         Attach a box (interval) constraint for the given vars at a specific layer.
 
-        约定：对于同一个 var_id，真正应该导出给 solver 的，是
-        “最后一个写这个 var 的 layer” 的 box；中间层的 box 只是局部信息。
+        Convention: for any var_id, only export the box from the last layer
+        that writes the variable; earlier layer boxes are local info only.
         """
         self.replace(Con(
             "INEQ",

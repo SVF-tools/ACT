@@ -275,23 +275,23 @@ def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
 
 def _upper_bound_violation(out_bounds: Optional[Bounds], t: int, margin: float = 0.0) -> float:
     """
-    给 TOP1 / MARGIN_ROBUST 里的 violation 变量 v 一个有限的上界：
+    Provide a finite upper bound for the violation variable v in TOP1/MARGIN_ROBUST:
 
         TOP1:   v >= max_j (y[j] - y[t])
         MARGIN: v >= max_j (y[j] - y[t] + margin)
 
-    用抽象 bounds 做个粗上界：
+    Use abstract bounds for a coarse upper bound:
         y[j] ∈ [lb_j, ub_j], y[t] ∈ [lb_t, ub_t]
         ⇒ y[j] - y[t] ≤ ub_j - lb_t
 
-    所以：
+    Therefore:
         TOP1:   v_max = max_j (ub_j - lb_t)
         MARGIN: v_max = max_j (ub_j - lb_t + margin)
 
-    如果拿不到 bounds，就用一个保守常数。
+    If bounds are unavailable, fall back to a conservative constant.
     """
     if out_bounds is None:
-        return 1e6  # fallback：保守常数，避免无界
+        return 1e6  # fallback: conservative constant to avoid unboundedness
 
     lb = out_bounds.lb.detach().cpu().numpy().reshape(-1)
     ub = out_bounds.ub.detach().cpu().numpy().reshape(-1)
@@ -312,19 +312,21 @@ def add_negated_assert_to_solver(
     """
     Add the *negation* of the ASSERT property as constraints to the solver.
 
-    当前版本只做可行性编码（SAT/UNSAT），不再引入标量 violation 变量作为目标：
+    Current version encodes feasibility only (SAT/UNSAT); no scalar violation
+    objective is introduced:
       - LINEAR_LE:      c·y ≤ d        →  ¬prop: c·y ≥ d + ε
       - TOP1_ROBUST:    y[t] > y[j]    →  ¬prop: ∃j: y[j] - y[t] ≥ 0
       - MARGIN_ROBUST:  y[t] - y[j] > margin
                          →  ¬prop: ∃j: y[j] - y[t] + margin ≥ 0
-      - RANGE:          lb ≤ y ≤ ub    →  ¬prop: ∃i: y[i] < lb[i] 或 y[i] > ub[i]
+      - RANGE:          lb ≤ y ≤ ub    →  ¬prop: ∃i: y[i] < lb[i] or y[i] > ub[i]
 
-    对于含“∃”的性质，用二进制选择变量 + big-M 进行 OR 编码。
-    返回值保留为 None（仅兼容老接口，不再使用）。
+    For properties with an existential quantifier, use binary selector
+    variables with big-M to encode the OR.
+    Return value remains None for legacy compatibility and is unused.
     """
     from act.back_end.cons_exportor import to_numpy
     k = assert_layer.meta.get("kind")
-    objective = None  # 为兼容旧接口保留，但当前始终为 None
+    objective = None  # Legacy placeholder; always None now
 
     # ---------------- LINEAR_LE ----------------
     if k == OutKind.LINEAR_LE:
@@ -431,7 +433,7 @@ def add_negated_assert_to_solver(
     #             )
 
     #     z_all = list(z_low) + list(z_up)
-    #     # 至少一个下界/上界违例成立
+    #     # At least one lower/upper bound violation must hold
     #     solver.add_lin_ge(z_all, [1.0] * len(z_all), 1.0)
 
     # else:
@@ -440,27 +442,27 @@ def add_negated_assert_to_solver(
     # return objective
     elif k == OutKind.RANGE:
         # Property: lb ≤ y ≤ ub
-        # Negation（编码的 witness 变量语义）:
-        #   对每个维度 i，我们定义两种违例度：
-        #       v_low_i = lb_i - y_i     (y_i < lb_i 时 > 0)
-        #       v_up_i  = y_i - ub_i     (y_i > ub_i 时 > 0)
-        #   然后:
-        #       v >= max( 0, max_i v_low_i, max_i v_up_i )
+        # Negation (witness variable semantics):
+        #   For each dimension i define two violations:
+        #       v_low_i = lb_i - y_i     (>0 when y_i < lb_i)
+        #       v_up_i  = y_i - ub_i     (>0 when y_i > ub_i)
+        #   Then:
+        #       v >= max(0, max_i v_low_i, max_i v_up_i)
         #
-        #   也就是说:
-        #       v > 0  <=>  存在 i 使得 y_i 超出 [lb_i, ub_i]
-        #       v = 0  <=>  对所有 i, lb_i <= y_i <= ub_i
+        #   Meaning:
+        #       v > 0  <=>  some i has y_i outside [lb_i, ub_i]
+        #       v = 0  <=>  all i satisfy lb_i <= y_i <= ub_i
         #
-        #   我们在 MILP 里做：
-        #       - 引入一个标量变量 v
-        #       - 对每个 i 加约束：
-        #           v >= lb_i - y_i      (如果有 lb)
-        #           v >= y_i - ub_i      (如果有 ub)
-        #       - 再加 v >= 0
-        #       - 用 big-M/抽象 bounds 给 v 一个上界，避免无界
-        #       - 最大化 v
+        #   MILP encoding:
+        #       - introduce a scalar variable v
+        #       - for each i add:
+        #           v >= lb_i - y_i      (if lb present)
+        #           v >= y_i - ub_i      (if ub present)
+        #       - also add v >= 0
+        #       - give v an upper bound via big-M/abstract bounds to avoid unboundedness
+        #       - maximize v
         #
-        #   之后在 verify_once 里：
+        #   In verify_once:
         #       v_opt > 0  → FALSIFIED
         #       v_opt ≤ 0  → CERTIFIED
         #
@@ -484,11 +486,11 @@ def add_negated_assert_to_solver(
         if ub is not None and ub.shape[0] != n_out:
             raise ValueError(f"RANGE: ub length {ub.shape[0]} != len(out_ids)={n_out}")
 
-        # 1) 新增 violation 变量 v
+        # 1) Add violation variable v
         v = solver.n
         solver.add_vars(1)
 
-        # 2) 用输出的抽象 bounds 估一个上界 v_max，避免无界
+        # 2) Estimate an upper bound v_max from output abstract bounds to avoid unboundedness
         #    y_i ∈ [y_lb_i, y_ub_i]
         #    lb_i - y_i ≤ lb_i - y_lb_i
         #    y_i - ub_i ≤ y_ub_i - ub_i
@@ -499,21 +501,21 @@ def add_negated_assert_to_solver(
             y_ub = to_numpy(out_bounds.ub).reshape(-1)
 
             if lb is not None:
-                # 所有可能的 lb_i - y_i 的最大值
+                # Maximum possible lb_i - y_i
                 v_max_terms.append(np.max(lb - y_lb))
             if ub is not None:
-                # 所有可能的 y_i - ub_i 的最大值
+                # Maximum possible y_i - ub_i
                 v_max_terms.append(np.max(y_ub - ub))
-        # 如果拿不到 bounds，就用保守常数
+        # If bounds are unavailable, use a conservative constant
         v_max = max(v_max_terms) if v_max_terms else 1e6
         if (not np.isfinite(v_max)) or v_max < 1e-3:
             v_max = 1e6
 
-        # 3) 约束: 0 <= v <= v_max
+        # 3) Constraints: 0 <= v <= v_max
         solver.add_lin_ge([v], [1.0], 0.0)        # v >= 0
         solver.add_lin_ge([v], [-1.0], -v_max)    # v <= v_max
 
-        # 4) 对每个维度 i 加 v >= lb_i - y_i 和/或 v >= y_i - ub_i
+        # 4) For each dimension i add v >= lb_i - y_i and/or v >= y_i - ub_i
         for i, yi in enumerate(out_ids):
             if lb is not None:
                 # v >= lb_i - y_i   <=>  v + y_i >= lb_i
@@ -530,7 +532,7 @@ def add_negated_assert_to_solver(
                     float(-ub[i]),
                 )
 
-        # 最大化 v
+        # Maximize v
         objective = {"var": v, "sense": "max"}
 
 
@@ -550,18 +552,18 @@ def setup_and_solve(
     Core verification workflow: setup constraints and solve.
     
     Workflow:
-      1. 从 ACT Net 结构中抽取 entry/input/output/spec/assert
-      2. 用 input_bounds + 全部 INPUT_SPEC 组成 entry_fact
-      3. 调用 analyze() 做抽象传播，得到 globalC + layer bounds
+      1. Extract entry/input/output/spec/assert from the ACT Net
+      2. Build entry_fact from input_bounds plus all INPUT_SPEC constraints
+      3. Run analyze() for abstract propagation to get globalC + layer bounds
       4. export_to_solver(globalC, solver)
-      5. 加上 ASSERT 的否定性质（add_negated_assert_to_solver）
-      6. 只做可行性求解（feasibility），从 solver 中抽取 CE input
+      5. Add the negated ASSERT property (add_negated_assert_to_solver)
+      6. Solve feasibility only and extract a CE input from the solver
 
-    返回:
+    Returns:
         (status, counterexample_input, stats)
         - status: SolveStatus.SAT/UNSAT/UNKNOWN
-        - counterexample_input: np.ndarray (只有 SAT 且有解时才非 None)
-        - stats: 调试/统计信息
+        - counterexample_input: np.ndarray (only non-None when SAT with a solution)
+        - stats: debug/statistics info
     """
     from act.back_end.analyze import analyze
     from act.back_end.cons_exportor import export_to_solver
@@ -605,7 +607,7 @@ def setup_and_solve(
     import logging
     logger = logging.getLogger(__name__)
 
-    # 从 ASSERT 的前驱层抓一个输出 box，用于 big-M 估计
+    # Grab an output box from the ASSERT predecessor for big-M estimation
     try:
         assert_preds = net.preds.get(assert_layer.id, [])
         if assert_preds:
@@ -617,7 +619,7 @@ def setup_and_solve(
                     out_bounds.lb.min().item(), out_bounds.lb.max().item(),
                     out_bounds.ub.min().item(), out_bounds.ub.max().item(),
                 )
-                # 额外 sanity check: 是否有 lb>ub 的维度
+                # Extra sanity check: any dimensions with lb>ub?
                 bad = out_bounds.lb > out_bounds.ub + 1e-9
                 if bad.any():
                     idx = bad.nonzero(as_tuple=False)
@@ -658,7 +660,7 @@ def setup_and_solve(
     # Export all constraints to solver (including LIN_POLY)
     export_to_solver(globalC, solver, objective=None, sense="min")
 
-    # 🔒 强制把输入变量限制在 seed box 里（覆盖 export_to_solver 里对输入的任何 bounds）
+    # Enforce input variables inside the seed box (override any solver bounds)
     try:
         lb_np = to_numpy(input_bounds.lb).reshape(-1)
         ub_np = to_numpy(input_bounds.ub).reshape(-1)
@@ -684,7 +686,7 @@ def setup_and_solve(
     assert_layer.meta.get("margin", None),
 )
 
-    # 加入 ASSERT 的否定性质（可能返回目标信息）
+    # Add the negated ASSERT property (may return objective info)
     objective = add_negated_assert_to_solver(
         solver,
         output_ids,
@@ -736,11 +738,11 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     """
     Single-shot verification without refinement.
 
-    语义（对所有 ASSERT 类型统一）：
-      - SolveStatus.UNSAT  →  CERTIFIED（性质在抽象 + MILP 下被证明）
-      - SolveStatus.SAT 且 CE 通过二次检查（输入满足 INPUT_SPEC 且输出确实违约）
-                           →  FALSIFIED（返回 torch.Tensor 形式的 counterexample）
-      - 其他情况           →  UNKNOWN（不敢下结论）
+    Semantics (uniform across ASSERT kinds):
+      - SolveStatus.UNSAT  →  CERTIFIED (property proven with abstraction + MILP)
+      - SolveStatus.SAT and CE passes secondary checks (input meets INPUT_SPEC and output truly violates)
+                           →  FALSIFIED (returns counterexample as torch.Tensor)
+      - Otherwise          →  UNKNOWN (no conclusion)
     """
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
@@ -757,7 +759,7 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     # Core solver workflow
     status, ce_input, stats = setup_and_solve(net, seed_bounds, solver, timelimit)
 
-    # --- DEBUG: 保留 solver 原始 CE（即使后面因为检查被丢掉） ---
+    # --- DEBUG: keep the solver's raw CE even if later discarded ---
     if ce_input is not None:
         try:
             stats["raw_ce_input"] = ce_input.copy()  # np.ndarray
@@ -765,7 +767,7 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
             stats["raw_ce_input"] = ce_input
     # ------------------------------------------------------------
 
-    # 过滤 spurious CE：既要满足输入 spec，又要真的违约
+    # Filter spurious CEs: must satisfy input spec and truly violate output property
     if status == SolveStatus.SAT and ce_input is not None:
         stats.setdefault("ce_checks", {})
         in_ok = input_satisfies_specs(ce_input, spec_layers)
@@ -775,14 +777,14 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
         stats["ce_checks"]["output_violated"] = bool(out_bad)
 
         if not (in_ok and out_bad):
-            # 解是 SAT，但 CE 不可信 → 标为 UNKNOWN，丢掉 CE
+            # SAT solution but CE not trustworthy → mark UNKNOWN and drop CE
             status = SolveStatus.UNKNOWN
             ce_input = None
 
-    # 统一解释状态
+    # Standardize status explanations
     if status == SolveStatus.SAT and ce_input is not None:
         print("[DEBUG VERIFY_ONCE] FINAL SAT+CE -> FALSIFIED")
-        # 真正的反例
+        # Genuine counterexample
         ce_x = torch.from_numpy(ce_input)
         return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
 
@@ -797,7 +799,7 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
             return VerifResult(VerifStatus.CERTIFIED, stats=stats)
 
     if status == SolveStatus.UNSAT:
-        # 否定性质不可行 → 原性质被证明
+        # Negated property infeasible → original property proven
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
 
     # Fallback: if we have a validated CE from solver stats, treat as FALSIFIED
@@ -820,7 +822,7 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
             stats=stats,
         )
 
-    # 其余情况（UNKNOWN / TIME_LIMIT / NUMERIC ISSUE 等）
+    # All other cases (UNKNOWN / TIME_LIMIT / NUMERIC ISSUE, etc.)
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)
 
 

@@ -61,7 +61,7 @@ def to_numpy(x) -> np.ndarray:
 #             lb = to_numpy(con.meta["lb"])
 #             ub = to_numpy(con.meta["ub"])
 
-#             # 统一成一维向量
+#             # Normalize to a 1D vector
 #             lb = lb.reshape(-1)
 #             ub = ub.reshape(-1)
 
@@ -69,7 +69,7 @@ def to_numpy(x) -> np.ndarray:
 #             n_ids = len(con.var_ids)
 
 #             if n_box == n_ids:
-#                 # 原来的“每个 var_id 一个 bound”模式
+#                 # Original mode: one bound per var_id
 #                 for i, vid in enumerate(con.var_ids):
 #                     cur = boxes.get(vid, (-np.inf, +np.inf))
 #                     boxes[vid] = (
@@ -81,7 +81,7 @@ def to_numpy(x) -> np.ndarray:
 #                 base = con.var_ids[0]
 #                 for offset in range(n_box):
 #                     vid = base + offset
-#                     # 这些变量是真实存在的，必须参与 all_ids 统计
+#                     # These variables truly exist and must count toward all_ids
 #                     all_ids.add(vid)
 
 #                     cur = boxes.get(vid, (-np.inf, +np.inf))
@@ -91,7 +91,7 @@ def to_numpy(x) -> np.ndarray:
 #                     )
 
 #             elif n_box == 1 and n_ids > 1:
-#                 # 兼容“标量 lb/ub 广播到一组 var_ids”
+#                 # Support scalar lb/ub broadcast to a group of var_ids
 #                 for vid in con.var_ids:
 #                     cur = boxes.get(vid, (-np.inf, +np.inf))
 #                     boxes[vid] = (
@@ -104,7 +104,7 @@ def to_numpy(x) -> np.ndarray:
 #                     f"box shape mismatch: lb len={n_box}, var_ids len={n_ids}"
 #                 )
 
-#         # 非 box 约束在这一步只是参与 all_ids 统计，box 逻辑之外不用动
+#         # Non-box constraints only contribute to all_ids counting here; no other changes
 
 
 #         # if tag.startswith("box:"):
@@ -124,7 +124,7 @@ def to_numpy(x) -> np.ndarray:
 #         lb = np.array([boxes[i][0] for i in idxs], dtype=np.float64)
 #         ub = np.array([boxes[i][1] for i in idxs], dtype=np.float64)
 
-#         # 🔍 调试：检查有没有 lb>ub 的变量
+#         # 🔍 Debug: check if any variable has lb>ub
 #         bad = lb > ub
 #         if np.any(bad):
 #             print("🚨 [BUG] In export_to_solver: found inconsistent box bounds!")
@@ -276,7 +276,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         )
 
     # ------------------------------------------------------------------
-    # 1) 收集所有变量 ID，并预先计算“每个 var 的最后写入 layer_id”
+    # 1) Collect all variable IDs and precompute the last writer layer_id per var
     # ------------------------------------------------------------------
     all_ids: set[int] = set()
     boxes: dict[int, Tuple[float, float]] = {}
@@ -292,7 +292,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         print("[DEBUG TAG]", con.meta.get("tag", ""))
 
 
-    # 这些是为了 debug 统计用
+    # These are for debug statistics
     used_in_cons: set[int] = set()
     used_in_box: set[int] = set()
 
@@ -304,7 +304,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         if not tag.startswith("box:"):
             continue
 
-        # 优先用 meta['layer_id']，没有的话再从 tag 中解析
+        # Prefer meta['layer_id']; otherwise parse from the tag
         if "layer_id" in con.meta:
             layer_id = int(con.meta["layer_id"])
         else:
@@ -319,7 +319,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                 last_box_layer_for_var[vid] = layer_id
 
     # ------------------------------------------------------------------
-    # 2) 第二遍：真正合并 box，只保留“最后写入层”的那一个
+    # 2) Second pass: merge boxes, keeping only the one from the last writer layer
     # ------------------------------------------------------------------
     for con in templates:
         tag = con.meta.get("tag", "")
@@ -329,11 +329,11 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         lb = to_numpy(con.meta["lb"])
         ub = to_numpy(con.meta["ub"])
 
-        # 统一成一维向量
+        # Flatten to 1D vectors
         lb = lb.reshape(-1)
         ub = ub.reshape(-1)
 
-        # 🔥 先在“单个 box 自己”层面检查有没有 lb>ub
+        # 🔥 First, within this single box, check for lb>ub
         local_bad = lb > ub
         if np.any(local_bad):
             print("🔥 [LOCAL BAD BOX] =================================================")
@@ -348,7 +348,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         n_box = lb.shape[0]
         n_ids = len(con.var_ids)
 
-        # 取出当前 box 的 layer_id
+        # Extract current box's layer_id
         if "layer_id" in con.meta:
             layer_id = int(con.meta["layer_id"])
         else:
@@ -358,12 +358,12 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                 layer_id = -1
 
         if n_box == n_ids:
-            # 标准：每个 var_id 一个 bounds
+            # Standard: one bounds entry per var_id
             for i, vid in enumerate(con.var_ids):
-                # ⭐ 核心：只保留这个 var 的“最后写入层”的 box
+                # ⭐ Core rule: keep only the box from the last layer that writes this var
                 last_writer = last_box_layer_for_var.get(vid, layer_id)
                 if layer_id != last_writer:
-                    # 说明还有更靠后的 layer 给这个 vid 写过 box，当前 box 是“旧的”，丢弃
+                    # A later layer wrote a box for this vid; drop this older box
                     continue
 
                 cur = boxes.get(vid, (-np.inf, +np.inf))
@@ -374,7 +374,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                 used_in_box.add(vid)
 
         elif n_box == 1 and n_ids > 1:
-            # 标量 lb/ub 广播到一组 var_ids，同样应用“最后写入层”规则
+            # Scalar lb/ub broadcast to a group of var_ids; still apply last-writer rule
             for vid in con.var_ids:
                 last_writer = last_box_layer_for_var.get(vid, layer_id)
                 if layer_id != last_writer:
@@ -397,7 +397,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             )
 
     # ------------------------------------------------------------------
-    # 3) 创建 MILP 变量 + 应用 box bounds（过滤掉 lb>ub 的）
+    # 3) Create MILP variables + apply box bounds (drop lb>ub)
     # ------------------------------------------------------------------
     nvars = max(all_ids) + 1 if all_ids else 0
 
@@ -428,14 +428,14 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             solver.set_bounds(idxs, lb, ub)
 
     # ------------------------------------------------------------------
-    # 4) 其他 tag（dense/relu/mcc/softmax/in:linpoly/...）+ used_in_cons 标记
+    # 4) Other tags (dense/relu/mcc/softmax/in:linpoly/...) + used_in_cons marks
     # ------------------------------------------------------------------
     for con in templates:
         tag = con.meta.get("tag", "")
         if tag.startswith("box:"):
             continue
 
-        # 统一：凡是这个约束涉及的 var_ids，都视为“出现在约束中”
+        # Rule: any var_ids appearing in this constraint are treated as "used in constraints"
         used_in_cons.update(con.var_ids)
 
         if tag.startswith("dense:"):
@@ -495,7 +495,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
 
         elif tag.startswith("relu:"):
             """
-            ReLU encoding (ACT 原版语义):
+            ReLU encoding (original ACT semantics):
 
             var_ids = [z | y]
               - z: post-activation (output), z = ReLU(y), z >= 0
@@ -515,9 +515,9 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             assert 2 * n == len(con.var_ids), \
                 f"relu: var_ids length not even: {len(con.var_ids)}"
 
-            # 注意：这里沿用 ACT 原来的语义：
-            #   z = ReLU 输出（post-activation）
-            #   y = ReLU 输入（pre-activation）
+            # Note: keep ACT's original semantics:
+            #   z = ReLU output (post-activation)
+            #   y = ReLU input (pre-activation)
             z = list(con.var_ids[:n])
             y = list(con.var_ids[n:])
 
@@ -528,7 +528,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             slope = to_numpy(meta["slope"])
             shift = to_numpy(meta["shift"])
 
-            # 1) 稳定 ON：y_lb >= 0 → z_i = y_i
+            # 1) Stable ON: y_lb >= 0 → z_i = y_i
             for i in idx_on:
                 solver.add_lin_eq(
                     [z[i], y[i]],
@@ -536,7 +536,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                     0.0,
                 )
 
-            # 2) 稳定 OFF：y_ub <= 0 → z_i = 0（y 不再约束）
+            # 2) Stable OFF: y_ub <= 0 → z_i = 0 (y unconstrained)
             for i in idx_off:
                 solver.add_lin_eq(
                     [z[i]],
@@ -544,7 +544,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                     0.0,
                 )
 
-            # 3) ambiguous：三角松弛
+            # 3) Ambiguous: triangular relaxation
             for k, i in enumerate(idx_amb):
                 # (a) z >= 0   →  -z <= 0
                 solver.add_lin_le(
@@ -595,15 +595,15 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         elif tag.startswith("top1:"):
             meta = con.meta
 
-            # 所有 logit 的变量 id
+            # Variable ids of all logits
             y_vars = list(con.var_ids)
 
-            # 目标类别 t（假设是单个 index）
+            # Target class t (assumed single index)
             t_idx  = int(to_numpy(meta["t_index"]).item())
             v_id   = int(meta["v_id"])
             margin = float(meta.get("margin", 0.0))
 
-            # 语义：v >= y_j - y_t - margin,  对所有 j != t
+            # Semantics: v >= y_j - y_t - margin, for all j != t
             for j, yj in enumerate(y_vars):
                 if j == t_idx:
                     continue
@@ -619,7 +619,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         elif tag.startswith("range:"):
             meta = con.meta
 
-            # 约定：var_ids[0] 是 violation 变量 v，其余是输出 y_j
+            # Convention: var_ids[0] is violation variable v; others are outputs y_j
             v_id = con.var_ids[0]
             y    = list(con.var_ids[1:])
 
@@ -632,7 +632,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             # v >= 0  ->  v >= 0
             solver.add_lin_ge([v_id], [1.0], 0.0)
 
-            # 对每个维度 j：
+            # For each dimension j:
             #   v >= lb_j - y_j      <=>  v + y_j >= lb_j
             #   v >= y_j - ub_j      <=>  v - y_j >= -ub_j
             for j, yj in enumerate(y):
@@ -730,11 +730,11 @@ def export_to_solver(globalC: ConSet, solver: Solver,
                 solver.add_lin_le(vids, list(A[i, :]), float(b[i]))
 
         else:
-            # 其他 tag 暂时忽略
+            # Other tags ignored for now
             pass
 
     # ------------------------------------------------------------------
-    # 4.5) Debug：哪一些变量只出现在 box / 只出现在约束？
+    # 4.5) Debug: which vars appear only in boxes vs only in constraints?
     # ------------------------------------------------------------------
     only_box = sorted(used_in_box - used_in_cons)
     only_cons = sorted(used_in_cons - used_in_box)
@@ -742,15 +742,15 @@ def export_to_solver(globalC: ConSet, solver: Solver,
     print(f"[DEBUG] vars only in constraints (count={len(only_cons)}): sample={only_cons[:20]}")
 
     # ------------------------------------------------------------------
-    # 5) objective (optional) —— 这里加“假目标”防止 UNBOUNDED
+    # 5) objective (optional) — add dummy objective to avoid UNBOUNDED
     # ------------------------------------------------------------------
     if objective is None:
-        # 如果有 box，就找一个有 box 的变量做 dummy 目标
+        # If boxes exist, pick any boxed variable for dummy objective
         if boxes:
             v0 = min(boxes.keys())
             solver.set_objective_linear([v0], [1.0], 0.0, "min")
         else:
-            # 完全没有 box 的话，只能退回常数目标（此时 UNBOUNDED 还是可能的）
+            # With no boxes, fall back to constant objective (UNBOUNDED still possible)
             solver.set_objective_linear([], [], 0.0, "min")
     else:
         c, c0 = objective

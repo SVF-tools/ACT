@@ -22,7 +22,7 @@ from act.back_end.verifier import (
 from act.front_end.specs import InKind
 
 
-# 只验证 control_* 和 reachability_* 系列
+# Only verify control_* and reachability_* families
 TARGET_NETS: List[str] = [
     "control_balanced",
     "control_strict",
@@ -33,7 +33,7 @@ TARGET_NETS: List[str] = [
 
 
 # ---------------------------------------------------------------
-# 通用工具：从 ACT Net 拿输入域、中心点、shape
+# Common helpers: extract input domain, center, and shape from ACT Net
 # ---------------------------------------------------------------
 def get_input_box_and_shape(net):
     spec_layers = gather_input_spec_layers(net)
@@ -42,7 +42,7 @@ def get_input_box_and_shape(net):
     lb = seed_bounds.lb.flatten()
     ub = seed_bounds.ub.flatten()
 
-    # 优先用 LINF_BALL 的 center（如果有）
+    # Prefer LINF_BALL center when available
     center = None
     for L in spec_layers:
         k = L.meta.get("kind")
@@ -59,7 +59,7 @@ def get_input_box_and_shape(net):
     print(f"[INFO] seed_bounds ub[min,max] = [{ub.min().item():.4f}, {ub.max().item():.4f}]")
     print(f"[INFO] center range            = [{center.min().item():.4f}, {center.max().item():.4f}]")
 
-    # 原来的 meta.shape 里往往已经带了一个 "1"，我们把它去掉
+    # meta.shape often includes a leading "1"; strip it
     inp_layer = next(L for L in net.layers if L.kind == "INPUT")
     shape_meta = list(inp_layer.meta.get("shape") or [center.numel()])
 
@@ -78,7 +78,7 @@ def build_torch_model(factory: ModelFactory, net_name: str) -> torch.nn.Module:
 
 
 # ---------------------------------------------------------------
-# 统一的 margin 计算函数：适配不同 ASSERT kind
+# Unified margin computation for different ASSERT kinds
 # ---------------------------------------------------------------
 def eval_margin_and_output(
     torch_model: torch.nn.Module,
@@ -132,7 +132,7 @@ def eval_margin_and_output(
 
 
 # ---------------------------------------------------------------
-# 随机采样搜索（逐点）——只做 sanity check，不做“百分百保证”
+# Random pointwise sampling — sanity check only, not exhaustive
 # ---------------------------------------------------------------
 def random_search_pointwise(
     torch_model: torch.nn.Module,
@@ -177,7 +177,7 @@ def random_search_pointwise(
 
 
 # ---------------------------------------------------------------
-# PGD 梯度上升搜索 —— 同样只是 heuristic
+# PGD gradient-ascent search — heuristic only
 # ---------------------------------------------------------------
 def pgd_search(
     torch_model: torch.nn.Module,
@@ -274,14 +274,15 @@ def pgd_search(
 
 
 # ---------------------------------------------------------------
-# 区间传播：一层 Linear 的区间 bound
+# Interval propagation: bounds for a single Linear layer
 # ---------------------------------------------------------------
 def compute_pre_bounds_box(
     W: np.ndarray, b: np.ndarray,
     lb_x: np.ndarray, ub_x: np.ndarray,
 ):
     """
-    对一般盒约束 x_j ∈ [lb_x[j], ub_x[j]] 做一层线性层的区间 bound：
+    Compute interval bounds for one linear layer given box constraints
+    x_j ∈ [lb_x[j], ub_x[j]]:
       a = W x + b
     """
     in_dim = W.shape[1]
@@ -310,22 +311,22 @@ def compute_pre_bounds_box(
 
 
 # ---------------------------------------------------------------
-# 通用：从 torch_model 中抽取 Linear + ReLU 序列
+# Utility: extract Linear + ReLU sequences from torch_model
 # ---------------------------------------------------------------
 class LinearBlock:
     def __init__(self, W: np.ndarray, b: np.ndarray, has_relu: bool):
         self.W = W  # shape: [out_dim, in_dim]
         self.b = b  # shape: [out_dim]
-        self.has_relu = has_relu  # 当前 Linear 后面是否紧跟一个 ReLU
+        self.has_relu = has_relu  # Whether this Linear is immediately followed by a ReLU
 
 
 def extract_linear_relu_blocks(torch_model: nn.Module) -> List[LinearBlock]:
     """
-    从 torch_model 中抽取一个按执行顺序的 [Linear (+ReLU?)] 块序列。
-    假设网络是“线性 / ReLU 的前馈网络”（control_*/reachability_* 属于这一类）。
+    Extract an execution-ordered sequence of [Linear (+ReLU?)] blocks from torch_model.
+    Assumes a feed-forward Linear/ReLU network (control_*/reachability_* fit this).
     """
     modules: List[nn.Module] = []
-    # modules() 会列出所有模块（包含顶层），我们只保留 Linear/ ReLU
+    # modules() lists all modules (including top-level); keep only Linear/ReLU
     for m in torch_model.modules():
         if isinstance(m, nn.Linear) or isinstance(m, nn.ReLU):
             modules.append(m)
@@ -340,11 +341,11 @@ def extract_linear_relu_blocks(torch_model: nn.Module) -> List[LinearBlock]:
             has_relu = False
             if i + 1 < len(modules) and isinstance(modules[i + 1], nn.ReLU):
                 has_relu = True
-                i += 1  # 再往前挪一格，把 ReLU 吃掉
+                i += 1  # Consume the following ReLU
             blocks.append(LinearBlock(W, b, has_relu))
             i += 1
         else:
-            # 如果遇到裸 ReLU（前面不是 Linear），按理说不会发生；保守跳过
+            # Encountering a bare ReLU (not preceded by Linear) should not happen; skip defensively
             i += 1
 
     if not blocks:
@@ -354,7 +355,7 @@ def extract_linear_relu_blocks(torch_model: nn.Module) -> List[LinearBlock]:
 
 
 # ---------------------------------------------------------------
-# 精确 MILP：对任意多层 Linear + ReLU 的前馈网络做“全网络 MILP”
+# Exact MILP: full-network MILP for any number of Linear + ReLU layers
 # ---------------------------------------------------------------
 def run_exact_milp_for_two_layer_mlp(
     net,
@@ -364,31 +365,31 @@ def run_exact_milp_for_two_layer_mlp(
     assert_layer,
 ) -> Optional[float]:
     """
-    用 gurobipy 搭“完全具体”的 MILP，在给定盒约束下，
-    精确最大化 violation margin。
+    Build a fully concrete MILP with gurobipy to maximize violation margin
+    under the given box constraints.
 
-    不再限制“两层 Linear”，而是对 torch_model 中所有
-    Linear + ReLU 组成的前馈网络都支持。
+    No longer limited to “two Linear layers”; supports all Linear + ReLU
+    feed-forward networks in torch_model.
 
-    目前重点支持：
+    Currently focused on:
       - LINEAR_LE (control_*)
       - RANGE      (reachability_*)
 
-    返回：
-      best_margin: float 或 None（如果求解失败）
+    Returns:
+      best_margin: float or None (if solving fails)
     """
     kind = assert_layer.meta.get("kind", assert_layer.kind)
     if kind not in ("LINEAR_LE", "RANGE"):
         raise RuntimeError(f"MILP currently supports LINEAR_LE / RANGE, got {kind}")
 
-    # 1) 从 torch_model 抽取顺序的 Linear (+ReLU?) blocks
+    # 1) Extract ordered Linear (+ReLU?) blocks from torch_model
     blocks = extract_linear_relu_blocks(torch_model)
     print(f"[MILP] extracted {len(blocks)} Linear blocks from torch_model")
 
     lb_x = lb.cpu().numpy().astype(float)
     ub_x = ub.cpu().numpy().astype(float)
 
-    # 2) 用简单的区间传播 (IBP) 先算每层的 pre-activation bound
+    # 2) Use simple interval propagation (IBP) to get each layer's pre-activation bounds
     pre_lbs: List[np.ndarray] = []
     pre_ubs: List[np.ndarray] = []
 
@@ -401,7 +402,7 @@ def run_exact_milp_for_two_layer_mlp(
         pre_lbs.append(lb_a)
         pre_ubs.append(ub_a)
 
-        # 经过激活后的 bound，给下一层用
+        # Post-activation bounds used by the next layer
         if blk.has_relu:
             cur_lb = np.maximum(lb_a, 0.0)
             cur_ub = np.maximum(ub_a, 0.0)
@@ -412,19 +413,19 @@ def run_exact_milp_for_two_layer_mlp(
     print("       lb_y[min,max] =", float(cur_lb.min()), float(cur_lb.max()))
     print("       ub_y[min,max] =", float(cur_ub.min()), float(cur_ub.max()))
 
-    # 3) 构建 MILP：输入 -> 一串 Linear(+ReLU?) -> 输出
+    # 3) Build MILP: input -> series of Linear(+ReLU?) -> output
     m = gp.Model(f"milp_{kind.lower()}")
 
     n_in = lb_x.shape[0]
-    # 每一层的“post-activation”向量 x_layers[k]
+    # Post-activation vector for each layer x_layers[k]
     x_layers: List[gp.tupledict] = []
 
-    # 输入层变量
+    # Input layer variables
     x0 = m.addVars(n_in, lb=lb_x, ub=ub_x, name="x_0")
     x_layers.append(x0)
 
-    # 对每一个 block 建 pre-activation + ReLU + 下一层变量
-    a_vars: List[gp.tupledict] = []  # 每层 pre-activation
+    # For each block, add pre-activation + ReLU + next-layer variables
+    a_vars: List[gp.tupledict] = []  # pre-activation per layer
     z_vars: List[Optional[gp.tupledict]] = []
 
     for l_idx, blk in enumerate(blocks):
@@ -466,21 +467,21 @@ def run_exact_milp_for_two_layer_mlp(
 
             x_layers.append(h_l)
         else:
-            # 无激活，post-activation 就是 a_l
+            # No activation: post-activation equals a_l
             z_vars.append(None)
             x_layers.append(a_l)
 
-    # 最后一层输出 y
+    # Final layer output y
     y = x_layers[-1]
     n_out = len(y)
 
-    # 4) 在这个精确网络上，对 assert 做 violation margin 最大化
+    # 4) On this exact network, maximize assertion violation margin
 
     best_margin = -1e9
     best_desc = None
 
     if kind == "LINEAR_LE":
-        # 性质：c^T y <= d
+        # Property: c^T y <= d
         c_list = assert_layer.params["c"]
         d = float(assert_layer.meta["d"])
         c_arr = np.array(c_list, dtype=float)
@@ -499,16 +500,16 @@ def run_exact_milp_for_two_layer_mlp(
             best_margin = float(m.ObjVal)
             best_desc = "LINEAR_LE: max (c^T y - d)"
         else:
-            print(f"[MILP] status = {m.Status} (非 OPTIMAL，LINEAR_LE 结果不可靠)")
+            print(f"[MILP] status = {m.Status} (not OPTIMAL; LINEAR_LE result unreliable)")
             return None
 
     elif kind == "RANGE":
-        # 性质：lb[i] <= y[i] <= ub[i]
+        # Property: lb[i] <= y[i] <= ub[i]
         lb_list = np.array(assert_layer.params["lb"], dtype=float)
         ub_list = np.array(assert_layer.params["ub"], dtype=float)
 
         for i in range(n_out):
-            # 上界违反: y[i] - ub[i]
+            # Upper-bound violation: y[i] - ub[i]
             expr_up = y[i] - ub_list[i]
             m.setObjective(expr_up, GRB.MAXIMIZE)
             m.Params.OutputFlag = 0
@@ -519,9 +520,9 @@ def run_exact_milp_for_two_layer_mlp(
                     best_margin = val_up
                     best_desc = f"RANGE: max (y[{i}] - ub[{i}])"
             else:
-                print(f"[MILP] status = {m.Status} @upper i={i} (忽略该方向)")
+                print(f"[MILP] status = {m.Status} @upper i={i} (skip this direction)")
 
-            # 下界违反: lb[i] - y[i]
+            # Lower-bound violation: lb[i] - y[i]
             expr_low = lb_list[i] - y[i]
             m.setObjective(expr_low, GRB.MAXIMIZE)
             m.optimize()
@@ -531,40 +532,40 @@ def run_exact_milp_for_two_layer_mlp(
                     best_margin = val_low
                     best_desc = f"RANGE: max (lb[{i}] - y[{i}])"
             else:
-                print(f"[MILP] status = {m.Status} @lower i={i} (忽略该方向)")
+                print(f"[MILP] status = {m.Status} @lower i={i} (skip this direction)")
 
         if best_desc is None:
-            print("[MILP] 所有 RANGE 方向求解都非 OPTIMAL，结果不可靠")
+            print("[MILP] All RANGE directions were non-OPTIMAL; result unreliable")
             return None
 
-    # 5) 打印结果，并在需要时还可以把 CE 取出来
+    # 5) Print results and optionally extract a CE
     print("=== EXACT MILP (full ReLU MLP) ===")
     print(f"[MILP] kind           = {kind}")
     print(f"[MILP] best objective = {best_margin:.6f}")
     if best_desc is not None:
         print(f"[MILP] objective src = {best_desc}")
     if best_margin > 0:
-        print("[MILP] ==> 找到了严格意义上的 CE（在精确网络上 + 该盒约束内）")
+        print("[MILP] ==> Found a strict CE (on exact network within the box)")
 
-        # 输出一个 CE 的 x*（可选）
+        # Output a CE x* (optional)
         n_in = lb_x.shape[0]
         ce_x = np.array([x_layers[0][j].X for j in range(n_in)], dtype=float)
         print(f"[MILP] example CE input x* = {ce_x}")
     else:
-        print("[MILP] ==> 在精确网络 + 盒约束下，没有 CE")
+        print("[MILP] ==> No CE under exact network + box constraints")
 
     return best_margin
 
 
 # ---------------------------------------------------------------
-# 单个 net 的完整检查流程（ACT + Search + MILP 三重校验）
+# Full check for a single net (ACT + Search + MILP triple validation)
 # ---------------------------------------------------------------
 def analyze_single_net(factory: ModelFactory, net_name: str):
     print("\n" + "=" * 80)
     print(f"[NET] {net_name}")
     print("=" * 80)
 
-    # 1. ACT + Gurobi 抽象验证
+    # 1. ACT + Gurobi abstract verification
     net = factory.get_act_net(net_name)
     solver = GurobiSolver()
     res = verify_once(net, solver)
@@ -573,22 +574,22 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
     print(f"[ACT] ncons           : {res.stats.get('ncons')}")
     print(f"[ACT] violation_var   : {res.stats.get('violation_var', None)}")
 
-    # 2. 输入域 box + 中心点 + shape
+    # 2. Input domain box + center + shape
     lb, ub, center, shape = get_input_box_and_shape(net)
 
-    # 3. PyTorch 模型 + ASSERT 层
+    # 3. PyTorch model + ASSERT layer
     torch_model = build_torch_model(factory, net_name)
     assert_layer = get_assert_layer(net)
     kind = assert_layer.meta.get("kind", assert_layer.kind)
     print(f"[ASSERT] kind = {kind}, meta = {assert_layer.meta}")
 
-    # 4. 中心点是不是 CE？
+    # 4. Check if the center point is a CE
     print("\n----- CHECK CENTER POINT -----")
     center_np = center.cpu().numpy()
     violated_center = check_violation_at_point(net, center_np, assert_layer)
     print(f"[CENTER] check_violation_at_point(center) = {violated_center}")
 
-    # 5. 随机搜索（辅助）
+    # 5. Random search (auxiliary)
     print("\n----- RANDOM SEARCH -----")
     best_margin_rand, best_x_rand, best_y_rand = random_search_pointwise(
         torch_model, lb, ub, shape, assert_layer, n_samples=2000
@@ -598,7 +599,7 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
         print(f"[RANDOM] best y = {best_y_rand}")
     print()
 
-    # 6. PGD 搜索（辅助）
+    # 6. PGD search (auxiliary)
     print("----- PGD SEARCH -----")
     best_margin_pgd, best_x_pgd, best_y_pgd = pgd_search(
         torch_model, lb, ub, shape, assert_layer,
@@ -608,7 +609,7 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
     if best_y_pgd is not None:
         print(f"[PGD] best y = {best_y_pgd}")
 
-    # 7. 全网络精确 MILP 检查（真正“百分之百”的来源）
+    # 7. Full-network exact MILP check (the definitive source)
     print("\n----- EXACT MILP (full ReLU MLP) -----")
     milp_margin = None
     try:
@@ -619,11 +620,11 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
         print(f"[MILP] error building MILP for {net_name}: {e}")
         milp_margin = None
 
-    # 8. 三重校验：ACT 抽象 + 数值搜索 + 精确 MILP
+    # 8. Triple check: ACT abstraction + numeric search + exact MILP
     print("\n----- TRIPLE CHECK (ACT + Search + MILP) -----")
     act_status = res.status  # CERTIFIED / FALSIFIED / UNKNOWN
 
-    # 数值层面的 CE：中心 or 随机 or PGD 找到 margin>0 就算 CE
+    # Numeric CE: center or random or PGD with margin>0 counts as CE
     concrete_ce = (
         bool(violated_center)
         or best_margin_rand > 0.0
@@ -642,39 +643,39 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
         f"(rand={best_margin_rand:.6f}, pgd={best_margin_pgd:.6f})"
     )
     if milp_margin is None:
-        print("[TRIPLE] MILP status        = ERROR/UNKNOWN (构建或求解失败)")
+        print("[TRIPLE] MILP status        = ERROR/UNKNOWN (build or solve failed)")
     else:
         print(
             f"[TRIPLE] MILP max violation = {milp_margin:.6f} "
             f"(CE? {milp_ce})"
         )
 
-    # “经验真相”：**这里以 MILP 为金标准**
+    # Empirical ground truth: use MILP as the gold standard
     if milp_ce is True:
-        truth = "UNSAFE (MILP 找到 CE)"
+        truth = "UNSAFE (MILP found a CE)"
     elif milp_ce is False:
-        truth = "SAFE (MILP 证明该盒约束内没有 CE)"
+        truth = "SAFE (MILP proved no CE inside the box)"
     else:
-        # MILP 挂掉，就退化到 Search（不再是 100%）
+        # If MILP failed, fall back to Search (no longer 100%)
         if concrete_ce:
-            truth = "UNSAFE? (Search 找到疑似 CE, 但 MILP 不可用)"
+            truth = "UNSAFE? (Search found a suspected CE, but MILP unavailable)"
         else:
-            truth = "UNKNOWN (MILP 不可用，只靠 Search 无法 100% 保证)"
+            truth = "UNKNOWN (MILP unavailable; Search alone is not 100% reliable)"
 
-    # 抽象结果 vs “MILP 真相”的一致性
+    # Consistency between abstraction result and MILP truth
     if truth.startswith("UNSAFE") and act_status == "FALSIFIED":
-        verdict = "CONSISTENT (ACT 正确报告 UNSAFE)"
+        verdict = "CONSISTENT (ACT correctly reports UNSAFE)"
     elif truth.startswith("SAFE") and act_status == "CERTIFIED":
-        verdict = "CONSISTENT (ACT 正确报告 SAFE)"
+        verdict = "CONSISTENT (ACT correctly reports SAFE)"
     elif act_status == "UNKNOWN":
-        verdict = f"INCONCLUSIVE (ACT=UNKNOWN, MILP 给出 {truth})"
+        verdict = f"INCONCLUSIVE (ACT=UNKNOWN, MILP says {truth})"
     else:
-        verdict = f"POSSIBLE BUG? (ACT={act_status}, MILP 真相={truth})"
+        verdict = f"POSSIBLE BUG? (ACT={act_status}, MILP truth={truth})"
 
     print(f"[TRIPLE] ground truth (MILP-based) = {truth}")
     print(f"[TRIPLE] verdict                   = {verdict}")
 
-    # 9. 总结
+    # 9. Summary
     print("\n----- SUMMARY FOR NET -----")
     print(f"[SUMMARY] net               = {net_name}")
     print(f"[SUMMARY] ACT VerifStatus   = {res.status}")
@@ -685,11 +686,11 @@ def analyze_single_net(factory: ModelFactory, net_name: str):
     print(f"[SUMMARY] MILP max margin   = {milp_margin if milp_margin is not None else 'N/A'}")
     print(f"[SUMMARY] MILP truth        = {truth}")
     print(f"[SUMMARY] Triple verdict    = {verdict}")
-    print("[SUMMARY] 解释：")
-    print("  - MILP 是对精确网络 + 精确盒约束的全局优化；")
-    print("  - MILP best_margin > 0  ⇔ 盒子里存在 CE；")
-    print("  - MILP best_margin ≤ 0  ⇔ 盒子里不存在 CE；")
-    print("  - 只要 MILP 求解状态是 OPTIMAL，这就是“百分之百”的结论（在求解器数值精度范围内）。")
+    print("[SUMMARY] Notes:")
+    print("  - MILP is a global optimization on the exact network + exact box.")
+    print("  - MILP best_margin > 0  ⇔ a CE exists in the box.")
+    print("  - MILP best_margin ≤ 0  ⇔ no CE exists in the box.")
+    print("  - When MILP status is OPTIMAL, this is the definitive conclusion (up to solver precision).")
 
 
 # ---------------------------------------------------------------
@@ -703,7 +704,7 @@ def main():
         try:
             analyze_single_net(factory, net_name)
         except Exception as e:
-            print(f"[ERROR] net {net_name} 出错: {e}")
+            print(f"[ERROR] net {net_name} failed: {e}")
 
 
 if __name__ == "__main__":

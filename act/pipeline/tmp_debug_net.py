@@ -5,8 +5,8 @@ from act.pipeline.verification.model_factory import ModelFactory
 
 def dump_net_var_ids(net_name: str = "mnist_robust_easy") -> None:
     """
-    打印指定 ACT Net 中每一层的 in_vars / out_vars 范围，
-    用来对照 box 约束里的 var_ids。
+    Print in_vars / out_vars ranges for each layer of a given ACT Net,
+    useful for mapping var_ids in box constraints.
     """
     factory = ModelFactory()
     net = factory.get_act_net(net_name)
@@ -32,7 +32,7 @@ def dump_net_var_ids(net_name: str = "mnist_robust_easy") -> None:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    # 你可以改成 "cifar_margin_strict" 等等
+    # You can change this to "cifar_margin_strict", etc.
     dump_net_var_ids("mnist_robust_easy")
 
 if __name__ == "__main__":

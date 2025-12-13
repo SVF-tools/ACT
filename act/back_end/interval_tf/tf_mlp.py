@@ -134,7 +134,7 @@ def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     k2, n = y_shape
     assert k == k2, "matmul: inner dim mismatch"
 
-    # 还原成矩阵
+    # Reshape back to matrix form
     X_lb = Bx.lb.view(m, k)
     X_ub = Bx.ub.view(m, k)
     Y_lb = By.lb.view(k, n)
@@ -144,7 +144,7 @@ def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     out_ub = []
     for i in range(m):
         for j in range(n):
-            # 收集 x[i, :] * y[:, j] 的 4 个角
+            # Collect the 4 corners of x[i, :] * y[:, j]
             xs_lb = X_lb[i, :]    # [k]
             xs_ub = X_ub[i, :]    # [k]
             ys_lb = Y_lb[:, j]    # [k]
@@ -378,7 +378,7 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
     axes   = L.meta.get("axes", list(range(len(inp_shape))))
     steps  = L.meta.get("steps", [1] * len(axes))
 
-    # 构造每个维度的 slice 对象
+    # Build slice objects for each dimension
     slices = [slice(None)] * len(inp_shape)
     for i, axis in enumerate(axes):
         s = starts[i]

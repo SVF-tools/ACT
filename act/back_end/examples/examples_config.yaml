@@ -329,7 +329,7 @@ toy_le:
       meta: {shape: [1, 1], dtype: "torch.float64"}
     - kind: INPUT_SPEC
       params: {}
-      meta: {kind: "BOX", lb_val: 0.0, ub_val: 0.0}  # 只包含 x=0
+      meta: {kind: "BOX", lb_val: 0.0, ub_val: 0.0}  # contains only x=0
     - kind: DENSE
       params: {}
       meta: {in_features: 1, out_features: 1, bias_enabled: true}

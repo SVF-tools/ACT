@@ -708,7 +708,7 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
     mode = L.meta.get("mode", "nearest")
     align_corners = bool(L.meta.get("align_corners", False))
 
-    # F.interpolate 的 scale_factor 必须是 float 或 tuple of float
+    # F.interpolate scale_factor must be float or tuple of float
     y_lb = F.interpolate(
         x_lb,
         size=size,

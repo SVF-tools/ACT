@@ -148,7 +148,7 @@ class TorchLPSolver(Solver):
             eff_max_iter = min(eff_max_iter, self._large_n_max_iter)
             eff_tol_feas = max(eff_tol_feas, self._large_n_tol)
 
-        # === 1) 初始化变量到 box 中点（或 0） ===
+        # === 1) Initialize variables to box midpoints (or 0) ===
         if self._x is None:
             lb = torch.where(torch.isfinite(self._lb),
                              self._lb,
@@ -174,7 +174,7 @@ class TorchLPSolver(Solver):
             weight_decay=self.weight_decay
         )
 
-        # === 3) 目标函数向量化处理 ===
+        # === 3) Vectorized objective construction ===
         vids, coeffs, c0, sense = self._objective
         if vids:
             vids_t = torch.as_tensor(vids, device=self._x.device, dtype=torch.long)
@@ -225,7 +225,7 @@ class TorchLPSolver(Solver):
         best_max_viol = math.inf
         stagnation_steps = 0
 
-        # === 4) 主循环：Adam + 罚项 + box projection ===
+        # === 4) Main loop: Adam + penalties + box projection ===
         for it in range(eff_max_iter):
             if t_end is not None and time.time() >= t_end:
                 self._status = SolveStatus.SAT
@@ -277,7 +277,7 @@ class TorchLPSolver(Solver):
                 if not self._x.requires_grad:
                     self._x.requires_grad_(True)
 
-            # === 5) 约束违背度检测（向量化） ===
+            # === 5) Constraint violation check (vectorized) ===
             # Reuse forward violations most steps; occasionally recompute on the
             # clamped x to keep the check honest without doubling work.
             recompute = (it % self._feas_check_stride == 0)
@@ -321,7 +321,7 @@ class TorchLPSolver(Solver):
 
             # Time limit reached
             if t_end is not None and time.time() >= t_end:
-                # 对 “找 CE” 的场景，只要有一个可行/近似可行点就够用
+                # For counterexample search, any feasible/near-feasible point suffices
                 self._status = SolveStatus.SAT if math.isfinite(max_viol) else SolveStatus.UNKNOWN
                 self._has_solution = True
                 self._sol = self._x.detach().clone()

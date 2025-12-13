@@ -117,9 +117,9 @@ class GurobiSolver(Solver):
         if self.m.Status in [3, 4, 5, 12]:  # infeasible, inf_or_unbd, unbounded, numeric
             self.m.write("debug_model.lp")
             print("[DEBUG] wrote LP model to debug_model.lp")
-        # ★ 如果仍然拿到了 INF_OR_UNBD，再关掉 DualReductions 重跑一遍
+        # If still INF_OR_UNBD, disable DualReductions and rerun once
         if self.m.Status == GRB.INF_OR_UNBD:
-            # 仅在第一次遇到时处理即可
+            # Handle only on the first encounter
             self.m.Params.DualReductions = 0
             self.m.optimize()
 
@@ -127,24 +127,24 @@ class GurobiSolver(Solver):
         """
         Map Gurobi status to {SAT, UNSAT, UNKNOWN}.
 
-        语义约定（从 ACT 框架角度）：
-          - SAT    : 至少找到一个满足所有约束的可行解
-                     （在“找反例”的模型中 = 找到了反例候选）
-          - UNSAT  : Gurobi 严格证明模型不可行（无任何可行解）
-                     （在“找反例”的模型中 = 证明不存在反例）
-          - UNKNOWN: 其他所有情况：
-                     - 未开始 / 被中断且无 incumbent
-                     - 数值问题
-                     - 不可行-或-无界 / 真无界
-                     - 没法确信可行性结论的情况
+        Semantics (from the ACT framework perspective):
+          - SAT    : At least one feasible solution satisfies all constraints
+                     (in a “find counterexample” model, this means a CE candidate exists)
+          - UNSAT  : Gurobi proves infeasibility (no feasible solutions)
+                     (in a “find counterexample” model, proves no counterexample exists)
+          - UNKNOWN: All other situations:
+                     - not started / interrupted with no incumbent
+                     - numeric issues
+                     - infeasible-or-unbounded / truly unbounded
+                     - any case where feasibility cannot be trusted
 
-        注意：
-        - 只有在 Gurobi 明确给出 INFEASIBLE 时才返回 UNSAT。
-        - 有解但未最优（时间限制 / 节点限制 / 中断）：
-          如果有 incumbent（SolCount > 0），我们认为 SAT（存在可行点），
-          因为“存在可行解”并不依赖最优性。
-        - 数值问题或 (INF_OR_UNBD / UNBOUNDED) 一律 UNKNOWN，
-          即使 SolCount > 0 也不信任，保证 soundness。
+        Notes:
+        - Return UNSAT only when Gurobi explicitly reports INFEASIBLE.
+        - If there is a solution but not optimal (time/node limits or interruption):
+          with an incumbent (SolCount > 0) we treat as SAT (a feasible point exists),
+          because existence of a feasible solution does not depend on optimality.
+        - Numeric issues or (INF_OR_UNBD / UNBOUNDED) are always UNKNOWN, even if
+          SolCount > 0, to preserve soundness.
         """
         if self.m is None:
             return SolveStatus.UNKNOWN
@@ -155,28 +155,28 @@ class GurobiSolver(Solver):
         except Exception:
             solcnt = 0
 
-        # 1. 明确不可行
+        # 1. Explicitly infeasible
         if st == GRB.INFEASIBLE:
             return SolveStatus.UNKNOWN
 
-        # 2. 数值问题 / 不可行或无界 / 真无界 ⇒ 不可信，统一 UNKNOWN
-        #    即便 SolCount > 0 也不要冒险当作 SAT
+        # 2. Numeric issues / infeasible-or-unbounded / unbounded ⇒ untrusted, treat as UNKNOWN
+        #    Even if SolCount > 0, do not risk labeling SAT
         if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED, GRB.NUMERIC):
             return SolveStatus.UNKNOWN
 
-        # 3. 正常终止，证明存在可行解
-        #    OPTIMAL: 有一个被证明为最优的可行解
-        #    SUBOPTIMAL: 有可行 incumbent，但由于数值/界裁剪等原因未完全证明最优
+        # 3. Normal termination, proven feasible solution exists
+        #    OPTIMAL: feasible solution proven optimal
+        #    SUBOPTIMAL: feasible incumbent but optimality not fully proven
         if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
             if solcnt > 0:
                 return SolveStatus.SAT
-            # 理论上 OPTIMAL/SUBOPTIMAL 一定有解；如果没有，就保守 UNKNOWN
+            # In theory OPTIMAL/SUBOPTIMAL implies a solution; if not, stay conservative
             return SolveStatus.UNKNOWN
 
-        # 4. 限制条件触发但有 incumbent 的情况：
+        # 4. Limits triggered but an incumbent exists:
         #    TIME_LIMIT, NODE_LIMIT, ITERATION_LIMIT, SOLUTION_LIMIT,
-        #    INTERRUPTED, CUTOFF, USER_OBJ_LIMIT 等。
-        #    —— 只要有 incumbent，就说明“存在一个可行解”，可以当作 SAT。
+        #    INTERRUPTED, CUTOFF, USER_OBJ_LIMIT, etc.
+        #    —— as long as an incumbent exists, a feasible solution exists, so treat as SAT.
         early_stop_with_incumbent = {
             GRB.TIME_LIMIT,
             GRB.NODE_LIMIT,
@@ -189,10 +189,10 @@ class GurobiSolver(Solver):
         if st in early_stop_with_incumbent:
             if solcnt > 0:
                 return SolveStatus.SAT
-            # 没有任何 incumbent，则无法判断可行性
+            # No incumbent means feasibility cannot be determined
             return SolveStatus.UNKNOWN
 
-        # 5. 其他所有状态（例如 LOADED, NOT_STARTED, INPROGRESS 等）一律 UNKNOWN
+        # 5. All other statuses (LOADED, NOT_STARTED, INPROGRESS, etc.) → UNKNOWN
         return SolveStatus.UNKNOWN
 
 

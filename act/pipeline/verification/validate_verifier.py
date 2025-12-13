@@ -238,29 +238,29 @@ class VerificationValidator:
         """
         Try to find a concrete counterexample through inference testing.
 
-        现在版本：优先利用 ACT 的 INPUT_SPEC (lb/ub) 做系统搜索：
-          1) 中心点
-          2) 低维时的小网格 (3^d 点，d<=4)
-          3) 中维时的 per-dimension 边界点 (d<=16)
-          4) 一批随机点 (uniform in [lb, ub])
-        找不到再退回旧的 center/boundary/random 逻辑。
+        Current version: prefer systematic search using ACT INPUT_SPEC (lb/ub):
+          1) center point
+          2) small grid for low dimension (3^d points, d<=4)
+          3) per-dimension boundary points for mid dimension (d<=16)
+          4) a batch of random points (uniform in [lb, ub])
+        Fall back to the old center/boundary/random logic if nothing found.
 
         Args:
             name:   Network name
             model:  PyTorch model for concrete execution
-            act_net: 对应的 ACT Net（可选，但建议传）
-            max_random: 随机采样的数量上限
+            act_net: Corresponding ACT Net (optional but recommended)
+            max_random: Upper bound on random samples
 
         Returns:
             (counterexample_input, results_dict) if found, None otherwise
         """
-        # 小工具：统一做一次 forward + 判定
+        # Helper: run a forward pass and check constraints once
         def _check_point(x_flat: torch.Tensor, tag: str):
             """
-            x_flat: 展平的输入向量（和 seed.lb 同 shape）
-            返回 (tensor_in_shape, results) 或 None
+            x_flat: flattened input vector (same shape as seed.lb)
+            Returns (tensor_in_shape, results) or None
             """
-            # 推断输入 shape（来自 ACT 的 INPUT layer）
+            # Infer input shape (from ACT INPUT layer)
             input_shape = None
             if act_net is not None:
                 for layer in act_net.layers:
@@ -268,14 +268,14 @@ class VerificationValidator:
                         input_shape = tuple(layer.meta.get("shape") or [])
                         break
             if input_shape is None:
-                # 没有 meta 的话，退化成 [1, dim] 的 batch 输入
+                # Without meta, fall back to [1, dim] batch input
                 input_shape = (1, x_flat.numel())
 
             try:
                 x = x_flat.view(*input_shape)
             except Exception as e:
                 logger.warning(
-                    "  [CE search] reshape flat -> %s 失败 (%s)，退化成 batch=1, flat",
+                    "  [CE search] reshape flat -> %s failed (%s); falling back to batch=1, flat",
                     input_shape, e,
                 )
                 x = x_flat.view(1, -1)
@@ -294,11 +294,11 @@ class VerificationValidator:
             return None
 
         # ============================================================
-        # 1. 如果有 ACT net，就尝试从 INPUT_SPEC 提取 [lb, ub]
+        # 1. If ACT net is available, extract [lb, ub] from INPUT_SPEC
         # ============================================================
         try:
             if act_net is not None:
-                # 复用 verifier 里已经引入的工具函数
+                # Reuse helper functions already imported for the verifier
                 specs = gather_input_spec_layers(act_net)
                 if specs:
                     seed = seed_from_input_specs(specs)
@@ -315,14 +315,14 @@ class VerificationValidator:
                         float(ub.min().item()), float(ub.max().item()),
                     )
 
-                    # -------- 1) 中心点 --------
+                    # -------- 1) Center --------
                     center = 0.5 * (lb + ub)
                     ce = _check_point(center, tag="center_from_spec")
                     if ce is not None:
                         return ce
 
-                    # -------- 2) 低维网格：3^d（d<=4）--------
-                    # 网格点 = {lb, (lb+ub)/2, ub}^d
+                    # -------- 2) Low-dim grid: 3^d (d<=4) --------
+                    # Grid points = {lb, (lb+ub)/2, ub}^d
                     if dim <= 4:
                         import itertools
                         grid_levels = torch.tensor([0.0, 0.5, 1.0], device=self.device, dtype=self.dtype)
@@ -334,26 +334,26 @@ class VerificationValidator:
                             if ce is not None:
                                 return ce
 
-                    # -------- 3) 中维：per-dim 边界点（d<=16）--------
-                    # 从中心出发，逐维推到 lb_i / ub_i
+                    # -------- 3) Mid-dim: per-dimension boundary points (d<=16) --------
+                    # Start from center and push each dimension to lb_i / ub_i
                     if dim <= 16:
                         center = 0.5 * (lb + ub)
                         for i in range(dim):
-                            # lb 方向
+                            # lb direction
                             x_flat = center.clone()
                             x_flat[i] = lb[i]
                             ce = _check_point(x_flat, tag=f"per_dim_lb_i={i}")
                             if ce is not None:
                                 return ce
-                            # ub 方向
+                            # ub direction
                             x_flat = center.clone()
                             x_flat[i] = ub[i]
                             ce = _check_point(x_flat, tag=f"per_dim_ub_i={i}")
                             if ce is not None:
                                 return ce
 
-                    # -------- 4) 随机点：uniform in [lb, ub] --------
-                    # 为了不太慢，这里采样 max_random 个
+                    # -------- 4) Random points: uniform in [lb, ub] --------
+                    # Sample at most max_random to keep things fast enough
                     for k in range(max_random):
                         r = torch.rand_like(lb)
                         x_flat = lb + r * (ub - lb)
@@ -361,7 +361,7 @@ class VerificationValidator:
                         if ce is not None:
                             return ce
 
-                    # 如果基于 spec 的 sampling 也没找到，就退回老逻辑
+                    # Fall back to legacy test_cases if spec-guided sampling finds nothing
                     logger.info(
                         "  [CE search] No CE found from INPUT_SPEC-guided sampling, "
                         "falling back to legacy test_cases."
@@ -374,9 +374,9 @@ class VerificationValidator:
             )
 
         # ============================================================
-        # 2. 退回原来的 center / boundary / random 逻辑，但加强 random 次数
+        # 2. Fall back to the original center / boundary / random logic but with more random tries
         # ============================================================
-        # 先跑一次 center / boundary
+        # First run center / boundary
         legacy_cases = ['center', 'boundary']
         for test_case in legacy_cases:
             input_tensor = self.factory.generate_test_input(name, test_case)
@@ -390,7 +390,7 @@ class VerificationValidator:
                     logger.info(f"     Output explanation: {results.get('output_explanation')}")
                     return (input_tensor, results)
 
-        # 再多跑几次 random（之前只跑 1 次，这里跑 max_random 次）
+        # Run more random trials (previously 1, now max_random)
         for k in range(max_random):
             input_tensor = self.factory.generate_test_input(name, 'random')
             input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
@@ -403,7 +403,7 @@ class VerificationValidator:
                     logger.info(f"     Output explanation: {results.get('output_explanation')}")
                     return (input_tensor, results)
 
-        # 还是没找到，就老老实实返回 None
+        # Still nothing? return None
         return None
 
     
@@ -640,7 +640,7 @@ class VerificationValidator:
             self.validation_results.append(error_result)
             return error_result
         
-        # === DEBUG: 针对 reachability_tight + gurobi 打印 RANGE 违例度对比 ===
+        # === DEBUG: print RANGE violation comparison for reachability_tight + gurobi ===
         try:
             if name == "reachability_tight" and solver == "gurobi":
                 self._debug_range_mismatch(
@@ -650,7 +650,7 @@ class VerificationValidator:
                     verify_result=verify_result,
                 )
         except Exception as dbg_e:
-            logger.warning("  [DEBUG RANGE] 调试失败: %s", dbg_e)
+            logger.warning("  [DEBUG RANGE] Debugging failed: %s", dbg_e)
         # =====================================================================
 
         
@@ -674,11 +674,11 @@ class VerificationValidator:
         verify_result,
     ) -> None:
         """
-        专门给 reachability_* 这类 RANGE 性质调试用：
-        - 打印 solver CE 的 input 向量 (raw_ce_input)
-        - 用 PyTorch VerifiableModel 重算一次 output
-        - 计算 RANGE 违例度（PyTorch 视角）
-        - 对比 solver 的 violation_var
+        Debug helper for reachability_* RANGE properties:
+        - Print the solver CE input vector (raw_ce_input)
+        - Recompute output with PyTorch VerifiableModel
+        - Compute RANGE violation from the PyTorch view
+        - Compare with solver's violation_var
         """
         try:
             assert_layer = get_assert_layer(act_net)
@@ -694,18 +694,18 @@ class VerificationValidator:
             logger.error("  solver violation_var v = %r", v_val)
 
             if raw_ce is None:
-                logger.error("  raw_ce_input is None (solver CE 未记录)，无法对齐调试。")
+                logger.error("  raw_ce_input is None (solver CE not recorded); cannot align debugging.")
                 logger.error("=== END DEBUG RANGE MISMATCH ===")
                 return
 
             import numpy as np
 
-            # 1) 打印 CE input（有限截断一下避免太长）
+            # 1) Print CE input (truncate for readability)
             raw_ce_np = np.asarray(raw_ce, dtype=float).reshape(-1)
             logger.error("  solver CE input (flat) shape=%s", raw_ce_np.shape)
             logger.error("  solver CE input (first 20 dims)=%s", raw_ce_np[:20])
 
-            # 2) 把 CE 映射成 VerifiableModel 的输入形状
+            # 2) Map CE into the VerifiableModel input shape
             input_shape = None
             for layer in act_net.layers:
                 if getattr(layer, "kind", None) == "INPUT":
@@ -718,7 +718,7 @@ class VerificationValidator:
                     x = x.view(*input_shape)
                 except Exception as e:
                     logger.error(
-                        "  reshape raw_ce -> %s 失败 (%s)，退化成 batch=1, flat 向量。",
+                        "  reshape raw_ce -> %s failed (%s); falling back to batch=1 flat vector.",
                         input_shape, e,
                     )
                     x = x.unsqueeze(0)
@@ -727,19 +727,19 @@ class VerificationValidator:
 
             x = x.to(device=self.device, dtype=self.dtype)
 
-            # 3) 用 PyTorch VerifiableModel 重算一次输出
+            # 3) Recompute output with PyTorch VerifiableModel
             with torch.no_grad():
                 res = model(x)
 
             if not isinstance(res, dict) or "output" not in res:
-                logger.error("  model(x) 返回类型=%r，不含 'output'，无法进一步调试。", type(res))
+                logger.error("  model(x) returned type=%r without 'output'; cannot continue debugging.", type(res))
                 logger.error("=== END DEBUG RANGE MISMATCH ===")
                 return
 
             y = res["output"].detach().cpu().numpy().reshape(-1)
             logger.error("  PyTorch output y (flat)=%s", y)
 
-            # 4) 取 ASSERT 的 lb / ub，并计算 PyTorch 视角的违例度
+            # 4) Use ASSERT lb/ub to compute violation from PyTorch view
             lb_t = assert_layer.params.get("lb", None)
             ub_t = assert_layer.params.get("ub", None)
 
@@ -755,13 +755,13 @@ class VerificationValidator:
             viol_terms = []
 
             if lb_np is not None:
-                viol_lower = lb_np - y          # >0 表示 y < lb 的违例程度
+                viol_lower = lb_np - y          # >0 indicates how much y < lb
                 max_vl = float(viol_lower.max())
                 viol_terms.append(max_vl)
                 logger.error("  max(lb - y) = %.6f", max_vl)
 
             if ub_np is not None:
-                viol_upper = y - ub_np          # >0 表示 y > ub 的违例程度
+                viol_upper = y - ub_np          # >0 indicates how much y > ub
                 max_vu = float(viol_upper.max())
                 viol_terms.append(max_vu)
                 logger.error("  max(y - ub) = %.6f", max_vu)
@@ -771,8 +771,8 @@ class VerificationValidator:
             else:
                 max_viol_py = float("nan")
 
-            logger.error("  PyTorch 视角 max RANGE violation = %.6f", max_viol_py)
-            logger.error("  Solver 视角 violation_var v    = %r", v_val)
+            logger.error("  PyTorch-view max RANGE violation = %.6f", max_viol_py)
+            logger.error("  Solver-view violation_var v    = %r", v_val)
             logger.error("=== END DEBUG RANGE MISMATCH ===")
 
         except Exception as e:
@@ -792,18 +792,17 @@ class VerificationValidator:
         """
         Cross-validate concrete inference vs formal verification (Level 1).
 
-        更保守、不会误报 reachability_* 为 FAILED 的版本：
+        More conservative logic that avoids false FAILED on reachability_*:
 
-        规则：
-        1. 如果存在“被确认的真实 CE”（测试样本 or 经过 checker 验证的 solver CE），
-           则：
-           - Verifier 返回 CERTIFIED → 这是确定的 soundness bug → FAILED
-           - Verifier 返回 FALSIFIED  → 正常，认为 PASSED
-           - Verifier 返回 UNKNOWN    → 不完整但 sound → ACCEPTABLE
+        Rules:
+        1. If there is a confirmed real CE (from tests or a solver CE that passes the checker):
+           - Verifier returns CERTIFIED → definite soundness bug → FAILED
+           - Verifier returns FALSIFIED → correct → PASSED
+           - Verifier returns UNKNOWN  → incomplete but sound → ACCEPTABLE
 
-        2. 如果目前没有任何被确认的 CE（测试没找到，solver CE 也没被确认为真），
-           无论 verifier 给什么结果，都记为 INCONCLUSIVE，
-           不再因为 FALSIFIED + “ce_checks 看起来像伪 CE”就报 FAILED。
+        2. If no confirmed CE exists yet (tests found none and solver CE not confirmed),
+           regardless of verifier result, mark INCONCLUSIVE; do not fail solely because
+           FALSIFIED + “ce_checks look spurious”.
         """
         result: Dict[str, Any] = {
             'network': network_name,
@@ -818,10 +817,10 @@ class VerificationValidator:
             'solver_ce_spurious': False,
         }
 
-        # 1) 来自 center/boundary/random 测试的 ground truth
+        # 1) Ground truth from center/boundary/random testing
         test_ce_exists = concrete_counterexample is not None
 
-        # 2) 来自 solver CE（通过 stats 或直接 CE）的 ground truth
+        # 2) Ground truth from solver CE (via stats or direct CE)
         solver_ce_is_ce = False
         solver_ce_spurious = False
         if isinstance(solver_ce_results, dict):
@@ -829,23 +828,23 @@ class VerificationValidator:
             ce_in_sat = bool(solver_ce_results.get('input_satisfied', False))
             ce_out_sat = bool(solver_ce_results.get('output_satisfied', True))
 
-            # 真 CE：输入满足 spec，输出违反 property
+            # True CE: input satisfies spec and output violates property
             solver_ce_is_ce = ce_in_sat and (not ce_out_sat)
-            # 伪 CE：输入不满足 spec 或者输出没有违反 property
+            # Spurious CE: input violates spec or output does not violate property
             solver_ce_spurious = (not ce_in_sat) or ce_out_sat
 
             result['solver_ce_is_ce'] = solver_ce_is_ce
             result['solver_ce_spurious'] = solver_ce_spurious
 
-        # 是否存在任何“被确认真实”的 CE
+        # Whether any confirmed CE exists
         any_ce_exists = test_ce_exists or solver_ce_is_ce
 
         # ===============================
-        # Case A: 至少有一个真实 CE
+        # Case A: At least one real CE
         # ===============================
         if any_ce_exists:
             if verifier_status == 'CERTIFIED':
-                # 典型 false negative：真实有 CE，verifier 却说 CERTIFIED
+                # Classic false negative: real CE exists but verifier says CERTIFIED
                 result['validation_status'] = 'FAILED'
                 result['explanation'] = (
                     "🚨 SOUNDNESS BUG DETECTED! Verifier returned CERTIFIED but a "
@@ -854,7 +853,7 @@ class VerificationValidator:
                 logger.error("\n  %s", result['explanation'])
 
             elif verifier_status == 'FALSIFIED':
-                # 有真实 CE，verifier 也报告 FALSIFIED：方向正确
+                # Real CE exists and verifier reports FALSIFIED: correct direction
                 result['validation_status'] = 'PASSED'
                 result['explanation'] = (
                     "✅ CORRECT - Verifier reported FALSIFIED and at least one "
@@ -863,7 +862,7 @@ class VerificationValidator:
                 logger.info("\n  %s", result['explanation'])
 
             elif verifier_status == 'UNKNOWN':
-                # 有真实 CE，但 verifier 不敢 CERTIFIED：不完整但 sound
+                # Real CE exists but verifier stays UNKNOWN: incomplete but sound
                 result['validation_status'] = 'ACCEPTABLE'
                 result['explanation'] = (
                     "⚠️ INCOMPLETE - Verifier returned UNKNOWN while a concrete "
@@ -879,10 +878,10 @@ class VerificationValidator:
             return result
 
         # ===============================
-        # Case B: 当前没有任何被确认的 CE
+        # Case B: No confirmed CEs at present
         # ===============================
-        # 测试没找到 CE，solver 给的 CE 也没被确认为真（可能是伪的，也可能我们检查不够强），
-        # 这种情况我们只能说 “INCONCLUSIVE”，不能直接指控 verifier unsound。
+        # Tests found no CE and solver CE is unverified (maybe spurious, maybe checker too weak);
+        # in this situation we can only say INCONCLUSIVE, not claim the verifier is unsound.
         result['validation_status'] = 'INCONCLUSIVE'
         result['explanation'] = (
             "⚪ INCONCLUSIVE - No concrete counterexample found in testing, "
@@ -985,7 +984,7 @@ class VerificationValidator:
                 params = layer.params or {}
                 meta = layer.meta or {}
 
-                # 1) BOX 优先
+                # 1) Prefer BOX
                 if "lb" in params and "ub" in params:
                     return Bounds(
                         lb=params["lb"].flatten().to(device=self.device, dtype=self.dtype),

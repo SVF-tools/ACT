@@ -23,7 +23,7 @@ import numpy as np
 # import torch
 # import numpy as np
 
-# # ★ 这里根据你的实际路径二选一：
+# # Choose the path that matches your setup:
 # from act.pipeline.model_factory import ModelFactory
 # # from act.pipeline.verification.model_factory import ModelFactory
 
@@ -62,18 +62,18 @@ def main():
         print(f"Gurobi SolCount : {getattr(solver.m, 'SolCount', 0)}")
 
     # ------------------------------------------------------------------
-    # STEP A ：用 PyTorch 真模型检查“中心点”是不是反例
+    # STEP A: Use the real PyTorch model to see if the center is a counterexample
     # ------------------------------------------------------------------
     print("\n===== STEP A: check center point with real PyTorch model =====")
 
-    # 1) 从 INPUT_SPEC 里拿 seed_bounds，并算出中心点
+    # 1) Get seed_bounds from INPUT_SPEC and compute the center
     spec_layers = gather_input_spec_layers(net)
     seed_bounds = seed_from_input_specs(spec_layers)
 
     lb = seed_bounds.lb.flatten()
     ub = seed_bounds.ub.flatten()
 
-    # 优先用 LINF_BALL 的 center，如果有的话
+    # Prefer LINF_BALL center when available
     center = None
     for L in spec_layers:
         k = L.meta.get("kind")
@@ -85,30 +85,30 @@ def main():
             break
 
     if center is None:
-        # 退一步：直接用 seed_bounds 的中点
+        # Fallback: midpoint of seed_bounds
         center = 0.5 * (lb + ub)
 
     print(f"[STEP A] seed_bounds lb[min,max] = [{lb.min().item():.4f}, {lb.max().item():.4f}]")
     print(f"[STEP A] seed_bounds ub[min,max] = [{ub.min().item():.4f}, {ub.max().item():.4f}]")
     print(f"[STEP A] center range            = [{center.min().item():.4f}, {center.max().item():.4f}]")
 
-    # 2) 拿 PyTorch 模型（带 VerifiableModel wrapper 的那种）
+    # 2) Load the PyTorch model (with VerifiableModel wrapper)
     torch_model = factory.create_model(net_name, load_weights=True)
     torch_model.eval()
 
-    # 3) 用 INPUT 层的 shape 把 center reshape 成模型输入形状
+    # 3) Reshape center using INPUT layer shape to match model input
     inp_layer = next(L for L in net.layers if L.kind == "INPUT")
-    shape = inp_layer.meta.get("shape") or [center.numel()]  # 例如 [1, 28, 28]
+    shape = inp_layer.meta.get("shape") or [center.numel()]  # e.g., [1, 28, 28]
     x = center.view(1, *shape)  # batch=1
 
     with torch.no_grad():
         out = torch_model(x)
 
-        # VerifiableModel 情况：返回 dict，里面有 'output'
+        # VerifiableModel returns a dict containing 'output'
         if isinstance(out, dict):
             logits = out["output"].view(-1)
         else:
-            # 兼容老的 plain nn.Module
+            # Compatible with plain nn.Module
             logits = out.view(-1)
 
     y_np = logits.cpu().numpy()
@@ -128,7 +128,7 @@ def main():
 
 
     # ------------------------------------------------------------------
-    # STEP D: 用 ACT 的 check_violation_at_point 再检查中心点
+    # STEP D: Re-check center using ACT's check_violation_at_point
     # ------------------------------------------------------------------
     from act.back_end.verifier import check_violation_at_point
 
@@ -139,4 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
