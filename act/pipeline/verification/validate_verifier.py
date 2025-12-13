@@ -1052,14 +1052,16 @@ class VerificationValidator:
             concrete_activations = self._get_concrete_activations(model, input_tensor, act_net)
             
             # Step 5: Prepare entry fact from input tensor
-            from act.back_end.core import Fact, Bounds
+            from act.back_end.core import Fact, Bounds, ConSet
             # entry_id = 0  # INPUT layer is typically layer 0
             entry_id = find_entry_layer_id(act_net)
             if spec_bounds is not None:
                 input_bounds = spec_bounds
             else:
                 input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
-            entry_fact = Fact(bounds=input_bounds, cons=None)
+            # Use an empty constraint set for inputs so downstream analysis
+            # never iterates over a None cons field.
+            entry_fact = Fact(bounds=input_bounds, cons=ConSet())
             
             # Step 6: Run abstract analysis
             try:

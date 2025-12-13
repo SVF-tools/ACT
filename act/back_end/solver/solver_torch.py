@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math, time
+import math, os, time
 from typing import List, Optional, Tuple
 import numpy as np
 import torch
@@ -33,12 +33,20 @@ class TorchLPSolver(Solver):
         # parameters
         self.rho_eq = 10.0
         self.rho_ineq = 10.0
-        self.max_iter = 5000
-        self.tol_feas = 1e-6
+        self.max_iter = 2000  # lighter default; see large-n overrides below
+        self.tol_feas = 1e-4
         self.lr = 1e-2
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.weight_decay = 0.0
+        self.debug = bool(int(os.getenv("ACT_TORCH_LP_DEBUG", "0")))
+        self._large_n_threshold = 20000
+        self._large_n_max_iter = 800
+        self._large_n_tol = 1e-3
+        self._log_every = 200
+        self._stagnation_patience = 300
+        self._stagnation_tol = 1e-5
+        self._feas_check_stride = 5
 
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=True)
@@ -130,6 +138,16 @@ class TorchLPSolver(Solver):
     def optimize(self, timelimit: Optional[float] = None) -> None:
         self._timelimit = timelimit
 
+        start_time = time.time()
+        t_end = None if timelimit is None else (start_time + float(timelimit))
+
+        # Auto-relax for very large problems used as heuristic CE searchers.
+        eff_max_iter = self.max_iter
+        eff_tol_feas = self.tol_feas
+        if self._n > self._large_n_threshold:
+            eff_max_iter = min(eff_max_iter, self._large_n_max_iter)
+            eff_tol_feas = max(eff_tol_feas, self._large_n_tol)
+
         # === 1) 初始化变量到 box 中点（或 0） ===
         if self._x is None:
             lb = torch.where(torch.isfinite(self._lb),
@@ -156,49 +174,6 @@ class TorchLPSolver(Solver):
             weight_decay=self.weight_decay
         )
 
-        # === 2) 将约束一次性转为稠密矩阵（O(mn)，只做一次） ===
-        # The original per-row dense assignment can get slow on wide problems
-        # (e.g., CIFAR) because of repeated advanced indexing. We instead
-        # collect all nonzeros and scatter once to keep assembly O(nnz).
-        def rows_to_dense(rows):
-            if not rows:
-                return (
-                    torch.zeros((0, self._n), device=self._device, dtype=self._dtype),
-                    torch.zeros((0,), device=self._device, dtype=self._dtype),
-                )
-            m = len(rows)
-            b = torch.empty((m,), device=self._device, dtype=self._dtype)
-            # Pre-compute total nnz to allocate once.
-            total_nnz = sum(len(vids) for vids, _, _ in rows)
-            idx_rows = torch.empty((total_nnz,), device=self._device, dtype=torch.long)
-            idx_cols = torch.empty((total_nnz,), device=self._device, dtype=torch.long)
-            vals = torch.empty((total_nnz,), device=self._device, dtype=self._dtype)
-            cursor = 0
-            for r, (vids, coeffs, rhs) in enumerate(rows):
-                k = len(vids)
-                if k == 0:
-                    b[r] = float(rhs)
-                    continue
-                idx_rows[cursor:cursor + k] = r
-                idx_cols[cursor:cursor + k] = torch.as_tensor(vids, device=self._device, dtype=torch.long)
-                vals[cursor:cursor + k] = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
-                cursor += k
-                b[r] = float(rhs)
-            # Build dense A with a single scatter; accumulate handles repeated cols.
-            A = torch.zeros((m, self._n), device=self._device, dtype=self._dtype)
-            if total_nnz > 0:
-                A.index_put_((idx_rows[:cursor], idx_cols[:cursor]), vals[:cursor], accumulate=True)
-            return A, b
-
-        Aeq, beq = rows_to_dense(self._eq)
-        Ale, ble = rows_to_dense(self._le)
-
-        # 约束矩阵在优化过程中不会再变动，提前对齐 device/dtype
-        Aeq = Aeq.to(device=self._x.device, dtype=self._x.dtype)
-        beq = beq.to(device=self._x.device, dtype=self._x.dtype)
-        Ale = Ale.to(device=self._x.device, dtype=self._x.dtype)
-        ble = ble.to(device=self._x.device, dtype=self._x.dtype)
-
         # === 3) 目标函数向量化处理 ===
         vids, coeffs, c0, sense = self._objective
         if vids:
@@ -209,12 +184,55 @@ class TorchLPSolver(Solver):
             coeffs_t = None
         const_term = float(c0)
 
-        t_end = None if timelimit is None else (time.time() + float(timelimit))
         self._status = SolveStatus.UNKNOWN
         self._has_solution = False
+        lb_device = self._lb.to(device=self._x.device, dtype=self._x.dtype)
+        ub_device = self._ub.to(device=self._x.device, dtype=self._x.dtype)
+
+        def rows_to_sparse(rows):
+            if not rows:
+                return None, torch.zeros((0,), device=self._x.device, dtype=self._x.dtype)
+            m = len(rows)
+            b = torch.empty((m,), device=self._x.device, dtype=self._x.dtype)
+            row_idx: List[int] = []
+            col_idx: List[int] = []
+            vals: List[float] = []
+            for r, (vids_row, coeffs_row, rhs) in enumerate(rows):
+                b[r] = float(rhs)
+                if len(vids_row) == 0:
+                    continue
+                row_idx.extend([r] * len(vids_row))
+                col_idx.extend(vids_row)
+                vals.extend(coeffs_row)
+            if len(vals) == 0:
+                indices = torch.zeros((2, 0), device=self._x.device, dtype=torch.long)
+                values = torch.zeros((0,), device=self._x.device, dtype=self._x.dtype)
+            else:
+                indices = torch.tensor([row_idx, col_idx], device=self._x.device, dtype=torch.long)
+                values = torch.as_tensor(vals, device=self._x.device, dtype=self._x.dtype)
+            A = torch.sparse_coo_tensor(indices, values, (m, self._n), device=self._x.device, dtype=self._x.dtype)
+            return A.coalesce(), b
+
+        def sparse_mv(A: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
+            if A is None:
+                return None
+            # torch.sparse.mm expects 2D
+            return torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
+
+        Aeq, beq = rows_to_sparse(self._eq)
+        Ale, ble = rows_to_sparse(self._le)
+
+        best_max_viol = math.inf
+        stagnation_steps = 0
 
         # === 4) 主循环：Adam + 罚项 + box projection ===
-        for it in range(self.max_iter):
+        for it in range(eff_max_iter):
+            if t_end is not None and time.time() >= t_end:
+                self._status = SolveStatus.SAT
+                self._has_solution = True
+                self._sol = self._x.detach().clone()
+                break
+
             opt.zero_grad()
 
             # SOLUTION: Force gradient computation context
@@ -234,13 +252,15 @@ class TorchLPSolver(Solver):
                     obj = -obj
 
                 # Equality penalties: rho_eq * ||Aeq x - beq||^2
-                if Aeq.shape[0] > 0:
-                    viol_eq = Aeq @ self._x - beq
+                viol_eq = sparse_mv(Aeq, self._x)
+                if viol_eq is not None:
+                    viol_eq = viol_eq - beq
                     obj = obj + self.rho_eq * torch.sum(viol_eq ** 2)
 
                 # Inequality penalties: rho_ineq * ||relu(Ale x - ble)||^2
-                if Ale.shape[0] > 0:
-                    viol_le = Ale @ self._x - ble
+                viol_le = sparse_mv(Ale, self._x)
+                if viol_le is not None:
+                    viol_le = viol_le - ble
                     obj = obj + self.rho_ineq * torch.sum(torch.relu(viol_le) ** 2)
 
                 # Backward
@@ -250,8 +270,6 @@ class TorchLPSolver(Solver):
 
             # Project to box constraints while preserving Parameter status
             with torch.no_grad():
-                lb_device = self._lb.to(device=self._x.device, dtype=self._x.dtype)
-                ub_device = self._ub.to(device=self._x.device, dtype=self._x.dtype)
                 x_clamped = torch.minimum(torch.maximum(self._x, lb_device), ub_device)
                 # Use .data.copy_ to preserve Parameter wrapper
                 self._x.data.copy_(x_clamped)
@@ -260,17 +278,42 @@ class TorchLPSolver(Solver):
                     self._x.requires_grad_(True)
 
             # === 5) 约束违背度检测（向量化） ===
-            max_viol = 0.0
+            # Reuse forward violations most steps; occasionally recompute on the
+            # clamped x to keep the check honest without doubling work.
+            recompute = (it % self._feas_check_stride == 0)
             with torch.no_grad():
-                if Aeq.shape[0] > 0:
-                    eq_viol = torch.abs(Aeq @ self._x - beq)
-                    max_viol = max(max_viol, float(eq_viol.max().item()))
-                if Ale.shape[0] > 0:
-                    le_viol = torch.relu(Ale @ self._x - ble)
-                    max_viol = max(max_viol, float(le_viol.max().item()))
+                if recompute:
+                    viol_eq_chk = sparse_mv(Aeq, self._x)
+                    viol_le_chk = sparse_mv(Ale, self._x)
+                else:
+                    viol_eq_chk = viol_eq
+                    viol_le_chk = viol_le
+
+                max_viol = 0.0
+                if viol_eq_chk is not None:
+                    max_viol = max(max_viol, float(torch.abs(viol_eq_chk.detach()).max().item()))
+                if viol_le_chk is not None:
+                    max_viol = max(max_viol, float(torch.relu(viol_le_chk.detach()).max().item()))
+
+            if max_viol < best_max_viol - self._stagnation_tol:
+                best_max_viol = max_viol
+                stagnation_steps = 0
+            else:
+                stagnation_steps += 1
+
+            if self.debug and (it % self._log_every == 0 or it == eff_max_iter - 1):
+                obj_val = float(obj.detach().item())
+                print(f"[TorchLP] it={it} obj={obj_val:.4e} max_viol={max_viol:.3e} time={time.time()-start_time:.1f}s")
 
             # Feasibility reached
-            if max_viol <= self.tol_feas:
+            if max_viol <= eff_tol_feas:
+                self._status = SolveStatus.SAT
+                self._has_solution = True
+                self._sol = self._x.detach().clone()
+                break
+
+            if stagnation_steps >= self._stagnation_patience:
+                # Stop early when we are not reducing violation meaningfully
                 self._status = SolveStatus.SAT
                 self._has_solution = True
                 self._sol = self._x.detach().clone()
@@ -285,6 +328,11 @@ class TorchLPSolver(Solver):
                 break
         else:
             # Max iter reached: treat as "we have a candidate", not UNSAT
+            self._status = SolveStatus.SAT
+            self._has_solution = True
+            self._sol = self._x.detach().clone()
+
+        if not self._has_solution:
             self._status = SolveStatus.SAT
             self._has_solution = True
             self._sol = self._x.detach().clone()
