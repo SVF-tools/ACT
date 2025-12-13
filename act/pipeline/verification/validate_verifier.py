@@ -141,6 +141,7 @@
 
 from curses import meta
 import os
+import copy
 
 # Mitigate OpenMP aborts seen on macOS when torch initializes multiple
 # runtimes (Abort trap in libomp during import). Set conservative defaults
@@ -963,7 +964,7 @@ class VerificationValidator:
         logger.info(f"{'='*80}")
         
         # Step 1: Load ACT Net and PyTorch model
-        act_net = self.factory.get_act_net(name)
+        act_net = self._clone_act_net_to_device(self.factory.get_act_net(name))
         model = self.factory.create_model(name, load_weights=True)
         model = model.to(device=self.device, dtype=self.dtype)
         
@@ -1236,6 +1237,25 @@ class VerificationValidator:
             hook.remove()
         
         return activations
+
+    def _clone_act_net_to_device(self, net):
+        """
+        Deep-copy an ACT Net and move all tensor parameters/caches to the
+        validator's device/dtype so abstract analysis matches the concrete
+        forward device (especially for CUDA runs).
+        """
+        net_copy = copy.deepcopy(net)
+        for layer in net_copy.layers:
+            if layer.params:
+                for k, v in list(layer.params.items()):
+                    if torch.is_tensor(v):
+                        layer.params[k] = v.to(device=self.device, dtype=self.dtype)
+            if layer.cache:
+                for k, v in list(layer.cache.items()):
+                    if torch.is_tensor(v):
+                        layer.cache[k] = v.to(device=self.device, dtype=self.dtype)
+        net_copy.by_id = {L.id: L for L in net_copy.layers}
+        return net_copy
     
     def validate_comprehensive(
         self,
