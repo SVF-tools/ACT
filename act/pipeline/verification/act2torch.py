@@ -290,36 +290,6 @@ class ACTToTorch:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
 
             return layer
-
-    # elif kind == "CONV2D":
-    #     in_channels = meta.get("in_channels")
-    #     out_channels = meta.get("out_channels")
-    #     kernel_size = meta.get("kernel_size", 3)
-    #     stride = meta.get("stride", 1)
-    #     padding = meta.get("padding", 0)
-    #     dilation = meta.get("dilation", 1)
-    #     groups = meta.get("groups", 1)
-        
-    #     if in_channels is None:
-    #         raise ValueError("CONV2D layer requires 'in_channels' in meta")
-    #     if out_channels is None:
-    #         raise ValueError("CONV2D layer requires 'out_channels' in meta")
-        
-    #     layer = nn.Conv2d(
-    #         in_channels=in_channels,
-    #         out_channels=out_channels,
-    #         kernel_size=kernel_size,
-    #         stride=stride,
-    #         padding=padding,
-    #         dilation=dilation,
-    #         groups=groups
-    #     )
-        
-    #     # Transfer weights and bias from ACT layer
-    #     if act_layer is not None:
-    #         self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
-        
-    #     return layer
         
         elif kind == "CONV1D":
             in_channels = meta.get("in_channels")

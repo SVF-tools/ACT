@@ -378,94 +378,8 @@ def add_negated_assert_to_solver(
         objective = {"var": v, "sense": "max"}
 
 
-    # ---------------- RANGE ----------------
-    # elif k == OutKind.RANGE:
-    #     # Property: lb ≤ y ≤ ub
-    #     # Negation: ∃i: y[i] < lb[i]  OR  y[i] > ub[i]
-    #     lb = assert_layer.params.get("lb", None)
-    #     ub = assert_layer.params.get("ub", None)
-    #     if lb is None and ub is None:
-    #         raise ValueError("RANGE assert requires lb and/or ub.")
 
-    #     eps = 1e-6
-
-    #     if out_bounds is None:
-    #         # Fallback conservative big-M
-    #         y_lb = None
-    #         y_ub = None
-    #     else:
-    #         y_lb = to_numpy(out_bounds.lb).reshape(-1)
-    #         y_ub = to_numpy(out_bounds.ub).reshape(-1)
-
-    #     z_low = []
-    #     z_up = []
-
-    #     if lb is not None:
-    #         lb_np = to_numpy(lb).reshape(-1)
-    #         z_low = solver.add_binary_vars(len(out_ids))
-    #         for i, yi in enumerate(out_ids):
-    #             if y_ub is not None:
-    #                 m_i = max(float(y_ub[i] - (lb_np[i] - eps)), 1e-6)
-    #             else:
-    #                 m_i = 1e3
-    #             # y[i] <= lb_i - eps + M*(1 - z_low_i)
-    #             # z_low_i = 1 ⇒ y[i] <= lb_i - eps
-    #             solver.add_lin_le(
-    #                 [yi, z_low[i]],
-    #                 [1.0, m_i],
-    #                 float(lb_np[i] - eps + m_i),
-    #             )
-
-    #     if ub is not None:
-    #         ub_np = to_numpy(ub).reshape(-1)
-    #         z_up = solver.add_binary_vars(len(out_ids))
-    #         for i, yi in enumerate(out_ids):
-    #             if y_lb is not None:
-    #                 m_i = max(float((ub_np[i] + eps) - y_lb[i]), 1e-6)
-    #             else:
-    #                 m_i = 1e3
-    #             # y[i] >= ub_i + eps - M*(1 - z_up_i)
-    #             # z_up_i = 1 ⇒ y[i] >= ub_i + eps
-    #             solver.add_lin_ge(
-    #                 [yi, z_up[i]],
-    #                 [1.0, -m_i],
-    #                 float(ub_np[i] + eps - m_i),
-    #             )
-
-    #     z_all = list(z_low) + list(z_up)
-    #     # At least one lower/upper bound violation must hold
-    #     solver.add_lin_ge(z_all, [1.0] * len(z_all), 1.0)
-
-    # else:
-    #     raise NotImplementedError(f"Unsupported ASSERT kind: {k}")
-
-    # return objective
     elif k == OutKind.RANGE:
-        # Property: lb ≤ y ≤ ub
-        # Negation (witness variable semantics):
-        #   For each dimension i define two violations:
-        #       v_low_i = lb_i - y_i     (>0 when y_i < lb_i)
-        #       v_up_i  = y_i - ub_i     (>0 when y_i > ub_i)
-        #   Then:
-        #       v >= max(0, max_i v_low_i, max_i v_up_i)
-        #
-        #   Meaning:
-        #       v > 0  <=>  some i has y_i outside [lb_i, ub_i]
-        #       v = 0  <=>  all i satisfy lb_i <= y_i <= ub_i
-        #
-        #   MILP encoding:
-        #       - introduce a scalar variable v
-        #       - for each i add:
-        #           v >= lb_i - y_i      (if lb present)
-        #           v >= y_i - ub_i      (if ub present)
-        #       - also add v >= 0
-        #       - give v an upper bound via big-M/abstract bounds to avoid unboundedness
-        #       - maximize v
-        #
-        #   In verify_once:
-        #       v_opt > 0  → FALSIFIED
-        #       v_opt ≤ 0  → CERTIFIED
-        #
         from act.back_end.cons_exportor import to_numpy
 
         lb_t = assert_layer.params.get("lb", None)
@@ -534,8 +448,6 @@ def add_negated_assert_to_solver(
 
         # Maximize v
         objective = {"var": v, "sense": "max"}
-
-
 
 # -----------------------------------------------------------------------------
 # Core solver workflow (shared by verify_once and BaB)

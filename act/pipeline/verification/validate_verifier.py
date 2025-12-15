@@ -196,37 +196,6 @@ class VerificationValidator:
                 f.write(f"{'='*80}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
     
-    # def find_concrete_counterexample(
-    #     self, 
-    #     name: str, 
-    #     model: torch.nn.Module
-    # ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
-    #     """
-    #     Try to find a concrete counterexample through inference testing.
-        
-    #     Args:
-    #         name: Network name
-    #         model: PyTorch model for concrete execution
-            
-    #     Returns:
-    #         (counterexample_input, results_dict) if found, None otherwise
-    #     """
-    #     test_cases = ['center', 'boundary', 'random']
-        
-    #     for test_case in test_cases:
-    #         input_tensor = self.factory.generate_test_input(name, test_case)
-    #         input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
-    #         results = model(input_tensor)
-            
-    #         # Check if this is a counterexample
-    #         if isinstance(results, dict):
-    #             if results['input_satisfied'] and not results['output_satisfied']:
-    #                 logger.info(f"  🔴 Counterexample found in '{test_case}' test case")
-    #                 logger.info(f"     Input explanation: {results['input_explanation']}")
-    #                 logger.info(f"     Output explanation: {results['output_explanation']}")
-    #                 return (input_tensor, results)
-        
-    #     return None
     
     def find_concrete_counterexample(
         self,
@@ -1001,45 +970,6 @@ class VerificationValidator:
                         eps = eps.to(device=self.device, dtype=self.dtype)
                     return Bounds(lb=center - eps, ub=center + eps)
             return None
-
-        # def _get_input_bounds_from_act(act_net_inner):
-        #     from act.back_end.core import Bounds
-        #     for layer in act_net_inner.layers:
-        #         if layer.kind == "INPUT_SPEC":
-        #             params = layer.params or {}
-        #             meta = layer.meta or {}
-        #             if 'lb' in params and 'ub' in params:
-        #                 return Bounds(
-        #                     lb=params['lb'].flatten().to(device=self.device, dtype=self.dtype),
-        #                     ub=params['ub'].flatten().to(device=self.device, dtype=self.dtype),
-        #                 )
-        #         # LINF_BALL: center in params, eps in meta
-        #         if 'center' in params and 'eps' in meta:
-        #             center = params['center'].flatten().to(device=self.device, dtype=self.dtype)
-        #             eps = meta['eps']
-        #             if not torch.is_tensor(eps):
-        #                 eps = torch.tensor(eps, device=self.device, dtype=self.dtype)
-        #             else:
-        #                 eps = eps.to(device=self.device, dtype=self.dtype)
-        #             return Bounds(lb=center - eps, ub=center + eps)
-        #     return None
-
-        
-        # # Extract input bounds from ACT net (prefer INPUT_SPEC params)
-        # def _get_input_bounds_from_act(act_net_inner):
-        #     from act.back_end.core import Bounds
-        #     for layer in act_net_inner.layers:
-        #         if layer.kind == "INPUT_SPEC":
-        #             params = layer.params or {}
-        #             if 'lb' in params and 'ub' in params:
-        #                 return Bounds(lb=params['lb'].flatten().to(device=self.device, dtype=self.dtype),
-        #                               ub=params['ub'].flatten().to(device=self.device, dtype=self.dtype))
-        #             if 'center' in params and 'eps' in params:
-        #                 center = params['center'].flatten().to(device=self.device, dtype=self.dtype)
-        #                 eps = params['eps'].to(device=self.device, dtype=self.dtype)
-        #                 # eps may be scalar tensor
-        #                 return Bounds(lb=center - eps, ub=center + eps)
-        #     return None
         
         spec_bounds = _get_input_bounds_from_act(act_net)
         

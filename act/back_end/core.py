@@ -157,9 +157,6 @@ class ConSet:
     def replace(self, c: Con): 
         self.S[c.signature()] = c
     
-    # def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
-    #     self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "lb": B.lb.clone(), "ub": B.ub.clone()}))
-    
     def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
         """
         Attach a box (interval) constraint for the given vars at a specific layer.
