@@ -1,0 +1,283 @@
+{
+  "format_version": "1.0",
+  "act_net": {
+    "layers": [
+      {
+        "id": 0,
+        "kind": "INPUT",
+        "params": {},
+        "meta": {
+          "shape": [
+            1,
+            6
+          ],
+          "dtype": "torch.float64",
+          "desc": "State space",
+          "dataset_name": "reachability",
+          "value_range": [
+            0.0,
+            1.0
+          ]
+        },
+        "in_vars": [],
+        "out_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "cache": {}
+      },
+      {
+        "id": 1,
+        "kind": "INPUT_SPEC",
+        "params": {
+          "lb": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "dtype": "torch.float64",
+            "shape": [
+              1,
+              6
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          },
+          "ub": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAADwPwAAAAAAAPA/AAAAAAAA8D8AAAAAAADwPwAAAAAAAPA/AAAAAAAA8D8=",
+            "dtype": "torch.float64",
+            "shape": [
+              1,
+              6
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "kind": "BOX",
+          "lb_val": 0.0,
+          "ub_val": 1.0
+        },
+        "in_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "out_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "cache": {}
+      },
+      {
+        "id": 2,
+        "kind": "DENSE",
+        "params": {
+          "W": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoMgISJQZuJP3spW+aPBLI/uUu3BwEtpb8RmTbvtnKAv1/Oe7E61rC/JAgmIyTFMj/7Pb5NLjO1v6XZ+ZXzcIc/xtxVq2Lmsr/MWaDAGF+oP4sEhCqoY3S/z+pzVsALvz8vGPv8Lyq8PzCehAOJI76/du9mv80xs7+4f6pCQna8vxvEa6R/F7G/CVQU5Bvftr9huRPcFHyAP5NtJwjdZrk/7K71vPSOnr/yWQPKDEi+P93cQwEWlMU/KC9f6ir5xL98AMRmowG0P6ui+axe4bc/AAAk912ItL/VsVGl6SWcv+9CHTq8srC/6WXTDcZGt7+SUtAQGR3EP5yv8XRSzsi/QGFO+oP1xb9k+dxeDlKIP9p/f1OpMay/rRDrogpMkj8=",
+            "dtype": "torch.float64",
+            "shape": [
+              6,
+              6
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          },
+          "b": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "dtype": "torch.float64",
+            "shape": [
+              6
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "in_features": 6,
+          "out_features": 6,
+          "bias_enabled": true
+        },
+        "in_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "out_vars": [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "cache": {}
+      },
+      {
+        "id": 3,
+        "kind": "TANH",
+        "params": {},
+        "meta": {},
+        "in_vars": [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "out_vars": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        "cache": {}
+      },
+      {
+        "id": 4,
+        "kind": "DENSE",
+        "params": {
+          "W": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArVdofQKvmpvwbPa6fPaqc/F2Yu28/LrL/ckjask0idP2bg+UzgX5O/wExkSDbKtL9lRlsD/ZKvPzyoqFEbSai/n1kpH7yEsD9PAH+hyba6v2wU1Sb4X6O/zbAtF3pzv7+KGoGg31ikv7kFTA6Mprg/nvq/OCNIoT+AC0d6FQG5P5RKS9leZJ+/J5fbDJPavL8=",
+            "dtype": "torch.float64",
+            "shape": [
+              3,
+              6
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          },
+          "b": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "dtype": "torch.float64",
+            "shape": [
+              3
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "in_features": 6,
+          "out_features": 3,
+          "bias_enabled": true
+        },
+        "in_vars": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        "out_vars": [
+          18,
+          19,
+          20
+        ],
+        "cache": {}
+      },
+      {
+        "id": 5,
+        "kind": "ASSERT",
+        "params": {
+          "lb": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArNzMw9zczMPc3MzD0=",
+            "dtype": "torch.float32",
+            "shape": [
+              3
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          },
+          "ub": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAA/AAAAPwAAAD8=",
+            "dtype": "torch.float32",
+            "shape": [
+              3
+            ],
+            "device": "cpu",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "kind": "RANGE"
+        },
+        "in_vars": [
+          18,
+          19,
+          20
+        ],
+        "out_vars": [],
+        "cache": {}
+      }
+    ],
+    "graph": {
+      "preds": {
+        "0": [],
+        "1": [
+          0
+        ],
+        "2": [
+          1
+        ],
+        "3": [
+          2
+        ],
+        "4": [
+          3
+        ],
+        "5": [
+          4
+        ]
+      },
+      "succs": {
+        "0": [
+          1
+        ],
+        "1": [
+          2
+        ],
+        "2": [
+          3
+        ],
+        "3": [
+          4
+        ],
+        "4": [
+          5
+        ],
+        "5": []
+      }
+    },
+    "metadata": {
+      "creation_time": "2025-12-15T14:27:00.034556",
+      "framework_version": "ACT-1.0",
+      "layer_count": 6,
+      "layer_kinds": [
+        "INPUT",
+        "INPUT_SPEC",
+        "DENSE",
+        "TANH",
+        "DENSE",
+        "ASSERT"
+      ],
+      "generated_by": "NetFactory"
+    }
+  }
+}
