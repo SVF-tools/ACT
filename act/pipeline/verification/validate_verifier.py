@@ -553,14 +553,8 @@ class VerificationValidator:
                                 j_alt=j_alt,
                                 timelimit=None,
                             )
-                            logger.info(
-                                "     [DEBUG FIXED LP] status=%s, ce_exists=%s, stats=%s",
-                                st_dbg,
-                                ce_dbg is not None,
-                                stats_dbg,
-                            )
                         except Exception as dbg_e:
-                            logger.warning("     [DEBUG FIXED LP] failed: %s", dbg_e)
+                            logger.warning("     [FIXED LP] failed: %s", dbg_e)
                 else:
                     logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
             else:
@@ -619,7 +613,7 @@ class VerificationValidator:
                     verify_result=verify_result,
                 )
         except Exception as dbg_e:
-            logger.warning("  [DEBUG RANGE] Debugging failed: %s", dbg_e)
+            logger.warning("  [RANGE] Debugging failed: %s", dbg_e)
         # =====================================================================
 
         

@@ -526,11 +526,6 @@ def setup_and_solve(
             last_hid = assert_preds[0]
             out_bounds = after[last_hid].bounds
             if out_bounds is not None:
-                logger.info(
-                    "[DEBUG] out_bounds: lb[min,max]=[%.4f, %.4f], ub[min,max]=[%.4f, %.4f]",
-                    out_bounds.lb.min().item(), out_bounds.lb.max().item(),
-                    out_bounds.ub.min().item(), out_bounds.ub.max().item(),
-                )
                 # Extra sanity check: any dimensions with lb>ub?
                 bad = out_bounds.lb > out_bounds.ub + 1e-9
                 if bad.any():
@@ -545,24 +540,13 @@ def setup_and_solve(
                             out_bounds.ub.view(-1)[flat_idx].item(),
                         )
             else:
-                logger.info("[DEBUG] out_bounds: None")
+                logger.info("out_bounds: None")
     except Exception:
         logger.exception("Error when adding output box / computing out_bounds")
 
     # Debug: report constraint sizes and bounds stats
     try:
         box_cons = [c for c in globalC if c.meta.get("tag", "").startswith("box:")]
-        logger.info(
-            "    [DEBUG] constraints total=%d boxes=%d input_ids=%d "
-            "seed_lb[min,max]=[%.4f, %.4f] seed_ub[min,max]=[%.4f, %.4f]",
-            len(globalC),
-            len(box_cons),
-            len(input_ids),
-            input_bounds.lb.min().item(),
-            input_bounds.lb.max().item(),
-            input_bounds.ub.min().item(),
-            input_bounds.ub.max().item(),
-        )
     except Exception:
         pass
 
@@ -584,10 +568,6 @@ def setup_and_solve(
             )
 
         solver.set_bounds(input_ids, lb_np, ub_np)
-        logger.info(
-            "[DEBUG] enforce input box on solver: id[0]=%d, lb[0]=%.4f, ub[0]=%.4f",
-            input_ids[0], lb_np[0], ub_np[0],
-        )
     except Exception as e:
         logger.warning("Failed to set input bounds on solver: %s", e)
 
@@ -695,7 +675,6 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
 
     # Standardize status explanations
     if status == SolveStatus.SAT and ce_input is not None:
-        print("[DEBUG VERIFY_ONCE] FINAL SAT+CE -> FALSIFIED")
         # Genuine counterexample
         ce_x = torch.from_numpy(ce_input)
         return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
@@ -717,7 +696,6 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     # Fallback: if we have a validated CE from solver stats, treat as FALSIFIED
     ce_checks = stats.get("ce_checks", {})
     if ce_checks.get("input_sat", False) and ce_checks.get("output_violated", False):
-        print("[DEBUG VERIFY_ONCE] FALLBACK CE_CHECKS -> FALSIFIED")
         raw_ce = ce_input
         if raw_ce is None:
             raw_ce = stats.get("raw_ce_input", None)
