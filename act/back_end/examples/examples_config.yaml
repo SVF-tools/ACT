@@ -319,20 +319,3 @@ networks:
       - kind: ASSERT
         params: {lb: [0.10, 0.10, 0.10], ub: [0.5, 0.5, 0.5]}
         meta: {kind: "RANGE"}  # 0 violates lower bound
-
-
-toy_le:
-  input_shape: [1, 1]
-  layers:
-    - kind: INPUT
-      params: {}
-      meta: {shape: [1, 1], dtype: "torch.float64"}
-    - kind: INPUT_SPEC
-      params: {}
-      meta: {kind: "BOX", lb_val: 0.0, ub_val: 0.0}  # contains only x=0
-    - kind: DENSE
-      params: {}
-      meta: {in_features: 1, out_features: 1, bias_enabled: true}
-    - kind: ASSERT
-      params: {c: [1.0]}
-      meta: {kind: "LINEAR_LE", d: -0.10}
