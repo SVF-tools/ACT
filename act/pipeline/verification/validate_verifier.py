@@ -196,185 +196,236 @@ class VerificationValidator:
                 f.write(f"{'='*80}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
     
-    
     def find_concrete_counterexample(
         self,
         name: str,
         model: torch.nn.Module,
-        act_net=None,
         max_random: int = 64,
     ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
         """
-        Try to find a concrete counterexample through inference testing.
+        Try to find a concrete counterexample via concrete execution.
 
-        Current version: prefer systematic search using ACT INPUT_SPEC (lb/ub):
-          1) center point
-          2) small grid for low dimension (3^d points, d<=4)
-          3) per-dimension boundary points for mid dimension (d<=16)
-          4) a batch of random points (uniform in [lb, ub])
-        Fall back to the old center/boundary/random logic if nothing found.
-
-        Args:
-            name:   Network name
-            model:  PyTorch model for concrete execution
-            act_net: Corresponding ACT Net (optional but recommended)
-            max_random: Upper bound on random samples
+        Strategy (single pass, streaming; no candidate list):
+          1) If ACT INPUT_SPEC is available: sample points guided by [lb, ub]
+             - center
+             - small grid when dim <= 4  (3^d points)
+             - per-dimension boundary when dim <= 16 (2*dim points)
+             - random in [lb, ub] (max_random points)
+          2) Always try legacy factory inputs:
+             - center, boundary
+             - random (max_random points)
 
         Returns:
-            (counterexample_input, results_dict) if found, None otherwise
+            (input_tensor, results_dict) if found, else None.
         """
-        # Helper: run a forward pass and check constraints once
-        def _check_point(x_flat: torch.Tensor, tag: str):
-            """
-            x_flat: flattened input vector (same shape as seed.lb)
-            Returns (tensor_in_shape, results) or None
-            """
-            # Infer input shape (from ACT INPUT layer)
+        if max_random < 0:
+            raise ValueError(f"max_random must be >= 0, got {max_random}")
+
+        # Concrete execution should not be affected by dropout/bn updates.
+        was_training = bool(getattr(model, "training", False))
+        model.eval()
+
+        try:
+            act_net = self.factory.get_act_net(name)
+
             input_shape = None
             if act_net is not None:
-                for layer in act_net.layers:
+                for layer in getattr(act_net, "layers", []):
                     if getattr(layer, "kind", None) == "INPUT":
-                        input_shape = tuple(layer.meta.get("shape") or [])
+                        shp = (layer.meta or {}).get("shape", None)
+                        # Accept only strictly-positive integer shapes
+                        if (
+                            isinstance(shp, (list, tuple))
+                            and len(shp) > 0
+                            and all(isinstance(x, int) and x > 0 for x in shp)
+                        ):
+                            input_shape = tuple(shp)
                         break
-            if input_shape is None:
-                # Without meta, fall back to [1, dim] batch input
-                input_shape = (1, x_flat.numel())
 
-            try:
-                x = x_flat.view(*input_shape)
-            except Exception as e:
-                logger.warning(
-                    "  [CE search] reshape flat -> %s failed (%s); falling back to batch=1, flat",
-                    input_shape, e,
-                )
-                x = x_flat.view(1, -1)
+            # Precompute product for safe reshape decision
+            shape_prod = None
+            if input_shape is not None:
+                p = 1
+                for d in input_shape:
+                    p *= d
+                shape_prod = p
 
-            x = x.to(device=self.device, dtype=self.dtype)
-            results = model(x)
-
-            if isinstance(results, dict):
+            def _is_ce(results: Any) -> bool:
+                if not isinstance(results, dict):
+                    return False
                 in_sat = bool(results.get("input_satisfied", False))
                 out_sat = bool(results.get("output_satisfied", True))
-                if in_sat and (not out_sat):
-                    logger.info(f"  🔴 Counterexample found ({tag})")
-                    logger.info(f"     Input explanation:  {results.get('input_explanation')}")
-                    logger.info(f"     Output explanation: {results.get('output_explanation')}")
-                    return x, results
-            return None
+                return in_sat and (not out_sat)
 
-        # ============================================================
-        # 1. If ACT net is available, extract [lb, ub] from INPUT_SPEC
-        # ============================================================
-        try:
+            spec_lb = None
+            spec_ub = None
+
             if act_net is not None:
-                # Reuse helper functions already imported for the verifier
                 specs = gather_input_spec_layers(act_net)
                 if specs:
                     seed = seed_from_input_specs(specs)
                     lb = seed.lb.to(device=self.device, dtype=self.dtype).flatten()
                     ub = seed.ub.to(device=self.device, dtype=self.dtype).flatten()
-                    assert lb.shape == ub.shape
-                    dim = lb.numel()
 
-                    logger.info(
-                        "  [CE search] Using INPUT_SPEC bounds for sampling: dim=%d, "
-                        "lb[min,max]=[%.4f, %.4f], ub[min,max]=[%.4f, %.4f]",
-                        dim,
-                        float(lb.min().item()), float(lb.max().item()),
-                        float(ub.min().item()), float(ub.max().item()),
-                    )
+                    if lb.shape != ub.shape:
+                        raise RuntimeError(
+                            f"INPUT_SPEC seed shape mismatch: lb{tuple(lb.shape)} vs ub{tuple(ub.shape)}"
+                        )
+                    if lb.numel() == 0:
+                        raise RuntimeError("INPUT_SPEC seed is empty (0-dim).")
+                    if torch.any(lb > ub):
+                        raise RuntimeError("INPUT_SPEC has lb > ub for some dimensions (invalid bounds).")
 
-                    # -------- 1) Center --------
-                    center = 0.5 * (lb + ub)
-                    ce = _check_point(center, tag="center_from_spec")
-                    if ce is not None:
-                        return ce
+                    spec_lb, spec_ub = lb, ub
 
-                    # -------- 2) Low-dim grid: 3^d (d<=4) --------
-                    # Grid points = {lb, (lb+ub)/2, ub}^d
-                    if dim <= 4:
-                        import itertools
-                        grid_levels = torch.tensor([0.0, 0.5, 1.0], device=self.device, dtype=self.dtype)
-                        for coeffs in itertools.product(range(3), repeat=dim):
-                            # coeffs ∈ {0,1,2}^d
-                            alphas = grid_levels[list(coeffs)]  # shape [dim]
-                            x_flat = lb + alphas * (ub - lb)
-                            ce = _check_point(x_flat, tag=f"grid_dim<=4_{coeffs}")
-                            if ce is not None:
-                                return ce
+            if spec_lb is not None and spec_ub is not None:
+                dim = int(spec_lb.numel())
+                delta = (spec_ub - spec_lb)
 
-                    # -------- 3) Mid-dim: per-dimension boundary points (d<=16) --------
-                    # Start from center and push each dimension to lb_i / ub_i
-                    if dim <= 16:
-                        center = 0.5 * (lb + ub)
-                        for i in range(dim):
-                            # lb direction
-                            x_flat = center.clone()
-                            x_flat[i] = lb[i]
-                            ce = _check_point(x_flat, tag=f"per_dim_lb_i={i}")
-                            if ce is not None:
-                                return ce
-                            # ub direction
-                            x_flat = center.clone()
-                            x_flat[i] = ub[i]
-                            ce = _check_point(x_flat, tag=f"per_dim_ub_i={i}")
-                            if ce is not None:
-                                return ce
+                # (a) center
+                x_flat = spec_lb + 0.5 * delta
+                if input_shape is not None and shape_prod == x_flat.numel():
+                    x = x_flat.reshape(*input_shape)
+                else:
+                    x = x_flat.reshape(1, -1)
+                x = x.to(device=self.device, dtype=self.dtype)
 
-                    # -------- 4) Random points: uniform in [lb, ub] --------
-                    # Sample at most max_random to keep things fast enough
-                    for k in range(max_random):
-                        r = torch.rand_like(lb)
-                        x_flat = lb + r * (ub - lb)
-                        ce = _check_point(x_flat, tag=f"random_spec[{k}]")
-                        if ce is not None:
-                            return ce
+                with torch.no_grad():
+                    results = model(x)
+                if _is_ce(results):
+                    logger.info("  🔴 Counterexample found (spec_center)")
+                    if isinstance(results, dict):
+                        if "input_explanation" in results:
+                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                        if "output_explanation" in results:
+                            logger.info("     Output explanation: %s", results.get("output_explanation"))
+                    return x, results
 
-                    # Fall back to legacy test_cases if spec-guided sampling finds nothing
-                    logger.info(
-                        "  [CE search] No CE found from INPUT_SPEC-guided sampling, "
-                        "falling back to legacy test_cases."
-                    )
-        except Exception as e:
-            logger.warning(
-                "  [CE search] INPUT_SPEC-guided sampling failed (%s), "
-                "falling back to legacy test_cases.",
-                e,
-            )
+                # (b) low-dim grid (3^d), only for dim<=4
+                if dim <= 4:
+                    import itertools
 
-        # ============================================================
-        # 2. Fall back to the original center / boundary / random logic but with more random tries
-        # ============================================================
-        # First run center / boundary
-        legacy_cases = ['center', 'boundary']
-        for test_case in legacy_cases:
-            input_tensor = self.factory.generate_test_input(name, test_case)
-            input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
-            results = model(input_tensor)
+                    grid_levels = torch.tensor([0.0, 0.5, 1.0], device=self.device, dtype=self.dtype)
+                    for coeffs in itertools.product(range(3), repeat=dim):
+                        alphas = grid_levels[list(coeffs)]
+                        x_flat = spec_lb + alphas * delta
 
-            if isinstance(results, dict):
-                if results.get('input_satisfied', False) and not results.get('output_satisfied', True):
-                    logger.info(f"  🔴 Counterexample found in legacy '{test_case}' test case")
-                    logger.info(f"     Input explanation: {results.get('input_explanation')}")
-                    logger.info(f"     Output explanation: {results.get('output_explanation')}")
-                    return (input_tensor, results)
+                        if input_shape is not None and shape_prod == x_flat.numel():
+                            x = x_flat.reshape(*input_shape)
+                        else:
+                            x = x_flat.reshape(1, -1)
+                        x = x.to(device=self.device, dtype=self.dtype)
 
-        # Run more random trials (previously 1, now max_random)
-        for k in range(max_random):
-            input_tensor = self.factory.generate_test_input(name, 'random')
-            input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
-            results = model(input_tensor)
+                        with torch.no_grad():
+                            results = model(x)
+                        if _is_ce(results):
+                            logger.info("  🔴 Counterexample found (spec_grid_%s)", str(coeffs))
+                            if isinstance(results, dict):
+                                if "input_explanation" in results:
+                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                                if "output_explanation" in results:
+                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
+                            return x, results
 
-            if isinstance(results, dict):
-                if results.get('input_satisfied', False) and not results.get('output_satisfied', True):
-                    logger.info(f"  🔴 Counterexample found in legacy random[{k}]")
-                    logger.info(f"     Input explanation: {results.get('input_explanation')}")
-                    logger.info(f"     Output explanation: {results.get('output_explanation')}")
-                    return (input_tensor, results)
+                # (c) per-dimension boundary, only for dim<=16
+                if dim <= 16:
+                    base = spec_lb + 0.5 * delta
+                    for i in range(dim):
+                        # lb direction
+                        x_flat = base.clone()
+                        x_flat[i] = spec_lb[i]
+                        if input_shape is not None and shape_prod == x_flat.numel():
+                            x = x_flat.reshape(*input_shape)
+                        else:
+                            x = x_flat.reshape(1, -1)
+                        x = x.to(device=self.device, dtype=self.dtype)
 
-        # Still nothing? return None
-        return None
+                        with torch.no_grad():
+                            results = model(x)
+                        if _is_ce(results):
+                            logger.info("  🔴 Counterexample found (spec_per_dim_lb_%d)", i)
+                            if isinstance(results, dict):
+                                if "input_explanation" in results:
+                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                                if "output_explanation" in results:
+                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
+                            return x, results
 
+                        # ub direction
+                        x_flat = base.clone()
+                        x_flat[i] = spec_ub[i]
+                        if input_shape is not None and shape_prod == x_flat.numel():
+                            x = x_flat.reshape(*input_shape)
+                        else:
+                            x = x_flat.reshape(1, -1)
+                        x = x.to(device=self.device, dtype=self.dtype)
+
+                        with torch.no_grad():
+                            results = model(x)
+                        if _is_ce(results):
+                            logger.info("  🔴 Counterexample found (spec_per_dim_ub_%d)", i)
+                            if isinstance(results, dict):
+                                if "input_explanation" in results:
+                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                                if "output_explanation" in results:
+                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
+                            return x, results
+
+                # (d) random points in [lb, ub]
+                for k in range(max_random):
+                    r = torch.rand_like(spec_lb)
+                    x_flat = spec_lb + r * delta
+
+                    if input_shape is not None and shape_prod == x_flat.numel():
+                        x = x_flat.reshape(*input_shape)
+                    else:
+                        x = x_flat.reshape(1, -1)
+                    x = x.to(device=self.device, dtype=self.dtype)
+
+                    with torch.no_grad():
+                        results = model(x)
+                    if _is_ce(results):
+                        logger.info("  🔴 Counterexample found (spec_random_%d)", k)
+                        if isinstance(results, dict):
+                            if "input_explanation" in results:
+                                logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                            if "output_explanation" in results:
+                                logger.info("     Output explanation: %s", results.get("output_explanation"))
+                        return x, results
+
+            for case in ("center", "boundary"):
+                x = self.factory.generate_test_input(name, case).to(device=self.device, dtype=self.dtype)
+                with torch.no_grad():
+                    results = model(x)
+                if _is_ce(results):
+                    logger.info("  🔴 Counterexample found (legacy_%s)", case)
+                    if isinstance(results, dict):
+                        if "input_explanation" in results:
+                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                        if "output_explanation" in results:
+                            logger.info("     Output explanation: %s", results.get("output_explanation"))
+                    return x, results
+
+            for k in range(max_random):
+                x = self.factory.generate_test_input(name, "random").to(device=self.device, dtype=self.dtype)
+                with torch.no_grad():
+                    results = model(x)
+                if _is_ce(results):
+                    logger.info("  🔴 Counterexample found (legacy_random_%d)", k)
+                    if isinstance(results, dict):
+                        if "input_explanation" in results:
+                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
+                        if "output_explanation" in results:
+                            logger.info("     Output explanation: %s", results.get("output_explanation"))
+                    return x, results
+
+            return None
+
+        finally:
+            # Restore training mode if caller expects it
+            if was_training:
+                model.train()
+    
     
     def validate_counterexamples(
         self, 
@@ -445,56 +496,18 @@ class VerificationValidator:
         
         # Step 1: Load ACT Net from factory
         act_net = self.factory.get_act_net(name)
-        # Debug: check input var wiring
-        try:
-            inp_layer = next((L for L in act_net.layers if getattr(L, "kind", "") == "INPUT"), None)
-            if inp_layer:
-                logger.debug(f"  [ACT INPUT] vars={len(inp_layer.out_vars)} shape={inp_layer.meta.get('shape')}")
-            specs = gather_input_spec_layers(act_net)
-            seed = seed_from_input_specs(specs)
-            input_ids = get_input_ids(act_net)
-            logger.debug(f"  [ACT INPUT_SPEC] ids={len(input_ids)}, seed_lb shape={tuple(seed.lb.shape)}, "
-                         f"lb[min,max]=[{seed.lb.min():.4f},{seed.lb.max():.4f}], "
-                         f"ub[min,max]=[{seed.ub.min():.4f},{seed.ub.max():.4f}]")
-        except Exception:
-            pass
-        # # print each layer info for debugging
-        # for layer in act_net.layers:
-        #     layer_name = layer.meta.get("name", "unnamed")
-        #     logger.error(f"  [ACT Layer] ID: {layer.id}, Kind: {layer.kind}, Name: {layer_name}")
-        
+    
         # Step 2: Create PyTorch model for concrete execution
         model = self.factory.create_model(name, load_weights=True)
         model = model.to(device=self.device, dtype=self.dtype)
-        # counterexample = self.find_concrete_counterexample(name, model)
-        counterexample = self.find_concrete_counterexample(
-            name=name,
-            model=model,
-            act_net=act_net,
-        )
+        counterexample = self.find_concrete_counterexample(name, model)
         
         # Step 3: Run formal verifier on ACT Net
         logger.info(f"\n  🔍 Running formal verifier ({solver})...")
         
         try:
             if solver == 'gurobi':
-                try:
-                    solver_instance = GurobiSolver()
-                except Exception as e:
-                    if "License" in str(e):
-                        logger.warning(f"     Skipping gurobi for {name}: {e}")
-                        skip_result = {
-                            'network': name,
-                            'solver': solver,
-                            'validation_type': 'counterexample',
-                            'validation_status': 'INCONCLUSIVE',
-                            'concrete_counterexample': counterexample is not None,
-                            'verifier_result': 'ERROR',
-                            'explanation': f"Skipped due to Gurobi license issue: {e}"
-                        }
-                        self.validation_results.append(skip_result)
-                        return skip_result
-                    raise
+                solver_instance = GurobiSolver()
             elif solver == 'torchlp':
                 solver_instance = TorchLPSolver()
             else:
@@ -533,28 +546,6 @@ class VerificationValidator:
                         ce_results.get("input_satisfied", None),
                         ce_results.get("output_satisfied", None),
                     )
-                    # Optional debug: fixed-input LP check using solver CE
-                    if os.environ.get("ACT_DEBUG_FIXED_INPUT_LP") and ce_results.get("output") is not None:
-                        try:
-                            from act.back_end.verifier import debug_fixed_input_lp, get_assert_layer
-                            assert_layer = get_assert_layer(act_net)
-                            t_idx = int(assert_layer.meta.get("y_true", 0))
-                            out_tensor = ce_results["output"]
-                            if out_tensor.dim() > 1:
-                                out_tensor = out_tensor.view(-1)
-                            j_alt = int(out_tensor.argmax().item())
-                            # Fresh solver instance of same class as solver_instance
-                            debug_solver = solver_instance.__class__()
-                            st_dbg, ce_dbg, stats_dbg = debug_fixed_input_lp(
-                                net=act_net,
-                                solver=debug_solver,
-                                x_ce=ce_tensor.detach().cpu(),
-                                t=t_idx,
-                                j_alt=j_alt,
-                                timelimit=None,
-                            )
-                        except Exception as dbg_e:
-                            logger.warning("     [FIXED LP] failed: %s", dbg_e)
                 else:
                     logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
             else:
@@ -574,21 +565,6 @@ class VerificationValidator:
                     )
             
         except Exception as e:
-            # Handle known license issues gracefully
-            if solver == 'gurobi' and "License" in str(e):
-                logger.warning(f"     Skipping gurobi for {name}: {e}")
-                skip_result = {
-                    'network': name,
-                    'solver': solver,
-                    'validation_type': 'counterexample',
-                    'validation_status': 'INCONCLUSIVE',
-                    'concrete_counterexample': counterexample is not None,
-                    'verifier_result': 'ERROR',
-                    'explanation': f"Skipped due to Gurobi license issue: {e}"
-                }
-                self.validation_results.append(skip_result)
-                return skip_result
-
             logger.error(f"     Verifier failed: {e}")
             import traceback
             traceback.print_exc()
@@ -602,21 +578,7 @@ class VerificationValidator:
             }
             self.validation_results.append(error_result)
             return error_result
-        
-        # === DEBUG: print RANGE violation comparison for reachability_tight + gurobi ===
-        try:
-            if name == "reachability_tight" and solver == "gurobi":
-                self._debug_range_mismatch(
-                    name=name,
-                    act_net=act_net,
-                    model=model,
-                    verify_result=verify_result,
-                )
-        except Exception as dbg_e:
-            logger.warning("  [RANGE] Debugging failed: %s", dbg_e)
-        # =====================================================================
 
-        
         # Step 4: Cross-validate results
         validation = self._cross_validate_counterexample(
             network_name=name,
@@ -628,121 +590,6 @@ class VerificationValidator:
         
         self.validation_results.append(validation)
         return validation
-    
-    def _debug_range_mismatch(
-        self,
-        name: str,
-        act_net,
-        model: torch.nn.Module,
-        verify_result,
-    ) -> None:
-        """
-        Debug helper for reachability_* RANGE properties:
-        - Print the solver CE input vector (raw_ce_input)
-        - Recompute output with PyTorch VerifiableModel
-        - Compute RANGE violation from the PyTorch view
-        - Compare with solver's violation_var
-        """
-        try:
-            assert_layer = get_assert_layer(act_net)
-            if assert_layer.meta.get("kind") != OutKind.RANGE:
-                return
-
-
-            stats = verify_result.stats or {}
-            raw_ce = stats.get("raw_ce_input", None)
-            v_val = stats.get("violation_var", None)
-
-            logger.error("=== DEBUG RANGE MISMATCH for %s ===", name)
-            logger.error("  solver violation_var v = %r", v_val)
-
-            if raw_ce is None:
-                logger.error("  raw_ce_input is None (solver CE not recorded); cannot align debugging.")
-                logger.error("=== END DEBUG RANGE MISMATCH ===")
-                return
-
-            import numpy as np
-
-            # 1) Print CE input (truncate for readability)
-            raw_ce_np = np.asarray(raw_ce, dtype=float).reshape(-1)
-            logger.error("  solver CE input (flat) shape=%s", raw_ce_np.shape)
-            logger.error("  solver CE input (first 20 dims)=%s", raw_ce_np[:20])
-
-            # 2) Map CE into the VerifiableModel input shape
-            input_shape = None
-            for layer in act_net.layers:
-                if getattr(layer, "kind", None) == "INPUT":
-                    input_shape = layer.meta.get("shape")
-                    break
-
-            x = torch.from_numpy(raw_ce_np)
-            if input_shape is not None:
-                try:
-                    x = x.view(*input_shape)
-                except Exception as e:
-                    logger.error(
-                        "  reshape raw_ce -> %s failed (%s); falling back to batch=1 flat vector.",
-                        input_shape, e,
-                    )
-                    x = x.unsqueeze(0)
-            else:
-                x = x.unsqueeze(0)
-
-            x = x.to(device=self.device, dtype=self.dtype)
-
-            # 3) Recompute output with PyTorch VerifiableModel
-            with torch.no_grad():
-                res = model(x)
-
-            if not isinstance(res, dict) or "output" not in res:
-                logger.error("  model(x) returned type=%r without 'output'; cannot continue debugging.", type(res))
-                logger.error("=== END DEBUG RANGE MISMATCH ===")
-                return
-
-            y = res["output"].detach().cpu().numpy().reshape(-1)
-            logger.error("  PyTorch output y (flat)=%s", y)
-
-            # 4) Use ASSERT lb/ub to compute violation from PyTorch view
-            lb_t = assert_layer.params.get("lb", None)
-            ub_t = assert_layer.params.get("ub", None)
-
-            lb_np = None
-            ub_np = None
-            if lb_t is not None:
-                lb_np = lb_t.detach().cpu().numpy().reshape(-1)
-                logger.error("  RANGE lb=%s", lb_np)
-            if ub_t is not None:
-                ub_np = ub_t.detach().cpu().numpy().reshape(-1)
-                logger.error("  RANGE ub=%s", ub_np)
-
-            viol_terms = []
-
-            if lb_np is not None:
-                viol_lower = lb_np - y          # >0 indicates how much y < lb
-                max_vl = float(viol_lower.max())
-                viol_terms.append(max_vl)
-                logger.error("  max(lb - y) = %.6f", max_vl)
-
-            if ub_np is not None:
-                viol_upper = y - ub_np          # >0 indicates how much y > ub
-                max_vu = float(viol_upper.max())
-                viol_terms.append(max_vu)
-                logger.error("  max(y - ub) = %.6f", max_vu)
-
-            if viol_terms:
-                max_viol_py = float(max(viol_terms))
-            else:
-                max_viol_py = float("nan")
-
-            logger.error("  PyTorch-view max RANGE violation = %.6f", max_viol_py)
-            logger.error("  Solver-view violation_var v    = %r", v_val)
-            logger.error("=== END DEBUG RANGE MISMATCH ===")
-
-        except Exception as e:
-            logger.exception(
-                "Error in _debug_range_mismatch for %s: %s", name, e
-            )
-
     
     def _cross_validate_counterexample(
         self,
@@ -802,36 +649,33 @@ class VerificationValidator:
         # Whether any confirmed CE exists
         any_ce_exists = test_ce_exists or solver_ce_is_ce
 
-        # ===============================
-        # Case A: At least one real CE
-        # ===============================
         if any_ce_exists:
             if verifier_status == 'CERTIFIED':
-                # Classic false negative: real CE exists but verifier says CERTIFIED
+                # CRITICAL BUG: Verifier claims safe, but we have a counterexample!
                 result['validation_status'] = 'FAILED'
                 result['explanation'] = (
-                    "🚨 SOUNDNESS BUG DETECTED! Verifier returned CERTIFIED but a "
-                    "concrete counterexample exists (false negative)."
+                    f"🚨 SOUNDNESS BUG DETECTED! Verifier claims CERTIFIED but "
+                    f"concrete counterexample exists. This is a false negative."
                 )
                 logger.error("\n  %s", result['explanation'])
 
             elif verifier_status == 'FALSIFIED':
-                # Real CE exists and verifier reports FALSIFIED: correct direction
+                # CORRECT: Verifier correctly identified the issue
                 result['validation_status'] = 'PASSED'
                 result['explanation'] = (
-                    "✅ CORRECT - Verifier reported FALSIFIED and at least one "
-                    "real counterexample exists (from tests and/or solver CE)."
+                    f"✅ CORRECT - Verifier correctly reported FALSIFIED "
+                    f"(matches concrete execution)"
                 )
                 logger.info("\n  %s", result['explanation'])
 
             elif verifier_status == 'UNKNOWN':
-                # Real CE exists but verifier stays UNKNOWN: incomplete but sound
+                # ACCEPTABLE: Verifier couldn't decide (incomplete but sound)
                 result['validation_status'] = 'ACCEPTABLE'
                 result['explanation'] = (
-                    "⚠️ INCOMPLETE - Verifier returned UNKNOWN while a concrete "
-                    "counterexample exists (sound but incomplete)."
+                    f"⚠️ INCOMPLETE - Verifier returned UNKNOWN, but concrete "
+                    f"counterexample exists (verifier is sound but incomplete)"
                 )
-                logger.warning("\n  %s", result['explanation'])
+                logger.warning(f"\n  {result['explanation']}")
 
             else:
                 result['validation_status'] = 'UNKNOWN'
@@ -840,11 +684,6 @@ class VerificationValidator:
 
             return result
 
-        # ===============================
-        # Case B: No confirmed CEs at present
-        # ===============================
-        # Tests found no CE and solver CE is unverified (maybe spurious, maybe checker too weak);
-        # in this situation we can only say INCONCLUSIVE, not claim the verifier is unsound.
         result['validation_status'] = 'INCONCLUSIVE'
         result['explanation'] = (
             "⚪ INCONCLUSIVE - No concrete counterexample found in testing, "
@@ -854,6 +693,7 @@ class VerificationValidator:
         logger.info("\n  %s", result['explanation'])
 
         return result
+
     
     def validate_bounds(
         self,
@@ -935,7 +775,7 @@ class VerificationValidator:
         set_transfer_function_mode(tf_mode)
         
         # Step 3: Sample concrete inputs
-        violations: List[Dict[str, Any]] = []
+        violations = []
         total_checks = 0
         
         def _get_input_bounds_from_act(act_net_inner):
@@ -990,11 +830,9 @@ class VerificationValidator:
             # Step 6: Run abstract analysis
             try:
                 before, after, globalC = analyze(act_net, entry_id, entry_fact)
-                # logger.info(f"  [This net has {len(after)} layers].")
                 
                 # Step 7: Check bounds containment
                 for layer_id, concrete_vals in concrete_activations.items():
-                    # logger.error(f"  [Sample {sample_idx}] Checking layer {layer_id}...")   
                     if layer_id not in after:
                         continue
                     
@@ -1019,42 +857,18 @@ class VerificationValidator:
                     total_checks += int(concrete_vals_flat.numel())
                     
                     if num_violations > 0:
-                        if name in ("control_strict", "reachability_tight") \
-                           and layer_id == 0 and sample_idx == 0:
-                            logger.error("=== DEBUG %s / tf_mode=%s / sample=%d / layer=%d ===",
-                                         name, tf_mode, sample_idx, layer_id)
-                            logger.error("concrete_vals_flat: %s", concrete_vals_flat)
-                            logger.error("lb: %s", lb)
-                            logger.error("ub: %s", ub)
-                            logger.error("viol_lt_lb idx: %s",
-                                         (concrete_vals_flat < lb).nonzero(as_tuple=False).view(-1))
-                            logger.error("viol_gt_ub idx: %s",
-                                         (concrete_vals_flat > ub).nonzero(as_tuple=False).view(-1))
-                            logger.error(
-                                "concrete[min, max]=[%.6f, %.6f], "
-                                "lb[min, max]=[%.6f, %.6f], "
-                                "ub[min, max]=[%.6f, %.6f]",
-                                float(concrete_vals_flat.min().item()),
-                                float(concrete_vals_flat.max().item()),
-                                float(lb.min().item()), float(lb.max().item()),
-                                float(ub.min().item()), float(ub.max().item()),
-                            )
-                            logger.error("=== END DEBUG ===")
                         violation_info = {
                             'sample_idx': sample_idx,
                             'layer_id': layer_id,
-                            'num_violations': num_violations,
-                            'total_neurons': int(concrete_vals_flat.numel()),
-                            'concrete_min': float(concrete_vals_flat.min().item()),
-                            'concrete_max': float(concrete_vals_flat.max().item()),
-                            'abstract_lb': float(lb.min().item()),
-                            'abstract_ub': float(ub.max().item()),
+                            'total_neurons': concrete_vals_flat.numel(),
+                            'concrete_min': concrete_vals_flat.min().item(),
+                            'concrete_max': concrete_vals_flat.max().item(),
+                            'abstract_lb': lb.min().item(),
+                            'abstract_ub': ub.max().item()
                         }
                         violations.append(violation_info)
-                        logger.error(
-                            "  ❌ Bounds violation at layer %s: %d/%d neurons",
-                            layer_id, num_violations, int(concrete_vals_flat.numel()),
-                        )
+                        logger.error(f"  ❌ Bounds violation at layer {layer_id}: "
+                                   f"{num_violations}/{concrete_vals_flat.numel()} neurons")
             
             except Exception as e:
                 logger.error(f"  ⚠️ Abstract analysis failed for sample {sample_idx}: {e}")

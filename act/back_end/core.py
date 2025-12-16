@@ -158,22 +158,7 @@ class ConSet:
         self.S[c.signature()] = c
     
     def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
-        """
-        Attach a box (interval) constraint for the given vars at a specific layer.
-
-        Convention: for any var_id, only export the box from the last layer
-        that writes the variable; earlier layer boxes are local info only.
-        """
-        self.replace(Con(
-            "INEQ",
-            tuple(var_ids),
-            {
-                "tag":      f"box:{layer_id}",
-                "layer_id": int(layer_id),
-                "lb":       B.lb.clone(),
-                "ub":       B.ub.clone(),
-            }
-        ))
+        self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "layer_id": int(layer_id), "lb": B.lb.clone(), "ub": B.ub.clone(),}))
     
     def __iter__(self):
         """Iterate over constraints (Con objects). Makes ConSet iterable."""

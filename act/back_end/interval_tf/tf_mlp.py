@@ -210,33 +210,16 @@ def tf_silu(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_max(L: Layer, By_list: List[Bounds]) -> Fact:
-    lbs = torch.stack([b.lb for b in By_list], dim=0)  # [k, N]
-    ubs = torch.stack([b.ub for b in By_list], dim=0)  # [k, N]
-    lb = lbs.max(dim=0).values
-    ub = ubs.max(dim=0).values
+    lb=torch.maximum.reduce([b.lb for b in By_list]); ub=torch.maximum.reduce([b.ub for b in By_list])
     B=Bounds(lb,ub); all_y=sum((L.meta["y_vars_list"][i] for i in range(len(By_list))), [])
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"max:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
-    lbs = torch.stack([b.lb for b in By_list], dim=0)  # [k, N]
-    ubs = torch.stack([b.ub for b in By_list], dim=0)  # [k, N]
-    lb = lbs.min(dim=0).values
-    ub = ubs.min(dim=0).values
-    if "y_vars_list" in L.meta:
-        all_y = sum((L.meta["y_vars_list"][i] for i in range(len(By_list))), [])
-    else:
-        all_y = L.in_vars
-    B = Bounds(lb, ub)
-    C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + all_y), {
-        "tag": f"min:{L.id}",
-        "k": len(By_list),
-        "mode": "convex",
-    }))
-    C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
-
+    lb=torch.minimum.reduce([b.lb for b in By_list]); ub=torch.minimum.reduce([b.ub for b in By_list])
+    B=Bounds(lb,ub); all_y=sum((L.meta["y_vars_list"][i] for i in range(len(By_list))), [])
+    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"min:{L.id}","k":len(By_list),"mode":"convex"}))
+    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_square(L: Layer, Bin: Bounds) -> Fact:
     l,u=Bin.lb,Bin.ub

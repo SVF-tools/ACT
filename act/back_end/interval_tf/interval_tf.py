@@ -99,15 +99,13 @@ class IntervalTF(TransferFunction):
         "POSENC": lambda L, bounds, tf: tf_posenc(L, bounds),
         "LAYERNORM": lambda L, bounds, tf: tf_layernorm(L, bounds),
         "GELU": lambda L, bounds, tf: tf_gelu(L, bounds),
-        "ATT_SCORES": lambda L, bounds, tf: tf_att_scores(
-            L,
+        "ATT_SCORES": lambda L, bounds, tf: tf_att_scores(L,
             tf._before.get(L.meta.get("q_src", L.id), Fact(bounds, ConSet())).bounds,
             tf._before.get(L.meta.get("k_src", L.id), Fact(bounds, ConSet())).bounds),
-        "ATT_MIX": lambda L, bounds, tf: tf_att_mix(
-            L,
+        "SOFTMAX": lambda L, bounds, tf: tf_softmax(L, bounds),
+        "ATT_MIX": lambda L, bounds, tf: tf_att_mix(L,
             tf._before.get(L.meta.get("w_src", L.id), Fact(bounds, ConSet())).bounds,
             tf._before.get(L.meta.get("v_src", L.id), Fact(bounds, ConSet())).bounds),
-        "SOFTMAX": lambda L, bounds, tf: tf_softmax(L, bounds),
         "MHA_SPLIT": lambda L, bounds, tf: tf_mha_split(L, bounds),
         "MHA_JOIN": lambda L, bounds, tf: tf_mha_join(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
         "MASK_ADD": lambda L, bounds, tf: tf_mask_add(L, bounds),

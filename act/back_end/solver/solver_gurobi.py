@@ -111,8 +111,6 @@ class GurobiSolver(Solver):
             self.m.Params.TimeLimit = float(timelimit)
         self.m.update()
         self.m.optimize()
-        print("Gurobi m.Status :", self.m.Status)
-        print("Gurobi SolCount :", self.m.SolCount)
 
         if self.m.Status in [3, 4, 5, 12]:  # infeasible, inf_or_unbd, unbounded, numeric
             self.m.write("debug_model.lp")
@@ -159,13 +157,10 @@ class GurobiSolver(Solver):
             return SolveStatus.UNKNOWN
 
         # 2. Numeric issues / infeasible-or-unbounded / unbounded ⇒ untrusted, treat as UNKNOWN
-        #    Even if SolCount > 0, do not risk labeling SAT
         if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED, GRB.NUMERIC):
             return SolveStatus.UNKNOWN
 
         # 3. Normal termination, proven feasible solution exists
-        #    OPTIMAL: feasible solution proven optimal
-        #    SUBOPTIMAL: feasible incumbent but optimality not fully proven
         if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
             if solcnt > 0:
                 return SolveStatus.SAT
@@ -173,9 +168,6 @@ class GurobiSolver(Solver):
             return SolveStatus.UNKNOWN
 
         # 4. Limits triggered but an incumbent exists:
-        #    TIME_LIMIT, NODE_LIMIT, ITERATION_LIMIT, SOLUTION_LIMIT,
-        #    INTERRUPTED, CUTOFF, USER_OBJ_LIMIT, etc.
-        #    —— as long as an incumbent exists, a feasible solution exists, so treat as SAT.
         early_stop_with_incumbent = {
             GRB.TIME_LIMIT,
             GRB.NODE_LIMIT,

@@ -131,9 +131,7 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     if any(L.meta.get("kind") == InKind.LIN_POLY for L in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
     
-    # No usable spec at all
     raise ValueError("No valid input specification found for seeding.")
-
 
 def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> None:
     """
@@ -150,21 +148,15 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
     for L in spec_layers:
         k = L.meta.get("kind")
         if k == InKind.BOX:
-            lb = L.params["lb"].flatten()
-            ub = L.params["ub"].flatten()
-            globalC.add_box(-1, input_ids, Bounds(lb, ub))
+            globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
         elif k == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
-                lb = L.params["lb"].flatten()
-                ub = L.params["ub"].flatten()
-                globalC.add_box(-1, input_ids, Bounds(lb, ub))
+                globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
             else:
                 center = L.params["center"]
                 eps = L.meta["eps"]
                 e = torch.tensor(eps, dtype=center.dtype, device=center.device)
-                lb = (center - e).flatten()
-                ub = (center + e).flatten()
-                globalC.add_box(-1, input_ids, Bounds(lb, ub))
+                globalC.add_box(-1, input_ids, Bounds(center - e, center + e))
         elif k == InKind.LIN_POLY:
             A, b = L.params["A"], L.params["b"]
             globalC.replace(Con("INEQ", tuple(input_ids), {"tag": "in:linpoly", "A": A, "b": b}))
@@ -326,20 +318,16 @@ def add_negated_assert_to_solver(
     """
     from act.back_end.cons_exportor import to_numpy
     k = assert_layer.meta.get("kind")
-    objective = None  # Legacy placeholder; always None now
+    objective = None 
 
-    # ---------------- LINEAR_LE ----------------
     if k == OutKind.LINEAR_LE:
-        # Property: c·y ≤ d
-        # Negation: c·y ≥ d + ε
+        # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
         coeffs = list(to_numpy(assert_layer.params["c"]))
         d = float(assert_layer.meta["d"])
         solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
 
-    # ---------------- TOP1_ROBUST ----------------
     elif k == OutKind.TOP1_ROBUST:
-        # Property: y[t] > y[j] for all j≠t
-        # Negation: ∃j: y[j] - y[t] ≥ 0
+        # Property: y[t] > y[j] for all j≠t  →  Negation: ∃j: y[j] ≥ y[t]
         t = int(assert_layer.meta["y_true"])
         v = solver.n
         solver.add_vars(1)
@@ -347,16 +335,13 @@ def add_negated_assert_to_solver(
         solver.add_lin_ge([v], [1.0], 0.0)       # v >= 0
         solver.add_lin_ge([v], [-1.0], -v_max)   # v <= v_max
         for j, oj in enumerate(out_ids):
-            if j == t:
-                continue
-            # v >= y[j] - y[t]
-            solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
+            if j != t:
+                solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
+        solver.add_lin_ge([v], [1.0], 0.0)
         objective = {"var": v, "sense": "max"}
 
-    # ---------------- MARGIN_ROBUST ----------------
     elif k == OutKind.MARGIN_ROBUST:
-        # Property: y[t] - y[j] > margin  for all j != t
-        # Negation: exists j: y[j] - y[t] + margin >= 0
+        # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
         t = int(assert_layer.meta["y_true"])
         margin = float(assert_layer.meta["margin"])
         v = solver.n
@@ -367,17 +352,10 @@ def add_negated_assert_to_solver(
         solver.add_lin_ge([v], [1.0], 0.0)       # v >= 0
         solver.add_lin_ge([v], [-1.0], -v_max)   # v <= v_max
         for j, oj in enumerate(out_ids):
-            if j == t:
-                continue
-            # v >= y[j] - y[t] + margin
-            solver.add_lin_ge(
-                [v, oj, out_ids[t]],
-                [1.0, -1.0, 1.0],
-                margin,
-            )
+            if j != t:
+                solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], -margin)
+        solver.add_lin_ge([v], [1.0], 0.0)
         objective = {"var": v, "sense": "max"}
-
-
 
     elif k == OutKind.RANGE:
         from act.back_end.cons_exportor import to_numpy
@@ -552,7 +530,7 @@ def setup_and_solve(
 
     # Validate constraints (validation runs if enabled, logging only if debug_tf also enabled)
     validate_constraints(globalC, after, net)
-
+    
     # Export all constraints to solver (including LIN_POLY)
     export_to_solver(globalC, solver, objective=None, sense="min")
 
@@ -607,10 +585,7 @@ def setup_and_solve(
     if st == SolveStatus.SAT and solver.has_solution():
         ce_input = solver.get_values(input_ids)
 
-    stats: Dict[str, Any] = {
-        "status": st,
-        "ncons": len(globalC),
-    }
+    stats = {"status": st, "ncons": len(globalC)}
     if objective and "var" in objective and solver.has_solution():
         try:
             stats["violation_var"] = float(solver.get_values([objective["var"]])[0])
@@ -618,7 +593,6 @@ def setup_and_solve(
             pass
 
     return st, ce_input, stats
-
 
 
 # -----------------------------------------------------------------------------
@@ -651,14 +625,6 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     # Core solver workflow
     status, ce_input, stats = setup_and_solve(net, seed_bounds, solver, timelimit)
 
-    # --- DEBUG: keep the solver's raw CE even if later discarded ---
-    if ce_input is not None:
-        try:
-            stats["raw_ce_input"] = ce_input.copy()  # np.ndarray
-        except Exception:
-            stats["raw_ce_input"] = ce_input
-    # ------------------------------------------------------------
-
     # Filter spurious CEs: must satisfy input spec and truly violate output property
     if status == SolveStatus.SAT and ce_input is not None:
         stats.setdefault("ce_checks", {})
@@ -675,7 +641,6 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
 
     # Standardize status explanations
     if status == SolveStatus.SAT and ce_input is not None:
-        # Genuine counterexample
         ce_x = torch.from_numpy(ce_input)
         return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
 
@@ -693,28 +658,27 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
         # Negated property infeasible → original property proven
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
 
-    # Fallback: if we have a validated CE from solver stats, treat as FALSIFIED
-    ce_checks = stats.get("ce_checks", {})
-    if ce_checks.get("input_sat", False) and ce_checks.get("output_violated", False):
-        raw_ce = ce_input
-        if raw_ce is None:
-            raw_ce = stats.get("raw_ce_input", None)
-        if raw_ce is not None:
-            try:
-                ce_x = torch.from_numpy(raw_ce)
-            except Exception:
-                ce_x = torch.as_tensor(raw_ce)
-        else:
-            ce_x = None
-        return VerifResult(
-            status=VerifStatus.FALSIFIED,
-            counterexample=ce_x,
-            stats=stats,
-        )
+    # # Fallback: if we have a validated CE from solver stats, treat as FALSIFIED
+    # ce_checks = stats.get("ce_checks", {})
+    # if ce_checks.get("input_sat", False) and ce_checks.get("output_violated", False):
+    #     raw_ce = ce_input
+    #     if raw_ce is None:
+    #         raw_ce = stats.get("raw_ce_input", None)
+    #     if raw_ce is not None:
+    #         try:
+    #             ce_x = torch.from_numpy(raw_ce)
+    #         except Exception:
+    #             ce_x = torch.as_tensor(raw_ce)
+    #     else:
+    #         ce_x = None
+    #     return VerifResult(
+    #         status=VerifStatus.FALSIFIED,
+    #         counterexample=ce_x,
+    #         stats=stats,
+    #     )
 
     # All other cases (UNKNOWN / TIME_LIMIT / NUMERIC ISSUE, etc.)
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)
-
 
 # -----------------------------------------------------------------------------
 # Debug helper: fixed-input LP with simple linear property

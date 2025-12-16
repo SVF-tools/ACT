@@ -175,7 +175,7 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
 
-    input_shape = L.meta["input_shape"]   # [b, c, w]
+    input_shape = L.meta["input_shape"]
     output_shape = L.meta["output_shape"]
 
     b, c, w = input_shape
@@ -193,12 +193,10 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
         "stride": stride,
         "padding": padding,
         "input_shape": input_shape,
-        "output_shape": output_shape,
+        "output_shape": output_shape
     }))
     C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
-
-
 
 def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta["kernel_size"]
