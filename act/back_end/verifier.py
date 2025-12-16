@@ -325,7 +325,7 @@ def add_negated_assert_to_solver(
         coeffs = list(to_numpy(assert_layer.params["c"]))
         d = float(assert_layer.meta["d"])
         solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
-
+        
     elif k == OutKind.TOP1_ROBUST:
         # Property: y[t] > y[j] for all j≠t  →  Negation: ∃j: y[j] ≥ y[t]
         t = int(assert_layer.meta["y_true"])
@@ -338,6 +338,7 @@ def add_negated_assert_to_solver(
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
         solver.add_lin_ge([v], [1.0], 0.0)
+        
         objective = {"var": v, "sense": "max"}
 
     elif k == OutKind.MARGIN_ROBUST:
@@ -441,19 +442,25 @@ def setup_and_solve(
     """
     Core verification workflow: setup constraints and solve.
     
-    Workflow:
-      1. Extract entry/input/output/spec/assert from the ACT Net
-      2. Build entry_fact from input_bounds plus all INPUT_SPEC constraints
-      3. Run analyze() for abstract propagation to get globalC + layer bounds
-      4. export_to_solver(globalC, solver)
-      5. Add the negated ASSERT property (add_negated_assert_to_solver)
-      6. Solve feasibility only and extract a CE input from the solver
+    This function encapsulates the common verification pattern:
+    1. Extract network structure (entry layer, input/output IDs, specs)
+    2. Create entry_fact with input_bounds and all INPUT_SPEC constraints
+    3. Run abstract interpretation (analyze)
+    4. Export constraints to solver
+    5. Add negated ASSERT property
+    6. Solve and return status + counterexample (if found)
+    
+    Args:
+        net: ACT network
+        input_bounds: Input region bounds (seed box or refinement box)
+        solver: Solver instance
+        timelimit: Optional timeout in seconds
 
     Returns:
-        (status, counterexample_input, stats)
+        Tuple of (status, counterexample_input, stats):
         - status: SolveStatus.SAT/UNSAT/UNKNOWN
-        - counterexample_input: np.ndarray (only non-None when SAT with a solution)
-        - stats: debug/statistics info
+        - counterexample_input: np.ndarray if SAT, else None
+        - stats: Dict with metadata (ncons, status, etc.)
     """
     from act.back_end.analyze import analyze
     from act.back_end.cons_exportor import export_to_solver
@@ -472,7 +479,7 @@ def setup_and_solve(
     # Create entry_fact with ALL input constraints
     entry_fact = Fact(bounds=input_bounds, cons=ConSet())
     add_all_input_specs(entry_fact.cons, input_ids, spec_layers)
-
+    
     # Analyze with full input specification (propagates constraints)
     before, after, globalC = analyze(net, entry_id, entry_fact)
 
@@ -584,7 +591,7 @@ def setup_and_solve(
     ce_input = None
     if st == SolveStatus.SAT and solver.has_solution():
         ce_input = solver.get_values(input_ids)
-
+    
     stats = {"status": st, "ncons": len(globalC)}
     if objective and "var" in objective and solver.has_solution():
         try:

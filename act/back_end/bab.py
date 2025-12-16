@@ -36,7 +36,10 @@ from act.back_end.verifier import (
     seed_from_input_specs,
     setup_and_solve,
 )
+
+# Front-end enums
 from act.front_end.specs import OutKind
+
 
 # -----------------------------------------------------------------------------
 # Branch-and-Bound verification
@@ -148,7 +151,6 @@ def verify_bab(net, solver: Solver,
 
     return VerifResult(VerifStatus.CERTIFIED, stats={"nodes": processed})
 
-
 # -----------------------------------------------------------------------------
 # Counterexample validation (lightweight, used internally by BaB)
 # -----------------------------------------------------------------------------
@@ -160,23 +162,23 @@ def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
     For external validation, caller should use full model inference.
     """
     from act.back_end.analyze import analyze
-
+    
     # Create tight bounds around point
     x_tensor = torch.from_numpy(x_np)
     point_bounds = Bounds(x_tensor, x_tensor)
-
+    
     # Create entry_fact with point bounds (no additional constraints for point eval)
     entry_fact = Fact(bounds=point_bounds, cons=ConSet())
-
+    
     # Analyze through network
     entry_id = find_entry_layer_id(net)
     _, after, _ = analyze(net, entry_id, entry_fact)
-
+    
     # Get output bounds (should be tight for point evaluation)
     output_layer_id = net.layers[-2].id  # Layer before ASSERT
     y_bounds = after[output_layer_id].bounds
     y_mid = ((y_bounds.lb + y_bounds.ub) / 2).cpu().numpy()
-
+    
     # Check violation
     k = assert_layer.meta.get("kind")
     if k == OutKind.TOP1_ROBUST:

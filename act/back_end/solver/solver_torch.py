@@ -60,7 +60,7 @@ class TorchLPSolver(Solver):
         if device is not None:
             self._device = torch.device(device)
         # else keep the device_manager default from __init__
-
+        
         self._n = 0
         self._x = None
         self._lb = None
@@ -83,14 +83,8 @@ class TorchLPSolver(Solver):
             old_n = self._n
             self._n += n
             # Extend tensors on the correct device and dtype
-            self._lb = torch.cat([
-                self._lb,
-                torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)
-            ])
-            self._ub = torch.cat([
-                self._ub,
-                torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)
-            ])
+            self._lb = torch.cat([self._lb, torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)])
+            self._ub = torch.cat([self._ub, torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)])
 
     def add_binary_vars(self, n: int) -> List[int]:
         start = self._n
@@ -131,8 +125,7 @@ class TorchLPSolver(Solver):
     def add_sos2(self, var_ids: List[int], weights: Optional[List[float]] = None) -> None:
         return  # no-op
 
-    def set_objective_linear(self, vids: List[int], coeffs: List[float],
-                             const: float = 0.0, sense: str = "min") -> None:
+    def set_objective_linear(self, vids: List[int], coeffs: List[float], const: float = 0.0, sense: str = "min") -> None:
         self._objective = (vids, coeffs, float(const), "min" if sense != "max" else "max")
 
     def optimize(self, timelimit: Optional[float] = None) -> None:
@@ -150,29 +143,17 @@ class TorchLPSolver(Solver):
 
         # === 1) Initialize variables to box midpoints (or 0) ===
         if self._x is None:
-            lb = torch.where(torch.isfinite(self._lb),
-                             self._lb,
-                             torch.zeros_like(self._lb))
-            ub = torch.where(torch.isfinite(self._ub),
-                             self._ub,
-                             torch.zeros_like(self._ub))
+            lb = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
+            ub = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
             mid = 0.5 * (lb + ub)
             both_inf = (~torch.isfinite(self._lb)) & (~torch.isfinite(self._ub))
             mid = torch.where(both_inf, torch.zeros_like(mid), mid)
-            self._x = torch.nn.Parameter(
-                mid.clone().to(device=self._device, dtype=self._dtype),
-                requires_grad=True
-            )
+            self._x = torch.nn.Parameter(mid.clone().to(device=self._device, dtype=self._dtype), requires_grad=True)
 
         # CRITICAL: Re-enable gradients after any potential parameter manipulation
         self._x.requires_grad_(True)
 
-        opt = torch.optim.Adam(
-            [self._x],
-            lr=self.lr,
-            betas=(self.beta1, self.beta2),
-            weight_decay=self.weight_decay
-        )
+        opt = torch.optim.Adam([self._x], lr=self.lr, betas=(self.beta1, self.beta2), weight_decay=self.weight_decay)
 
         # === 3) Vectorized objective construction ===
         vids, coeffs, c0, sense = self._objective
@@ -265,15 +246,14 @@ class TorchLPSolver(Solver):
 
                 # Backward
                 obj.backward()
-
+            
             opt.step()
 
             # Project to box constraints while preserving Parameter status
             with torch.no_grad():
                 x_clamped = torch.minimum(torch.maximum(self._x, lb_device), ub_device)
                 # Use .data.copy_ to preserve Parameter wrapper
-                self._x.data.copy_(x_clamped)
-                # Ensure gradients are still enabled after projection
+                self._x.data.copy_(x_clamped)  # Use .data.copy_ to preserve Parameter wrapper
                 if not self._x.requires_grad:
                     self._x.requires_grad_(True)
 

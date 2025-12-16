@@ -170,10 +170,6 @@ class TorchToACT:
         new_layers, out_vars = self.input_layer.to_act_layers(len(self.layers), [])
         self.layers.extend(new_layers)
         self.prev_out = out_vars
-        # Bump the global var counter so subsequent layers get fresh IDs.
-        # Without this, later _alloc_ids() calls would start from 0 again,
-        # causing different layers to share the same variable indices and
-        # making downstream MILP constraints inconsistent.
         if out_vars:
             self.next_var = max(out_vars) + 1
 

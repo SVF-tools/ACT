@@ -186,7 +186,6 @@ class GurobiSolver(Solver):
         # 5. All other statuses (LOADED, NOT_STARTED, INPROGRESS, etc.) → UNKNOWN
         return SolveStatus.UNKNOWN
 
-
     def has_solution(self) -> bool:
         return self.m is not None and getattr(self.m, 'SolCount', 0) > 0
 

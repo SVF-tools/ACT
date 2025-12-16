@@ -42,17 +42,17 @@ def export_to_solver(globalC: ConSet, solver: Solver,
     # Use device manager to get optimal device hint
     default_device = get_default_device()
     dev_hint = str(default_device)  # Use global device manager default
-
+    
     # Only initialize solver if it hasn't been pre-configured
-    if hasattr(solver, "n") and solver.n == 0:
+    if hasattr(solver, 'n') and solver.n == 0:
         print(f"🔧 export_to_solver: Initializing solver (current vars: {solver.n})")
         solver.begin("verify", device=dev_hint)
     else:
         print(f"🔧 export_to_solver: Solver already initialized (current vars: {getattr(solver, 'n', 'unknown')})")
 
-    # 1) Collect all variable IDs and precompute the last writer layer_id per var
-    all_ids: set[int] = set(); boxes = {}
-    templates = list(globalC)
+    # 1) global var set and merged boxes
+    all_ids=set(); boxes={}
+    templates=list(globalC)
     for con in templates:
         all_ids.update(con.var_ids)
         tag = con.meta.get("tag","")
@@ -72,8 +72,8 @@ def export_to_solver(globalC: ConSet, solver: Solver,
 
     # 2) materialize per-tag
     for con in templates:
-        tag = con.meta.get("tag", "")
-        if tag.startswith("box:"):continue
+        tag = con.meta.get("tag","")
+        if tag.startswith("box:"): continue
 
         if tag.startswith("dense:"):
             W = to_numpy(con.meta["W"]); b = to_numpy(con.meta["b"])
@@ -214,7 +214,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             vids = list(con.var_ids)
             for i in range(A.shape[0]):
                 solver.add_lin_le(vids, list(A[i, :]), float(b[i]))
-
+        
         else:
             pass
 
@@ -223,5 +223,4 @@ def export_to_solver(globalC: ConSet, solver: Solver,
     else:
         c,c0 = objective; vids=list(range(len(c))); coeffs=[float(ci) for ci in c]
         solver.set_objective_linear(vids, coeffs, float(c0), sense)
-
     return nvars

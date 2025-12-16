@@ -185,7 +185,7 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     lb_out = F.avg_pool1d(lb_in, kernel_size, stride, padding)
     ub_out = F.avg_pool1d(ub_in, kernel_size, stride, padding)
 
-    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    B_output = Bounds(lb_out.view(-1), ub_out.view(-1))
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"avgpool1d:{L.id}",
@@ -195,8 +195,8 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
         "input_shape": input_shape,
         "output_shape": output_shape
     }))
-    C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    C.add_box(L.id, L.out_vars, B_output)
+    return Fact(B_output, C)
 
 def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta["kernel_size"]

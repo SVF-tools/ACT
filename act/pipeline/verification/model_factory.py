@@ -116,10 +116,7 @@ class ModelFactory:
                 self._repair_variable_ids(act_net)
                 self.nets[name] = act_net
                 inp_layer = next((L for L in act_net.layers if L.kind == "INPUT"), None)
-                logger.debug(
-                    f"Pre-loaded ACT Net '{name}' from {net_path} "
-                    f"(input vars={len(inp_layer.out_vars) if inp_layer else 'N/A'})"
-                )
+                logger.debug(f"Pre-loaded ACT Net '{name}' from {net_path}")
             except Exception as e:
                 logger.error(f"Failed to load ACT Net '{name}' from {net_path}: {e}")
                 continue

@@ -274,7 +274,7 @@ class ACTToTorch:
                 raise ValueError("CONV2D layer requires 'in_channels' in meta")
             if out_channels is None:
                 raise ValueError("CONV2D layer requires 'out_channels' in meta")
-
+            
             layer = nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -288,7 +288,7 @@ class ACTToTorch:
 
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
-
+            
             return layer
         
         elif kind == "CONV1D":

@@ -253,7 +253,7 @@ class NetFactory:
             # Validate both are present
             if "lb" not in params or "ub" not in params:
                 raise ValueError("RANGE requires both 'lb' and 'ub' in params")
-    
+
     def _generate_layer_variables(self, kind: str,
                                   layer_index: int,
                                   var_counter: int,
@@ -343,7 +343,7 @@ class NetFactory:
         # Get current device_manager dtype for INPUT layer consistency
         current_dtype = str(get_default_dtype())
 
-        layers: List[Layer] = []
+        layers = []
         next_var = 0               # running variable id counter
         prev_out: List[int] = []   # out_vars of previous layer
         current_shape = None       # track shape for shape-based layers
@@ -463,9 +463,9 @@ class NetFactory:
                 in_vars=in_vars,
                 out_vars=out_vars
             )
-
+            
             layers.append(layer)
-
+        
         # Create graph structure for Net
         preds = {i: [i-1] if i > 0 else [] for i in range(len(layers))}
         succs = {i: [i+1] if i < len(layers)-1 else [] for i in range(len(layers))}

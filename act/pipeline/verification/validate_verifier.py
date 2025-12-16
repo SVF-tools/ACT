@@ -496,7 +496,7 @@ class VerificationValidator:
         
         # Step 1: Load ACT Net from factory
         act_net = self.factory.get_act_net(name)
-    
+        
         # Step 2: Create PyTorch model for concrete execution
         model = self.factory.create_model(name, load_weights=True)
         model = model.to(device=self.device, dtype=self.dtype)
@@ -578,7 +578,7 @@ class VerificationValidator:
             }
             self.validation_results.append(error_result)
             return error_result
-
+        
         # Step 4: Cross-validate results
         validation = self._cross_validate_counterexample(
             network_name=name,
@@ -614,7 +614,7 @@ class VerificationValidator:
            regardless of verifier result, mark INCONCLUSIVE; do not fail solely because
            FALSIFIED + “ce_checks look spurious”.
         """
-        result: Dict[str, Any] = {
+        result = {
             'network': network_name,
             'solver': solver_name,
             'validation_type': 'counterexample',
@@ -657,7 +657,10 @@ class VerificationValidator:
                     f"🚨 SOUNDNESS BUG DETECTED! Verifier claims CERTIFIED but "
                     f"concrete counterexample exists. This is a false negative."
                 )
-                logger.error("\n  %s", result['explanation'])
+                logger.error(f"\n  {result['explanation']}")
+                logger.error(f"     Counterexample input: {input_tensor.shape}, "
+                            f"range=[{input_tensor.min():.4f}, {input_tensor.max():.4f}]")
+                logger.error(f"     Output violation: {inference_results['output_explanation']}")
 
             elif verifier_status == 'FALSIFIED':
                 # CORRECT: Verifier correctly identified the issue
@@ -666,8 +669,8 @@ class VerificationValidator:
                     f"✅ CORRECT - Verifier correctly reported FALSIFIED "
                     f"(matches concrete execution)"
                 )
-                logger.info("\n  %s", result['explanation'])
-
+                logger.info(f"\n  {result['explanation']}")
+                
             elif verifier_status == 'UNKNOWN':
                 # ACCEPTABLE: Verifier couldn't decide (incomplete but sound)
                 result['validation_status'] = 'ACCEPTABLE'
@@ -694,7 +697,6 @@ class VerificationValidator:
 
         return result
 
-    
     def validate_bounds(
         self,
         networks: Optional[List[str]] = None,
@@ -927,9 +929,9 @@ class VerificationValidator:
         Returns:
             Dictionary mapping layer_id to activation tensor
         """
-        activations: Dict[int, torch.Tensor] = {}
-        hooks: List[Any] = []
-        collected: List[torch.Tensor] = []
+        activations = {}
+        hooks = []
+        collected = []
         
         def make_hook(temp_id: int):
             def hook(module, input, output):
@@ -944,12 +946,12 @@ class VerificationValidator:
         }
         
         # Register hooks on relevant torch modules; map to ACT ids after forward
-        temp_id = 0
+        layer_id = 0
         for module in model.modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ReLU, torch.nn.Flatten)):
-                hook = module.register_forward_hook(make_hook(temp_id))
+                hook = module.register_forward_hook(make_hook(layer_id))
                 hooks.append(hook)
-                temp_id += 1
+                layer_id += 1
         
         # Run forward pass
         with torch.no_grad():
@@ -1075,7 +1077,7 @@ class VerificationValidator:
         inconclusive = sum(1 for r in results if r.get('validation_status') == 'INCONCLUSIVE')
         errors = sum(1 for r in results if r.get('status') == 'ERROR')
         
-        summary: Dict[str, Any] = {
+        summary = {
             'validation_type': validation_type,
             'total': total,
             'passed': passed,
@@ -1235,3 +1237,4 @@ def main():
 if __name__ == "__main__":
     import sys
     sys.exit(main())
+
