@@ -37,16 +37,13 @@ def changed_or_maskdiff(L, B: Bounds, masks: Optional[Dict[str, torch.Tensor]], 
 
     lb_ok = torch.all(lb >= plb - eps)
     ub_ok = torch.all(ub <= pub + eps)
-
     prev = L.cache.get("masks")
-
     if (masks is None) ^ (prev is None): return True
     if masks is None: return False
 
     for k in masks.keys():
         if (k not in prev) or (masks[k].shape != prev[k].shape) or torch.any(masks[k] != prev[k]):
             return True
-
     return False
 
 def update_cache(L, B: Bounds, masks: Optional[Dict[str, torch.Tensor]]):

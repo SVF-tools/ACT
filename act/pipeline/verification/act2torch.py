@@ -455,7 +455,7 @@ class ACTToTorch:
         elif kind == "EMBEDDING":
             num_embeddings = meta.get("num_embeddings")
             embedding_dim = meta.get("embedding_dim")
-
+            
             if num_embeddings is None:
                 raise ValueError("EMBEDDING requires 'num_embeddings' in meta")
             if embedding_dim is None:

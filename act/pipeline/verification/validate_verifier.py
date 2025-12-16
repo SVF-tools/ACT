@@ -696,7 +696,7 @@ class VerificationValidator:
         logger.info("\n  %s", result['explanation'])
 
         return result
-
+    
     def validate_bounds(
         self,
         networks: Optional[List[str]] = None,
@@ -933,7 +933,7 @@ class VerificationValidator:
         hooks = []
         collected = []
         
-        def make_hook(temp_id: int):
+        def make_hook(layer_id):
             def hook(module, input, output):
                 collected.append(output.detach().clone())
             return hook

@@ -106,7 +106,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             for i, zi in enumerate(z): solver.add_lin_eq([zi,x[i],y[i]],[1.0,-1.0,-1.0], 0.0)
 
         elif tag.startswith("relu:"):
-            meta = con.meta; n = len(con.var_ids) // 2; z = list(con.var_ids[:n]); y = list(con.var_ids[n:])
+            meta=con.meta; n=len(con.var_ids)//2; z=list(con.var_ids[:n]); y=list(con.var_ids[n:])
 
             idx_on  = to_numpy(meta["idx_on"]).astype(int)
             idx_off = to_numpy(meta["idx_off"]).astype(int)

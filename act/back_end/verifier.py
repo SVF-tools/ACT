@@ -280,10 +280,9 @@ def _upper_bound_violation(out_bounds: Optional[Bounds], t: int, margin: float =
         TOP1:   v_max = max_j (ub_j - lb_t)
         MARGIN: v_max = max_j (ub_j - lb_t + margin)
 
-    If bounds are unavailable, fall back to a conservative constant.
     """
     if out_bounds is None:
-        return 1e6  # fallback: conservative constant to avoid unboundedness
+        return 1e6
 
     lb = out_bounds.lb.detach().cpu().numpy().reshape(-1)
     ub = out_bounds.ub.detach().cpu().numpy().reshape(-1)
@@ -455,7 +454,7 @@ def setup_and_solve(
         input_bounds: Input region bounds (seed box or refinement box)
         solver: Solver instance
         timelimit: Optional timeout in seconds
-
+    
     Returns:
         Tuple of (status, counterexample_input, stats):
         - status: SolveStatus.SAT/UNSAT/UNKNOWN
@@ -585,7 +584,7 @@ def setup_and_solve(
     else:
         solver.set_objective_linear([], [], 0.0, sense="min")
     solver.optimize(timelimit)
-
+    
     # Extract result
     st = solver.status()
     ce_input = None

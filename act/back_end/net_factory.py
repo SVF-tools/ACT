@@ -342,7 +342,7 @@ class NetFactory:
         """Create network from YAML spec."""
         # Get current device_manager dtype for INPUT layer consistency
         current_dtype = str(get_default_dtype())
-
+        
         layers = []
         next_var = 0               # running variable id counter
         prev_out: List[int] = []   # out_vars of previous layer
@@ -418,7 +418,6 @@ class NetFactory:
                 prev_out = out_vars
 
             elif kind == "CONV2D":
-                # Expect output_shape in meta; fall back to input_shape if missing
                 out_shape = tuple(meta.get("output_shape") or current_shape or [])
                 if not out_shape:
                     raise ValueError("CONV2D requires output_shape in meta to allocate variables.")
