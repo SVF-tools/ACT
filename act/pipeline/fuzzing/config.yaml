@@ -7,10 +7,10 @@ fuzzing:
   
   # Mutation strategy weights (must sum to 1.0)
   mutation_weights:
-    gradient: 0.4      # FGSM-style gradient-guided
-    activation: 0.3    # Activation-guided (DeepXplore)
-    boundary: 0.2      # Boundary exploration
-    random: 0.1        # Random baseline
+    gradient: 1.0      # FGSM-style gradient-guided
+    activation: 0.0    # Activation-guided (DeepXplore)
+    boundary: 0.0      # Boundary exploration
+    random: 0.0       # Random baseline
   
   # Mutation perturbation size configuration
   # =========================================
@@ -37,8 +37,8 @@ fuzzing:
   #   - perturb_scale=0.1 (default): Balanced exploration (10 steps)
   #   - perturb_scale=0.05: Fine-grained exploration (20 steps)
   #   - perturb_scale=0.2: Coarse exploration (5 steps)
-  perturb_mode: "adaptive_scalar"
-  perturb_scale: 0.1
+  perturb_mode: "fixed"
+  perturb_scale: 1
   
   # Seed selection
   seed_selection_strategy: "energy"  # or "random"
