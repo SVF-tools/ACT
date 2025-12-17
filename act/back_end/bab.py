@@ -31,7 +31,6 @@ from act.back_end.verifier import (
     VerifResult,
     find_entry_layer_id,
     gather_input_spec_layers,
-    check_violation_at_point,
     get_assert_layer,
     seed_from_input_specs,
     setup_and_solve,

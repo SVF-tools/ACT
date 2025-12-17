@@ -139,16 +139,8 @@
 #
 #===---------------------------------------------------------------------===#
 
-from curses import meta
 import os
 import copy
-
-# Mitigate OpenMP aborts seen on macOS when torch initializes multiple
-# runtimes (Abort trap in libomp during import). Set conservative defaults
-# before importing torch.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-
 import torch
 import logging
 from pathlib import Path

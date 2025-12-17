@@ -112,8 +112,6 @@ class GurobiSolver(Solver):
         self.m.update()
         self.m.optimize()
 
-        if self.m.Status in [3, 4, 5, 12]:  # infeasible, inf_or_unbd, unbounded, numeric
-            self.m.write("debug_model.lp")
         # If still INF_OR_UNBD, disable DualReductions and rerun once
         if self.m.Status == GRB.INF_OR_UNBD:
             # Handle only on the first encounter

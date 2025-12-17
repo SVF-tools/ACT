@@ -460,16 +460,8 @@ class ACTToTorch:
                 raise ValueError("EMBEDDING requires 'num_embeddings' in meta")
             if embedding_dim is None:
                 raise ValueError("EMBEDDING requires 'embedding_dim' in meta")
-
-            layer = nn.Embedding(num_embeddings, embedding_dim)
-
-            if act_layer is not None:
-                with torch.no_grad():
-                    p = act_layer.params
-                    if "weight" in p:
-                        layer.weight.copy_(p["weight"])
-            return layer
-
+            
+            return nn.Embedding(num_embeddings, embedding_dim)
         
         elif kind == "RNN":
             input_size = meta.get("input_size")
