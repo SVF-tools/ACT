@@ -320,8 +320,6 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B_out)
     return Fact(B_out, C)
 
-
-
 def _conv2d_to_linear_matrix(
     weight: torch.Tensor,
     input_shape: Tuple[int, ...],

@@ -218,17 +218,17 @@ class TorchLPSolver(Solver):
 
             # SOLUTION: Force gradient computation context
             with torch.enable_grad():
-                # Small regularizer to keep x bounded / well-conditioned
-                obj = 0.001 * torch.sum(self._x ** 2)
+                # Create objective function components
+                obj = 0.001 * torch.sum(self._x**2)  # Small regularizer
+                
+                # Add linear objective
+                if vids and len(coeffs) > 0:
+                    for vid, coeff in zip(vids, coeffs):
+                        obj = obj + float(coeff) * self._x[vid]
 
-                # Linear objective: c^T x
-                if vids_t is not None and coeffs_t is not None:
-                    obj = obj + torch.dot(self._x[vids_t], coeffs_t)
-
-                # Constant term
-                obj = obj + const_term
-
-                # Sense: max -> minimize -obj
+                # Add constant term
+                obj = obj + float(c0)
+                
                 if sense == "max":
                     obj = -obj
 
@@ -258,8 +258,6 @@ class TorchLPSolver(Solver):
                     self._x.requires_grad_(True)
 
             # === 5) Constraint violation check (vectorized) ===
-            # Reuse forward violations most steps; occasionally recompute on the
-            # clamped x to keep the check honest without doubling work.
             recompute = (it % self._feas_check_stride == 0)
             with torch.no_grad():
                 if recompute:

@@ -268,7 +268,6 @@ class ACTToTorch:
             padding = meta.get("padding", 0)
             dilation = meta.get("dilation", 1)
             groups = meta.get("groups", 1)
-            bias_enabled = meta.get("bias_enabled", True)  # flag provided via meta
 
             if in_channels is None:
                 raise ValueError("CONV2D layer requires 'in_channels' in meta")
@@ -282,10 +281,10 @@ class ACTToTorch:
                 stride=stride,
                 padding=padding,
                 dilation=dilation,
-                groups=groups,
-                bias=bias_enabled  # use the flag from meta
+                groups=groups
             )
 
+            # Transfer weights and bias from ACT layer
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
             

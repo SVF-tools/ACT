@@ -107,25 +107,12 @@ def export_to_solver(globalC: ConSet, solver: Solver,
 
         elif tag.startswith("relu:"):
             meta=con.meta; n=len(con.var_ids)//2; z=list(con.var_ids[:n]); y=list(con.var_ids[n:])
-
-            idx_on  = to_numpy(meta["idx_on"]).astype(int)
-            idx_off = to_numpy(meta["idx_off"]).astype(int)
-            idx_amb = to_numpy(meta["idx_amb"]).astype(int)
-
-            slope = to_numpy(meta["slope"])
-            shift = to_numpy(meta["shift"])
-
-            # 1) Stable ON: y_lb >= 0 → z_i = y_i
-            for i in idx_on: solver.add_lin_eq([z[i], y[i]], [1.0, -1.0], 0.0)
-            # 2) Stable OFF: y_ub <= 0 → z_i = 0 (y unconstrained)
-            for i in idx_off: solver.add_lin_eq([z[i]], [1.0], 0.0)
-            # 3) Ambiguous: triangular relaxation
-            for k, i in enumerate(idx_amb):
-                # (a) z >= 0   ->  -z <= 0
+            for i in to_numpy(meta["idx_on"]).astype(int):  solver.add_lin_eq([z[i],y[i]],[1.0,-1.0],0.0)
+            for i in to_numpy(meta["idx_off"]).astype(int): solver.add_lin_eq([z[i]],[1.0],0.0)
+            slope=to_numpy(meta["slope"]); shift=to_numpy(meta["shift"])
+            for k, i in enumerate(to_numpy(meta["idx_amb"]).astype(int)):
                 solver.add_lin_le([z[i]], [-1.0], 0.0)
-                # (b) z >= y   ->  y - z <= 0
-                solver.add_lin_le([y[i], z[i]],[1.0, -1.0], 0.0)
-                # (c) z <= slope * y + shift -> z - slope*y <= shift
+                solver.add_lin_le([y[i], z[i]], [1.0, -1.0], 0.0)
                 solver.add_lin_le([z[i], y[i]], [1.0, -float(slope[k])], float(shift[k]))
 
         elif tag.startswith("lrelu:"):

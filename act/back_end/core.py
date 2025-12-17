@@ -158,7 +158,7 @@ class ConSet:
         self.S[c.signature()] = c
     
     def add_box(self, layer_id: int, var_ids: List[int], B: Bounds):
-        self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "layer_id": int(layer_id), "lb": B.lb.clone(), "ub": B.ub.clone()}))
+        self.replace(Con("INEQ", tuple(var_ids), {"tag": f"box:{layer_id}", "lb": B.lb.clone(), "ub": B.ub.clone()}))
     
     def __iter__(self):
         """Iterate over constraints (Con objects). Makes ConSet iterable."""
