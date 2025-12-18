@@ -167,7 +167,7 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
     """Add the negation of ASSERT property as constraints to solver."""
     from act.back_end.cons_exportor import to_numpy
     k = assert_layer.meta.get("kind")
-
+    
     if k == OutKind.LINEAR_LE:
         # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
         coeffs = list(to_numpy(assert_layer.params["c"]))
