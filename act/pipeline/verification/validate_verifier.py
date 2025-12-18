@@ -187,7 +187,7 @@ class VerificationValidator:
                 f.write(f"Device: {device}, Dtype: {dtype}\n")
                 f.write(f"{'='*80}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
-    
+            
     def find_concrete_counterexample(
         self,
         name: str,
@@ -196,228 +196,90 @@ class VerificationValidator:
     ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
         """
         Try to find a concrete counterexample via concrete execution.
-
-        Strategy (single pass, streaming; no candidate list):
-          1) If ACT INPUT_SPEC is available: sample points guided by [lb, ub]
-             - center
-             - small grid when dim <= 4  (3^d points)
-             - per-dimension boundary when dim <= 16 (2*dim points)
-             - random in [lb, ub] (max_random points)
-          2) Always try legacy factory inputs:
-             - center, boundary
-             - random (max_random points)
-
-        Returns:
-            (input_tensor, results_dict) if found, else None.
+        Returns (input_tensor, results_dict) if found, else None.
         """
         if max_random < 0:
             raise ValueError(f"max_random must be >= 0, got {max_random}")
-
-        # Concrete execution should not be affected by dropout/bn updates.
         was_training = bool(getattr(model, "training", False))
         model.eval()
 
         try:
             act_net = self.factory.get_act_net(name)
-
             input_shape = None
+            shape_prod = None
             if act_net is not None:
                 for layer in getattr(act_net, "layers", []):
                     if getattr(layer, "kind", None) == "INPUT":
                         shp = (layer.meta or {}).get("shape", None)
-                        # Accept only strictly-positive integer shapes
-                        if (
-                            isinstance(shp, (list, tuple))
-                            and len(shp) > 0
-                            and all(isinstance(x, int) and x > 0 for x in shp)
-                        ):
+                        if (isinstance(shp, (list, tuple)) and shp and all(isinstance(x, int) and x > 0 for x in shp)):
                             input_shape = tuple(shp)
+                            shape_prod = int(torch.tensor(input_shape).prod().item())
                         break
 
-            # Precompute product for safe reshape decision
-            shape_prod = None
-            if input_shape is not None:
-                p = 1
-                for d in input_shape:
-                    p *= d
-                shape_prod = p
-
-            def _is_ce(results: Any) -> bool:
-                if not isinstance(results, dict):
-                    return False
-                in_sat = bool(results.get("input_satisfied", False))
-                out_sat = bool(results.get("output_satisfied", True))
-                return in_sat and (not out_sat)
-
-            spec_lb = None
-            spec_ub = None
-
+            spec_lb = spec_ub = None
             if act_net is not None:
                 specs = gather_input_spec_layers(act_net)
                 if specs:
                     seed = seed_from_input_specs(specs)
                     lb = seed.lb.to(device=self.device, dtype=self.dtype).flatten()
                     ub = seed.ub.to(device=self.device, dtype=self.dtype).flatten()
+                    if lb.shape == ub.shape and lb.numel() > 0 and (not torch.any(lb > ub)):
+                        spec_lb, spec_ub = lb, ub
 
-                    if lb.shape != ub.shape:
-                        raise RuntimeError(
-                            f"INPUT_SPEC seed shape mismatch: lb{tuple(lb.shape)} vs ub{tuple(ub.shape)}"
-                        )
-                    if lb.numel() == 0:
-                        raise RuntimeError("INPUT_SPEC seed is empty (0-dim).")
-                    if torch.any(lb > ub):
-                        raise RuntimeError("INPUT_SPEC has lb > ub for some dimensions (invalid bounds).")
+            if spec_lb is None or spec_ub is None:
+                return None
 
-                    spec_lb, spec_ub = lb, ub
+            delta = spec_ub - spec_lb
+            dim = int(spec_lb.numel())
 
-            if spec_lb is not None and spec_ub is not None:
-                dim = int(spec_lb.numel())
-                delta = (spec_ub - spec_lb)
+            # center
+            x_flat = spec_lb + 0.5 * delta
+            x = x_flat.reshape(*input_shape) if (input_shape and shape_prod == x_flat.numel()) else x_flat.reshape(1, -1)
+            x = x.to(device=self.device, dtype=self.dtype)
+            with torch.no_grad():
+                res = model(x)
+            if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                logger.info("  🔴 Counterexample found (spec_center)")
+                logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                logger.info("     Output explanation: %s", res.get("output_explanation"))
+                return x, res
 
-                # (a) center
-                x_flat = spec_lb + 0.5 * delta
-                if input_shape is not None and shape_prod == x_flat.numel():
-                    x = x_flat.reshape(*input_shape)
-                else:
-                    x = x_flat.reshape(1, -1)
-                x = x.to(device=self.device, dtype=self.dtype)
-
-                with torch.no_grad():
-                    results = model(x)
-                if _is_ce(results):
-                    logger.info("  🔴 Counterexample found (spec_center)")
-                    if isinstance(results, dict):
-                        if "input_explanation" in results:
-                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                        if "output_explanation" in results:
-                            logger.info("     Output explanation: %s", results.get("output_explanation"))
-                    return x, results
-
-                # (b) low-dim grid (3^d), only for dim<=4
-                if dim <= 4:
-                    import itertools
-
-                    grid_levels = torch.tensor([0.0, 0.5, 1.0], device=self.device, dtype=self.dtype)
-                    for coeffs in itertools.product(range(3), repeat=dim):
-                        alphas = grid_levels[list(coeffs)]
-                        x_flat = spec_lb + alphas * delta
-
-                        if input_shape is not None and shape_prod == x_flat.numel():
-                            x = x_flat.reshape(*input_shape)
-                        else:
-                            x = x_flat.reshape(1, -1)
+            # per-dimension edges (dim<=16)
+            if dim <= 16:
+                base = spec_lb + 0.5 * delta
+                for i in range(dim):
+                    for val, tag in ((spec_lb[i], "lb"), (spec_ub[i], "ub")):
+                        x_edge = base.clone()
+                        x_edge[i] = val
+                        x = x_edge.reshape(*input_shape) if (input_shape and shape_prod == x_edge.numel()) else x_edge.reshape(1, -1)
                         x = x.to(device=self.device, dtype=self.dtype)
-
                         with torch.no_grad():
-                            results = model(x)
-                        if _is_ce(results):
-                            logger.info("  🔴 Counterexample found (spec_grid_%s)", str(coeffs))
-                            if isinstance(results, dict):
-                                if "input_explanation" in results:
-                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                                if "output_explanation" in results:
-                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
-                            return x, results
+                            res = model(x)
+                        if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                            logger.info("  🔴 Counterexample found (spec_per_dim_%s_%d)", tag, i)
+                            logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                            logger.info("     Output explanation: %s", res.get("output_explanation"))
+                            return x, res
 
-                # (c) per-dimension boundary, only for dim<=16
-                if dim <= 16:
-                    base = spec_lb + 0.5 * delta
-                    for i in range(dim):
-                        # lb direction
-                        x_flat = base.clone()
-                        x_flat[i] = spec_lb[i]
-                        if input_shape is not None and shape_prod == x_flat.numel():
-                            x = x_flat.reshape(*input_shape)
-                        else:
-                            x = x_flat.reshape(1, -1)
-                        x = x.to(device=self.device, dtype=self.dtype)
-
-                        with torch.no_grad():
-                            results = model(x)
-                        if _is_ce(results):
-                            logger.info("  🔴 Counterexample found (spec_per_dim_lb_%d)", i)
-                            if isinstance(results, dict):
-                                if "input_explanation" in results:
-                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                                if "output_explanation" in results:
-                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
-                            return x, results
-
-                        # ub direction
-                        x_flat = base.clone()
-                        x_flat[i] = spec_ub[i]
-                        if input_shape is not None and shape_prod == x_flat.numel():
-                            x = x_flat.reshape(*input_shape)
-                        else:
-                            x = x_flat.reshape(1, -1)
-                        x = x.to(device=self.device, dtype=self.dtype)
-
-                        with torch.no_grad():
-                            results = model(x)
-                        if _is_ce(results):
-                            logger.info("  🔴 Counterexample found (spec_per_dim_ub_%d)", i)
-                            if isinstance(results, dict):
-                                if "input_explanation" in results:
-                                    logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                                if "output_explanation" in results:
-                                    logger.info("     Output explanation: %s", results.get("output_explanation"))
-                            return x, results
-
-                # (d) random points in [lb, ub]
-                for k in range(max_random):
-                    r = torch.rand_like(spec_lb)
-                    x_flat = spec_lb + r * delta
-
-                    if input_shape is not None and shape_prod == x_flat.numel():
-                        x = x_flat.reshape(*input_shape)
-                    else:
-                        x = x_flat.reshape(1, -1)
-                    x = x.to(device=self.device, dtype=self.dtype)
-
-                    with torch.no_grad():
-                        results = model(x)
-                    if _is_ce(results):
-                        logger.info("  🔴 Counterexample found (spec_random_%d)", k)
-                        if isinstance(results, dict):
-                            if "input_explanation" in results:
-                                logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                            if "output_explanation" in results:
-                                logger.info("     Output explanation: %s", results.get("output_explanation"))
-                        return x, results
-
-            for case in ("center", "boundary"):
-                x = self.factory.generate_test_input(name, case).to(device=self.device, dtype=self.dtype)
-                with torch.no_grad():
-                    results = model(x)
-                if _is_ce(results):
-                    logger.info("  🔴 Counterexample found (legacy_%s)", case)
-                    if isinstance(results, dict):
-                        if "input_explanation" in results:
-                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                        if "output_explanation" in results:
-                            logger.info("     Output explanation: %s", results.get("output_explanation"))
-                    return x, results
-
+            # random in [lb, ub]
             for k in range(max_random):
-                x = self.factory.generate_test_input(name, "random").to(device=self.device, dtype=self.dtype)
+                r = torch.rand_like(spec_lb)
+                x_flat = spec_lb + r * delta
+                x = x_flat.reshape(*input_shape) if (input_shape and shape_prod == x_flat.numel()) else x_flat.reshape(1, -1)
+                x = x.to(device=self.device, dtype=self.dtype)
                 with torch.no_grad():
-                    results = model(x)
-                if _is_ce(results):
-                    logger.info("  🔴 Counterexample found (legacy_random_%d)", k)
-                    if isinstance(results, dict):
-                        if "input_explanation" in results:
-                            logger.info("     Input explanation:  %s", results.get("input_explanation"))
-                        if "output_explanation" in results:
-                            logger.info("     Output explanation: %s", results.get("output_explanation"))
-                    return x, results
-
+                    res = model(x)
+                if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                    logger.info("  🔴 Counterexample found (spec_random_%d)", k)
+                    logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                    logger.info("     Output explanation: %s", res.get("output_explanation"))
+                    return x, res
+                
             return None
 
         finally:
-            # Restore training mode if caller expects it
             if was_training:
                 model.train()
-    
     
     def validate_counterexamples(
         self, 
@@ -1151,4 +1013,3 @@ def main():
 if __name__ == "__main__":
     import sys
     sys.exit(main())
-
