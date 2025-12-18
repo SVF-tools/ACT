@@ -167,7 +167,7 @@ def add_negated_assert_to_solver(
     solver: Solver,
     out_ids: List[int],
     assert_layer,
-    out_bounds: Optional[Bounds] = None,
+    # out_bounds: Optional[Bounds] = None,
 ):
     """
     Add the *negation* of the ASSERT property as constraints to the solver.
@@ -246,16 +246,6 @@ def add_negated_assert_to_solver(
         #    y_i - ub_i ≤ y_ub_i - ub_i
         v_max_terms = []
 
-        if out_bounds is not None:
-            y_lb = to_numpy(out_bounds.lb).reshape(-1)
-            y_ub = to_numpy(out_bounds.ub).reshape(-1)
-
-            if lb is not None:
-                # Maximum possible lb_i - y_i
-                v_max_terms.append(np.max(lb - y_lb))
-            if ub is not None:
-                # Maximum possible y_i - ub_i
-                v_max_terms.append(np.max(y_ub - ub))
         # If bounds are unavailable, use a conservative constant
         v_max = max(v_max_terms) if v_max_terms else 1e6
         if (not np.isfinite(v_max)) or v_max < 1e-3:
