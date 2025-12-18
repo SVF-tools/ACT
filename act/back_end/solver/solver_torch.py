@@ -129,148 +129,111 @@ class TorchLPSolver(Solver):
 
     def optimize(self, timelimit: Optional[float] = None) -> None:
         self._timelimit = timelimit
+        t_end = None if timelimit is None else (time.time() + float(timelimit))
 
-        start_time = time.time()
-        t_end = None if timelimit is None else (start_time + float(timelimit))
-
-        # Auto-relax for very large problems used as heuristic CE searchers.
         eff_max_iter = self.max_iter
         eff_tol_feas = self.tol_feas
         if self._n > self._large_n_threshold:
             eff_max_iter = min(eff_max_iter, self._large_n_max_iter)
             eff_tol_feas = max(eff_tol_feas, self._large_n_tol)
 
-        # === 1) Initialize variables to box midpoints (or 0) ===
         if self._x is None:
-            lb = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
-            ub = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
-            mid = 0.5 * (lb + ub)
+            lb0 = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
+            ub0 = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
+            mid = 0.5 * (lb0 + ub0)
             both_inf = (~torch.isfinite(self._lb)) & (~torch.isfinite(self._ub))
             mid = torch.where(both_inf, torch.zeros_like(mid), mid)
-            self._x = torch.nn.Parameter(mid.clone().to(device=self._device, dtype=self._dtype), requires_grad=True)
+            self._x = torch.nn.Parameter(mid.to(device=self._device, dtype=self._dtype), requires_grad=True)
+        else:
+            self._x = torch.nn.Parameter(self._x.detach().to(device=self._device, dtype=self._dtype), requires_grad=True)
 
-        # CRITICAL: Re-enable gradients after any potential parameter manipulation
-        self._x.requires_grad_(True)
-
-        opt = torch.optim.Adam([self._x], lr=self.lr, betas=(self.beta1, self.beta2), weight_decay=self.weight_decay)
-
-        # === 3) Vectorized objective construction ===
         vids, coeffs, c0, sense = self._objective
+        is_max = (sense == "max")
         if vids:
-            vids_t = torch.as_tensor(vids, device=self._x.device, dtype=torch.long)
-            coeffs_t = torch.as_tensor(coeffs, device=self._x.device, dtype=self._x.dtype)
+            vids_t = torch.as_tensor(vids, device=self._device, dtype=torch.long)
+            coeffs_t = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
         else:
             vids_t = None
             coeffs_t = None
         const_term = float(c0)
 
-        self._status = SolveStatus.UNKNOWN
-        self._has_solution = False
-        lb_device = self._lb.to(device=self._x.device, dtype=self._x.dtype)
-        ub_device = self._ub.to(device=self._x.device, dtype=self._x.dtype)
+        lb = self._lb.to(device=self._device, dtype=self._dtype)
+        ub = self._ub.to(device=self._device, dtype=self._dtype)
 
-        def rows_to_sparse(rows):
+        def build_sparse(rows):
             if not rows:
-                return None, torch.zeros((0,), device=self._x.device, dtype=self._x.dtype)
+                zero = torch.zeros((0,), device=self._device, dtype=self._dtype)
+                return None, zero
             m = len(rows)
-            b = torch.empty((m,), device=self._x.device, dtype=self._x.dtype)
-            row_idx: List[int] = []
-            col_idx: List[int] = []
+            b = torch.empty((m,), device=self._device, dtype=self._dtype)
+            ri: List[int] = []
+            ci: List[int] = []
             vals: List[float] = []
             for r, (vids_row, coeffs_row, rhs) in enumerate(rows):
                 b[r] = float(rhs)
-                if len(vids_row) == 0:
-                    continue
-                row_idx.extend([r] * len(vids_row))
-                col_idx.extend(vids_row)
+                ri.extend([r] * len(vids_row))
+                ci.extend(vids_row)
                 vals.extend(coeffs_row)
-            if len(vals) == 0:
-                indices = torch.zeros((2, 0), device=self._x.device, dtype=torch.long)
-                values = torch.zeros((0,), device=self._x.device, dtype=self._x.dtype)
+            if not vals:
+                idx = torch.zeros((2, 0), device=self._device, dtype=torch.long)
+                val_t = torch.zeros((0,), device=self._device, dtype=self._dtype)
             else:
-                indices = torch.tensor([row_idx, col_idx], device=self._x.device, dtype=torch.long)
-                values = torch.as_tensor(vals, device=self._x.device, dtype=self._x.dtype)
-            A = torch.sparse_coo_tensor(indices, values, (m, self._n), device=self._x.device, dtype=self._x.dtype)
+                idx = torch.tensor([ri, ci], device=self._device, dtype=torch.long)
+                val_t = torch.as_tensor(vals, device=self._device, dtype=self._dtype)
+            A = torch.sparse_coo_tensor(idx, val_t, (m, self._n), device=self._device, dtype=self._dtype)
             return A.coalesce(), b
 
-        def sparse_mv(A: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
-            if A is None:
-                return None
-            # torch.sparse.mm expects 2D
-            return torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
+        Aeq, beq = build_sparse(self._eq)
+        Ale, ble = build_sparse(self._le)
 
-        Aeq, beq = rows_to_sparse(self._eq)
-        Ale, ble = rows_to_sparse(self._le)
-
+        opt = torch.optim.Adam([self._x], lr=self.lr, betas=(self.beta1, self.beta2), weight_decay=self.weight_decay)
+        self._status = SolveStatus.UNKNOWN
+        self._has_solution = False
         best_max_viol = math.inf
         stagnation_steps = 0
+        viol_eq = None
+        viol_le = None
 
-        # === 4) Main loop: Adam + penalties + box projection ===
         for it in range(eff_max_iter):
             if t_end is not None and time.time() >= t_end:
-                self._status = SolveStatus.SAT
-                self._has_solution = True
-                self._sol = self._x.detach().clone()
                 break
 
-            opt.zero_grad()
-
-            # SOLUTION: Force gradient computation context
+            opt.zero_grad(set_to_none=True)
             with torch.enable_grad():
-                # Create objective function components
-                obj = 0.001 * torch.sum(self._x**2)  # Small regularizer
-                
-                # Add linear objective
-                if vids and len(coeffs) > 0:
-                    for vid, coeff in zip(vids, coeffs):
-                        obj = obj + float(coeff) * self._x[vid]
-                
-                # Add constant term
-                obj = obj + float(c0)
-                
-                if sense == "max":
+                obj = 0.001 * (self._x * self._x).sum() + const_term
+                if vids_t is not None and coeffs_t is not None and vids_t.numel() > 0:
+                    obj = obj + torch.dot(coeffs_t, self._x.index_select(0, vids_t))
+                if is_max:
                     obj = -obj
 
-                # Equality penalties: rho_eq * ||Aeq x - beq||^2
-                viol_eq = sparse_mv(Aeq, self._x)
+                viol_eq = None if Aeq is None else torch.sparse.mm(Aeq, self._x.unsqueeze(1)).squeeze(1) - beq
                 if viol_eq is not None:
-                    viol_eq = viol_eq - beq
-                    obj = obj + self.rho_eq * torch.sum(viol_eq ** 2)
+                    obj = obj + self.rho_eq * (viol_eq * viol_eq).sum()
 
-                # Inequality penalties: rho_ineq * ||relu(Ale x - ble)||^2
-                viol_le = sparse_mv(Ale, self._x)
+                viol_le = None if Ale is None else torch.sparse.mm(Ale, self._x.unsqueeze(1)).squeeze(1) - ble
                 if viol_le is not None:
-                    viol_le = viol_le - ble
-                    obj = obj + self.rho_ineq * torch.sum(torch.relu(viol_le) ** 2)
+                    obj = obj + self.rho_ineq * (torch.relu(viol_le) ** 2).sum()
 
-                # Backward
                 obj.backward()
-            
             opt.step()
 
-            # Project to box constraints while preserving Parameter status
             with torch.no_grad():
-                x_clamped = torch.minimum(torch.maximum(self._x, lb_device), ub_device)
-                # Use .data.copy_ to preserve Parameter wrapper
-                self._x.data.copy_(x_clamped)  # Use .data.copy_ to preserve Parameter wrapper
-                if not self._x.requires_grad:
-                    self._x.requires_grad_(True)
+                self._x.data.clamp_(lb, ub)
 
-            # === 5) Constraint violation check (vectorized) ===
             recompute = (it % self._feas_check_stride == 0)
             with torch.no_grad():
                 if recompute:
-                    viol_eq_chk = sparse_mv(Aeq, self._x)
-                    viol_le_chk = sparse_mv(Ale, self._x)
+                    v_eq = None if Aeq is None else torch.sparse.mm(Aeq, self._x.unsqueeze(1)).squeeze(1) - beq
+                    v_le = None if Ale is None else torch.sparse.mm(Ale, self._x.unsqueeze(1)).squeeze(1) - ble
                 else:
-                    viol_eq_chk = viol_eq
-                    viol_le_chk = viol_le
+                    v_eq = viol_eq
+                    v_le = viol_le
 
                 max_viol = 0.0
-                if viol_eq_chk is not None:
-                    max_viol = max(max_viol, float(torch.abs(viol_eq_chk.detach()).max().item()))
-                if viol_le_chk is not None:
-                    max_viol = max(max_viol, float(torch.relu(viol_le_chk.detach()).max().item()))
+                if v_eq is not None and v_eq.numel() > 0:
+                    max_viol = max(max_viol, float(v_eq.abs().max().item()))
+                if v_le is not None and v_le.numel() > 0:
+                    max_viol = max(max_viol, float(torch.relu(v_le).max().item()))
 
             if max_viol < best_max_viol - self._stagnation_tol:
                 best_max_viol = max_viol
@@ -278,31 +241,12 @@ class TorchLPSolver(Solver):
             else:
                 stagnation_steps += 1
 
-            # Feasibility reached
-            if max_viol <= eff_tol_feas:
-                self._status = SolveStatus.SAT
-                self._has_solution = True
-                self._sol = self._x.detach().clone()
+            if max_viol <= eff_tol_feas or stagnation_steps >= self._stagnation_patience:
                 break
 
-            if stagnation_steps >= self._stagnation_patience:
-                # Stop early when we are not reducing violation meaningfully
-                self._status = SolveStatus.SAT
-                self._has_solution = True
-                self._sol = self._x.detach().clone()
-                break
-
-            # Time limit reached
-            if t_end is not None and time.time() >= t_end:
-                # For counterexample search, any feasible/near-feasible point suffices
-                self._status = SolveStatus.SAT if math.isfinite(max_viol) else SolveStatus.UNKNOWN
-                self._has_solution = True
-                self._sol = self._x.detach().clone()
-                break
-        else:
-            self._status = SolveStatus.SAT
-            self._has_solution = True
-            self._sol = self._x.detach().clone()
+        self._status = SolveStatus.SAT
+        self._has_solution = True
+        self._sol = self._x.detach().clone()
 
     def status(self) -> str:
         return self._status
