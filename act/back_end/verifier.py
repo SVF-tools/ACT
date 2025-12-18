@@ -163,30 +163,10 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
         else:
             raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
 
-def add_negated_assert_to_solver(
-    solver: Solver,
-    out_ids: List[int],
-    assert_layer,
-    # out_bounds: Optional[Bounds] = None,
-):
-    """
-    Add the *negation* of the ASSERT property as constraints to the solver.
-
-    Current version encodes feasibility only (SAT/UNSAT); no scalar violation
-    objective is introduced:
-      - LINEAR_LE:      c·y ≤ d        →  ¬prop: c·y ≥ d + ε
-      - TOP1_ROBUST:    y[t] > y[j]    →  ¬prop: ∃j: y[j] - y[t] ≥ 0
-      - MARGIN_ROBUST:  y[t] - y[j] > margin
-                         →  ¬prop: ∃j: y[j] - y[t] + margin ≥ 0
-      - RANGE:          lb ≤ y ≤ ub    →  ¬prop: ∃i: y[i] < lb[i] or y[i] > ub[i]
-
-    For properties with an existential quantifier, use binary selector
-    variables with big-M to encode the OR.
-    Return value remains None for legacy compatibility and is unused.
-    """
+def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer) -> None:
+    """Add the negation of ASSERT property as constraints to solver."""
     from act.back_end.cons_exportor import to_numpy
     k = assert_layer.meta.get("kind")
-    objective = None 
 
     if k == OutKind.LINEAR_LE:
         # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
@@ -217,14 +197,12 @@ def add_negated_assert_to_solver(
         
     elif k == OutKind.RANGE:
         from act.back_end.cons_exportor import to_numpy
-
         lb_t = assert_layer.params.get("lb", None)
         ub_t = assert_layer.params.get("ub", None)
         if lb_t is None and ub_t is None:
             raise ValueError("RANGE assert requires lb and/or ub.")
 
-        lb = None
-        ub = None
+        lb = None; ub = None
         if lb_t is not None:
             lb = to_numpy(lb_t).reshape(-1)
         if ub_t is not None:
@@ -236,44 +214,20 @@ def add_negated_assert_to_solver(
         if ub is not None and ub.shape[0] != n_out:
             raise ValueError(f"RANGE: ub length {ub.shape[0]} != len(out_ids)={n_out}")
 
-        # 1) Add violation variable v
         v = solver.n
         solver.add_vars(1)
-
-        # 2) Estimate an upper bound v_max from output abstract bounds to avoid unboundedness
-        #    y_i ∈ [y_lb_i, y_ub_i]
-        #    lb_i - y_i ≤ lb_i - y_lb_i
-        #    y_i - ub_i ≤ y_ub_i - ub_i
         v_max_terms = []
 
-        # If bounds are unavailable, use a conservative constant
         v_max = max(v_max_terms) if v_max_terms else 1e6
         if (not np.isfinite(v_max)) or v_max < 1e-3:
             v_max = 1e6
 
-        # 3) Constraints: 0 <= v <= v_max
         solver.add_lin_ge([v], [1.0], 0.0)        # v >= 0
         solver.add_lin_ge([v], [-1.0], -v_max)    # v <= v_max
 
-        # 4) For each dimension i add v >= lb_i - y_i and/or v >= y_i - ub_i
         for i, yi in enumerate(out_ids):
-            if lb is not None:
-                # v >= lb_i - y_i   <=>  v + y_i >= lb_i
-                solver.add_lin_ge(
-                    [v, yi],
-                    [1.0, 1.0],
-                    float(lb[i]),
-                )
-            if ub is not None:
-                # v >= y_i - ub_i   <=>  v - y_i >= -ub_i
-                solver.add_lin_ge(
-                    [v, yi],
-                    [1.0, -1.0],
-                    float(-ub[i]),
-                )
-
-        # Maximize v
-        objective = {"var": v, "sense": "max"}
+            if lb is not None: solver.add_lin_ge([v, yi], [1.0, 1.0], float(lb[i]))
+            if ub is not None: solver.add_lin_ge([v, yi], [1.0, -1.0], float(-ub[i]))
 
 # -----------------------------------------------------------------------------
 # Core solver workflow (shared by verify_once and BaB)

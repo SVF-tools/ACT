@@ -368,7 +368,7 @@ class VerificationValidator:
             verify_result = verify_once(act_net, solver=solver_instance)
             verifier_status = verify_result.status
             logger.info(f"     Verifier result: {verifier_status}")
-
+            
             # If verifier found counterexample, validate it with model
             if verify_result.counterexample is not None:
                 logger.info(f"     Verifier counterexample shape: {verify_result.counterexample.shape}")
@@ -392,7 +392,7 @@ class VerificationValidator:
                 if isinstance(ce_results, dict):
                     logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
                               f"output_sat={ce_results['output_satisfied']}")
-
+            
         except Exception as e:
             logger.error(f"     Verifier failed: {e}")
             import traceback
