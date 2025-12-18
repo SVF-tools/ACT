@@ -20,6 +20,8 @@ from act.back_end.solver.solver_base import Solver
 from act.util.device_manager import get_default_device, get_default_dtype
 
 TANH_EPS = 1e-9
+TANH_IDENTITY_WINDOW = 0.25  # treat tanh(x) ≈ x within this window
+TANH_IDENTITY_TOL = 1e-6    # symmetric tolerance when approximating identity
 
 def _tanh_value(x: float) -> float:
     return float(np.tanh(x))
@@ -62,6 +64,14 @@ def _add_tanh_small_band(solver: Solver, yi: int, zi: int, lo: float, hi: float)
 def _add_tanh_constraints_for_var(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
     if not np.isfinite(lo) or not np.isfinite(hi):
         return
+
+    max_abs = max(abs(lo), abs(hi))
+    if max_abs <= TANH_IDENTITY_WINDOW:
+        delta = max(abs(_tanh_value(lo) - lo), abs(_tanh_value(hi) - hi), TANH_IDENTITY_TOL)
+        solver.add_lin_le([zi, yi], [1.0, -1.0], float(delta))
+        solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
+        return
+
     if hi - lo <= TANH_EPS:
         val = _tanh_value(0.5 * (hi + lo))
         solver.add_lin_ge([zi], [1.0], float(val))

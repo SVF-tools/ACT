@@ -1,0 +1,361 @@
+{
+  "format_version": "1.0",
+  "act_net": {
+    "layers": [
+      {
+        "id": 0,
+        "kind": "INPUT",
+        "params": {},
+        "meta": {
+          "shape": [
+            1,
+            12
+          ],
+          "dtype": "torch.float64",
+          "desc": "extra_ce_04_linearle: CE: LINEAR_LE with c=0, d=-0.05 (always violated); mlp 12->20->2 with Tanh; LinfBall input"
+        },
+        "in_vars": [],
+        "out_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "cache": {}
+      },
+      {
+        "id": 1,
+        "kind": "INPUT_SPEC",
+        "params": {
+          "center": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEsIDEyKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqamZmZmZnJv5qZmZmZmcm/mpmZmZmZyb+amZmZmZnJv5qZmZmZmcm/mpmZmZmZyb+amZmZmZnJv5qZmZmZmcm/mpmZmZmZyb+amZmZmZnJv5qZmZmZmcm/mpmZmZmZyb8=",
+            "dtype": "torch.float64",
+            "shape": [
+              1,
+              12
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          },
+          "lb": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEsIDEyKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqQwvUoXI/Sv5DC9Shcj9K/kML1KFyP0r+QwvUoXI/Sv5DC9Shcj9K/kML1KFyP0r+QwvUoXI/Sv5DC9Shcj9K/kML1KFyP0r+QwvUoXI/Sv5DC9Shcj9K/kML1KFyP0r8=",
+            "dtype": "torch.float64",
+            "shape": [
+              1,
+              12
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          },
+          "ub": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDEsIDEyKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoqXI/C9Si8vypcj8L1KLy/KlyPwvUovL8qXI/C9Si8vypcj8L1KLy/KlyPwvUovL8qXI/C9Si8vypcj8L1KLy/KlyPwvUovL8qXI/C9Si8vypcj8L1KLy/KlyPwvUovL8=",
+            "dtype": "torch.float64",
+            "shape": [
+              1,
+              12
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "kind": "LINF_BALL",
+          "center_val": -0.2,
+          "eps": 0.09
+        },
+        "in_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "out_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "cache": {}
+      },
+      {
+        "id": 2,
+        "kind": "DENSE",
+        "params": {
+          "W": {
+            "data": "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",
+            "dtype": "torch.float64",
+            "shape": [
+              20,
+              12
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          },
+          "b": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDIwLCksIH0gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "dtype": "torch.float64",
+            "shape": [
+              20
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "in_features": 12,
+          "out_features": 20,
+          "bias_enabled": true
+        },
+        "in_vars": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "out_vars": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "cache": {}
+      },
+      {
+        "id": 3,
+        "kind": "TANH",
+        "params": {},
+        "meta": {},
+        "in_vars": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "out_vars": [
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51
+        ],
+        "cache": {}
+      },
+      {
+        "id": 4,
+        "kind": "DENSE",
+        "params": {
+          "W": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDIsIDIwKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoEaCG7TcqDv4CSD6BYmsM/vSnvMgC4qb9QQwBn7ym5v/mB8EoV2bO/oGqLD954tD96+YPmKLiwP8/chSxxQr0/KOLD36GapD9ngrHLkszNPx63QyeKZrI/gxBEUedWpb/ELRiSpiHHvxsgvBBj1bY/+hh4pQJxkL/yWgdj2iHAP7UIFuCdeLa/BhBpDzTWxD/bCUmxtTazP+/eaXZXK6K/wPoL3i4wyL9Z3MbbmOylP21TXzkASq4/ZuLTZOvgob9QihWVrkC6P1XypQGG6q+/4LPzR3B4nL/o/TB/CA22P2oWMApeY7C/s6D5yDyS1r9diCkR6E+Pv9s29v7CGpm/u5ZBuBimkD9/JSidxJ+9P08lLyYLD6+/C5Dp3w9Ztr9pp0a3OCSiPw25YNs+cME/GuUtdH4Mrz+UPwPSV6m3Pw==",
+            "dtype": "torch.float64",
+            "shape": [
+              2,
+              20
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          },
+          "b": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDIsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAA",
+            "dtype": "torch.float64",
+            "shape": [
+              2
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "in_features": 20,
+          "out_features": 2,
+          "bias_enabled": true
+        },
+        "in_vars": [
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51
+        ],
+        "out_vars": [
+          52,
+          53
+        ],
+        "cache": {}
+      },
+      {
+        "id": 5,
+        "kind": "ASSERT",
+        "params": {
+          "c": {
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDIsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAA==",
+            "dtype": "torch.float32",
+            "shape": [
+              2
+            ],
+            "device": "cuda:0",
+            "requires_grad": false
+          }
+        },
+        "meta": {
+          "kind": "LINEAR_LE",
+          "d": -0.05
+        },
+        "in_vars": [
+          52,
+          53
+        ],
+        "out_vars": [
+          52,
+          53
+        ],
+        "cache": {}
+      }
+    ],
+    "graph": {
+      "preds": {
+        "0": [],
+        "1": [
+          0
+        ],
+        "2": [
+          1
+        ],
+        "3": [
+          2
+        ],
+        "4": [
+          3
+        ],
+        "5": [
+          4
+        ]
+      },
+      "succs": {
+        "0": [
+          1
+        ],
+        "1": [
+          2
+        ],
+        "2": [
+          3
+        ],
+        "3": [
+          4
+        ],
+        "4": [
+          5
+        ],
+        "5": []
+      }
+    },
+    "metadata": {
+      "creation_time": "2025-12-18T18:21:29.869155",
+      "framework_version": "ACT-1.0",
+      "layer_count": 6,
+      "layer_kinds": [
+        "INPUT",
+        "INPUT_SPEC",
+        "DENSE",
+        "TANH",
+        "DENSE",
+        "ASSERT"
+      ],
+      "generated_by": "NetFactory"
+    }
+  }
+}

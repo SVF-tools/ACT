@@ -12,12 +12,7 @@
             8
           ],
           "dtype": "torch.float64",
-          "desc": "Control state",
-          "dataset_name": "control",
-          "value_range": [
-            -1.0,
-            1.0
-          ]
+          "desc": "extra_ce_01_linearle: CE: LINEAR_LE with c=0, d=-0.11 (always violated); mlp 8->16->4 with ReLU; BOX input"
         },
         "in_vars": [],
         "out_vars": [
@@ -89,7 +84,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDE2LCA4KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqfcqSm8yutPw47VJCpu5C/fvQkaAKFhj/MidqF1IrQP7IuNZovr6u/AWXkSMcRpT8CBytZj2Ktv5BNK2ya9L6/+k8esrzyxL8kJDiASZTLv5zFCGymx70/EFLv5Thrqr+IBn+NRfikv117DeW7d6o/JGN45rOjvb/meJISH7a2P6Y9yCEokMm/PHmBH91Vqb+QasXTscN6P3yl+VNk/fA+lWSLBO+8rj81UpYRHsqyv2QEYG2QRra/9bgYOp5Xlr+NIEq5omugPzdlyhywDJq/MA92BPvPuT8Ho7pA5bF2PyB0Mx8Ek68/4QcZYHOes79g1nvL32y1v0iVUYnMDKk/NuYvco06sT9ZqW6qfcSEv+e3vcoFfsG/Dx/dENWywD8WQKsWqE6hP82EBcqrKLM/TJOxYOgOwj8HWpembTW2v+S64q7jWMM/om//U7npiz8IVZhL6qi4v9ercWkNXro/SOI+oitMhr8TQ03gRFuZP/4edU4JScW/KKLBkF/5dj/yvZK6IfeuvzgpQVehJ8O/eVQyuAiTkL/aBe5IPA+6P7Jq5JZmJ3G/cMsEjjMZor+/IfLZo4+QPxGDCxpq3Ke/zHASECFKjj+Tk81hlNRxP1/XA+m/n5k/ehV1kyB6hz9hXkXuJA2Yv09pW3zGNsG/xODaCupTvb95DJpxCbK4P7+tvr+3D6w/U1YUIZCNkL/9a4dj2XvEP99llg23prC/OPBut6OeyT943Iz2VaB+vxrlUWXd8r8/ypEeK7CBZT8idmTX8gvLv32kU5o8mJU/hzAPn7aPoj9Q2J0/JKC4P0DxLWLnPMQ/2v94kv1Cv79xl4+2Zluov4r/t2/ecbq/7U1yyG5Fur/F69wUKL7HP9uoR2rIyJC//B8aqieYuz873te62nKovycOI3KS4aI/36d8T09duz+KhnzR4R+6P6yHSoflDLK/ljhwLNWAhz9FfOzY7TiOv6Qba32I/Jk/peewUat3r78n32MEZq6pP6w6ztLMmpI/CSYX/RMLuT/WtNvgAbTAvzeJiugBuMA/QvdqYCs5sD+tb1VvTV6NP3oixbHjMGe/xdqNlOjucz8mPmNa8AeoPzrCtejWlMO/7RN4oS57xb+0SqGGTrulP+d9jthjfMw/OIRCFDOwzD9su/SNXsDJP7EhhOZIx9G/g1yRxP77cT+Lb1faC3DCv3h8MCSrKYq/5QCtbKXtwr9RNj1RUHLAvyJIXyMmuMq/h9RT0+MJwb+V8WbXD/S+P/B4A+BevaS/pExrNKvKpL+YMsBRh/2mP3p3htZMBKC/tvkTluEksj/bsyIScYrEPySVzqXMB48/C7J4By7Jpj8I+THLRWmnP6qoNo7Cw5q/",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDE2LCA4KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArCbzhwJOO5PyiIYIxQxr2/L0daBlDlsD8+rQVYemF0v4rJPAVcEs0/UNEIOFxhwT8raFPNqBC0Pyyq+ajkAKS/dy7zDcN4pr93/GWIWZPAP+TL/bNTMcg/OReJMAHGwL/hBbptvevBPz4DcThsfbC/+4n3bksrk7/F4nvjC7Cdv2j7QVF/+MQ/JOiOTrbhrD8HD4RnPKe7P2RwA2tHRZw/nUcFwFzmsr8UOigpIHmtvziL8bISyYK/1F4jwH9swL+M/F/jK4KoPyQzq27WoZm/sNWNbvfWxr9N3vmWkuO/vwZCOP0yyMA/zMT2YeKiur9yDPaTjQ6Uv3h0Vn9csqm/wHKimz5Toz/dcROu5l+/P+UcCgd6zpy/MpngOAdcm78IzLiEmg66vwf83ObQLcE/Bk/ZFhqUxL8B2i2G/rijPyDlD0qbF8e/PUYf/vtLwb+orTTKVBWFv4vd7CzRqbI/iOin6q2svL8EiC1SedV1P12Q1OMCK8U/pR0nN41KwD+YaCMLhg6Cv8p0aPTmPac/yjWH/VdBrj+qwmM8e5mrv6OOZnVveZg/Zezl9LcYqb8v7+uGMpG6vzB+7Rrj8oW/ey8hL7rxtL+aCrLMDQe7P3oHNYIzH6m/RGMfLMidpD8oGGsZetSYv/mPTCqIeZQ/CvRvfw95zb9D31/TAXTCv8/w2E4iRJW/jRTTejXmx79jMiwi1pSTv6XyKSH3L8S/Wu0iIUFfur88l68w68yjPyvVijGOaKa/pr3k3VwAp795BgIOhT/CP0rM2bqUGaE/DKYiT000oT+lfhhiDZS3P7pyYQyhbZu/cgj33DbnqT+NOfJNHiOev+QrrOSJ4qM/kcn66O5DwT8auAL/0evCP7SwhaS7gpe/5bCdy0UIvj8ZDwcnDoO1P/ImEt7ykq+/s+8G89BPgj8AviMP4BTEvxx+P2hxTKS/n6zfHRYOoD8bm16RUd7GP1B+DMs/xMs/uOIKQKU2yb8x4iyh8nmyP1Rij2ColZ+/N42kddtnsb/oR7NK9TWov7rItRGrTb+/kDu06ug8vL91VX3RxVuzP9iPL1hS85G/2VXh/Mzmxj+2n52UsXS2PxJOljgqZLW/f2+PlpuGlz9A5qXry0tzv/GLZC0f4sQ/SPZti0oBt7/gbZDYmU2xv6OkMzcN87K/cAT/kXndtz8AZxf7DbeOP2HI2GRKMcO/F6y+aWH4vr9FuweTXL6UP8y0E44Fn4m/xcDENEpDub/hRvHKxwehv8yzIuNlEL+/FwMNxLm6uj/66EFxeki+v0JP4E1do8G/sP9LGfHOqL9cdXslveLHP6b1Nch+zsK/IHpYb865tT98CQH1UGyzv/VSjaRvfK4/",
             "dtype": "torch.float64",
             "shape": [
               16,
@@ -191,7 +186,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDE2KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAq9OQkzfoXEvwwBwSBFVKo/PMm3lfD8tz9cPwpmlqSuv1Qtz4if7Zm/VvHDxUbVlL/GY/MKs2ujvw9x5Wa0C8C/ys/3EqhptL9rg2iWoAK1vzeFSNqJxKw/6hxiJz+mwj95/IxxsH+3v0w2N8Dirri/Zax5a7LwvL8KQWdd/7rDP+UXcImIW4A/HGvtr9cutD8tmnKdjZbDP9wW0G5Rnbk/+VEQ9uzpxL9w3h/s+B2bP0c4Ye+TBZG/oFkGcZUGpb8rkwZevjixP4Q2o1wH/sa/Wv95vRaHaj8lZQapbrOlv4pU9R4PFrA/LNLDDj+trb9vJepKJZa2P00m1XJ1ec0/8ltj0mU3vD8tPJH5Iqe5Pzy6c92Mg8Q/iTXHo3Ikt7/irKvgQ+icv8/t/PBThbC/XDgc8a/OVz+VvZFJYEe6P5IxUd3KhL2/jHXCPtj3q7/8qzvmRIikv/mbPwJxwLC/eezwGhLmyD8kxzYRfAWfPzdRKfeQRKU/zQa2PJ3ru7+dkS0Yt0uAv4p5Ey1hXKW/JPoAN/BDvL+u4J0EXFGxP1eVe+Yngp4/yLpKMS3uwj9StDEgKgW6P7v7dzS81NM/vaEGkqGlob/sDE41xO6pv1I4Xq8wXbu/1izv6+xxuT95ha2jIiHGP8NA/nC2QsA/Z9C7ffpBqr+N9T+fS1C5vw==",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsIDE2KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAomPSk1SMHHPwNI9LXH97c/13DSxBYRob+YOCVUQyqovwnq7KQvvMO/BMflFcunrz+0BFNH6IfBP9P/sKD3Ccm/Z0peUDtFkb+AiaGJZwzGv8Vk+Hzzxq6/uEZIF+nYx784yDC7/MvCP+2W1hi+X7C/wktLzBI5q7+IEZOxA0Kkv/pkrA3wAsS/FJ8k/PMptL9TVamAJcGxv9e+hqIOwaQ/CkC9D53ueT8VZzr+T3uavzSb4EXjX9M/ghFK/V5QqL8dAGUAtoa4P3T0Ak738ZW/CNpe2/0buT+kwGiLiGHHP6jGfB0752Q/XeeMdfEcpL/TW/p2HQmiP0R9tKu2o6O/23aB7rRDh7+KqxuLKNuJPzC5Xl0QJby/HMgcawRRh79Mn1z7wMXGP+2ERnCt38e/FlmXvA3gsT/D3/f1Y5XCv4Y7xaWPzrW/7PyKn1hznT/kurKBOIR1v4Jf6dfTXKs/omWY3RfJwj9AE73jkxajvzwyM6WqxHu/YA8WYJnypr8ViHER/M6uv7gF3Y94m7+/fIy2spDSs79hgoee0Hy4P3i0nt1gV5a/l/aqgHY6vD+YsaDAbua6P3eDIjIhoru/KIOIZrbXvL/V8D6ejv1xvzbvmge6QoM/xr80/VbpsD9vGkatgja1v0ADoXQsta+/iFikvE4Ge78syRTghaydvw==",
             "dtype": "torch.float64",
             "shape": [
               4,
@@ -246,7 +241,7 @@
         "kind": "ASSERT",
         "params": {
           "c": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAIA/AACAPwAAgD8AAIA/",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDQsKSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAAAAAAAAAAA",
             "dtype": "torch.float32",
             "shape": [
               4
@@ -257,7 +252,7 @@
         },
         "meta": {
           "kind": "LINEAR_LE",
-          "d": -0.1
+          "d": -0.11
         },
         "in_vars": [
           40,
@@ -313,7 +308,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-12-18T18:21:29.862904",
+      "creation_time": "2025-12-18T18:21:29.866846",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [

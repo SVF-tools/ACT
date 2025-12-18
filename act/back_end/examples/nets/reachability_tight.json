@@ -83,7 +83,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApMkjMtPX2Kvyf7fPiwmru/F+L2IkhhtT/dTTnwvOGZvw1u0DN+VMK/Kv21Kf5cob/2b4mHJ/yTP7RrWEhXT5k/NE+ZOnYhmr/SDgDjU6axPyf0HJfSjKw/EAtsFhs/ur8QHrPALQ66PwO8jv4caWG/Y6ongYaqtL8gpTIH2ta6P9TM6Qrn27E/R6jDYADGrb/kTxclct3Bv/JeNXoG1rG/gLMG5mytuz+sW2ibtwaMv0gwe028psa/2G7rbtduvz+cbSS8Uc24vyOyuVR0qLG/Tq/MaAi+t787qeWAd0WGP/VtpMAGy7a/hDBNRCyhw78FdF7sUE2ovzFASN1fm3c/tE7YsL2xlD/ZI5rzalmhvztVPD1pibG/Gp8KklA/rr8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo0uGzRhkOov7/eWQwOn3u/y5EkeUb3oT88biKkRHrSP+aB8fD3d8S/1e0AWngUwr/ZxC6VD0awv3AAjCzt3sG/r4S2xJIGoj/8UNdSrD+lv9lt09j9AbA/PENymeMlpT+BD1b+qCWRP01uJmhZgq+/9EUwPi8gkD/vI/93aWWtvzvoKb7b5ME/TFNRpDGbzr+PgbinpK2ovw7jmpgzPbC/3qmZxRZLmL91zrWsuBmjv3tqqTo7b8O/NMTtcFqSvT9gxKjOnKHFP/woDW2w8q8/eSGDLq0Hor9NkABe0ii4v9/jnYWUIbW/+8jy+7MQqD8wrjZZ8vRLv678BQ5F5LC/Y+oltS1+tj80zscKe1m5v6j/c6kWRHO/LpJ4PC7AoD8=",
             "dtype": "torch.float64",
             "shape": [
               6,
@@ -153,7 +153,7 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArO6RF7NfK0vxItmtAjQac/IpxdpckHmr+8hEoHYquqPxzwhlcN2rY/sDdTjNgonb94XZZwtRy/v6c20fMAPK+/rLmvUlE4zL8IAf+SjZt6P+8RyVFkZIC/n+CXR3PQvT+vlT+olHXAvy+fiZbb06i/RIFAHsLabD9i7nhtsi6oP6lci2CpErY/eyR2nR8KwD8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoEgbl7GN7NP0LLDlJb3KI/5d7RyihXsD8wYUUct17MP5yBqJ5gfqu/gNClqZTLcT/idxJr27lAv02aOt7sWa0/nHTzxi79xL9kneDGTZChP0i88q0pNZ2/hDy0Z09fnr+QNznDxYi1v+6wu6SnQKQ/nD3EUaB2u7+FukE6SnKuP9uEiYfAncc/B7LCM29Wuj8=",
             "dtype": "torch.float64",
             "shape": [
               3,
@@ -270,7 +270,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-12-18T13:58:18.946071",
+      "creation_time": "2025-12-18T18:21:29.865678",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [
