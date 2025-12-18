@@ -528,18 +528,8 @@ class VerificationValidator:
                 ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
-                     logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
+                    logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
                               f"output_sat={ce_results['output_satisfied']}")
-                else:
-                    logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
-            else:
-                ce_checks = verify_result.stats.get("ce_checks", None)
-                if isinstance(ce_checks, dict):
-                    logger.info(
-                        "     CE validation: input_sat=%s, output_sat=%s",
-                        ce_checks.get("input_sat"),
-                        not bool(ce_checks.get("output_violated", False)),
-                    )
 
         except Exception as e:
             logger.error(f"     Verifier failed: {e}")

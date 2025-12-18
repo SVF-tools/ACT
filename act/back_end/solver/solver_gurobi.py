@@ -59,7 +59,6 @@ class GurobiSolver(Solver):
         # device hint ignored (CPU solver)
         self.m = gp.Model(name)
         self.m.Params.OutputFlag = 0
-        self.m.Params.DualReductions = 0
         self._x = []
 
     def add_vars(self, n: int) -> None:
@@ -111,81 +110,18 @@ class GurobiSolver(Solver):
             self.m.Params.TimeLimit = float(timelimit)
         self.m.update()
         self.m.optimize()
-
-        # If still INF_OR_UNBD, disable DualReductions and rerun once
-        if self.m.Status == GRB.INF_OR_UNBD:
-            # Handle only on the first encounter
-            self.m.Params.DualReductions = 0
-            self.m.optimize()
-
+    
     def status(self) -> str:
-        """
-        Map Gurobi status to {SAT, UNSAT, UNKNOWN}.
-
-        Semantics (from the ACT framework perspective):
-          - SAT    : At least one feasible solution satisfies all constraints
-                     (in a “find counterexample” model, this means a CE candidate exists)
-          - UNSAT  : Gurobi proves infeasibility (no feasible solutions)
-                     (in a “find counterexample” model, proves no counterexample exists)
-          - UNKNOWN: All other situations:
-                     - not started / interrupted with no incumbent
-                     - numeric issues
-                     - infeasible-or-unbounded / truly unbounded
-                     - any case where feasibility cannot be trusted
-
-        Notes:
-        - Return UNSAT only when Gurobi explicitly reports INFEASIBLE.
-        - If there is a solution but not optimal (time/node limits or interruption):
-          with an incumbent (SolCount > 0) we treat as SAT (a feasible point exists),
-          because existence of a feasible solution does not depend on optimality.
-        - Numeric issues or (INF_OR_UNBD / UNBOUNDED) are always UNKNOWN, even if
-          SolCount > 0, to preserve soundness.
-        """
-        if self.m is None:
-            return SolveStatus.UNKNOWN
-
-        st = self.m.Status
-        try:
-            solcnt = int(getattr(self.m, "SolCount", 0))
-        except Exception:
-            solcnt = 0
-
-        # 1. Explicitly infeasible
-        if st == GRB.INFEASIBLE:
-            return SolveStatus.UNKNOWN
-
-        # 2. Numeric issues / infeasible-or-unbounded / unbounded ⇒ untrusted, treat as UNKNOWN
-        if st in (GRB.INF_OR_UNBD, GRB.UNBOUNDED, GRB.NUMERIC):
-            return SolveStatus.UNKNOWN
-
-        # 3. Normal termination, proven feasible solution exists
-        if st in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-            if solcnt > 0:
-                return SolveStatus.SAT
-            # In theory OPTIMAL/SUBOPTIMAL implies a solution; if not, stay conservative
-            return SolveStatus.UNKNOWN
-
-        # 4. Limits triggered but an incumbent exists:
-        early_stop_with_incumbent = {
-            GRB.TIME_LIMIT,
-            GRB.NODE_LIMIT,
-            GRB.ITERATION_LIMIT,
-            GRB.SOLUTION_LIMIT,
-            GRB.INTERRUPTED,
-            GRB.CUTOFF,
-            GRB.USER_OBJ_LIMIT,
-        }
-        if st in early_stop_with_incumbent:
-            if solcnt > 0:
-                return SolveStatus.SAT
-            # No incumbent means feasibility cannot be determined
-            return SolveStatus.UNKNOWN
-
-        # 5. All other statuses (LOADED, NOT_STARTED, INPROGRESS, etc.) → UNKNOWN
+        if self.m.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+            return SolveStatus.SAT
+        if self.m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+            return SolveStatus.UNSAT
+        if self.m.SolCount > 0:
+            return SolveStatus.SAT
         return SolveStatus.UNKNOWN
 
     def has_solution(self) -> bool:
-        return self.m is not None and getattr(self.m, 'SolCount', 0) > 0
+        return self.m.SolCount > 0
 
     def get_values(self, vids: List[int]) -> np.ndarray:
         return np.array([self._x[i].X for i in vids], dtype=float)

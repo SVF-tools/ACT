@@ -39,7 +39,6 @@ class TorchLPSolver(Solver):
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.weight_decay = 0.0
-        self.debug = bool(int(os.getenv("ACT_TORCH_LP_DEBUG", "0")))
         self._large_n_threshold = 20000
         self._large_n_max_iter = 800
         self._large_n_tol = 1e-3
@@ -225,7 +224,7 @@ class TorchLPSolver(Solver):
                 if vids and len(coeffs) > 0:
                     for vid, coeff in zip(vids, coeffs):
                         obj = obj + float(coeff) * self._x[vid]
-
+                
                 # Add constant term
                 obj = obj + float(c0)
                 
@@ -279,10 +278,6 @@ class TorchLPSolver(Solver):
             else:
                 stagnation_steps += 1
 
-            if self.debug and (it % self._log_every == 0 or it == eff_max_iter - 1):
-                obj_val = float(obj.detach().item())
-                print(f"[TorchLP] it={it} obj={obj_val:.4e} max_viol={max_viol:.3e} time={time.time()-start_time:.1f}s")
-
             # Feasibility reached
             if max_viol <= eff_tol_feas:
                 self._status = SolveStatus.SAT
@@ -305,12 +300,6 @@ class TorchLPSolver(Solver):
                 self._sol = self._x.detach().clone()
                 break
         else:
-            # Max iter reached: treat as "we have a candidate", not UNSAT
-            self._status = SolveStatus.SAT
-            self._has_solution = True
-            self._sol = self._x.detach().clone()
-
-        if not self._has_solution:
             self._status = SolveStatus.SAT
             self._has_solution = True
             self._sol = self._x.detach().clone()
