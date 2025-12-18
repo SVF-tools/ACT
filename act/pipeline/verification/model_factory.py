@@ -113,9 +113,7 @@ class ModelFactory:
                 with open(net_path, 'r') as f:
                     net_dict = json.load(f)
                 act_net, _ = NetSerializer.deserialize_net(net_dict)
-                self._repair_variable_ids(act_net)
                 self.nets[name] = act_net
-                inp_layer = next((L for L in act_net.layers if L.kind == "INPUT"), None)
                 logger.debug(f"Pre-loaded ACT Net '{name}' from {net_path}")
             except Exception as e:
                 logger.error(f"Failed to load ACT Net '{name}' from {net_path}: {e}")
@@ -282,97 +280,6 @@ class ModelFactory:
     def list_networks(self) -> List[str]:
         """List all available network names."""
         return list(self.config['networks'].keys())
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _repair_variable_ids(self, net: Net) -> None:
-        """
-        Ensure in_vars/out_vars align with layer widths.
-        Original serialized nets use sequential scalar ids; we rebuild ids
-        based on actual layer dimensions so solvers receive correct shapes.
-        """
-        next_var = 0
-        prev_out: List[int] = []
-        current_shape: Optional[Tuple[int, ...]] = None
-        net.by_id = {L.id: L for L in net.layers}  # initialize mapping
-
-        def prod(shape_list):
-            w = 1
-            for s in shape_list:
-                w *= int(s)
-            return w
-
-        for layer in net.layers:
-            kind = layer.kind
-
-            if kind == "INPUT":
-                shape = tuple(layer.meta.get("shape") or [])
-                # Drop batch dim when counting vars
-                flat = prod(shape[1:]) if len(shape) > 1 else prod(shape) if shape else 1
-                layer.in_vars = []
-                layer.out_vars = list(range(next_var, next_var + flat))
-                next_var += flat
-                current_shape = shape
-
-            elif kind == "INPUT_SPEC":
-                layer.in_vars = prev_out
-                layer.out_vars = prev_out
-
-            elif kind == "CONV2D":
-                out_shape = layer.meta.get("output_shape") or ()
-                if out_shape:
-                    flat = prod(out_shape[1:]) if len(out_shape) > 1 else prod(out_shape)
-                else:
-                    weight = layer.params.get("weight")
-                    flat = weight.shape[0] if weight is not None else len(prev_out)
-                layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + flat))
-                next_var += flat
-                current_shape = tuple(out_shape) if out_shape else current_shape
-
-            elif kind == "FLATTEN":
-                start_dim = int(layer.meta.get("start_dim", 1))
-                shape_list = list(current_shape) if current_shape is not None else []
-                if not shape_list:
-                    flat = len(prev_out)
-                    new_shape = (flat,)
-                else:
-                    tail = prod(shape_list[start_dim:]) if start_dim < len(shape_list) else 1
-                    new_shape = tuple(shape_list[:start_dim] + [tail])
-                    flat = tail
-                layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + flat))
-                next_var += flat
-                current_shape = new_shape
-
-            elif kind == "DENSE":
-                out_features = int(layer.params["W"].shape[0])
-                layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + out_features))
-                next_var += out_features
-                current_shape = (1, out_features)
-
-            elif kind in ("RELU", "TANH", "SIGMOID", "GELU", "SILU", "LRELU", "PRELU", "SOFTPLUS", "ABS", "CLIP"):
-                layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + len(prev_out)))
-                next_var += len(layer.out_vars)
-                # shape unchanged
-
-            elif kind == "ASSERT":
-                layer.in_vars = prev_out
-                layer.out_vars = []
-
-            else:
-                # Fallback: treat as shape-preserving elementwise
-                layer.in_vars = prev_out
-                layer.out_vars = list(range(next_var, next_var + len(prev_out)))
-                next_var += len(layer.out_vars)
-
-            prev_out = layer.out_vars
-
-        # Refresh lookup dict with updated vars
-        net.by_id = {L.id: L for L in net.layers}
     
     def get_network_info(self, name: str) -> Dict[str, Any]:
         """Get metadata about a network without creating it."""

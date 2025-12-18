@@ -404,50 +404,22 @@ def setup_and_solve(
 def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> VerifResult:
     """
     Single-shot verification without refinement.
-
-    Semantics (uniform across ASSERT kinds):
-      - SolveStatus.UNSAT  →  CERTIFIED (property proven with abstraction + MILP)
-      - SolveStatus.SAT and CE passes secondary checks (input meets INPUT_SPEC and output truly violates)
-                           →  FALSIFIED (returns counterexample as torch.Tensor)
-      - Otherwise          →  UNKNOWN (no conclusion)
+    Returns CERTIFIED/FALSIFIED/UNKNOWN with optional counterexample input.
     """
+    
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
     seed_bounds = seed_from_input_specs(spec_layers)
 
-    # Sanity check: seed width matches input vars
-    input_ids = get_input_ids(net)
-    if seed_bounds.lb.numel() != len(input_ids) or seed_bounds.ub.numel() != len(input_ids):
-        raise ValueError(
-            f"Seed bounds/input_ids mismatch: lb={seed_bounds.lb.numel()}, "
-            f"ub={seed_bounds.ub.numel()}, input_ids={len(input_ids)}"
-        )
-
     # Core solver workflow
     status, ce_input, stats = setup_and_solve(net, seed_bounds, solver, timelimit)
-
-    # Filter spurious CEs: must satisfy input spec and truly violate output property
-    if status == SolveStatus.SAT and ce_input is not None:
-        stats.setdefault("ce_checks", {})
-
-    # Standardize status explanations
+    
+    # Interpret result
     if status == SolveStatus.SAT and ce_input is not None:
         ce_x = torch.from_numpy(ce_input)
         return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
 
-    # Use violation_var (objective-based) to interpret status if available
-    v_val = stats.get("violation_var", None)
-    if v_val is not None:
-        if float(v_val) > 1e-8:
-            raw_ce = ce_input if ce_input is not None else stats.get("raw_ce_input", None)
-            ce_x = torch.from_numpy(raw_ce) if raw_ce is not None else None
-            return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
-        else:
-            return VerifResult(VerifStatus.CERTIFIED, stats=stats)
-
     if status == SolveStatus.UNSAT:
-        # Negated property infeasible → original property proven
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
 
-    # All other cases (UNKNOWN / TIME_LIMIT / NUMERIC ISSUE, etc.)
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)

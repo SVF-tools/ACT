@@ -170,8 +170,6 @@ class TorchToACT:
         new_layers, out_vars = self.input_layer.to_act_layers(len(self.layers), [])
         self.layers.extend(new_layers)
         self.prev_out = out_vars
-        if out_vars:
-            self.next_var = max(out_vars) + 1
 
     # --- recursive module processing ---
 

@@ -25,17 +25,7 @@ def box_join(a: Bounds, b: Bounds) -> Bounds:
 def changed_or_maskdiff(L, B: Bounds, masks: Optional[Dict[str, torch.Tensor]], eps=1e-9) -> bool:
     plb = L.cache.get("prev_lb"); pub = L.cache.get("prev_ub")
     if plb is None or pub is None: return True
-
-    lb = B.lb
-    ub = B.ub
-
-    widened_lb = torch.any(lb < plb)
-    widened_ub = torch.any(ub > pub)
-    if widened_lb or widened_ub:
-        return True
-
-    lb_ok = torch.all(lb >= plb - eps)
-    ub_ok = torch.all(ub <= pub + eps)
+    if torch.any(torch.abs(plb - B.lb) > eps) or torch.any(torch.abs(pub - B.ub) > eps): return True
     prev = L.cache.get("masks")
     if (masks is None) ^ (prev is None): return True
     if masks is None: return False

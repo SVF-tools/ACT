@@ -484,8 +484,6 @@ class VerificationValidator:
         logger.info(f"Validating: {name} (solver: {solver})")
         logger.info(f"{'='*80}")
         
-        solver_ce_results: Optional[Dict[str, Any]] = None
-        
         # Step 1: Load ACT Net from factory
         act_net = self.factory.get_act_net(name)
         
@@ -508,8 +506,6 @@ class VerificationValidator:
             verify_result = verify_once(act_net, solver=solver_instance)
             verifier_status = verify_result.status
             logger.info(f"     Verifier result: {verifier_status}")
-            
-            solver_ce_results = None
 
             # If verifier found counterexample, validate it with model
             if verify_result.counterexample is not None:
@@ -532,7 +528,6 @@ class VerificationValidator:
                 ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
-                    solver_ce_results = ce_results
                     logger.info(
                         "     CE validation: input_sat=%s, output_sat=%s",
                         ce_results.get("input_satisfied", None),
@@ -541,21 +536,14 @@ class VerificationValidator:
                 else:
                     logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
             else:
-                # Even if CE was filtered out inside verify_once, we may still
-                # have checker results stored in stats (ce_checks). Use them to
-                # distinguish spurious vs real solver CEs for non-class specs.
                 ce_checks = verify_result.stats.get("ce_checks", None)
                 if isinstance(ce_checks, dict):
-                    solver_ce_results = {
-                        "input_satisfied": ce_checks.get("input_sat"),
-                        "output_satisfied": not bool(ce_checks.get("output_violated", False)),
-                    }
                     logger.info(
-                        "     CE validation (from stats): input_sat=%s, output_sat=%s",
-                        solver_ce_results.get("input_satisfied", None),
-                        solver_ce_results.get("output_satisfied", None),
+                        "     CE validation: input_sat=%s, output_sat=%s",
+                        ce_checks.get("input_sat"),
+                        not bool(ce_checks.get("output_violated", False)),
                     )
-            
+
         except Exception as e:
             logger.error(f"     Verifier failed: {e}")
             import traceback
@@ -576,8 +564,7 @@ class VerificationValidator:
             network_name=name,
             solver_name=solver,
             concrete_counterexample=counterexample,
-            verifier_status=verifier_status,
-            solver_ce_results=solver_ce_results,
+            verifier_status=verifier_status
         )
         
         self.validation_results.append(validation)
@@ -588,23 +575,14 @@ class VerificationValidator:
         network_name: str,
         solver_name: str,
         concrete_counterexample: Optional[Tuple],
-        verifier_status: str,
-        solver_ce_results: Optional[Dict[str, Any]] = None
+        verifier_status: str
     ) -> Dict[str, Any]:
         """
         Cross-validate concrete inference vs formal verification (Level 1).
-
-        More conservative logic that avoids false FAILED on reachability_*:
-
-        Rules:
-        1. If there is a confirmed real CE (from tests or a solver CE that passes the checker):
-           - Verifier returns CERTIFIED → definite soundness bug → FAILED
-           - Verifier returns FALSIFIED → correct → PASSED
-           - Verifier returns UNKNOWN  → incomplete but sound → ACCEPTABLE
-
-        2. If no confirmed CE exists yet (tests found none and solver CE not confirmed),
-           regardless of verifier result, mark INCONCLUSIVE; do not fail solely because
-           FALSIFIED + “ce_checks look spurious”.
+        
+        Validation Rules:
+        1. If concrete counterexample found → verifier MUST report FALSIFIED or UNKNOWN
+        2. If no concrete counterexample → verifier can report anything (testing incomplete)
         """
         result = {
             'network': network_name,
@@ -613,35 +591,13 @@ class VerificationValidator:
             'concrete_counterexample': concrete_counterexample is not None,
             'verifier_result': verifier_status,
             'validation_status': None,
-            'explanation': None,
-            'solver_ce_checked': False,
-            'solver_ce_is_ce': False,
-            'solver_ce_spurious': False,
+            'explanation': None
         }
-
-        # 1) Ground truth from center/boundary/random testing
-        test_ce_exists = concrete_counterexample is not None
-
-        # 2) Ground truth from solver CE (via stats or direct CE)
-        solver_ce_is_ce = False
-        solver_ce_spurious = False
-        if isinstance(solver_ce_results, dict):
-            result['solver_ce_checked'] = True
-            ce_in_sat = bool(solver_ce_results.get('input_satisfied', False))
-            ce_out_sat = bool(solver_ce_results.get('output_satisfied', True))
-
-            # True CE: input satisfies spec and output violates property
-            solver_ce_is_ce = ce_in_sat and (not ce_out_sat)
-            # Spurious CE: input violates spec or output does not violate property
-            solver_ce_spurious = (not ce_in_sat) or ce_out_sat
-
-            result['solver_ce_is_ce'] = solver_ce_is_ce
-            result['solver_ce_spurious'] = solver_ce_spurious
-
-        # Whether any confirmed CE exists
-        any_ce_exists = test_ce_exists or solver_ce_is_ce
-
-        if any_ce_exists:
+        
+        if concrete_counterexample is not None:
+            # We found a real counterexample - verifier MUST NOT claim CERTIFIED
+            input_tensor, inference_results = concrete_counterexample
+            
             if verifier_status == 'CERTIFIED':
                 # CRITICAL BUG: Verifier claims safe, but we have a counterexample!
                 result['validation_status'] = 'FAILED'
@@ -653,7 +609,7 @@ class VerificationValidator:
                 logger.error(f"     Counterexample input: {input_tensor.shape}, "
                             f"range=[{input_tensor.min():.4f}, {input_tensor.max():.4f}]")
                 logger.error(f"     Output violation: {inference_results['output_explanation']}")
-
+                
             elif verifier_status == 'FALSIFIED':
                 # CORRECT: Verifier correctly identified the issue
                 result['validation_status'] = 'PASSED'
@@ -671,22 +627,21 @@ class VerificationValidator:
                     f"counterexample exists (verifier is sound but incomplete)"
                 )
                 logger.warning(f"\n  {result['explanation']}")
-
+                
             else:
                 result['validation_status'] = 'UNKNOWN'
-                result['explanation'] = f"Unknown verifier result: {verifier_status!r}"
-                logger.warning("\n  %s", result['explanation'])
-
-            return result
-
-        result['validation_status'] = 'INCONCLUSIVE'
-        result['explanation'] = (
-            "⚪ INCONCLUSIVE - No concrete counterexample found in testing, "
-            "and solver-proposed CEs are not validated as real counterexamples. "
-            f"Verifier result: {verifier_status}."
-        )
-        logger.info("\n  %s", result['explanation'])
-
+                result['explanation'] = f"Unknown verifier result: {verifier_status}"
+                logger.warning(f"\n  {result['explanation']}")
+        
+        else:
+            # No concrete counterexample found in testing
+            result['validation_status'] = 'INCONCLUSIVE'
+            result['explanation'] = (
+                f"⚪ INCONCLUSIVE - No counterexample found in concrete testing. "
+                f"Verifier result: {verifier_status} (cannot validate with this test)"
+            )
+            logger.info(f"\n  {result['explanation']}")
+        
         return result
     
     def validate_bounds(
