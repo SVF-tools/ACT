@@ -163,111 +163,6 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
         else:
             raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
 
-
-def input_satisfies_specs(x_np: np.ndarray, spec_layers, tol: float = 1e-7) -> bool:
-    """
-    Check whether a candidate input satisfies all INPUT_SPEC layers.
-    Supports BOX, LINF_BALL, and LIN_POLY.
-    """
-    x = torch.from_numpy(x_np).reshape(-1)
-    x_device = x.device
-
-    for L in spec_layers:
-        k = L.meta.get("kind")
-        if k == InKind.BOX:
-            lb = L.params["lb"].flatten().to(device=x_device)
-            ub = L.params["ub"].flatten().to(device=x_device)
-            if torch.any(x < lb - tol) or torch.any(x > ub + tol):
-                return False
-
-        elif k == InKind.LINF_BALL:
-            if "lb" in L.params and "ub" in L.params:
-                lb = L.params["lb"].flatten().to(device=x_device)
-                ub = L.params["ub"].flatten().to(device=x_device)
-            else:
-                center = L.params["center"].flatten().to(device=x_device)
-                eps = torch.tensor(L.meta["eps"], dtype=center.dtype, device=center.device)
-                lb = center - eps
-                ub = center + eps
-                lb = lb.to(device=x_device)
-                ub = ub.to(device=x_device)
-            if torch.any(x < lb - tol) or torch.any(x > ub + tol):
-                return False
-
-        elif k == InKind.LIN_POLY:
-            A, b = L.params["A"], L.params["b"]
-            x_flat = x.to(dtype=A.dtype, device=A.device, non_blocking=True)
-            lhs = torch.mv(A, x_flat)
-            if torch.any(lhs > b + tol):
-                return False
-
-        else:
-            raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
-
-    return True
-
-
-def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
-    """
-    Evaluate the ACT Net at a point and check if the ASSERT property is violated.
-    Used to filter spurious counterexamples after solver returns SAT.
-    """
-    # Use concrete PyTorch evaluation for robustness (avoid midpoint loss)
-    from act.pipeline.verification.act2torch import ACTToTorch
-
-    model = getattr(net, "_ce_eval_model", None)
-    if model is None:
-        model = ACTToTorch(net).run()
-        model.eval()
-        setattr(net, "_ce_eval_model", model)
-
-    x_tensor = torch.from_numpy(x_np)
-    entry_shape = net.by_id[find_entry_layer_id(net)].meta.get("shape")
-    try:
-        if entry_shape is not None:
-            x_tensor = x_tensor.view(*entry_shape)
-        else:
-            x_tensor = x_tensor.view(1, -1)
-    except Exception:
-        x_tensor = x_tensor.view(1, -1)
-
-    first_param = next(model.parameters(), None)
-    if first_param is not None:
-        x_tensor = x_tensor.to(dtype=first_param.dtype, device=first_param.device)
-
-    with torch.no_grad():
-        res = model(x_tensor)
-
-    if isinstance(res, dict):
-        return not bool(res.get("output_satisfied", False))
-
-    # Fallback: raw tensor output
-    y_mid = res.flatten().detach().cpu().numpy()
-    k = assert_layer.meta.get("kind")
-    if k == OutKind.TOP1_ROBUST:
-        t = int(assert_layer.meta["y_true"])
-        others = [i for i in range(len(y_mid)) if i != t]
-        return (y_mid[others] - y_mid[t]).max() >= 0.0
-    elif k == OutKind.MARGIN_ROBUST:
-        t = int(assert_layer.meta["y_true"])
-        margin = float(assert_layer.meta["margin"])
-        others = [i for i in range(len(y_mid)) if i != t]
-        return (y_mid[others] - y_mid[t] + margin).max() >= 0.0
-    elif k == OutKind.LINEAR_LE:
-        c = np.asarray(assert_layer.params["c"], dtype=float)
-        d = float(assert_layer.meta["d"])
-        return float(np.dot(c, y_mid)) >= d + 1e-8
-    elif k == OutKind.RANGE:
-        lb = assert_layer.params.get("lb")
-        ub = assert_layer.params.get("ub")
-        if lb is not None and np.any(y_mid < np.asarray(lb, dtype=float) - 1e-8):
-            return True
-        if ub is not None and np.any(y_mid > np.asarray(ub, dtype=float) + 1e-8):
-            return True
-        return False
-    else:
-        raise NotImplementedError(f"ASSERT kind not supported: {k}")
-
 def _upper_bound_violation(out_bounds: Optional[Bounds], t: int, margin: float = 0.0) -> float:
     """
     Provide a finite upper bound for the violation variable v in TOP1/MARGIN_ROBUST:
@@ -466,126 +361,30 @@ def setup_and_solve(
     """
     from act.back_end.analyze import analyze
     from act.back_end.cons_exportor import export_to_solver
-    from act.back_end.cons_exportor import to_numpy
-    import os
-
+    
     # Extract network structure
     entry_id = find_entry_layer_id(net)
     input_ids = get_input_ids(net)
     output_ids = get_output_ids(net)
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
-
-    out_bounds: Optional[Bounds] = None
-
+    
     # Create entry_fact with ALL input constraints
     entry_fact = Fact(bounds=input_bounds, cons=ConSet())
     add_all_input_specs(entry_fact.cons, input_ids, spec_layers)
     
     # Analyze with full input specification (propagates constraints)
     before, after, globalC = analyze(net, entry_id, entry_fact)
-
-    # Optional debug/relaxation: drop internal box constraints (keep input seed)
-    if os.environ.get("ACT_SKIP_INTERNAL_BOXES"):
-        filtered = ConSet()
-        for con in globalC:
-            tag = con.meta.get("tag", "")
-            layer_id = con.meta.get("layer_id", None)
-            if not tag.startswith("box:"):
-                filtered.replace(con)
-            else:
-                if layer_id is None:
-                    try:
-                        layer_id = int(str(tag).split("box:")[-1])
-                    except Exception:
-                        layer_id = 0
-                if int(layer_id) < 0:
-                    filtered.replace(con)
-        globalC = filtered
-
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # Grab an output box from the ASSERT predecessor for big-M estimation
-    try:
-        assert_preds = net.preds.get(assert_layer.id, [])
-        if assert_preds:
-            last_hid = assert_preds[0]
-            out_bounds = after[last_hid].bounds
-            if out_bounds is not None:
-                # Extra sanity check: any dimensions with lb>ub?
-                bad = out_bounds.lb > out_bounds.ub + 1e-9
-                if bad.any():
-                    idx = bad.nonzero(as_tuple=False)
-                    logger.error("🔥 [STEP B-1] out_bounds has lb>ub at %d dims", idx.shape[0])
-                    for k in idx[:20]:
-                        flat_idx = int(k.view(-1)[0].item())
-                        logger.error(
-                            "    dim %d: lb=%.6f, ub=%.6f",
-                            flat_idx,
-                            out_bounds.lb.view(-1)[flat_idx].item(),
-                            out_bounds.ub.view(-1)[flat_idx].item(),
-                        )
-            else:
-                logger.info("out_bounds: None")
-    except Exception:
-        logger.exception("Error when adding output box / computing out_bounds")
-
-    # Debug: report constraint sizes and bounds stats
-    try:
-        box_cons = [c for c in globalC if c.meta.get("tag", "").startswith("box:")]
-    except Exception:
-        pass
-
+    
     # Validate constraints (validation runs if enabled, logging only if debug_tf also enabled)
     validate_constraints(globalC, after, net)
     
     # Export all constraints to solver (including LIN_POLY)
     export_to_solver(globalC, solver, objective=None, sense="min")
-
-    # Enforce input variables inside the seed box (override any solver bounds)
-    try:
-        lb_np = to_numpy(input_bounds.lb).reshape(-1)
-        ub_np = to_numpy(input_bounds.ub).reshape(-1)
-
-        if lb_np.shape[0] != len(input_ids) or ub_np.shape[0] != len(input_ids):
-            raise ValueError(
-                f"Input bounds size mismatch in setup_and_solve: "
-                f"lb={lb_np.shape[0]}, ub={ub_np.shape[0]}, input_ids={len(input_ids)}"
-            )
-
-        solver.set_bounds(input_ids, lb_np, ub_np)
-    except Exception as e:
-        logger.warning("Failed to set input bounds on solver: %s", e)
-
-    logger.info(
-    "Before call add_negated_assert_to_solver, ASSERT kind=%s, y_true=%s, margin=%s",
-    assert_layer.meta.get("kind"),
-    assert_layer.meta.get("y_true", None),
-    assert_layer.meta.get("margin", None),
-)
-
-    # Add the negated ASSERT property (may return objective info)
-    objective = add_negated_assert_to_solver(
-        solver,
-        output_ids,
-        assert_layer,
-        out_bounds=out_bounds,
-    )
+    add_negated_assert_to_solver(solver, output_ids, assert_layer)
     
-    logger.info(
-    "After call add_negated_assert_to_solver, ASSERT kind=%s, y_true=%s, margin=%s",
-    assert_layer.meta.get("kind"),
-    assert_layer.meta.get("y_true", None),
-    assert_layer.meta.get("margin", None),
-)
-
-
-    # Set objective if provided (e.g., violation variable for TOP1/MARGIN)
-    if objective and "var" in objective:
-        solver.set_objective_linear([objective["var"]], [1.0], 0.0, sense=objective.get("sense", "max"))
-    else:
-        solver.set_objective_linear([], [], 0.0, sense="min")
+    # Solve (feasibility check only)
+    solver.set_objective_linear([], [], 0.0, sense="min")
     solver.optimize(timelimit)
     
     # Extract result
@@ -595,14 +394,7 @@ def setup_and_solve(
         ce_input = solver.get_values(input_ids)
     
     stats = {"status": st, "ncons": len(globalC)}
-    if objective and "var" in objective and solver.has_solution():
-        try:
-            stats["violation_var"] = float(solver.get_values([objective["var"]])[0])
-        except Exception:
-            pass
-
     return st, ce_input, stats
-
 
 # -----------------------------------------------------------------------------
 # Single-shot verification
@@ -637,16 +429,6 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     # Filter spurious CEs: must satisfy input spec and truly violate output property
     if status == SolveStatus.SAT and ce_input is not None:
         stats.setdefault("ce_checks", {})
-        in_ok = input_satisfies_specs(ce_input, spec_layers)
-        out_bad = check_violation_at_point(net, ce_input, assert_layer)
-
-        stats["ce_checks"]["input_sat"] = bool(in_ok)
-        stats["ce_checks"]["output_violated"] = bool(out_bad)
-
-        if not (in_ok and out_bad):
-            # SAT solution but CE not trustworthy → mark UNKNOWN and drop CE
-            status = SolveStatus.UNKNOWN
-            ce_input = None
 
     # Standardize status explanations
     if status == SolveStatus.SAT and ce_input is not None:
@@ -667,112 +449,5 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
         # Negated property infeasible → original property proven
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
 
-    # # Fallback: if we have a validated CE from solver stats, treat as FALSIFIED
-    # ce_checks = stats.get("ce_checks", {})
-    # if ce_checks.get("input_sat", False) and ce_checks.get("output_violated", False):
-    #     raw_ce = ce_input
-    #     if raw_ce is None:
-    #         raw_ce = stats.get("raw_ce_input", None)
-    #     if raw_ce is not None:
-    #         try:
-    #             ce_x = torch.from_numpy(raw_ce)
-    #         except Exception:
-    #             ce_x = torch.as_tensor(raw_ce)
-    #     else:
-    #         ce_x = None
-    #     return VerifResult(
-    #         status=VerifStatus.FALSIFIED,
-    #         counterexample=ce_x,
-    #         stats=stats,
-    #     )
-
     # All other cases (UNKNOWN / TIME_LIMIT / NUMERIC ISSUE, etc.)
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)
-
-# -----------------------------------------------------------------------------
-# Debug helper: fixed-input LP with simple linear property
-# -----------------------------------------------------------------------------
-
-@torch.no_grad()
-def debug_fixed_input_lp(
-    net,
-    solver: Solver,
-    x_ce: torch.Tensor,
-    t: int,
-    j_alt: int,
-    timelimit: Optional[float] = None,
-) -> tuple[str, Optional[np.ndarray], Dict[str, Any]]:
-    """
-    Debug-only helper:
-      - Pin the input to a concrete counterexample x_ce (lb = ub = x_ce).
-      - Replace ASSERT with a simple linear property y[j_alt] - y[t] <= 0,
-        i.e., negation y[j_alt] - y[t] >= 0.
-      - Build and solve the MILP; return status/ce_input/stats.
-    """
-    from types import SimpleNamespace
-    from act.back_end.analyze import analyze
-    from act.back_end.cons_exportor import export_to_solver, to_numpy
-
-    # Flatten CE and build fixed bounds
-    x_flat = x_ce.flatten()
-    seed_bounds = Bounds(x_flat.clone(), x_flat.clone())
-
-    entry_id = find_entry_layer_id(net)
-    input_ids = get_input_ids(net)
-    output_ids = get_output_ids(net)
-    assert_layer = get_assert_layer(net)
-
-    # Synthetic ASSERT: property y[j_alt] - y[t] <= 0 (LINEAR_LE)
-    c = torch.zeros(len(output_ids), dtype=x_flat.dtype, device=x_flat.device)
-    c[j_alt] = 1.0
-    c[t] = -1.0
-    linear_assert = SimpleNamespace(
-        meta={"kind": OutKind.LINEAR_LE, "d": 0.0},
-        params={"c": c},
-    )
-
-    # Entry fact with only fixed box (skip other input specs to isolate network encoding)
-    entry_fact = Fact(bounds=seed_bounds, cons=ConSet())
-
-    before, after, globalC = analyze(net, entry_id, entry_fact)
-
-    # Extract output bounds for big-M if available
-    out_bounds: Optional[Bounds] = None
-    try:
-        assert_preds = net.preds.get(assert_layer.id, [])
-        if assert_preds:
-            last_hid = assert_preds[0]
-            out_bounds = after[last_hid].bounds
-    except Exception:
-        out_bounds = None
-
-    # Export constraints
-    export_to_solver(globalC, solver, objective=None, sense="min")
-
-    # Pin inputs exactly to CE
-    x_np = to_numpy(x_flat).reshape(-1)
-    solver.set_bounds(input_ids, x_np, x_np)
-
-    # Add negated linear property
-    add_negated_assert_to_solver(
-        solver,
-        output_ids,
-        linear_assert,
-        out_bounds=out_bounds,
-    )
-
-    solver.set_objective_linear([], [], 0.0, sense="min")
-    solver.optimize(timelimit)
-
-    st = solver.status()
-    ce_input = None
-    if st == SolveStatus.SAT and solver.has_solution():
-        ce_input = solver.get_values(input_ids)
-
-    stats: Dict[str, Any] = {
-        "status": st,
-        "ncons": len(globalC),
-        "debug_mode": "fixed_input_lp",
-    }
-
-    return st, ce_input, stats
