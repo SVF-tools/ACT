@@ -228,15 +228,10 @@ def add_negated_assert_to_solver(
         t = int(assert_layer.meta["y_true"])
         v = solver.n
         solver.add_vars(1)
-        v_max = _upper_bound_violation(out_bounds, t, margin=0.0)
-        solver.add_lin_ge([v], [1.0], 0.0)       # v >= 0
-        solver.add_lin_ge([v], [-1.0], -v_max)   # v <= v_max
         for j, oj in enumerate(out_ids):
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
         solver.add_lin_ge([v], [1.0], 0.0)
-        
-        objective = {"var": v, "sense": "max"}
 
     elif k == OutKind.MARGIN_ROBUST:
         # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
@@ -244,16 +239,10 @@ def add_negated_assert_to_solver(
         margin = float(assert_layer.meta["margin"])
         v = solver.n
         solver.add_vars(1)
-        v_max = _upper_bound_violation(out_bounds, t, margin=margin)
-        if not np.isfinite(v_max) or v_max < 1e-3:
-            v_max = 1e6
-        solver.add_lin_ge([v], [1.0], 0.0)       # v >= 0
-        solver.add_lin_ge([v], [-1.0], -v_max)   # v <= v_max
         for j, oj in enumerate(out_ids):
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], -margin)
         solver.add_lin_ge([v], [1.0], 0.0)
-        objective = {"var": v, "sense": "max"}
 
     elif k == OutKind.RANGE:
         from act.back_end.cons_exportor import to_numpy
@@ -396,6 +385,7 @@ def setup_and_solve(
     stats = {"status": st, "ncons": len(globalC)}
     return st, ce_input, stats
 
+
 # -----------------------------------------------------------------------------
 # Single-shot verification
 # -----------------------------------------------------------------------------
@@ -406,11 +396,9 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     Single-shot verification without refinement.
     Returns CERTIFIED/FALSIFIED/UNKNOWN with optional counterexample input.
     """
-    
     spec_layers = gather_input_spec_layers(net)
-    assert_layer = get_assert_layer(net)
     seed_bounds = seed_from_input_specs(spec_layers)
-
+    
     # Core solver workflow
     status, ce_input, stats = setup_and_solve(net, seed_bounds, solver, timelimit)
     
@@ -418,8 +406,8 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     if status == SolveStatus.SAT and ce_input is not None:
         ce_x = torch.from_numpy(ce_input)
         return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
-
+    
     if status == SolveStatus.UNSAT:
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
-
+    
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)

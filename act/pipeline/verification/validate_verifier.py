@@ -528,11 +528,8 @@ class VerificationValidator:
                 ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
-                    logger.info(
-                        "     CE validation: input_sat=%s, output_sat=%s",
-                        ce_results.get("input_satisfied", None),
-                        ce_results.get("output_satisfied", None),
-                    )
+                     logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
+                              f"output_sat={ce_results['output_satisfied']}")
                 else:
                     logger.warning("     CE validation returned unexpected result type; cannot interpret as spec/property.")
             else:
@@ -774,7 +771,7 @@ class VerificationValidator:
                 input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
             # Use an empty constraint set for inputs so downstream analysis
             # never iterates over a None cons field.
-            entry_fact = Fact(bounds=input_bounds, cons=ConSet())
+            entry_fact = Fact(bounds=input_bounds, cons=None)
             
             # Step 6: Run abstract analysis
             try:
@@ -794,21 +791,20 @@ class VerificationValidator:
                     
                     # Ensure shapes match (ACT may have different neuron counts)
                     if concrete_vals_flat.shape != lb.shape:
-                        logger.warning(
-                            "  ⚠️ Shape mismatch at layer %s: concrete=%s, abstract=%s. Skipping.",
-                            layer_id, tuple(concrete_vals_flat.shape), tuple(lb.shape),
-                        )
+                        logger.warning(f"  ⚠️ Shape mismatch at layer {layer_id}: "
+                                     f"concrete={concrete_vals_flat.shape}, abstract={lb.shape}. Skipping.")
                         continue
                     
                     # Check if concrete values are within bounds
                     violations_mask = (concrete_vals_flat < lb) | (concrete_vals_flat > ub)
-                    num_violations = int(violations_mask.sum().item())
-                    total_checks += int(concrete_vals_flat.numel())
+                    num_violations = violations_mask.sum().item()
+                    total_checks += concrete_vals_flat.numel()
                     
                     if num_violations > 0:
                         violation_info = {
                             'sample_idx': sample_idx,
                             'layer_id': layer_id,
+                            'num_violations': num_violations,
                             'total_neurons': concrete_vals_flat.numel(),
                             'concrete_min': concrete_vals_flat.min().item(),
                             'concrete_max': concrete_vals_flat.max().item(),
