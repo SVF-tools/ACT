@@ -344,9 +344,7 @@ class NetFactory:
         current_dtype = str(get_default_dtype())
         
         layers = []
-        next_var = 0               # running variable id counter
-        prev_out: List[int] = []   # out_vars of previous layer
-        current_shape = None       # track shape for shape-based layers
+        var_counter = 0  # init in/out var counter
 
         for i, layer_spec in enumerate(spec['layers']):
             # Copy params and add required weight tensors if needed
@@ -354,25 +352,39 @@ class NetFactory:
             meta = layer_spec.get('meta', {}).copy()  # Use copy() to avoid modifying YAML
             kind = layer_spec['kind']
 
+            # Simple sequential variable assignment
+            in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
+            
             # Update INPUT layer dtype to match current device_manager
             if kind == "INPUT" and 'dtype' in meta:
                 meta['dtype'] = current_dtype
-
-            # Helper: compute flat size from a shape tuple/list
-            def _flat_size(shape) -> int:
-                p = 1
-                for s in shape:
-                    p *= int(s)
-                return p
-
+            
             # Get input shape for INPUT_SPEC generation
-            input_shape = current_shape
-
-            # === AUTO-GENERATION DISPATCH (params/meta) ===
+            input_shape = None
+            if i > 0 and layers[i-1].kind == "INPUT":
+                input_shape = layers[i-1].meta.get("shape")
+            
+            # Get output shape for ASSERT generation (from last non-wrapper layer)
+            output_shape = None
+            if i > 0:
+                # Look at previous layer's meta for out_features (DENSE) or output shape
+                for j in range(i-1, -1, -1):
+                    prev_layer = layers[j]
+                    if prev_layer.kind == "DENSE":
+                        out_features = prev_layer.meta.get("out_features")
+                        if out_features:
+                            output_shape = [1, out_features]
+                            break
+                    elif prev_layer.kind in ["CONV2D", "CONV1D", "CONV3D"]:
+                        # For conv layers, would need to compute output shape
+                        # For now, skip as we're using flatten + dense
+                        pass
+            
+            # === AUTO-GENERATION DISPATCH ===
             if kind == "INPUT_SPEC":
                 self._generate_input_spec_params(params, meta, input_shape)
             elif kind == "ASSERT":
-                self._generate_assert_params(params, meta, current_shape)
+                self._generate_assert_params(params, meta, output_shape)
             elif kind == "DENSE" and "W" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
@@ -385,74 +397,9 @@ class NetFactory:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
                     params["weight"] = weight
-
-            # === Variable wiring & shape tracking ===
-            if kind == "INPUT":
-                shape = tuple(meta["shape"])
-                flat = _flat_size(shape[1:])  # drop batch dim
-                in_vars: List[int] = []
-                out_vars = list(range(next_var, next_var + flat))
-                next_var += flat
-                current_shape = shape
-                prev_out = out_vars
-
-            elif kind == "INPUT_SPEC":
-                # Wrapper layer: no new vars, same shape
-                in_vars = prev_out
-                out_vars = prev_out
-
-            elif kind in ("RELU", "TANH", "SIGMOID", "LRELU", "ABS", "CLIP", "SILU", "SOFTPLUS"):
-                # Elementwise, shape preserved
-                in_vars = prev_out
-                out_vars = list(range(next_var, next_var + len(prev_out)))
-                next_var += len(out_vars)
-                prev_out = out_vars
-                # shape unchanged
-
-            elif kind == "DENSE":
-                out_features = int(meta.get("out_features", params.get("W", torch.zeros(1, 1)).shape[0]))
-                in_vars = prev_out
-                out_vars = list(range(next_var, next_var + out_features))
-                next_var += out_features
-                current_shape = (1, out_features)
-                prev_out = out_vars
-
-            elif kind == "CONV2D":
-                out_shape = tuple(meta.get("output_shape") or current_shape or [])
-                if not out_shape:
-                    raise ValueError("CONV2D requires output_shape in meta to allocate variables.")
-                flat = _flat_size(out_shape[1:])
-                in_vars = prev_out
-                out_vars = list(range(next_var, next_var + flat))
-                next_var += flat
-                current_shape = out_shape
-                prev_out = out_vars
-
-            elif kind == "FLATTEN":
-                # Flatten from start_dim (default 1)
-                start_dim = int(meta.get("start_dim", 1))
-                if current_shape is None:
-                    raise ValueError("FLATTEN requires a known current_shape.")
-                # Convert shape to list for manipulation
-                shape_list = list(current_shape)
-                if start_dim >= len(shape_list):
-                    raise ValueError(f"FLATTEN start_dim {start_dim} out of range for shape {current_shape}")
-                tail = _flat_size(shape_list[start_dim:])
-                new_shape = tuple(shape_list[:start_dim] + [tail])
-                in_vars = prev_out
-                out_vars = list(range(next_var, next_var + tail))
-                next_var += tail
-                current_shape = new_shape
-                prev_out = out_vars
-
-            elif kind == "ASSERT":
-                # Terminal property layer: consumes prev_out, no new vars
-                in_vars = prev_out
-                out_vars = []
-
-            else:
-                raise NotImplementedError(f"Unsupported layer kind in NetFactory: {kind}")
-
+                # Generate bias if needed (CONV layers typically have bias by default)
+                # For now, we don't add bias to CONV layers unless specified
+            
             # Create layer (validation happens automatically in __post_init__)
             layer = Layer(
                 id=i,

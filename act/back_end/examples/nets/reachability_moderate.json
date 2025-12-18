@@ -41,7 +41,7 @@
               1,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "ub": {
@@ -51,7 +51,7 @@
               1,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -83,13 +83,13 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDgsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArM/c6IxBBZv2cCb1QsTpu/xYosJkwXvL83gMRRqVGwP40mzDcAVq6/GkAbVdqFur9JKVbcuQLAv8INdHUnHsO/zfEjZJf5wT/S5zZcNpa7vzKVpEbVkK6/Mz+RvRgEkD8yX0gGWUGtv2haKCEy1a4/Q1GIS9Zdqb9IWM281iC6v93f2zXMLLO/ZHsmpjurvj8Ejlg9mYPJPyx0x9+UrJ2/Ys/iux9WsT9i8DBtO/Wsv8MFd21zdqU/mEFpMOQ5sr93RPlIzP/AP03kjxorZaS/GMFfQI6AuT9E6WTD6orEv0jRvLrnDrE/76uoVYxWwj+uzxa8j7u1vwJlr10glsQ/Hwlv0RrZoL/7Inl4dlOivzWtTyO9W7s/JxA8QcXAsb+sXRY+YIisP4hsjp5aqKQ/Ro32DQ3pwz9yeSnfcKqmP9A9yvgp2KE/LADY+CpOn7/aw5VXKzuZvyD2WinjkbU/fvgKF4l20D+Y5gPBa+yjP8eYA/gI8JG/z/ZQjK40wL8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDgsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqqpZoEKUubv+Rdq0H28L0/aXJB6KXloj/ot2316mi0v098/IQUxs0//jKvvTtC0z//EIgzDq6JP65Xl3PCYJG/yJLWVbqImb+FqgwrK2+1v/u8/wrFGnk/iNi99+0Pj7+KaSgzn5C1P05g7WGJT9O/nf51FuOXhr/s33YtCRq3v6pTRcCuI8m/cHdvymiGnr8y91Wn+Xmxv4m1cTSSXbe/q5qIiFexxb/Lggxv7Qq5P3yipt0rYbE/vIW5TGPYvL+V67bnluy9P81x25v6r44/D6tZdqFbu7+HIaNmmlGqPwKGA1Z37KI/w9AjEEXmwj/Ygr4he76IP+4fatPYX7e/d7r/gmtbyT9JO/3+gvuHvy/4dHl2GrE/g17QoXl2xT9PxszXGsLDvz1UTAQR8q2/sdQ5k/Dfxz+lksDyZMCnv6XOmXlKXMI/CvS/bfBOir9pzgeMQvqxv9xLMM9Ulbi/Qrf72HWvs7815LcEP8Wfv+jIemo49KM/LC7g5o/Uwb8=",
             "dtype": "torch.float64",
             "shape": [
               8,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "b": {
@@ -98,7 +98,7 @@
             "shape": [
               8
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -159,13 +159,13 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAr8bAizb+ivvxy1DJl1U4e/MqYTy73Ioz9I6flCxBF9P7wVGc3Ywy4/un0Bb8u1pj9MiLPUc+LDv7wdpW+0ypA/EQvJUgUUs78DL+uN9fWSv2w8qM1cynS/VzYUkNUToL/kGuYZ+9O6P5J0J/OCUrK/ry0vjt+UY7//prrIJrfAP9Q3jpnJWrI/l1wnmpHbmT890Sqo5Ti7v90bpltMdsc/P87YysVLjb8KP59s0cl+v6RcBNb/lbA/6mxVjuLynL8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqiIekoWlGwPwjWwLb7RKQ/g9VY5I8Xlz812x7/hGCrv5WgGepCDa6/0xJyczfdkD+hcEL43jO3PzzGPU7Sn6Q/gOHD4sHNsz8CMrSo4u6ZvygaVyDPvLs/G1uV58D5sT8PP0+GyfLQP+EIWiZ4Q4a/oIKgjgresz8zHSt0PTO5v/1gYfVG6a0/BFWRPKCEib+3MAYWgOGfP8Jk7GzmucC/vdmZYIdhjD8kYwWtmEPGPxhMjGhU6Lg/MPkVGGh4xr8=",
             "dtype": "torch.float64",
             "shape": [
               3,
               8
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "b": {
@@ -174,7 +174,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -210,7 +210,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "ub": {
@@ -219,7 +219,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -231,7 +231,11 @@
           23,
           24
         ],
-        "out_vars": [],
+        "out_vars": [
+          22,
+          23,
+          24
+        ],
         "cache": {}
       }
     ],
@@ -274,7 +278,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-12-15T14:27:00.033979",
+      "creation_time": "2025-12-18T13:58:18.945515",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [

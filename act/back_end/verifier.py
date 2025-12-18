@@ -170,24 +170,27 @@ def input_satisfies_specs(x_np: np.ndarray, spec_layers, tol: float = 1e-7) -> b
     Supports BOX, LINF_BALL, and LIN_POLY.
     """
     x = torch.from_numpy(x_np).reshape(-1)
+    x_device = x.device
 
     for L in spec_layers:
         k = L.meta.get("kind")
         if k == InKind.BOX:
-            lb = L.params["lb"].flatten()
-            ub = L.params["ub"].flatten()
+            lb = L.params["lb"].flatten().to(device=x_device)
+            ub = L.params["ub"].flatten().to(device=x_device)
             if torch.any(x < lb - tol) or torch.any(x > ub + tol):
                 return False
 
         elif k == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
-                lb = L.params["lb"].flatten()
-                ub = L.params["ub"].flatten()
+                lb = L.params["lb"].flatten().to(device=x_device)
+                ub = L.params["ub"].flatten().to(device=x_device)
             else:
-                center = L.params["center"].flatten()
+                center = L.params["center"].flatten().to(device=x_device)
                 eps = torch.tensor(L.meta["eps"], dtype=center.dtype, device=center.device)
                 lb = center - eps
                 ub = center + eps
+                lb = lb.to(device=x_device)
+                ub = ub.to(device=x_device)
             if torch.any(x < lb - tol) or torch.any(x > ub + tol):
                 return False
 

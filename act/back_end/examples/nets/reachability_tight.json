@@ -41,7 +41,7 @@
               1,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "ub": {
@@ -51,7 +51,7 @@
               1,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -83,13 +83,13 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoMgISJQZuJP3spW+aPBLI/uUu3BwEtpb8RmTbvtnKAv1/Oe7E61rC/JAgmIyTFMj/7Pb5NLjO1v6XZ+ZXzcIc/xtxVq2Lmsr/MWaDAGF+oP4sEhCqoY3S/z+pzVsALvz8vGPv8Lyq8PzCehAOJI76/du9mv80xs7+4f6pCQna8vxvEa6R/F7G/CVQU5Bvftr9huRPcFHyAP5NtJwjdZrk/7K71vPSOnr/yWQPKDEi+P93cQwEWlMU/KC9f6ir5xL98AMRmowG0P6ui+axe4bc/AAAk912ItL/VsVGl6SWcv+9CHTq8srC/6WXTDcZGt7+SUtAQGR3EP5yv8XRSzsi/QGFO+oP1xb9k+dxeDlKIP9p/f1OpMay/rRDrogpMkj8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDYsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIApMkjMtPX2Kvyf7fPiwmru/F+L2IkhhtT/dTTnwvOGZvw1u0DN+VMK/Kv21Kf5cob/2b4mHJ/yTP7RrWEhXT5k/NE+ZOnYhmr/SDgDjU6axPyf0HJfSjKw/EAtsFhs/ur8QHrPALQ66PwO8jv4caWG/Y6ongYaqtL8gpTIH2ta6P9TM6Qrn27E/R6jDYADGrb/kTxclct3Bv/JeNXoG1rG/gLMG5mytuz+sW2ibtwaMv0gwe028psa/2G7rbtduvz+cbSS8Uc24vyOyuVR0qLG/Tq/MaAi+t787qeWAd0WGP/VtpMAGy7a/hDBNRCyhw78FdF7sUE2ovzFASN1fm3c/tE7YsL2xlD/ZI5rzalmhvztVPD1pibG/Gp8KklA/rr8=",
             "dtype": "torch.float64",
             "shape": [
               6,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "b": {
@@ -98,7 +98,7 @@
             "shape": [
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -153,13 +153,13 @@
         "kind": "DENSE",
         "params": {
           "W": {
-            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArVdofQKvmpvwbPa6fPaqc/F2Yu28/LrL/ckjask0idP2bg+UzgX5O/wExkSDbKtL9lRlsD/ZKvPzyoqFEbSai/n1kpH7yEsD9PAH+hyba6v2wU1Sb4X6O/zbAtF3pzv7+KGoGg31ikv7kFTA6Mprg/nvq/OCNIoT+AC0d6FQG5P5RKS9leZJ+/J5fbDJPavL8=",
+            "data": "k05VTVBZAQB2AHsnZGVzY3InOiAnPGY4JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDMsIDYpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArO6RF7NfK0vxItmtAjQac/IpxdpckHmr+8hEoHYquqPxzwhlcN2rY/sDdTjNgonb94XZZwtRy/v6c20fMAPK+/rLmvUlE4zL8IAf+SjZt6P+8RyVFkZIC/n+CXR3PQvT+vlT+olHXAvy+fiZbb06i/RIFAHsLabD9i7nhtsi6oP6lci2CpErY/eyR2nR8KwD8=",
             "dtype": "torch.float64",
             "shape": [
               3,
               6
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "b": {
@@ -168,7 +168,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -202,7 +202,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           },
           "ub": {
@@ -211,7 +211,7 @@
             "shape": [
               3
             ],
-            "device": "cpu",
+            "device": "cuda:0",
             "requires_grad": false
           }
         },
@@ -223,7 +223,11 @@
           19,
           20
         ],
-        "out_vars": [],
+        "out_vars": [
+          18,
+          19,
+          20
+        ],
         "cache": {}
       }
     ],
@@ -266,7 +270,7 @@
       }
     },
     "metadata": {
-      "creation_time": "2025-12-15T14:27:00.034556",
+      "creation_time": "2025-12-18T13:58:18.946071",
       "framework_version": "ACT-1.0",
       "layer_count": 6,
       "layer_kinds": [
