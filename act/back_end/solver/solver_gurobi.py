@@ -110,7 +110,7 @@ class GurobiSolver(Solver):
             self.m.Params.TimeLimit = float(timelimit)
         self.m.update()
         self.m.optimize()
-    
+
     def status(self) -> str:
         if self.m.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
             return SolveStatus.SAT
