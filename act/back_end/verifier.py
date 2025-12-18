@@ -163,35 +163,6 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
         else:
             raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
 
-def _upper_bound_violation(out_bounds: Optional[Bounds], t: int, margin: float = 0.0) -> float:
-    """
-    Provide a finite upper bound for the violation variable v in TOP1/MARGIN_ROBUST:
-
-        TOP1:   v >= max_j (y[j] - y[t])
-        MARGIN: v >= max_j (y[j] - y[t] + margin)
-
-    Use abstract bounds for a coarse upper bound:
-        y[j] ∈ [lb_j, ub_j], y[t] ∈ [lb_t, ub_t]
-        ⇒ y[j] - y[t] ≤ ub_j - lb_t
-
-    Therefore:
-        TOP1:   v_max = max_j (ub_j - lb_t)
-        MARGIN: v_max = max_j (ub_j - lb_t + margin)
-
-    """
-    if out_bounds is None:
-        return 1e6
-
-    lb = out_bounds.lb.detach().cpu().numpy().reshape(-1)
-    ub = out_bounds.ub.detach().cpu().numpy().reshape(-1)
-
-    lb_t = float(lb[t])
-    diff = ub - lb_t + margin
-    v_max = float(np.nanmax(diff))
-    if not np.isfinite(v_max):
-        return 1e6
-    return max(v_max, 1e3)
-
 def add_negated_assert_to_solver(
     solver: Solver,
     out_ids: List[int],
@@ -232,7 +203,7 @@ def add_negated_assert_to_solver(
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
         solver.add_lin_ge([v], [1.0], 0.0)
-
+        
     elif k == OutKind.MARGIN_ROBUST:
         # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
         t = int(assert_layer.meta["y_true"])
@@ -243,7 +214,7 @@ def add_negated_assert_to_solver(
             if j != t:
                 solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], -margin)
         solver.add_lin_ge([v], [1.0], 0.0)
-
+        
     elif k == OutKind.RANGE:
         from act.back_end.cons_exportor import to_numpy
 
