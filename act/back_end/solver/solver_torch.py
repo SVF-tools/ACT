@@ -137,13 +137,15 @@ class TorchLPSolver(Solver):
             eff_max_iter = min(eff_max_iter, self._large_n_max_iter)
             eff_tol_feas = max(eff_tol_feas, self._large_n_tol)
 
+        # initialize x at box center (or zeros where infinite)
         if self._x is None:
-            lb0 = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
-            ub0 = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
-            mid = 0.5 * (lb0 + ub0)
+            lb = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
+            ub = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
+            mid = 0.5 * (lb + ub)
             both_inf = (~torch.isfinite(self._lb)) & (~torch.isfinite(self._ub))
             mid = torch.where(both_inf, torch.zeros_like(mid), mid)
-            self._x = torch.nn.Parameter(mid.to(device=self._device, dtype=self._dtype), requires_grad=True)
+            self._x = torch.nn.Parameter(mid.clone().to(device=self._device, dtype=self._dtype), requires_grad=True)
+            # self._x = torch.nn.Parameter(mid.to(device=self._device, dtype=self._dtype), requires_grad=True)
         else:
             self._x = torch.nn.Parameter(self._x.detach().to(device=self._device, dtype=self._dtype), requires_grad=True)
 
