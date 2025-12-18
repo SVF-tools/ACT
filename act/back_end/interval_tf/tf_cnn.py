@@ -104,8 +104,11 @@ def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
 
     lb_out = F.max_pool1d(lb_in, kernel_size, stride, padding, dilation)
     ub_out = F.max_pool1d(ub_in, kernel_size, stride, padding, dilation)
+    assert lb_out.shape == (b, c, out_w), f"maxpool1d output shape mismatch: got {tuple(lb_out.shape)}, expected {(b, c, out_w)}"
+    assert lb_out.numel() == len(L.out_vars), f"maxpool1d out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
 
     B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    assert torch.all(B.lb <= B.ub), "maxpool1d produced invalid bounds (lb > ub)"
     C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"maxpool1d:{L.id}",
@@ -213,8 +216,11 @@ def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
 
     lb_out = F.max_pool3d(lb_in, kernel_size, stride, padding, dilation)
     ub_out = F.max_pool3d(ub_in, kernel_size, stride, padding, dilation)
+    assert lb_out.shape == tuple(output_shape), f"maxpool3d output shape mismatch: got {tuple(lb_out.shape)}, expected {tuple(output_shape)}"
+    assert lb_out.numel() == len(L.out_vars), f"maxpool3d out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
 
     B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    assert torch.all(B.lb <= B.ub), "maxpool3d produced invalid bounds (lb > ub)"
     C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"maxpool3d:{L.id}",
@@ -234,6 +240,7 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
         pads = L.meta.get("pads", None)
     if pads is None:
         raise KeyError(f"pad/pads not found in meta for PAD layer {L.id}")
+    assert len(pads) % 2 == 0, f"pad expects pairs, got pads={pads}"
 
     mode = L.meta.get("mode", "constant")
     value = float(L.meta.get("value", 0.0))
@@ -244,8 +251,10 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
 
     lb_out = F.pad(lb_in, pads, mode=mode, value=value)
     ub_out = F.pad(ub_in, pads, mode=mode, value=value)
+    assert lb_out.numel() == len(L.out_vars), f"pad out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
 
     B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
+    assert torch.all(B.lb <= B.ub), "pad produced invalid bounds (lb > ub)"
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"pad:{L.id}",
@@ -257,29 +266,9 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for Flatten / View / Reshape-like layers.
-
-    Semantics:
-      - Flatten is a pure reshaping: it does not change any scalar value,
-        only how they are grouped into tensors.
-      - In the interval domain we already store bounds as 1D vectors, so the
-        operation is effectively the identity on (lb, ub); only the logical
-        shape metadata changes.
-
-    Design choices:
-      - We keep Bounds as a flat 1D vector (identity on intervals).
-      - We record input/output shapes (and optional axis/start_dim/end_dim)
-        in the constraint metadata for debugging / reconstruction.
-      - We do NOT build an explicit W matrix (which would be a permutation),
-        to avoid quadratic blow-up; instead we just register an EQ constraint
-        tagged as "flatten".
-    """
     lb = Bin.lb
     ub = Bin.ub
 
-    # 1) Best-effort recovery of shapes from meta
-    #    (these are only for bookkeeping; we don't enforce them on the data)
     if "input_shape" in L.meta:
         input_shape = tuple(L.meta["input_shape"])
     else:
@@ -290,18 +279,19 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     else:
         output_shape = (int(lb.numel()),)
 
-    # Optional extra info from different front-ends (PyTorch / ONNX style)
     axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
     start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
     end_dim   = L.meta.get("end_dim", None)
 
-    # 2) For intervals, flatten is just identity (we already use 1D vectors)
     lb_flat = lb.view(-1)
     ub_flat = ub.view(-1)
+    assert lb_flat.numel() == len(L.out_vars), f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.numel()}"
+    if "output_shape" in L.meta:
+        expected = int(torch.tensor(output_shape).prod().item())
+        assert lb_flat.numel() == expected, f"flatten output numel {lb_flat.numel()} != expected {expected}"
     B_out = Bounds(lb_flat, ub_flat)
+    assert torch.all(B_out.lb <= B_out.ub), "flatten produced invalid bounds (lb > ub)"
 
-    # 3) Lightweight constraint: we don't encode the full permutation matrix,
-    #    just tag the relation between in_vars and out_vars.
     C = ConSet()
     C.replace(Con(
         "EQ",
@@ -316,7 +306,6 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
         },
     ))
 
-    # 4) Attach the interval box on out_vars as usual
     C.add_box(L.id, L.out_vars, B_out)
     return Fact(B_out, C)
 
@@ -648,6 +637,7 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
     scale_factor = L.meta.get("scale_factor", None)
     mode = L.meta.get("mode", "nearest")
     align_corners = bool(L.meta.get("align_corners", False))
+    assert size is not None or scale_factor is not None, "upsample requires size or scale_factor"
 
     # F.interpolate scale_factor must be float or tuple of float
     y_lb = F.interpolate(
@@ -665,7 +655,13 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
         align_corners=align_corners if "linear" in mode else None,
     )
 
+    if "output_shape" in L.meta:
+        expected_shape = tuple(L.meta["output_shape"])
+        assert tuple(y_lb.shape) == expected_shape, f"upsample output shape mismatch: got {tuple(y_lb.shape)}, expected {expected_shape}"
+    assert y_lb.numel() == len(L.out_vars), f"upsample out_vars length {len(L.out_vars)} != output elements {y_lb.numel()}"
+
     B = Bounds(y_lb.reshape(-1), y_ub.reshape(-1))
+    assert torch.all(B.lb <= B.ub), "upsample produced invalid bounds (lb > ub)"
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"upsample:{L.id}",
