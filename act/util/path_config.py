@@ -144,7 +144,9 @@ def get_pipeline_log_dir() -> str:
     Returns:
         Absolute path to act/pipeline/log/ directory
     """
-    return os.path.join(act_root, 'pipeline', 'log')
+    os.makedirs(d := os.path.join(act_root, "pipeline", "log"), exist_ok=True); 
+    return d
+
 
 
 def get_path_relative_to_project(relative_path: str) -> str:
