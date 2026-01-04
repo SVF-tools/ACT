@@ -81,7 +81,7 @@ wrapped_models, reports = synthesize_models_from_specs(selected_instances)
 print(f"✓ Models wrapped for {len(wrapped_models)} instances\n")
 
 # Load fuzzing config from YAML
-config_path = "/home/guanqinzhang/guanqin/ACT/act/pipeline/fuzzing/config.yaml"
+config_path = "./act/pipeline/fuzzing/config.yaml"
 with open(config_path) as f:
     yaml_data = yaml.safe_load(f)
     yaml_config = yaml_data['fuzzing']
