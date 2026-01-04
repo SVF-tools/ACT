@@ -4,6 +4,10 @@ Mutation strategies for ACTFuzzer.
 Implements gradient-guided, activation-guided, boundary, and random mutations.
 All mutations automatically respect InputSpec constraints via projection.
 
+Gradient-guided now accommodates two mutated input generation methods: FGSM (Fast Gradient Sign Method) and PGD (Projected Gradient Descent).
+    1) FGSM: single-step gradient-based perturbation.
+    2) PGD: iterative gradient-based perturbation.
+
 ## Adaptive Perturbation Sizing
 
 NOTE: We use "perturb_size" (not "epsilon") to avoid confusion with InputSpec.eps (L∞ radius).
@@ -59,7 +63,7 @@ License: AGPLv3+
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Union
+from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 import numpy as np
@@ -90,51 +94,131 @@ class MutationStrategy(ABC):
         pass
 
 
-class GradientMutation(MutationStrategy):
+class FGSMMutation(MutationStrategy):
     """
-    FGSM-style gradient-guided mutation.
-    
-    Computes gradients to maximize output variance, then applies
-    signed gradient perturbation.
+    FGSM-style gradient-guided mutation (single-step).
+
+    Computes gradients to maximize output variance, then applies a single-step
+    sign-gradient perturbation.
     """
-    
-    def __init__(self, perturb_size: Union[float, torch.Tensor] = 0.01):
+
+    def __init__(self, perturb_size: Union[float, torch.Tensor] = 8/255):
         """
-        Initialize gradient mutation.
-        
+        Initialize FGSM mutation.
+
         Args:
             perturb_size: Mutation perturbation magnitude (scalar or per-dimension tensor)
         """
         self.perturb_size = perturb_size
-    
+
     def mutate(self, input_tensor, model, activations=None):
-        """Apply gradient-based perturbation."""
+        """Apply FGSM gradient-based perturbation (single-step)."""
         # Enable gradients
         x = input_tensor.clone().detach().requires_grad_(True)
-        
+
         # Forward pass
         output = model(x)
-        
+
         # Extract output tensor if dict (from VerifiableModel)
         if isinstance(output, dict):
             output = output['output']
-        
-        # Compute loss: maximize output variance
+
+        # Compute loss: maximize output variance (unsupervised, label-free)
         loss = output.var()
-        
-        # Backward pass
-        loss.backward()
-        
-        # Get gradient
-        grad = x.grad.detach()
-        
+
+        # Get gradient w.r.t. input only (avoid accumulating grads on model params)
+        grad = torch.autograd.grad(loss, x, retain_graph=False, create_graph=False)[0].detach()
+
         # FGSM: sign of gradient
-        # Handle both scalar and tensor perturb_size
         perturb_size = self.perturb_size.to(input_tensor.device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
         perturbation = perturb_size * torch.sign(grad)
-        
+
         # Apply perturbation
         return input_tensor + perturbation
+
+
+class PGDMutation(MutationStrategy):
+    """
+    PGD-style gradient-guided mutation (iterative).
+
+    Implementation follows the notebook approach:
+    - Define a feasible box around x0: [x0 - perturb_size, x0 + perturb_size]
+    - Optional random start within the feasible box
+    - Iterative sign-gradient ascent with projection back to the feasible box
+
+    Note: Global InputSpec constraints are enforced by MutationEngine projection after mutation.
+    """
+
+    def __init__(
+        self,
+        perturb_size: Union[float, torch.Tensor] = 8/255,
+        num_steps: int = 10,
+        step_size: Optional[float] = None,
+        random_start: bool = True,
+    ):
+        """
+        Initialize PGD mutation.
+
+        Args:
+            perturb_size: L_infinity radius of local feasible box around the seed (scalar or per-dimension tensor)
+            num_steps: Number of PGD iterations
+            step_size: Per-iteration step size (if None, computed from feasible box range / steps as in notebook)
+            random_start: Whether to start uniformly within the feasible box (recommended)
+        """
+        self.perturb_size = perturb_size
+        self.num_steps = int(num_steps)
+        self.step_size = step_size
+        self.random_start = random_start
+
+    def mutate(self, input_tensor, model, activations=None):
+        """Apply PGD mutation with notebook-style projection and step size heuristic."""
+        x0 = input_tensor.detach()
+
+        perturb_size = self.perturb_size.to(input_tensor.device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
+        x_low = x0 - perturb_size
+        x_high = x0 + perturb_size
+
+        # Default step size: spread movement across the available range (notebook heuristic)
+        if self.step_size is None:
+            # (x_high - x_low) == 2*perturb_size; take max range element as scalar step size
+            step_size = float((x_high - x_low).abs().max().item()) / max(self.num_steps, 1)
+            step_size = max(step_size, 1e-6)
+        else:
+            step_size = float(self.step_size)
+
+        # Random start inside feasible box
+        if self.random_start:
+            x_adv = x_low + torch.rand_like(x0) * (x_high - x_low)
+        else:
+            x_adv = x0.clone()
+
+        # Ensure start in-bounds
+        x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
+
+        for _ in range(self.num_steps):
+            x_adv.requires_grad_(True)
+
+            # Forward pass
+            output = model(x_adv)
+
+            # Extract output tensor if dict (from VerifiableModel)
+            if isinstance(output, dict):
+                output = output['output']
+
+            # Loss: maximize output variance (unsupervised, label-free)
+            loss = output.var()
+
+            grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0].detach()
+
+            # Gradient ascent on loss
+            x_adv = (x_adv + step_size * torch.sign(grad)).detach()
+
+            # Project back to feasible box
+            x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
+
+        return x_adv.detach()
+
+
 
 
 class ActivationMutation(MutationStrategy):
@@ -224,7 +308,6 @@ class MutationEngine:
     - Weighted random strategy selection
     - Automatic InputSpec projection
     - Activation capture via forward hooks
-    - Statistics tracking
     
     Example:
         >>> engine = MutationEngine(model, input_spec, weights, device)
@@ -261,15 +344,24 @@ class MutationEngine:
         
         # Initialize strategies with computed perturb_size
         self.strategies = {
-            "gradient": GradientMutation(perturb_size=perturb_size),
+            "gradient": FGSMMutation(perturb_size=perturb_size),
+            "pgd": PGDMutation(perturb_size=perturb_size),
             "activation": ActivationMutation(perturb_size=perturb_size),
             "boundary": BoundaryMutation(perturb_size=perturb_size * 0.5),  # Half perturb_size for boundary (more conservative)
             "random": RandomMutation(perturb_size=perturb_size * 0.5)       # Half perturb_size for random (more conservative)
         }
-        
-        # Normalize weights
-        total = sum(weights.values())
-        self.weights = {k: v/total for k, v in weights.items()}
+
+        # Validate and normalize weights
+        unknown = set(weights.keys()) - set(self.strategies.keys())
+        if unknown:
+            raise ValueError(
+                f"Unknown mutation strategy keys in weights: {sorted(unknown)}. "
+                f"Valid options: {sorted(self.strategies.keys())}"
+            )
+        total = sum(float(v) for v in weights.values())
+        if total <= 0.0:
+            raise ValueError(f"Mutation weights must sum to > 0. Got total={total}.")
+        self.weights = {k: float(v) / total for k, v in weights.items()}
         
         # Statistics
         self.total_mutations = 0
@@ -378,6 +470,8 @@ class MutationEngine:
     
     def _setup_hooks(self):
         """Setup forward hooks to capture activations."""
+
+        
         def make_hook(name):
             def hook(module, input, output):
                 # Store activation (handle both tensor and dict outputs)
@@ -385,12 +479,14 @@ class MutationEngine:
                     self.last_activations[name] = output.detach()
                 elif isinstance(output, dict) and 'output' in output:
                     self.last_activations[name] = output['output'].detach()
+            
             return hook
         
         # Register hooks on computational layers
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.ReLU, nn.Linear, nn.Conv2d)):
                 module.register_forward_hook(make_hook(name))
+                
     
     def mutate(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -485,6 +581,7 @@ class MutationEngine:
     def get_last_activations(self) -> Dict[str, torch.Tensor]:
         """Get activations from last inference."""
         return self.last_activations
+    
     
     def get_last_gradients(self) -> Optional[Dict[str, torch.Tensor]]:
         """Get gradients from last mutation (Level 3 tracing only)."""

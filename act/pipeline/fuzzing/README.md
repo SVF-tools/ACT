@@ -88,6 +88,7 @@ fuzzing:
   max_iterations: 10000
   mutation_weights:
     gradient: 0.4      # FGSM-style
+    pgd: 0.0           # PGD-style (iterative; opt-in)
     activation: 0.3    # DeepXplore
     boundary: 0.2      # Edge cases
     random: 0.1        # Baseline
@@ -95,25 +96,34 @@ fuzzing:
 
 ## Mutation Strategies
 
-### 1. Gradient-Guided (40%)
-FGSM-style adversarial perturbations:
+### 1. Gradient-Guided (FGSM) (40%)
+Single-step FGSM-style perturbations:
 ```
 x' = x + ε * sign(∇_x Loss(x))
 ```
 
-### 2. Activation-Guided (30%)
+### 2. Gradient-Guided (PGD) (0% by default)
+Iterative PGD-style perturbations with projection each step:
+```
+x_low  = x - ε
+x_high = x + ε
+repeat K steps:
+  x = proj_[x_low,x_high](x + α * sign(∇_x Loss(x)))
+```
+
+### 3. Activation-Guided (30%)
 Targets neurons with low activation (DeepXplore):
 ```
 Maximize: Σ inactive_neurons
 ```
 
-### 3. Boundary Exploration (20%)
+### 4. Boundary Exploration (20%)
 Samples near InputSpec boundaries:
 ```
 x' = x + ε * direction_to_boundary
 ```
 
-### 4. Random (10%)
+### 5. Random (10%)
 Gaussian noise baseline:
 ```
 x' = x + N(0, ε²)
@@ -208,6 +218,10 @@ ACTFuzzer tracks **neuron coverage**:
 ```
 Coverage = |{neurons that fired}| / |{total neurons}|
 ```
+
+Coverage strategies (config `coverage_strategy`):
+- `pic`: per-input coverage values (tracks per-input coverage history; no global union)
+- `glc`: global union coverage across all inputs (supports never-activated neuron queries)
 
 A neuron "fired" if `activation > threshold` (default: 0.1).
 

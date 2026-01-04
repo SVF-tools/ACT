@@ -16,3 +16,5 @@ ipynb/*
 Abstract-Constraint-Transformer.wiki/
 act/pipeline/log/*
 act/back_end/examples/nets/*
+act/ipynb/fuzzing_results_vnnlib/*
+fuzzing_results_vnnlib/*

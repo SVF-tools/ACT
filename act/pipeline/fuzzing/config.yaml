@@ -5,9 +5,13 @@ fuzzing:
   max_iterations: 10000
   timeout_seconds: 3600.0  # 1 hour
   
+  coverage_strategy: "pic"  # "pic: per-input coverage" or "glc: global coverage"
+  activation_threshold: 0.1  # Neuron activation threshold
+
   # Mutation strategy weights (must sum to 1.0)
   mutation_weights:
     gradient: 0.4      # FGSM-style gradient-guided
+    pgd: 0.0           # PGD-style gradient-guided (iterative; opt-in)
     activation: 0.3    # Activation-guided (DeepXplore)
     boundary: 0.2      # Boundary exploration
     random: 0.1        # Random baseline

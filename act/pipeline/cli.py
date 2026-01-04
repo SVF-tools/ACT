@@ -292,6 +292,7 @@ def cmd_fuzz(args):
         report_interval=args.report_interval,
         mutation_weights={
             "gradient": 0.4,
+            "pgd": 0.0,
             "activation": 0.3,
             "boundary": 0.2,
             "random": 0.1
