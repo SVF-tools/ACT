@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Callable, Dict, Any
 
 import numpy as np
+from scipy import stats
 import torch
 
 # ACT backend imports
@@ -195,14 +196,38 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
         solver.add_lin_ge([v], [1.0], 0.0)
         
     elif k == OutKind.RANGE:
-        # Property: lb ≤ y ≤ ub  →  Negation: y > ub (or y < lb)
-        ub = assert_layer.params.get("ub")
-        if ub is not None:
-            for i, yi in enumerate(out_ids):
-                solver.add_lin_ge([yi], [1.0], float(ub[i].item()) + 1e-6)
-    else:
-        raise NotImplementedError(f"Unsupported ASSERT kind: {k}")
+        from act.back_end.cons_exportor import to_numpy
+        lb_t = assert_layer.params.get("lb", None)
+        ub_t = assert_layer.params.get("ub", None)
+        if lb_t is None and ub_t is None:
+            raise ValueError("RANGE assert requires lb and/or ub.")
 
+        lb = None; ub = None
+        if lb_t is not None:
+            lb = to_numpy(lb_t).reshape(-1)
+        if ub_t is not None:
+            ub = to_numpy(ub_t).reshape(-1)
+
+        n_out = len(out_ids)
+        if lb is not None and lb.shape[0] != n_out:
+            raise ValueError(f"RANGE: lb length {lb.shape[0]} != len(out_ids)={n_out}")
+        if ub is not None and ub.shape[0] != n_out:
+            raise ValueError(f"RANGE: ub length {ub.shape[0]} != len(out_ids)={n_out}")
+
+        v = solver.n
+        solver.add_vars(1)
+        v_max_terms = []
+
+        v_max = max(v_max_terms) if v_max_terms else 1e6
+        if (not np.isfinite(v_max)) or v_max < 1e-3:
+            v_max = 1e6
+
+        solver.add_lin_ge([v], [1.0], 0.0)        # v >= 0
+        solver.add_lin_ge([v], [-1.0], -v_max)    # v <= v_max
+
+        for i, yi in enumerate(out_ids):
+            if lb is not None: solver.add_lin_ge([v, yi], [1.0, 1.0], float(lb[i]))
+            if ub is not None: solver.add_lin_ge([v, yi], [1.0, -1.0], float(-ub[i]))
 
 # -----------------------------------------------------------------------------
 # Core solver workflow (shared by verify_once and BaB)
@@ -301,5 +326,4 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
         return VerifResult(VerifStatus.CERTIFIED, stats=stats)
     
     return VerifResult(VerifStatus.UNKNOWN, stats=stats)
-
 

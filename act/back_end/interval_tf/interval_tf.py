@@ -95,7 +95,7 @@ class IntervalTF(TransferFunction):
         "EXPAND": lambda L, bounds, tf: tf_expand(L, bounds),
         
         # Transformer operations
-        "EMBEDDING_TF": lambda L, bounds, tf: tf_embedding(L),
+        "EMBEDDING_TF": lambda L, bounds, tf: tf_embedding(L, bounds),
         "POSENC": lambda L, bounds, tf: tf_posenc(L, bounds),
         "LAYERNORM": lambda L, bounds, tf: tf_layernorm(L, bounds),
         "GELU": lambda L, bounds, tf: tf_gelu(L, bounds),

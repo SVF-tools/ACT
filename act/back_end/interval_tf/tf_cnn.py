@@ -87,6 +87,41 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
 
+def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
+    dilation = L.meta.get("dilation", 1)
+
+    input_shape = L.meta["input_shape"]   # [batch, channels, width]
+    output_shape = L.meta["output_shape"] # [batch, channels, out_w]
+
+    b, c, w = input_shape
+    _, _, out_w = output_shape
+
+    lb_in = Bin.lb.view(b, c, w)
+    ub_in = Bin.ub.view(b, c, w)
+
+    lb_out = F.max_pool1d(lb_in, kernel_size, stride, padding, dilation)
+    ub_out = F.max_pool1d(ub_in, kernel_size, stride, padding, dilation)
+    assert lb_out.shape == (b, c, out_w), f"maxpool1d output shape mismatch: got {tuple(lb_out.shape)}, expected {(b, c, out_w)}"
+    assert lb_out.numel() == len(L.out_vars), f"maxpool1d out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
+
+    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    assert torch.all(B.lb <= B.ub), "maxpool1d produced invalid bounds (lb > ub)"
+    C = ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"maxpool1d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
 
 def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     """
@@ -138,38 +173,141 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
 
+def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
 
-def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for Flatten layer.
-    
-    Simply reshapes the bounds without changing values.
-    """
-    # Extract shape information
     input_shape = L.meta["input_shape"]
     output_shape = L.meta["output_shape"]
-    
-    # Flatten is just a reshape operation - bounds remain the same
-    input_size = torch.prod(torch.tensor(input_shape)).item()
-    output_size = torch.prod(torch.tensor(output_shape)).item()
-    
-    if input_size != output_size:
-        raise ValueError(f"Flatten: input size {input_size} != output size {output_size}")
-    
-    # Bounds are preserved, just reshaped
-    B_output = Bounds(Bin.lb.view(-1), Bin.ub.view(-1))
-    
-    # Create identity constraint
+
+    b, c, w = input_shape
+    lb_in = Bin.lb.view(b, c, w)
+    ub_in = Bin.ub.view(b, c, w)
+
+    lb_out = F.avg_pool1d(lb_in, kernel_size, stride, padding)
+    ub_out = F.avg_pool1d(ub_in, kernel_size, stride, padding)
+
+    B_output = Bounds(lb_out.view(-1), ub_out.view(-1))
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"flatten:{L.id}",
+        "tag": f"avgpool1d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
         "input_shape": input_shape,
         "output_shape": output_shape
     }))
-    
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
 
+def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.meta["kernel_size"]
+    stride = L.meta.get("stride", kernel_size)
+    padding = L.meta.get("padding", 0)
+    dilation = L.meta.get("dilation", 1)
+
+    input_shape = L.meta["input_shape"]   # [b, c, d, h, w]
+    output_shape = L.meta["output_shape"] # [b, c, od, oh, ow]
+
+    b, c, d, h, w = input_shape
+    lb_in = Bin.lb.view(b, c, d, h, w)
+    ub_in = Bin.ub.view(b, c, d, h, w)
+
+    lb_out = F.max_pool3d(lb_in, kernel_size, stride, padding, dilation)
+    ub_out = F.max_pool3d(ub_in, kernel_size, stride, padding, dilation)
+    assert lb_out.shape == tuple(output_shape), f"maxpool3d output shape mismatch: got {tuple(lb_out.shape)}, expected {tuple(output_shape)}"
+    assert lb_out.numel() == len(L.out_vars), f"maxpool3d out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
+
+    B = Bounds(lb_out.view(-1), ub_out.view(-1))
+    assert torch.all(B.lb <= B.ub), "maxpool3d produced invalid bounds (lb > ub)"
+    C = ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"maxpool3d:{L.id}",
+        "kernel_size": kernel_size,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+def tf_pad(L: Layer, Bin: Bounds) -> Fact:
+    pads = L.meta.get("pad", None)
+    if pads is None:
+        pads = L.meta.get("pads", None)
+    if pads is None:
+        raise KeyError(f"pad/pads not found in meta for PAD layer {L.id}")
+    assert len(pads) % 2 == 0, f"pad expects pairs, got pads={pads}"
+
+    mode = L.meta.get("mode", "constant")
+    value = float(L.meta.get("value", 0.0))
+
+    in_shape = tuple(L.meta["input_shape"])
+    lb_in = Bin.lb.view(*in_shape)
+    ub_in = Bin.ub.view(*in_shape)
+
+    lb_out = F.pad(lb_in, pads, mode=mode, value=value)
+    ub_out = F.pad(ub_in, pads, mode=mode, value=value)
+    assert lb_out.numel() == len(L.out_vars), f"pad out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
+
+    B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
+    assert torch.all(B.lb <= B.ub), "pad produced invalid bounds (lb > ub)"
+    C = ConSet()
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"pad:{L.id}",
+        "pads": list(pads),
+        "mode": mode,
+        "value": value,
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
+    lb = Bin.lb
+    ub = Bin.ub
+
+    if "input_shape" in L.meta:
+        input_shape = tuple(L.meta["input_shape"])
+    else:
+        input_shape = (int(lb.numel()),)
+
+    if "output_shape" in L.meta:
+        output_shape = tuple(L.meta["output_shape"])
+    else:
+        output_shape = (int(lb.numel()),)
+
+    axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
+    start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
+    end_dim   = L.meta.get("end_dim", None)
+
+    lb_flat = lb.view(-1)
+    ub_flat = ub.view(-1)
+    assert lb_flat.numel() == len(L.out_vars), f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.numel()}"
+    if "output_shape" in L.meta:
+        expected = int(torch.tensor(output_shape).prod().item())
+        assert lb_flat.numel() == expected, f"flatten output numel {lb_flat.numel()} != expected {expected}"
+    B_out = Bounds(lb_flat, ub_flat)
+    assert torch.all(B_out.lb <= B_out.ub), "flatten produced invalid bounds (lb > ub)"
+
+    C = ConSet()
+    C.replace(Con(
+        "EQ",
+        tuple(L.out_vars + L.in_vars),
+        {
+            "tag":          f"flatten:{L.id}",
+            "input_shape":  input_shape,
+            "output_shape": output_shape,
+            "axis":         axis,
+            "start_dim":    start_dim,
+            "end_dim":      end_dim,
+        },
+    ))
+
+    C.add_box(L.id, L.out_vars, B_out)
+    return Fact(B_out, C)
 
 def _conv2d_to_linear_matrix(
     weight: torch.Tensor,
@@ -489,6 +627,52 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
+
+def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
+    in_shape = tuple(L.meta["input_shape"])
+    x_lb = Bin.lb.view(*in_shape)
+    x_ub = Bin.ub.view(*in_shape)
+
+    size = L.meta.get("size", None)
+    scale_factor = L.meta.get("scale_factor", None)
+    mode = L.meta.get("mode", "nearest")
+    align_corners = bool(L.meta.get("align_corners", False))
+    assert size is not None or scale_factor is not None, "upsample requires size or scale_factor"
+
+    # F.interpolate scale_factor must be float or tuple of float
+    y_lb = F.interpolate(
+        x_lb,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners if "linear" in mode else None,
+    )
+    y_ub = F.interpolate(
+        x_ub,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners if "linear" in mode else None,
+    )
+
+    if "output_shape" in L.meta:
+        expected_shape = tuple(L.meta["output_shape"])
+        assert tuple(y_lb.shape) == expected_shape, f"upsample output shape mismatch: got {tuple(y_lb.shape)}, expected {expected_shape}"
+    assert y_lb.numel() == len(L.out_vars), f"upsample out_vars length {len(L.out_vars)} != output elements {y_lb.numel()}"
+
+    B = Bounds(y_lb.reshape(-1), y_ub.reshape(-1))
+    assert torch.all(B.lb <= B.ub), "upsample produced invalid bounds (lb > ub)"
+    C = ConSet()
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        "tag": f"upsample:{L.id}",
+        "mode": mode,
+        "size": list(size) if size is not None else None,
+        "scale_factor": scale_factor,
+        "input_shape": in_shape,
+        "output_shape": list(y_lb.shape),
+    }))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
 
 
 # -------- Helper functions for new conv layers --------

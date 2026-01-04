@@ -66,7 +66,7 @@ def tf_softmax(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_att_mix(L: Layer, Bw: Bounds, Bv: Bounds) -> Fact:
     lo=torch.minimum(torch.minimum(Bw.lb*Bv.lb, Bw.lb*Bv.ub), torch.minimum(Bw.ub*Bv.lb, Bw.ub*Bv.ub)).sum(dim=-1)
-    hi=torch.maximum(torch.maximum(Bw.lb*Bv.lb, Bw.lb*Bv.ub), torch.maximum(Bw.ub*Bv.la, Bw.ub*Bv.ub)).sum(dim=-1)
+    hi=torch.maximum(torch.maximum(Bw.lb*Bv.lb, Bw.lb*Bv.ub), torch.maximum(Bw.ub*Bv.lb, Bw.ub*Bv.ub)).sum(dim=-1)
     B=Bounds(lo,hi); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars + L.meta["w_vars"] + L.meta["v_vars"]), {"tag":f"att_mix:{L.id}","mcc":True,"rowsize":L.meta["rowsize"]}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)

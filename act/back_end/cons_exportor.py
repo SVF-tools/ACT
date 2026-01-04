@@ -19,6 +19,84 @@ from act.back_end.core import ConSet
 from act.back_end.solver.solver_base import Solver
 from act.util.device_manager import get_default_device, get_default_dtype
 
+TANH_EPS = 1e-9
+TANH_IDENTITY_WINDOW = 0.25  # treat tanh(x) ≈ x within this window
+TANH_IDENTITY_TOL = 1e-6    # symmetric tolerance when approximating identity
+
+def _tanh_value(x: float) -> float:
+    return float(np.tanh(x))
+
+def _tanh_derivative(x: float) -> float:
+    t = np.tanh(x)
+    return float(1.0 - t * t)
+
+def _add_tanh_convex_segment(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    if hi - lo <= TANH_EPS:
+        return
+    f_lo = _tanh_value(lo)
+    f_hi = _tanh_value(hi)
+    slope_sec = (f_hi - f_lo) / (hi - lo)
+    intercept_sec = f_lo - slope_sec * lo
+    solver.add_lin_le([zi, yi], [1.0, -float(slope_sec)], float(intercept_sec))
+    slope_tan = _tanh_derivative(hi)
+    intercept_tan = f_hi - slope_tan * hi
+    solver.add_lin_ge([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+def _add_tanh_concave_segment(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    if hi - lo <= TANH_EPS:
+        return
+    f_lo = _tanh_value(lo)
+    f_hi = _tanh_value(hi)
+    slope_sec = (f_hi - f_lo) / (hi - lo)
+    intercept_sec = f_lo - slope_sec * lo
+    solver.add_lin_ge([zi, yi], [1.0, -float(slope_sec)], float(intercept_sec))
+
+    slope_tan = _tanh_derivative(lo)
+    intercept_tan = f_lo - slope_tan * lo
+    solver.add_lin_le([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+def _add_tanh_small_band(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    diff = max(abs(_tanh_value(lo) - lo), abs(_tanh_value(hi) - hi))
+    delta = max(diff, TANH_EPS)
+    solver.add_lin_le([zi, yi], [1.0, -1.0], float(delta))
+    solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
+
+def _add_tanh_constraints_for_var(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+
+    max_abs = max(abs(lo), abs(hi))
+    if max_abs <= TANH_IDENTITY_WINDOW:
+        delta = max(abs(_tanh_value(lo) - lo), abs(_tanh_value(hi) - hi), TANH_IDENTITY_TOL)
+        solver.add_lin_le([zi, yi], [1.0, -1.0], float(delta))
+        solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
+        return
+
+    if hi - lo <= TANH_EPS:
+        val = _tanh_value(0.5 * (hi + lo))
+        solver.add_lin_ge([zi], [1.0], float(val))
+        solver.add_lin_ge([zi], [-1.0], float(-val))
+        return
+
+    if hi <= -TANH_EPS:
+        _add_tanh_convex_segment(solver, yi, zi, lo, hi)
+        return
+    if lo >= TANH_EPS:
+        _add_tanh_concave_segment(solver, yi, zi, lo, hi)
+        return
+
+    added = False
+    if lo < -TANH_EPS:
+        neg_hi = min(hi, -TANH_EPS)
+        _add_tanh_convex_segment(solver, yi, zi, lo, neg_hi)
+        added = True
+    if hi > TANH_EPS:
+        pos_lo = max(lo, TANH_EPS)
+        _add_tanh_concave_segment(solver, yi, zi, pos_lo, hi)
+        added = True
+    if not added:
+        _add_tanh_small_band(solver, yi, zi, lo, hi)
+
 def to_numpy(x) -> np.ndarray:
     try:
         if isinstance(x, torch.Tensor):
@@ -126,6 +204,34 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             slope=to_numpy(meta["slope"]); shift=to_numpy(meta["shift"])
             for k, i in enumerate(to_numpy(meta["idx_amb"]).astype(int)):
                 solver.add_lin_le([z[i], y[i]], [1.0, -float(slope[k])], float(shift[k]))
+
+        elif tag.startswith("tanh:"):
+            n = len(con.var_ids) // 2
+            z_vars = list(con.var_ids[:n])
+            y_vars = list(con.var_ids[n:])
+            for zi, yi in zip(z_vars, y_vars):
+                bounds = boxes.get(yi)
+                if bounds is None:
+                    continue
+                lo, hi = bounds
+                _add_tanh_constraints_for_var(solver, yi, zi, float(lo), float(hi))
+
+        elif tag.startswith("top1:"):
+            meta = con.meta; y_vars = list(con.var_ids)
+            t_idx  = int(to_numpy(meta["t_index"]).item()); v_id = int(meta["v_id"])
+            margin = float(meta.get("margin", 0.0))
+            for j, yj in enumerate(y_vars):
+                if j == t_idx:
+                    continue
+                solver.add_lin_ge([v_id, yj, y_vars[t_idx]], [1.0, -1.0, 1.0], -margin)
+                
+        elif tag.startswith("range:"):
+            meta = con.meta; v_id = con.var_ids[0]; y = list(con.var_ids[1:])
+            lb = to_numpy(meta["lb"]).reshape(-1); ub = to_numpy(meta["ub"]).reshape(-1)
+            solver.add_lin_ge([v_id], [1.0], 0.0)
+            for j, yj in enumerate(y): 
+                solver.add_lin_ge([v_id, yj], [1.0, 1.0], float(lb[j]))
+                solver.add_lin_ge([v_id, yj], [1.0, -1.0], float(-ub[j]))
 
         elif tag.startswith("abs:"):
             meta=con.meta; n=len(con.var_ids)//2; z=list(con.var_ids[:n]); y=list(con.var_ids[n:])

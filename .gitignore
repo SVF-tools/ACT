@@ -14,4 +14,5 @@ verifier/out.txt
 ipynb/*
 !ipynb/*.ipynb
 Abstract-Constraint-Transformer.wiki/
-act/pipeline/log/
+act/pipeline/log/*
+act/back_end/examples/nets/*

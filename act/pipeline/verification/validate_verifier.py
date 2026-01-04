@@ -139,6 +139,8 @@
 #
 #===---------------------------------------------------------------------===#
 
+import os
+import copy
 import torch
 import logging
 from pathlib import Path
@@ -146,11 +148,12 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from act.pipeline.verification.model_factory import ModelFactory
 from act.pipeline.verification.torch2act import TorchToACT
-from act.back_end.verifier import verify_once
+from act.back_end.verifier import verify_once, gather_input_spec_layers, seed_from_input_specs, get_input_ids, get_assert_layer, find_entry_layer_id
 from act.back_end.analyze import analyze
 from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.back_end.solver.solver_torch import TorchLPSolver
 from act.util.options import PerformanceOptions
+from act.front_end.specs import OutKind
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -184,38 +187,99 @@ class VerificationValidator:
                 f.write(f"Device: {device}, Dtype: {dtype}\n")
                 f.write(f"{'='*80}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
-    
+            
     def find_concrete_counterexample(
-        self, 
-        name: str, 
-        model: torch.nn.Module
+        self,
+        name: str,
+        model: torch.nn.Module,
+        max_random: int = 64,
     ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
         """
-        Try to find a concrete counterexample through inference testing.
-        
-        Args:
-            name: Network name
-            model: PyTorch model for concrete execution
-            
-        Returns:
-            (counterexample_input, results_dict) if found, None otherwise
+        Try to find a concrete counterexample via concrete execution.
+        Returns (input_tensor, results_dict) if found, else None.
         """
-        test_cases = ['center', 'boundary', 'random']
-        
-        for test_case in test_cases:
-            input_tensor = self.factory.generate_test_input(name, test_case)
-            input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
-            results = model(input_tensor)
-            
-            # Check if this is a counterexample
-            if isinstance(results, dict):
-                if results['input_satisfied'] and not results['output_satisfied']:
-                    logger.info(f"  🔴 Counterexample found in '{test_case}' test case")
-                    logger.info(f"     Input explanation: {results['input_explanation']}")
-                    logger.info(f"     Output explanation: {results['output_explanation']}")
-                    return (input_tensor, results)
-        
-        return None
+        if max_random < 0:
+            raise ValueError(f"max_random must be >= 0, got {max_random}")
+        was_training = bool(getattr(model, "training", False))
+        model.eval()
+
+        try:
+            act_net = self.factory.get_act_net(name)
+            input_shape = None
+            shape_prod = None
+            if act_net is not None:
+                for layer in getattr(act_net, "layers", []):
+                    if getattr(layer, "kind", None) == "INPUT":
+                        shp = (layer.meta or {}).get("shape", None)
+                        if (isinstance(shp, (list, tuple)) and shp and all(isinstance(x, int) and x > 0 for x in shp)):
+                            input_shape = tuple(shp)
+                            shape_prod = int(torch.tensor(input_shape).prod().item())
+                        break
+
+            spec_lb = spec_ub = None
+            if act_net is not None:
+                specs = gather_input_spec_layers(act_net)
+                if specs:
+                    seed = seed_from_input_specs(specs)
+                    lb = seed.lb.to(device=self.device, dtype=self.dtype).flatten()
+                    ub = seed.ub.to(device=self.device, dtype=self.dtype).flatten()
+                    if lb.shape == ub.shape and lb.numel() > 0 and (not torch.any(lb > ub)):
+                        spec_lb, spec_ub = lb, ub
+
+            if spec_lb is None or spec_ub is None:
+                return None
+
+            delta = spec_ub - spec_lb
+            dim = int(spec_lb.numel())
+
+            # center
+            x_flat = spec_lb + 0.5 * delta
+            x = x_flat.reshape(*input_shape) if (input_shape and shape_prod == x_flat.numel()) else x_flat.reshape(1, -1)
+            x = x.to(device=self.device, dtype=self.dtype)
+            with torch.no_grad():
+                res = model(x)
+            if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                logger.info("  🔴 Counterexample found (spec_center)")
+                logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                logger.info("     Output explanation: %s", res.get("output_explanation"))
+                return x, res
+
+            # per-dimension edges (dim<=16)
+            if dim <= 16:
+                base = spec_lb + 0.5 * delta
+                for i in range(dim):
+                    for val, tag in ((spec_lb[i], "lb"), (spec_ub[i], "ub")):
+                        x_edge = base.clone()
+                        x_edge[i] = val
+                        x = x_edge.reshape(*input_shape) if (input_shape and shape_prod == x_edge.numel()) else x_edge.reshape(1, -1)
+                        x = x.to(device=self.device, dtype=self.dtype)
+                        with torch.no_grad():
+                            res = model(x)
+                        if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                            logger.info("  🔴 Counterexample found (spec_per_dim_%s_%d)", tag, i)
+                            logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                            logger.info("     Output explanation: %s", res.get("output_explanation"))
+                            return x, res
+
+            # random in [lb, ub]
+            for k in range(max_random):
+                r = torch.rand_like(spec_lb)
+                x_flat = spec_lb + r * delta
+                x = x_flat.reshape(*input_shape) if (input_shape and shape_prod == x_flat.numel()) else x_flat.reshape(1, -1)
+                x = x.to(device=self.device, dtype=self.dtype)
+                with torch.no_grad():
+                    res = model(x)
+                if isinstance(res, dict) and res.get("input_satisfied", False) and (not res.get("output_satisfied", True)):
+                    logger.info("  🔴 Counterexample found (spec_random_%d)", k)
+                    logger.info("     Input explanation:  %s", res.get("input_explanation"))
+                    logger.info("     Output explanation: %s", res.get("output_explanation"))
+                    return x, res
+                
+            return None
+
+        finally:
+            if was_training:
+                model.train()
     
     def validate_counterexamples(
         self, 
@@ -308,7 +372,22 @@ class VerificationValidator:
             # If verifier found counterexample, validate it with model
             if verify_result.counterexample is not None:
                 logger.info(f"     Verifier counterexample shape: {verify_result.counterexample.shape}")
-                ce_tensor = verify_result.counterexample.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+                # Reshape CE to the model's expected input shape (avoid conv2d shape errors)
+                ce_raw = verify_result.counterexample
+                input_shape = None
+                for layer in act_net.layers:
+                    if getattr(layer, "kind", None) == "INPUT":
+                        input_shape = layer.meta.get("shape")
+                        break
+                try:
+                    if input_shape is not None:
+                        ce_tensor = ce_raw.view(*input_shape)
+                    else:
+                        ce_tensor = ce_raw.unsqueeze(0)
+                except Exception as reshape_err:
+                    logger.warning(f"     CE reshape failed, using vector: {reshape_err}")
+                    ce_tensor = ce_raw.unsqueeze(0)
+                ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
                     logger.info(f"     CE validation: input_sat={ce_results['input_satisfied']}, "
@@ -497,18 +576,53 @@ class VerificationValidator:
         violations = []
         total_checks = 0
         
+        def _get_input_bounds_from_act(act_net_inner):
+            from act.back_end.core import Bounds
+            for layer in act_net_inner.layers:
+                if layer.kind != "INPUT_SPEC":
+                    continue
+
+                params = layer.params or {}
+                meta = layer.meta or {}
+
+                # 1) Prefer BOX
+                if "lb" in params and "ub" in params:
+                    return Bounds(
+                        lb=params["lb"].flatten().to(device=self.device, dtype=self.dtype),
+                        ub=params["ub"].flatten().to(device=self.device, dtype=self.dtype),
+                    )
+
+                # 2) LINF_BALL: center + eps
+                if "center" in params and "eps" in meta:
+                    center = params["center"].flatten().to(device=self.device, dtype=self.dtype)
+                    eps = meta["eps"]
+                    if not torch.is_tensor(eps):
+                        eps = torch.tensor(eps, device=self.device, dtype=self.dtype)
+                    else:
+                        eps = eps.to(device=self.device, dtype=self.dtype)
+                    return Bounds(lb=center - eps, ub=center + eps)
+            return None
+        
+        spec_bounds = _get_input_bounds_from_act(act_net)
+        
         for sample_idx in range(num_samples):
             # Generate random input within spec
             input_tensor = self.factory.generate_test_input(name, 'random')
             input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
             
             # Step 4: Get concrete activations via forward hooks
-            concrete_activations = self._get_concrete_activations(model, input_tensor)
+            concrete_activations = self._get_concrete_activations(model, input_tensor, act_net)
             
             # Step 5: Prepare entry fact from input tensor
-            from act.back_end.core import Fact, Bounds
-            entry_id = 0  # INPUT layer is typically layer 0
-            input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
+            from act.back_end.core import Fact, Bounds, ConSet
+            # entry_id = 0  # INPUT layer is typically layer 0
+            entry_id = find_entry_layer_id(act_net)
+            if spec_bounds is not None:
+                input_bounds = spec_bounds
+            else:
+                input_bounds = Bounds(lb=input_tensor.flatten(), ub=input_tensor.flatten())
+            # Use an empty constraint set for inputs so downstream analysis
+            # never iterates over a None cons field.
             entry_fact = Fact(bounds=input_bounds, cons=None)
             
             # Step 6: Run abstract analysis
@@ -596,7 +710,8 @@ class VerificationValidator:
     def _get_concrete_activations(
         self,
         model: torch.nn.Module,
-        input_tensor: torch.Tensor
+        input_tensor: torch.Tensor,
+        act_net=None
     ) -> Dict[int, torch.Tensor]:
         """
         Get concrete activation values by running forward pass with hooks.
@@ -604,22 +719,31 @@ class VerificationValidator:
         Args:
             model: PyTorch model
             input_tensor: Input tensor
+            act_net: Optional ACT Net to align hooks to ACT layer ids
             
         Returns:
             Dictionary mapping layer_id to activation tensor
         """
         activations = {}
         hooks = []
+        collected = []
         
         def make_hook(layer_id):
             def hook(module, input, output):
-                activations[layer_id] = output.detach().clone()
+                collected.append(output.detach().clone())
             return hook
         
-        # Register hooks on all layers
+        hook_kinds = {
+            "DENSE": torch.nn.Linear,
+            "CONV2D": torch.nn.Conv2d,
+            "RELU": torch.nn.ReLU,
+            "FLATTEN": torch.nn.Flatten,
+        }
+        
+        # Register hooks on relevant torch modules; map to ACT ids after forward
         layer_id = 0
         for module in model.modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ReLU)):
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ReLU, torch.nn.Flatten)):
                 hook = module.register_forward_hook(make_hook(layer_id))
                 hooks.append(hook)
                 layer_id += 1
@@ -627,6 +751,20 @@ class VerificationValidator:
         # Run forward pass
         with torch.no_grad():
             model(input_tensor)
+        
+        # Align collected activations with ACT layer ids so shapes match
+        if act_net is not None:
+            act_ids = [layer.id for layer in act_net.layers if layer.kind in hook_kinds]
+            if len(act_ids) != len(collected):
+                logger.warning(
+                    "  ⚠️ Hook count mismatch: torch collected %d, ACT hookable layers=%d; aligning by position.",
+                    len(collected), len(act_ids),
+                )
+            for idx, act_id in enumerate(act_ids[:len(collected)]):
+                activations[act_id] = collected[idx]
+        else:
+            for idx, tensor in enumerate(collected):
+                activations[idx] = tensor
         
         # Remove hooks
         for hook in hooks:
@@ -875,4 +1013,3 @@ def main():
 if __name__ == "__main__":
     import sys
     sys.exit(main())
-

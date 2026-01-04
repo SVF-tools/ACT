@@ -285,7 +285,7 @@ def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Sequential]:
         
         # Create specs for all downloaded dataset-model pairs
         spec_results = spec_creator.create_specs_for_data_model_pairs(
-            num_samples=3,  # Use 3 samples per pair for synthesis
+            num_samples=1,  # Use 1 sample per pair for synthesis
             validate_shapes=True
         )
     
