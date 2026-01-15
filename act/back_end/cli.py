@@ -294,6 +294,16 @@ Examples:
   python -m act.back_end --list-examples
   
   # ============================================================================
+  # CONFIGNET - Sample and materialize networks
+  # ============================================================================
+
+  # Sample instance specs only
+  python -m act.back_end --confignet sample --num 3 --seed 0
+
+  # Generate and materialize into examples_config.yaml
+  python -m act.back_end --confignet generate --num 2 --seed 0 --device cpu --dtype float64
+
+  # ============================================================================
   # VERIFICATION - Run verification on networks
   # ============================================================================
   
@@ -365,6 +375,11 @@ Examples:
         help="List available example networks"
     )
     cmd_group.add_argument(
+        "--confignet",
+        action="store_true",
+        help="Run Confignet subcommands (sample/generate)"
+    )
+    cmd_group.add_argument(
         "--test-serialization",
         action="store_true",
         dest="test_serialization",
@@ -434,8 +449,15 @@ Examples:
     # Add standard device/dtype arguments (shared across all ACT CLIs)
     add_device_args(parser)
     
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     
+    if args.confignet:
+        from act.back_end import confignet
+        return confignet.main(unknown)
+
+    if unknown:
+        parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
+
     # Initialize device manager from CLI arguments
     initialize_from_args(args)
     
