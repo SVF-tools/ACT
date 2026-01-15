@@ -52,8 +52,8 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     # init with +/- inf boxes (vector length per layer's out_vars)
     for L in net.layers:
         n = len(L.out_vars)
-        hi = torch.full((n,), -float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
-        lo = torch.full((n,), +float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
+        hi = torch.full((n,), float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
+        lo = torch.full((n,), -float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
         before[L.id] = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
         after[L.id]  = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
         L.cache.clear()
@@ -67,10 +67,14 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
 
         # merge predecessors into before[lid]
         if net.preds.get(lid):
-            ref = after[net.preds[lid][0]].bounds
-            Bjoin = Bounds(lb=torch.full_like(ref.lb, +float("inf")), ub=torch.full_like(ref.ub, -float("inf")))
+            preds_list = net.preds[lid]
+            # Initialize from first predecessor (not infinite bounds)
+            first_bounds = after[preds_list[0]].bounds
+            Bjoin = Bounds(lb=first_bounds.lb.clone(), ub=first_bounds.ub.clone())
             Cjoin = ConSet()
-            for pid in net.preds[lid]:
+            for con in after[preds_list[0]].cons: Cjoin.replace(con)
+            # Join with remaining predecessors (for DAG merge points)
+            for pid in preds_list[1:]:
                 Bjoin = box_join(Bjoin, after[pid].bounds)
                 for con in after[pid].cons: Cjoin.replace(con)
             before[lid] = Fact(Bjoin, Cjoin)

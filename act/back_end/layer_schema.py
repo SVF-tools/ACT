@@ -117,6 +117,8 @@ class LayerKind(str, enum.Enum):
     POW = "POW"
     MIN = "MIN"
     MAX = "MAX"
+    SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
+    BIAS = "BIAS"    # Element-wise addition of constant: y = x + c
 
     # Tensor plumbing
     CONCAT = "CONCAT"
@@ -211,6 +213,8 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
     LayerKind.POW.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.MIN.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.MAX.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
+    LayerKind.SCALE.value:       {"params_required": ["a"], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape","original_shape"]},
+    LayerKind.BIAS.value:        {"params_required": ["c"], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape","original_shape"]},
 
     # Tensor plumbing
     LayerKind.CONCAT.value:      {"params_required": [], "params_optional": [], "meta_required": ["concat_dim"], "meta_optional": []},

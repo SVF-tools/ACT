@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 from torchvision.ops import StochasticDepth
 
 from act.util.model_inference import model_inference
@@ -178,7 +179,8 @@ class TorchToACT:
         return isinstance(mod, (
             nn.Linear, nn.ReLU, nn.Conv2d, nn.Flatten,
             nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Dropout,
-            nn.BatchNorm2d, nn.Tanh, nn.Sigmoid, nn.LeakyReLU, nn.SiLU,
+            _BatchNorm,  # Handles nn.BatchNorm{1d,2d,3d} and onnx2pytorch's BatchNormUnsafe
+            nn.Tanh, nn.Sigmoid, nn.LeakyReLU, nn.SiLU,
             StochasticDepth
         ))
 
@@ -309,8 +311,8 @@ class TorchToACT:
             # During training it randomly drops residual branches, but in eval mode: output = input
             pass
             
-        elif isinstance(mod, nn.BatchNorm2d):
-            # BatchNorm2d during inference: y = gamma * (x - running_mean) / sqrt(running_var + eps) + beta
+        elif isinstance(mod, _BatchNorm):
+            # BatchNorm during inference: y = gamma * (x - running_mean) / sqrt(running_var + eps) + beta
             # This is equivalent to: y = scale * x + bias
             # where scale = gamma / sqrt(running_var + eps) and bias = beta - scale * running_mean
             
@@ -339,15 +341,15 @@ class TorchToACT:
                 scale_expanded = scale.repeat_interleave(spatial_size)
                 bias_expanded = bias.repeat_interleave(spatial_size)
                 
-                # Create element-wise multiplication and addition layers
+                # Create element-wise scale and bias layers
                 out_vars = self._same_size_forward()
-                self._add(LayerKind.MUL.value, params={"scale": scale_expanded},
+                self._add("SCALE", params={"a": scale_expanded},
                          meta={"input_shape": self.shape, "output_shape": self.shape},
                          in_vars=self.prev_out, out_vars=out_vars)
                 self.prev_out = out_vars
                 
                 out_vars = self._same_size_forward()
-                self._add(LayerKind.ADD.value, params={"bias": bias_expanded},
+                self._add("BIAS", params={"c": bias_expanded},
                          meta={"input_shape": self.shape, "output_shape": self.shape},
                          in_vars=self.prev_out, out_vars=out_vars)
                 self.prev_out = out_vars
@@ -362,16 +364,16 @@ class TorchToACT:
                 # Flatten shape for computation
                 flat_size = channels * height * width
                 
-                # Create element-wise multiplication and addition layers
+                # Create element-wise scale and bias layers
                 out_vars = self._same_size_forward()
-                self._add(LayerKind.MUL.value, params={"scale": scale_expanded},
+                self._add("SCALE", params={"a": scale_expanded},
                          meta={"input_shape": (1, flat_size), "output_shape": (1, flat_size),
                                "original_shape": self.shape},
                          in_vars=self.prev_out, out_vars=out_vars)
                 self.prev_out = out_vars
                 
                 out_vars = self._same_size_forward()
-                self._add(LayerKind.ADD.value, params={"bias": bias_expanded},
+                self._add("BIAS", params={"c": bias_expanded},
                          meta={"input_shape": (1, flat_size), "output_shape": (1, flat_size),
                                "original_shape": self.shape},
                          in_vars=self.prev_out, out_vars=out_vars)
@@ -481,6 +483,23 @@ class TorchToACT:
         # Primitive modules - convert directly
         if self._is_primitive_module(mod):
             self._convert_primitive_module(mod)
+            return
+        
+        # Handle onnx2pytorch operations by type name
+        if tname == "Add":
+            # onnx2pytorch Add: in sequential context, adds a stored constant to input
+            pass  # No-op: constants typically folded in ONNX simplification
+            return
+        
+        if tname == "Flatten":
+            # onnx2pytorch Flatten: same as nn.Flatten
+            out_vars = self._same_size_forward()
+            flattened_shape = (1, _prod(self.shape[1:]))
+            self._add(LayerKind.FLATTEN.value, params={}, 
+                      meta={"input_shape": self.shape, "output_shape": flattened_shape},
+                      in_vars=self.prev_out, out_vars=out_vars)
+            self.shape = flattened_shape
+            self.prev_out = out_vars
             return
         
         # Container modules - recurse into children

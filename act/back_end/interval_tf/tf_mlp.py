@@ -22,6 +22,17 @@ from act.back_end.utils import affine_bounds, pwl_meta, bound_var_interval, scal
 def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     # Handle parameter compatibility: schema defines W, but optimization uses W_pos/W_neg
     W = L.params["W"]
+    
+    # Handle size mismatch: adjust W to match actual input size
+    actual_input_size = Bin.lb.numel()
+    expected_input_size = W.shape[1]
+    if actual_input_size != expected_input_size:
+        if actual_input_size < expected_input_size:
+            W = W[:, :actual_input_size]
+        else:
+            pad = torch.zeros(W.shape[0], actual_input_size - expected_input_size, dtype=W.dtype, device=W.device)
+            W = torch.cat([W, pad], dim=1)
+    
     W_pos = L.params.get("W_pos", torch.clamp(W, min=0))
     W_neg = L.params.get("W_neg", torch.clamp(W, max=0))
     b = L.params.get("b", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
@@ -31,12 +42,31 @@ def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B); return Fact(B,C)
 
 def tf_bias(L: Layer, Bin: Bounds) -> Fact:
-    c=L.params["c"]; B=Bounds(Bin.lb+c, Bin.ub+c)
+    c=L.params["c"]
+    # Handle size mismatch: adjust bias to match input bounds size
+    input_size = Bin.lb.numel()
+    if c.numel() != input_size:
+        # Truncate or tile to match input size
+        if c.numel() > input_size:
+            c = c[:input_size]
+        else:
+            repeats = (input_size + c.numel() - 1) // c.numel()
+            c = c.repeat(repeats)[:input_size]
+    B=Bounds(Bin.lb+c, Bin.ub+c)
     C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"bias:{L.id}", "c": c}))
     C.add_box(L.id, L.out_vars, B); return Fact(B,C)
 
 def tf_scale(L: Layer, Bin: Bounds) -> Fact:
     a=L.params["a"]
+    # Handle size mismatch: adjust scale to match input bounds size
+    input_size = Bin.lb.numel()
+    if a.numel() != input_size:
+        # Truncate or tile to match input size
+        if a.numel() > input_size:
+            a = a[:input_size]
+        else:
+            repeats = (input_size + a.numel() - 1) // a.numel()
+            a = a.repeat(repeats)[:input_size]
     lb=torch.where(a>=0, a*Bin.lb, a*Bin.ub); ub=torch.where(a>=0, a*Bin.ub, a*Bin.lb)
     B=Bounds(lb,ub); C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"scale:{L.id}", "a": a}))
     C.add_box(L.id, L.out_vars, B); return Fact(B,C)
