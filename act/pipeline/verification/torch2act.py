@@ -293,11 +293,49 @@ class TorchToACT:
                 "kernel_size": kernel_size,
                 "stride": stride,
                 "padding": padding,
-                "output_size": (out_h, out_w)  # Schema expects this field
+                "output_size": (out_h, out_w),
+                "input_shape": input_shape,
+                "output_shape": output_shape,
             }
             
             out_vars = self._alloc_ids(out_features)
             self._add(LayerKind.MAXPOOL2D.value, params={}, meta=meta,
+                      in_vars=self.prev_out, out_vars=out_vars)
+            self.shape = (1, out_features)
+            self.prev_out = out_vars
+
+        elif isinstance(mod, nn.AvgPool2d):
+            # AvgPool2d: Apply pooling operation
+            if len(self.shape) == 2:
+                n_features = self.shape[1]
+                spatial_size = int(n_features ** 0.5)
+                channels = 1
+                input_shape = (1, channels, spatial_size, spatial_size)
+            else:
+                input_shape = self.shape
+
+            batch, in_c, in_h, in_w = input_shape
+            kernel_size = mod.kernel_size if isinstance(mod.kernel_size, tuple) else (mod.kernel_size, mod.kernel_size)
+            stride = mod.stride if mod.stride is not None else kernel_size
+            stride = stride if isinstance(stride, tuple) else (stride, stride)
+            padding = mod.padding if isinstance(mod.padding, tuple) else (mod.padding, mod.padding)
+
+            out_h = (in_h + 2 * padding[0] - kernel_size[0]) // stride[0] + 1
+            out_w = (in_w + 2 * padding[1] - kernel_size[1]) // stride[1] + 1
+            output_shape = (1, in_c, out_h, out_w)
+            out_features = in_c * out_h * out_w
+
+            meta = {
+                "kernel_size": kernel_size,
+                "stride": stride,
+                "padding": padding,
+                "output_size": (out_h, out_w),
+                "input_shape": input_shape,
+                "output_shape": output_shape,
+            }
+
+            out_vars = self._alloc_ids(out_features)
+            self._add(LayerKind.AVGPOOL2D.value, params={}, meta=meta,
                       in_vars=self.prev_out, out_vars=out_vars)
             self.shape = (1, out_features)
             self.prev_out = out_vars
@@ -409,7 +447,9 @@ class TorchToACT:
                 "kernel_size": (kernel_h, kernel_w),
                 "stride": (stride_h, stride_w),
                 "padding": (0, 0),
-                "output_size": output_size
+                "output_size": output_size,
+                "input_shape": input_shape,
+                "output_shape": output_shape,
             }
             
             out_vars = self._alloc_ids(out_features)
@@ -466,6 +506,11 @@ class TorchToACT:
         if tname == self._InputLayerTypeName:
             return
         
+        # Residual blocks (custom modules with skip connections)
+        if getattr(mod, "is_residual_block", False):
+            self._convert_residual_block(mod)
+            return
+
         # ACT wrapper layers with to_act_layers() protocol
         if hasattr(mod, 'to_act_layers'):
             new_layers, out_vars = mod.to_act_layers(len(self.layers), self.prev_out)
@@ -510,6 +555,70 @@ class TorchToACT:
             f"  or implement the to_act_layers() protocol."
         )
 
+    def _convert_module_on_vars(self, mod: nn.Module, in_vars: List[int], shape: Tuple[int, ...]) -> Tuple[List[int], Tuple[int, ...]]:
+        """Convert a module using provided input vars/shape without changing caller state."""
+        saved_prev = self.prev_out
+        saved_shape = self.shape
+        self.prev_out = list(in_vars)
+        self.shape = shape
+
+        if self._is_primitive_module(mod):
+            self._convert_primitive_module(mod)
+        elif isinstance(mod, nn.Sequential):
+            for child in mod:
+                if not self._is_primitive_module(child):
+                    raise NotImplementedError(f"Residual block child not supported: {type(child).__name__}")
+                self._convert_primitive_module(child)
+        else:
+            raise NotImplementedError(f"Unsupported residual projection module: {type(mod).__name__}")
+
+        out_vars = list(self.prev_out)
+        out_shape = self.shape
+
+        self.prev_out = saved_prev
+        self.shape = saved_shape
+        return out_vars, out_shape
+
+    def _convert_residual_block(self, mod: nn.Module) -> None:
+        """Convert a residual block with a skip add into ACT layers."""
+        skip_vars = list(self.prev_out)
+        skip_shape = self.shape
+
+        # Residual path
+        for child in mod.res_layers:
+            if not self._is_primitive_module(child):
+                raise NotImplementedError(f"Residual block child not supported: {type(child).__name__}")
+            self._convert_primitive_module(child)
+
+        res_vars = list(self.prev_out)
+        res_shape = self.shape
+
+        # Skip projection (optional)
+        if mod.skip_proj is not None:
+            skip_vars, skip_shape = self._convert_module_on_vars(mod.skip_proj, skip_vars, skip_shape)
+
+        if tuple(res_shape) != tuple(skip_shape):
+            raise ValueError(f"Residual add shape mismatch: res={res_shape} skip={skip_shape}")
+
+        if len(res_vars) != len(skip_vars):
+            raise ValueError("Residual add requires matching var counts")
+
+        out_vars = self._alloc_ids(len(res_vars))
+        meta = {
+            "x_vars": list(res_vars),
+            "y_vars": list(skip_vars),
+            "input_shape": res_shape,
+            "output_shape": res_shape,
+        }
+        self._add(LayerKind.ADD.value, params={}, meta=meta, in_vars=list(res_vars) + list(skip_vars), out_vars=out_vars)
+        self.prev_out = out_vars
+        self.shape = res_shape
+
+        if mod.post_add_activation is not None:
+            if not self._is_primitive_module(mod.post_add_activation):
+                raise NotImplementedError(f"Residual post-activation not supported: {type(mod.post_add_activation).__name__}")
+            self._convert_primitive_module(mod.post_add_activation)
+
     # --- main conversion ---
 
     def run(self) -> Net:
@@ -528,9 +637,27 @@ class TorchToACT:
         for mod in self.m.children():
             self._process_module(mod)
 
-        # Build linear graph structure (sequential layers)
-        preds = {i: ([] if i == 0 else [i - 1]) for i in range(len(self.layers))}
-        succs = {i: ([] if i == len(self.layers) - 1 else [i + 1]) for i in range(len(self.layers))}
+        # Build graph structure from variable provenance
+        var_src: Dict[int, int] = {}
+        preds: Dict[int, List[int]] = {layer.id: [] for layer in self.layers}
+        succs: Dict[int, List[int]] = {layer.id: [] for layer in self.layers}
+        for layer in self.layers:
+            sources: List[int] = []
+            for v in layer.in_vars:
+                if int(v) in var_src:
+                    sources.append(var_src[int(v)])
+            seen = set()
+            uniq = []
+            for s in sources:
+                if s not in seen:
+                    seen.add(s)
+                    uniq.append(s)
+            preds[layer.id] = uniq
+            for s in uniq:
+                succs[s].append(layer.id)
+            for v in layer.out_vars:
+                var_src[int(v)] = int(layer.id)
+
         net = Net(layers=self.layers, preds=preds, succs=succs)
 
         # Validate the created network structure

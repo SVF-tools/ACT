@@ -298,10 +298,10 @@ Examples:
   # ============================================================================
 
   # Sample instance specs only
-  python -m act.back_end --confignet sample --num 3 --seed 0
+  python -m act.back_end --confignet sample --num 3
 
   # Generate and materialize into examples_config.yaml
-  python -m act.back_end --confignet generate --num 2 --seed 0 --device cpu --dtype float64
+  python -m act.back_end --confignet generate --num 2 --device cpu --dtype float64
 
   # ============================================================================
   # VERIFICATION - Run verification on networks

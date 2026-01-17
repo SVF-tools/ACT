@@ -117,8 +117,6 @@ class LayerKind(str, enum.Enum):
     POW = "POW"
     MIN = "MIN"
     MAX = "MAX"
-    SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
-    BIAS = "BIAS"    # Element-wise addition of constant: y = x + c
 
     # Tensor plumbing
     CONCAT = "CONCAT"
@@ -194,27 +192,25 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
     LayerKind.RELU.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
     LayerKind.LRELU.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["negative_slope"]},
     LayerKind.PRELU.value:       {"params_required": ["weight"], "params_optional": [], "meta_required": [], "meta_optional": []},
-    LayerKind.SIGMOID.value:     {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
-    LayerKind.TANH.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
-    LayerKind.SOFTPLUS.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
+    LayerKind.SIGMOID.value:     {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
+    LayerKind.TANH.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
+    LayerKind.SOFTPLUS.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.SILU.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
     LayerKind.GELU.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["approximate"]},
-    LayerKind.RELU6.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
+    LayerKind.RELU6.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.HARDTANH.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["min_val","max_val"]},
     LayerKind.HARDSIGMOID.value: {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["alpha","beta"]},
-    LayerKind.HARDSWISH.value:   {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
-    LayerKind.SOFTSIGN.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
-    LayerKind.ABS.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
+    LayerKind.HARDSWISH.value:   {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
+    LayerKind.SOFTSIGN.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
+    LayerKind.ABS.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.CLIP.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["min","max"]},
-    LayerKind.ADD.value:         {"params_required": [], "params_optional": ["bias"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape","x_vars","y_vars","x_src","y_src"]},
+    LayerKind.ADD.value:         {"params_required": [], "params_optional": ["bias"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape","x_vars","y_vars"]},
     LayerKind.SUB.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.MUL.value:         {"params_required": [], "params_optional": ["scale"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape"]},
     LayerKind.DIV.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.POW.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.MIN.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
     LayerKind.MAX.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
-    LayerKind.SCALE.value:       {"params_required": ["a"], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape","original_shape"]},
-    LayerKind.BIAS.value:        {"params_required": ["c"], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape","original_shape"]},
 
     # Tensor plumbing
     LayerKind.CONCAT.value:      {"params_required": [], "params_optional": [], "meta_required": ["concat_dim"], "meta_optional": []},

@@ -145,11 +145,20 @@ from act.util.device_manager import get_default_dtype
 class NetFactory:
     """Concise factory that reads config and generates models in nets folder."""
     
-    def __init__(self, config_path: str = "act/back_end/examples/examples_config.yaml"):
+    def __init__(
+        self,
+        config_path: str = "act/back_end/examples/examples_config.yaml",
+        output_dir: Optional[str] = None,
+    ):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        self.output_dir = Path("act/back_end/examples/nets")
-        self.output_dir.mkdir(exist_ok=True)
+        if output_dir is None:
+            output_dir = (self.config or {}).get("generator", {}).get(
+                "output_dir",
+                "act/back_end/examples/nets",
+            )
+        self.output_dir = Path(str(output_dir))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
     
     def generate_weight_tensor(self, kind: str, meta: Dict[str, Any]) -> torch.Tensor:
         """Generate minimal weight tensors that satisfy schema requirements."""
@@ -310,6 +319,23 @@ class NetFactory:
             out_vars = list(range(var_counter, var_counter + out_num_vars))
             var_counter += out_num_vars
             return in_vars, out_vars, var_counter
+        
+        elif kind in ["MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D"]:
+            if layers and layer_index > 0:
+                in_vars = layers[layer_index - 1].out_vars
+            else:
+                raise ValueError(f"Pooling layer '{kind}' cannot be the first layer in network")
+
+            output_shape = meta.get("output_shape")
+            if output_shape:
+                out_num_vars = torch.Size(output_shape).numel()
+            else:
+                raise ValueError(
+                    f"Pooling layer '{kind}' requires 'output_shape' in meta for variable generation")
+
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            var_counter += out_num_vars
+            return in_vars, out_vars, var_counter
 
         elif kind == "FLATTEN":
             if layers and layer_index > 0:
@@ -329,9 +355,22 @@ class NetFactory:
                 raise ValueError(f"Layer '{kind}' cannot be the first layer in network")
 
         else:
-            supported_types = ["INPUT", "DENSE", "RELU", "SIGMOID", "TANH",
-                               "CONV1D", "CONV2D", "CONV3D", "FLATTEN",
-                               "INPUT_SPEC", "ASSERT"]
+            supported_types = [
+                "INPUT",
+                "DENSE",
+                "RELU",
+                "SIGMOID",
+                "TANH",
+                "CONV1D",
+                "CONV2D",
+                "CONV3D",
+                "MAXPOOL2D",
+                "AVGPOOL2D",
+                "ADAPTIVEAVGPOOL2D",
+                "FLATTEN",
+                "INPUT_SPEC",
+                "ASSERT",
+            ]
             raise NotImplementedError(
                 f"Layer type '{kind}' is not supported for variable generation. "
                 f"Supported types: {supported_types}. "
