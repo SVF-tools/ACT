@@ -328,7 +328,7 @@ class ConfigNetConfig:
     mlp_activation_choices: Tuple[str, ...] = ("relu", "tanh", "sigmoid")
     mlp_dropout_p_choices: Tuple[float, ...] = (0.0,)
     mlp_block_p: float = 0.6
-    mlp_block_count_range: Tuple[int, int] = (2, 6)
+    mlp_block_count_range: Tuple[int, int] = (2, 4)
     mlp_block_width_choices: Tuple[int, ...] = (32, 64, 128)
     mlp_post_block_activation_p: float = 0.8
 
