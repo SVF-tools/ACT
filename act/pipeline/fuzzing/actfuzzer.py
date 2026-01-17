@@ -19,7 +19,7 @@ from pathlib import Path
 
 from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.spec_creator_base import LabeledInputTensor
-from act.front_end.verifiable_model import InputSpecLayer, OutputSpecLayer
+# InputSpecLayer, OutputSpecLayer no longer needed - specs accessed via VerifiableModel attributes
 from act.pipeline.fuzzing.mutations import MutationEngine
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
@@ -173,7 +173,7 @@ class ACTFuzzer:
     """
     
     def __init__(self,
-                 wrapped_model: nn.Sequential,
+                 wrapped_model: nn.Module,
                  initial_seeds: List[LabeledInputTensor],
                  config: Optional[FuzzingConfig] = None):
         """
@@ -189,20 +189,20 @@ class ACTFuzzer:
         self.model = wrapped_model.to(self.config.device)
         self.device = torch.device(self.config.device)
         
-        # Extract specs from model
-        self.input_spec = self._extract_spec(InputSpecLayer)
-        self.output_spec = self._extract_spec(OutputSpecLayer)
+        # Extract specs from VerifiableModel
+        self.input_spec = wrapped_model.input_spec
+        self.output_spec = wrapped_model.output_spec
         
         # Initialize components
         self.mutation_engine = MutationEngine(
-            model=self.model,
+            model=self.model.model,  # Pass the actual PyTorch model
             input_spec=self.input_spec,
             weights=self.config.mutation_weights,
             device=self.device,
             perturb_mode=self.config.perturb_mode,
             perturb_scale=self.config.perturb_scale
         )
-        self.coverage_tracker = CoverageTracker(model=self.model,threshold=self.config.activation_threshold, strategy=self.config.coverage_strategy)
+        self.coverage_tracker = CoverageTracker(model=self.model.model, threshold=self.config.activation_threshold, strategy=self.config.coverage_strategy)  # Pass actual PyTorch model
         self.property_checker = PropertyChecker(self.output_spec)
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds,
@@ -241,13 +241,6 @@ class ACTFuzzer:
     def _get_trace_ext(self) -> str:
         """Get file extension for trace storage."""
         return {"hdf5": "h5", "json": "json"}[self.config.trace_storage]
-    
-    def _extract_spec(self, layer_type) -> Optional[InputSpec | OutputSpec]:
-        """Extract spec from wrapper layer."""
-        for layer in self.model:
-            if isinstance(layer, layer_type):
-                return layer.spec
-        return None
     
     def fuzz(self) -> FuzzingReport:
         """

@@ -12,9 +12,10 @@
 
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
 from act.back_end.utils import affine_bounds, pwl_meta, bound_var_interval, scale_interval
+from act.back_end.layer_util import normalize_to_tuple
 
 
 def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
@@ -26,46 +27,37 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
+    stride = normalize_to_tuple(L.meta.get("stride", 1), 2)
+    padding = normalize_to_tuple(L.meta.get("padding", 0), 2)
+    dilation = normalize_to_tuple(L.meta.get("dilation", 1), 2)
     groups = L.meta.get("groups", 1)
-    
-    # Normalize stride/padding/dilation to tuples
-    if isinstance(stride, int):
-        stride = (stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding)
-    if isinstance(dilation, int):
-        dilation = (dilation, dilation)
     
     # Get weight dimensions
     out_channels, in_channels_per_group, kernel_h, kernel_w = weight.shape
     in_channels = in_channels_per_group * groups
     
-    # Get ACTUAL input size from bounds (not metadata - metadata may be wrong!)
-    actual_input_size = Bin.lb.numel()
+    # Require input_shape in metadata (4D: batch, channels, height, width)
+    if "input_shape" not in L.meta or len(L.meta["input_shape"]) != 4:
+        raise ValueError(
+            f"CONV2D layer {L.id} requires 'input_shape' metadata with 4 dimensions. "
+            f"Got: {L.meta.get('input_shape', 'missing')}"
+        )
     
-    # Infer spatial dimensions from actual input size
-    spatial_size = actual_input_size // in_channels
-    in_h = in_w = int(spatial_size ** 0.5)  # Assume square initially
+    meta_input_shape = tuple(L.meta["input_shape"])
+    _, _, in_h, in_w = meta_input_shape
     
-    # Verify and adjust if needed
-    if in_h * in_w * in_channels != actual_input_size:
-        # Try to find correct rectangular dimensions
-        for h in range(int(spatial_size ** 0.5) + 10, 0, -1):
-            if spatial_size % h == 0:
-                in_h = h
-                in_w = spatial_size // h
-                if in_h * in_w * in_channels == actual_input_size:
-                    break
-    
+    # Construct input_shape with in_channels from weight tensor (ensures consistency)
     input_shape = (1, in_channels, in_h, in_w)
     
-    # Compute output dimensions using standard conv formula
-    out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
-    out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
-    output_shape = (1, out_channels, out_h, out_w)
+    # Use metadata output shape if available, otherwise compute
+    if "output_shape" in L.meta and len(L.meta["output_shape"]) == 4:
+        output_shape = tuple(L.meta["output_shape"])
+        _, _, out_h, out_w = output_shape
+    else:
+        # Compute output dimensions using standard conv formula
+        out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
+        out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
+        output_shape = (1, out_channels, out_h, out_w)
     
     # Create equivalent linear transformation matrix using im2col
     # This converts the convolution to matrix multiplication
@@ -340,9 +332,9 @@ def _conv2d_to_linear_matrix(
     weight: torch.Tensor,
     input_shape: Tuple[int, ...],
     output_shape: Tuple[int, ...],
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
+    stride: Union[int, Tuple[int, ...]] = 1,
+    padding: Union[int, Tuple[int, ...]] = 0,
+    dilation: Union[int, Tuple[int, ...]] = 1,
     groups: int = 1
 ) -> torch.Tensor:
     """
@@ -361,13 +353,15 @@ def _conv2d_to_linear_matrix(
     # Initialize the equivalent weight matrix
     W_equiv = torch.zeros(output_flat_size, input_flat_size, dtype=weight.dtype, device=weight.device)
     
-    # Convert stride, padding, dilation to tuples if they're integers
-    if isinstance(stride, int):
-        stride = (stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding)
-    if isinstance(dilation, int):
-        dilation = (dilation, dilation)
+    # Normalize stride, padding, dilation to tuples
+    stride = normalize_to_tuple(stride, 2)
+    padding = normalize_to_tuple(padding, 2)
+    dilation = normalize_to_tuple(dilation, 2)
+    
+    # Handle grouped convolutions
+    # Weight shape is [out_channels, in_channels_per_group, kH, kW]
+    in_channels_per_group = in_channels // groups
+    out_channels_per_group = out_channels // groups
     
     # For each output position, find corresponding input positions
     for out_c in range(out_channels):
@@ -376,8 +370,8 @@ def _conv2d_to_linear_matrix(
                 # Calculate output linear index
                 out_idx = out_c * (out_h * out_w) + out_y * out_w + out_x
                 
-                # For each kernel position
-                for in_c in range(in_channels):
+                # For each kernel position - loop only over channels within the group
+                for in_c in range(in_channels_per_group):
                     for k_y in range(kernel_h):
                         for k_x in range(kernel_w):
                             # Calculate input position
@@ -386,10 +380,14 @@ def _conv2d_to_linear_matrix(
                             
                             # Check bounds
                             if 0 <= in_y < in_h and 0 <= in_x < in_w:
-                                # Calculate input linear index
-                                in_idx = in_c * (in_h * in_w) + in_y * in_w + in_x
+                                # Calculate actual input channel with group offset
+                                group_idx = out_c // out_channels_per_group
+                                actual_in_c = group_idx * in_channels_per_group + in_c
                                 
-                                # Set weight in equivalent matrix
+                                # Calculate input linear index using actual input channel
+                                in_idx = actual_in_c * (in_h * in_w) + in_y * in_w + in_x
+                                
+                                # Use local in_c for weight access (weight has in_channels_per_group)
                                 W_equiv[out_idx, in_idx] = weight[out_c, in_c, k_y, k_x]
     
     return W_equiv
@@ -450,9 +448,9 @@ def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
 def _avgpool2d_to_linear_matrix(
     input_shape: Tuple[int, ...],
     output_shape: Tuple[int, ...],
-    kernel_size: int,
-    stride: int,
-    padding: int
+    kernel_size: Union[int, Tuple[int, ...]],
+    stride: Union[int, Tuple[int, ...]],
+    padding: Union[int, Tuple[int, ...]]
 ) -> torch.Tensor:
     """Convert AvgPool2d to equivalent linear transformation matrix."""
     batch_size, channels, in_h, in_w = input_shape
@@ -463,12 +461,10 @@ def _avgpool2d_to_linear_matrix(
     
     W_equiv = torch.zeros(output_flat_size, input_flat_size)
     
-    if isinstance(kernel_size, int):
-        kernel_size = (kernel_size, kernel_size)
-    if isinstance(stride, int):
-        stride = (stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding)
+    # Normalize to tuples
+    kernel_size = normalize_to_tuple(kernel_size, 2)
+    stride = normalize_to_tuple(stride, 2)
+    padding = normalize_to_tuple(padding, 2)
     
     kernel_h, kernel_w = kernel_size
     
@@ -746,9 +742,9 @@ def _conv3d_to_linear_matrix(
     weight: torch.Tensor,
     input_shape: Tuple[int, ...],
     output_shape: Tuple[int, ...],
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
+    stride: Union[int, Tuple[int, ...]] = 1,
+    padding: Union[int, Tuple[int, ...]] = 0,
+    dilation: Union[int, Tuple[int, ...]] = 1,
     groups: int = 1
 ) -> torch.Tensor:
     """Convert Conv3d to equivalent linear transformation matrix."""
@@ -762,13 +758,10 @@ def _conv3d_to_linear_matrix(
     
     kernel_d, kernel_h, kernel_w = weight.shape[2], weight.shape[3], weight.shape[4]
     
-    # Handle stride/padding as tuples or ints
-    if isinstance(stride, int):
-        stride = (stride, stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding, padding)
-    if isinstance(dilation, int):
-        dilation = (dilation, dilation, dilation)
+    # Normalize stride/padding/dilation to tuples
+    stride = normalize_to_tuple(stride, 3)
+    padding = normalize_to_tuple(padding, 3)
+    dilation = normalize_to_tuple(dilation, 3)
     
     for out_c in range(out_channels):
         for out_d_idx in range(out_d):
@@ -802,10 +795,10 @@ def _convtranspose2d_to_linear_matrix(
     weight: torch.Tensor,
     input_shape: Tuple[int, ...],
     output_shape: Tuple[int, ...],
-    stride: int = 1,
-    padding: int = 0,
-    output_padding: int = 0,
-    dilation: int = 1,
+    stride: Union[int, Tuple[int, ...]] = 1,
+    padding: Union[int, Tuple[int, ...]] = 0,
+    output_padding: Union[int, Tuple[int, ...]] = 0,
+    dilation: Union[int, Tuple[int, ...]] = 1,
     groups: int = 1
 ) -> torch.Tensor:
     """Convert ConvTranspose2d to equivalent linear transformation matrix."""
@@ -819,15 +812,11 @@ def _convtranspose2d_to_linear_matrix(
     
     kernel_h, kernel_w = weight.shape[2], weight.shape[3]
     
-    # Handle stride/padding as tuples or ints
-    if isinstance(stride, int):
-        stride = (stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding)
-    if isinstance(output_padding, int):
-        output_padding = (output_padding, output_padding)
-    if isinstance(dilation, int):
-        dilation = (dilation, dilation)
+    # Normalize stride/padding/dilation to tuples
+    stride = normalize_to_tuple(stride, 2)
+    padding = normalize_to_tuple(padding, 2)
+    output_padding = normalize_to_tuple(output_padding, 2)
+    dilation = normalize_to_tuple(dilation, 2)
     
     # Transpose convolution: each input position contributes to multiple output positions
     for in_c in range(in_channels):

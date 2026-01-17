@@ -25,7 +25,7 @@
 #     No-op at inference, converted to INPUT layer in ACT.
 #
 #   InputSpecLayer:
-#     Input constraint checking (BOX, L_INF, LIN_POLY).
+#     Input constraint checking (BOX, LINF_BALL, LIN_POLY).
 #     Returns (x, satisfied, explanation) tuple during inference.
 #     Converted to INPUT_SPEC layer in ACT.
 #
@@ -38,7 +38,7 @@
 #   1. Build model with wrapper layers:
 #      model = nn.Sequential(
 #          InputLayer(shape=(1, 28, 28)),
-#          InputSpecLayer(InputSpec(kind=InKind.L_INF, eps=0.03)),
+#          InputSpecLayer(InputSpec(kind=InKind.LINF_BALL, eps=0.03)),
 #          nn.Flatten(),
 #          nn.Linear(784, 128),
 #          nn.ReLU(),
@@ -46,8 +46,8 @@
 #          OutputSpecLayer(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=5))
 #      )
 #
-#   2. Wrap with VerifiableModel (from act2torch.py):
-#      verifiable = VerifiableModel(*model)
+#   2. Wrap with VerifiableModel:
+#      verifiable = VerifiableModel(model=model, ...)
 #
 #   3. Run with automatic constraint checking:
 #      results = verifiable(input_tensor)
@@ -89,107 +89,6 @@ def prod(seq: Tuple[int, ...]) -> int:
     for s in seq:
         p *= s
     return p
-
-
-class VerifiableModel(nn.Sequential):
-    """
-    Sequential model wrapper that provides spec-free verification.
-    
-    Automatically collects constraint checking results from InputSpecLayer
-    and OutputSpecLayer, returning a dict with both model output and
-    constraint satisfaction status.
-    
-    Strict Mode:
-        Controlled via VerifiableModel.set_strict_mode(True/False).
-        When enabled, raises ValueError on input/output constraint violations.
-        Default: False (graceful violation reporting).
-    
-    Args:
-        *args: Layers to include in the sequential model
-    
-    Returns:
-        Dict with keys:
-        - 'output': Model output tensor
-        - 'input_satisfied': True if input constraints satisfied
-        - 'input_explanation': Human-readable input constraint result
-        - 'output_satisfied': True if output constraints satisfied
-        - 'output_explanation': Human-readable output constraint result
-    
-    Raises:
-        ValueError: If strict mode enabled and input/output constraints are violated
-    """
-    
-    # Class-level strict mode setting (shared across all instances)
-    _strict_mode: bool = False
-    
-    def __init__(self, *args):
-        super().__init__(*args)
-    
-    @classmethod
-    def set_strict_mode(cls, enabled: bool) -> None:
-        """
-        When enabled, forward() raises ValueError on input/output violations.
-        """
-        cls._strict_mode = enabled
-    
-    @classmethod
-    def get_strict_mode(cls) -> bool:
-        return cls._strict_mode
-    
-    def forward(self, x):
-        """
-        Forward pass with automatic constraint checking.
-        
-        Intercepts tuple returns from InputSpecLayer/OutputSpecLayer
-        and collects verification results.
-        """
-        input_satisfied = True
-        input_explanation = "No INPUT_SPEC layer"
-        output_satisfied = True
-        output_explanation = "No OUTPUT_SPEC layer"
-        
-        # Process through all layers
-        for i, module in enumerate(self):
-            result = module(x)
-            
-            # Check if layer returned constraint checking tuple
-            if isinstance(result, tuple) and len(result) == 3:
-                x, satisfied, explanation = result
-                
-                # Identify if this is input or output spec layer
-                # Input spec layers typically appear early (first few layers)
-                # Output spec layers typically appear at the end
-                if i < len(self) // 2:  # First half = likely INPUT_SPEC
-                    input_satisfied = satisfied
-                    input_explanation = explanation
-                else:  # Second half = likely OUTPUT_SPEC
-                    output_satisfied = satisfied
-                    output_explanation = explanation
-            else:
-                # Regular layer, just pass through
-                x = result
-        
-        # Strict mode: raise on constraint violations
-        if self._strict_mode:
-            if not input_satisfied:
-                print(f"[STRICT MODE] {input_explanation}")
-                raise ValueError(
-                    f"Input constraint violated in strict mode: {input_explanation}"
-                )
-            if not output_satisfied:
-                print(f"[STRICT MODE] {output_explanation}")
-                raise ValueError(
-                    f"Output constraint violated in strict mode: {output_explanation}"
-                )
-        
-        # Return comprehensive verification result
-        return {
-            'output': x,
-            'input_satisfied': input_satisfied,
-            'input_explanation': input_explanation,
-            'output_satisfied': output_satisfied,
-            'output_explanation': output_explanation
-        }
 
 
 class InputLayer(nn.Module):
@@ -727,3 +626,288 @@ class OutputSpecLayer(nn.Module):
         
         else:
             return (y, True, f"⚠️ OUTPUT: Unknown kind {self.kind}")
+
+
+class VerifiableModel(nn.Module):
+    """
+    Unified wrapper for verifying any nn.Module.
+    
+    Wraps any nn.Module with input/output specifications for formal verification.
+    Provides automatic constraint checking during inference.
+    
+    Strict Mode:
+        Controlled via VerifiableModel.set_strict_mode(True/False).
+        When enabled, raises ValueError on input/output constraint violations.
+        Default: False (graceful violation reporting).
+    
+    Args:
+        model: Any nn.Module to verify
+        input_spec: Optional input constraints (InputSpec). If None, no input checking.
+        output_spec: Optional output constraints (OutputSpec). If None, no output checking.
+        input_shape: Optional input shape including batch dimension (e.g., (1, 3, 32, 32))
+        labeled_input: Optional input tensor with ground truth label
+        dtype: Data type for tensors (default: torch.float64)
+    
+    Returns:
+        Dict with keys:
+        - 'output': Model output tensor
+        - 'input_satisfied': True if input constraints satisfied (or no spec)
+        - 'input_explanation': Human-readable input constraint result
+        - 'output_satisfied': True if output constraints satisfied (or no spec)
+        - 'output_explanation': Human-readable output constraint result
+    
+    Example:
+        >>> model = nn.Sequential(nn.Linear(10, 5), nn.ReLU(), nn.Linear(5, 2))
+        >>> x = torch.randn(1, 10, dtype=torch.float64)
+        >>> labeled_input = LabeledInputTensor(tensor=x, label=0)
+        >>> 
+        >>> verifiable = VerifiableModel(
+        ...     model=model,
+        ...     input_spec=InputSpec(kind=InKind.BOX, center=x, eps=0.1),
+        ...     output_spec=OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=0),
+        ...     input_shape=(1, 10),
+        ...     labeled_input=labeled_input,
+        ... )
+        >>> 
+        >>> # Inference with constraint checking
+        >>> result = verifiable(x)
+        >>> print(result['output'], result['input_satisfied'], result['output_satisfied'])
+        >>> 
+        >>> # Convert to ACT Net for formal verification
+        >>> net = verifiable.to_act_net()
+    """
+    
+    # Class-level strict mode setting (shared across all instances)
+    _strict_mode: bool = False
+    
+    def __init__(
+        self,
+        model: Optional[nn.Module] = None,
+        layers: Optional[List[nn.Module]] = None,
+        input_spec: Optional[InputSpec] = None,
+        output_spec: Optional[OutputSpec] = None,
+        input_shape: Optional[Tuple[int, ...]] = None,
+        labeled_input: Optional[LabeledInputTensor] = None,
+        dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        # Accept either model or layers
+        if layers is not None:
+            self.model = nn.Sequential(*layers)
+        elif model is not None:
+            self.model = model
+        else:
+            raise ValueError("Either 'model' or 'layers' must be provided")
+        self.input_spec = input_spec
+        self.output_spec = output_spec
+        self.input_shape = input_shape
+        self.labeled_input = labeled_input
+        self.dtype = dtype
+        
+        # Defensive validation: check dtype matches device_manager
+        # This helps catch dtype mismatches early before they cause issues during to_act_net()
+        try:
+            from act.util.device_manager import get_default_dtype
+            expected_dtype = get_default_dtype()
+            if dtype != expected_dtype:
+                import warnings
+                warnings.warn(
+                    f"VerifiableModel dtype ({dtype}) doesn't match device_manager dtype ({expected_dtype}). "
+                    f"This may cause conversion errors. Consider converting your tensor: "
+                    f"tensor.to(dtype={expected_dtype})",
+                    UserWarning,
+                    stacklevel=2
+                )
+        except Exception:
+            # If device_manager is not initialized or import fails, skip validation
+            pass
+        
+        # Cached ACT Net
+        self._net = None
+    
+    @classmethod
+    def set_strict_mode(cls, enabled: bool) -> None:
+        """
+        Enable or disable strict mode for constraint violations.
+        
+        When enabled, forward() raises ValueError on input/output violations.
+        """
+        cls._strict_mode = enabled
+    
+    @classmethod
+    def get_strict_mode(cls) -> bool:
+        """Get current strict mode setting."""
+        return cls._strict_mode
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+        """
+        Forward pass with automatic constraint checking.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Dict with 'output', 'input_satisfied', 'input_explanation',
+            'output_satisfied', 'output_explanation'
+            
+        Raises:
+            ValueError: If strict mode enabled and constraints are violated
+        """
+        # Check input constraints
+        input_satisfied = True
+        input_explanation = "No input spec"
+        if self.input_spec is not None:
+            input_satisfied, input_explanation = self._check_input_spec(x)
+        
+        # Run model forward pass
+        output = self.model(x)
+        
+        # Check output constraints
+        output_satisfied = True
+        output_explanation = "No output spec"
+        if self.output_spec is not None:
+            output_satisfied, output_explanation = self._check_output_spec(output)
+        
+        # Strict mode: raise on constraint violations
+        if self._strict_mode:
+            if not input_satisfied:
+                raise ValueError(f"Input constraint violated: {input_explanation}")
+            if not output_satisfied:
+                raise ValueError(f"Output constraint violated: {output_explanation}")
+        
+        return {
+            'output': output,
+            'input_satisfied': input_satisfied,
+            'input_explanation': input_explanation,
+            'output_satisfied': output_satisfied,
+            'output_explanation': output_explanation
+        }
+    
+    def _check_input_spec(self, x: torch.Tensor) -> Tuple[bool, str]:
+        """Check if input satisfies input specification."""
+        spec = self.input_spec
+        if spec.kind == InKind.BOX:
+            lb, ub = spec.lb, spec.ub
+            if lb is not None and ub is not None:
+                in_bounds = (x >= lb).all() and (x <= ub).all()
+                if in_bounds:
+                    return True, "INPUT: Within bounds"
+                else:
+                    return False, "INPUT: Out of bounds"
+        elif spec.kind == InKind.LINF_BALL:
+            center, eps = spec.center, spec.eps
+            if center is not None and eps is not None:
+                diff = (x - center).abs().max().item()
+                if diff <= eps:
+                    return True, f"INPUT: Within L_inf ball (eps={eps})"
+                else:
+                    return False, f"INPUT: Outside L_inf ball (diff={diff:.4f} > eps={eps})"
+        return True, f"INPUT: Spec kind {spec.kind} (not checked)"
+    
+    def _check_output_spec(self, y: torch.Tensor) -> Tuple[bool, str]:
+        """Check if output satisfies output specification."""
+        spec = self.output_spec
+        if spec.kind == OutKind.TOP1_ROBUST:
+            y_true = spec.y_true
+            pred = y.argmax(dim=-1).item()
+            if pred == y_true:
+                margin = y[0, y_true] - y[0, [i for i in range(y.shape[-1]) if i != y_true]].max()
+                return True, f"OUTPUT: Correct (margin={margin.item():.4f})"
+            else:
+                return False, f"OUTPUT: Misclassified (pred={pred}, true={y_true})"
+        return True, f"OUTPUT: Spec kind {spec.kind} (not checked)"
+    
+    def to_act_net(self):
+        """
+        Convert to ACT Net for verification.
+        
+        Returns:
+            Net: ACT network with layers, preds, succs
+        """
+        if self._net is None:
+            self._net = self._build_act_net()
+        return self._net
+    
+    def _build_act_net(self):
+        """Build ACT Net from model and specifications."""
+        from act.pipeline.verification.torch2act import trace_model
+        from act.back_end.core import Net
+        
+        # Step 1: Trace the model to get model layers
+        model_layers, model_preds, model_succs = trace_model(
+            self.model, self.input_shape, self.dtype
+        )
+        
+        # Step 2: Build INPUT layer
+        input_layer = InputLayer(
+            labeled_input=self.labeled_input,
+            shape=self.input_shape,
+            dtype=self.dtype,
+        )
+        input_act_layers, input_out_vars = input_layer.to_act_layers(0, [])
+        
+        # Step 3: Build INPUT_SPEC layer
+        input_spec_layer = InputSpecLayer(spec=self.input_spec)
+        spec_act_layers, spec_out_vars = input_spec_layer.to_act_layers(
+            len(input_act_layers), input_out_vars
+        )
+        
+        # Step 4: Offset model layer IDs
+        wrapper_offset = len(input_act_layers) + len(spec_act_layers)
+        for layer in model_layers:
+            layer.id += wrapper_offset
+        
+        # Step 5: Build ASSERT layer
+        assert_layer = OutputSpecLayer(spec=self.output_spec)
+        
+        # Get the last model layer's output vars
+        if model_layers:
+            last_model_out_vars = model_layers[-1].out_vars
+        else:
+            last_model_out_vars = spec_out_vars
+        
+        assert_act_layers, _ = assert_layer.to_act_layers(
+            wrapper_offset + len(model_layers), last_model_out_vars
+        )
+        
+        # Step 6: Combine all layers
+        all_layers = input_act_layers + spec_act_layers + model_layers + assert_act_layers
+        
+        # Step 7: Build complete preds/succs
+        n_total = len(all_layers)
+        preds = {i: [] for i in range(n_total)}
+        succs = {i: [] for i in range(n_total)}
+        
+        # First, copy model layer graph (offset IDs)
+        for old_id, pred_list in model_preds.items():
+            new_id = old_id + wrapper_offset
+            preds[new_id] = [p + wrapper_offset for p in pred_list]
+        
+        for old_id, succ_list in model_succs.items():
+            new_id = old_id + wrapper_offset
+            succs[new_id] = [s + wrapper_offset for s in succ_list]
+        
+        # INPUT -> INPUT_SPEC
+        if len(input_act_layers) > 0 and len(spec_act_layers) > 0:
+            preds[len(input_act_layers)] = [len(input_act_layers) - 1]
+            succs[len(input_act_layers) - 1] = [len(input_act_layers)]
+        
+        # INPUT_SPEC -> first model layer (add to existing preds, don't overwrite)
+        if len(spec_act_layers) > 0 and len(model_layers) > 0:
+            first_model_id = wrapper_offset
+            last_spec_id = wrapper_offset - 1
+            if last_spec_id not in preds[first_model_id]:
+                preds[first_model_id].insert(0, last_spec_id)
+            if first_model_id not in succs[last_spec_id]:
+                succs[last_spec_id].append(first_model_id)
+        
+        # Last model layer -> ASSERT
+        if model_layers and assert_act_layers:
+            last_model_id = wrapper_offset + len(model_layers) - 1
+            assert_id = wrapper_offset + len(model_layers)
+            if last_model_id not in preds[assert_id]:
+                preds[assert_id].append(last_model_id)
+            if assert_id not in succs[last_model_id]:
+                succs[last_model_id].append(assert_id)
+        
+        return Net(layers=all_layers, preds=preds, succs=succs)

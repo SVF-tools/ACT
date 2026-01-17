@@ -65,7 +65,29 @@ jobs:
           cd ${{ github.workspace }}
           python -m act.pipeline --verify act2torch --device cpu --dtype float64
 
-      - name: Run Torch2ACT Pipeline Tests
+      - name: Run Torch2ACT Pipeline Tests - MNIST Simple CNN
         run: |
           cd ${{ github.workspace }}
-          python -m act.pipeline --verify torch2act --device cpu --dtype float64
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset MNIST --model simple_cnn
+
+      - name: Run Torch2ACT Pipeline Tests - MNIST ResNet18
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset MNIST --model resnet18
+
+      - name: Run Torch2ACT Pipeline Tests - MNIST EfficientNet family
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset MNIST --model efficientnet_b0
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset MNIST --model lenet5
+          
+      - name: Run Torch2ACT Pipeline Tests - CIFAR10 - EfficientNet family
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset CIFAR10 --model efficientnet_b0
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset CIFAR10 --model mobilenet_v2
+
+      - name: Run Torch2ACT Pipeline Tests - CIFAR10 - ResNet18
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.pipeline --verify torch2act --device cpu --dtype float64 --dataset CIFAR10 --model resnet18

@@ -22,7 +22,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 # ------------------- Model Inference Function --------------------------------
 # Helper function for single model inference
 # -----------------------------------------------------------------------------
-def infer_single_model(combo_id: str, model: nn.Sequential, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
+def infer_single_model(combo_id: str, model: nn.Module, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
     """
     Test a single wrapped model with input tensor.
     
@@ -50,15 +50,15 @@ def infer_single_model(combo_id: str, model: nn.Sequential, input_tensor: torch.
 
 # Main model inference function
 # -----------------------------------------------------------------------------
-def model_inference(models: Dict[str, nn.Sequential]) -> Dict[str, nn.Sequential]:
+def model_inference(models: Dict[str, nn.Module]) -> Dict[str, nn.Module]:
     """
     Test all wrapped models with their stored inputs and provide execution statistics.
     
     Args:
-        models: Dict[combo_id, nn.Sequential] - Synthesized wrapped models to test
+        models: Dict[combo_id, nn.Module] - Synthesized wrapped models to test
         
     Returns:
-        Dict[combo_id, nn.Sequential] - Successfully inferred models only
+        Dict[combo_id, nn.Module] - Successfully inferred models only
     """
     print(f"\n🔧 Testing {len(models)} models...")
     
@@ -74,15 +74,14 @@ def model_inference(models: Dict[str, nn.Sequential]) -> Dict[str, nn.Sequential
     successful_models = {}  # Track successfully inferred models
     
     for combo_id, model in models.items():
-        # Extract input and label from InputLayer (first layer)
-        input_layer = model[0]
-        if not hasattr(input_layer, 'input_tensor'):
-            print(f"⚠️  Model {combo_id} missing input_tensor in InputLayer")
+        # Extract input and label from VerifiableModel
+        if not hasattr(model, 'labeled_input') or model.labeled_input is None:
+            print(f"⚠️  Model {combo_id} missing labeled_input in VerifiableModel")
             failure_count += 1
             continue
         
-        test_input = input_layer.input_tensor
-        test_label = input_layer.label  # Extract ground truth label
+        test_input = model.labeled_input.tensor
+        test_label = model.labeled_input.label  # Extract ground truth label
         dataset = combo_id.split('|')[1].split(':')[1]  # Extract from x:dataset_name
         model_name = combo_id.split('|')[0].split(':')[1]
         success, output, error_msg = infer_single_model(combo_id, model, test_input)

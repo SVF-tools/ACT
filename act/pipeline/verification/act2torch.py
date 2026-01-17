@@ -16,19 +16,19 @@
 #   - Bidirectional: Inverse of torch2act.py for round-trip conversion
 #   - Weight preservation: Transfers all ACT parameters to PyTorch layers
 #   - VerifiableModel: Returns wrapped model with automatic constraint checking
-#   - Spec reconstruction: Rebuilds InputSpecLayer/OutputSpecLayer from ACT
+#   - Spec reconstruction: Rebuilds InputSpec/OutputSpec from ACT layers
 #   - Comprehensive coverage: Supports 40+ layer types (MLP, CNN, RNN, etc.)
 #
 # Architecture:
-#   INPUT      → (skipped)           (no-op, shape already defined)
-#   INPUT_SPEC → InputSpecLayer      (input constraint checking)
+#   INPUT      → (extract metadata)  (input_shape, dtype, labeled_input)
+#   INPUT_SPEC → (extract InputSpec) (input constraints)
 #   DENSE      → nn.Linear           (fully connected layers)
 #   CONV2D     → nn.Conv2d           (convolutional layers)
 #   RELU       → nn.ReLU             (activation functions)
-#   ASSERT     → OutputSpecLayer     (output constraint checking)
+#   ASSERT     → (extract OutputSpec)(output constraints)
 #
 # VerifiableModel:
-#   Wraps nn.Sequential to provide automatic constraint verification.
+#   Wraps nn.Module to provide automatic constraint verification.
 #   Returns dict with:
 #   - 'output': Model predictions
 #   - 'input_satisfied': Input constraint satisfaction status
@@ -78,13 +78,13 @@ class ACTToTorch:
     
     Usage:
         converter = ACTToTorch(act_net)
-        model = converter.run()  # Returns nn.Sequential
+        model = converter.run()  # Returns nn.Module
     
     Args:
         act_net: ACT Net object containing layers with architecture and weights
     
     Returns:
-        PyTorch nn.Sequential model ready for inference
+        PyTorch nn.Module model ready for inference
     """
     
     def __init__(self, act_net: Net):
@@ -106,17 +106,23 @@ class ACTToTorch:
         Convert ACT Net to PyTorch nn.Module.
         
         Iterates through ACT layers, creates corresponding PyTorch layers,
-        transfers weights, and assembles into VerifiableModel model.
+        transfers weights, and assembles into VerifiableModel.
         
         Returns:
-            VerifiableModel model with embedded constraint checking
+            VerifiableModel with embedded constraint checking
         
         Raises:
             ValueError: If no valid PyTorch layers can be created
         """
+        from act.front_end.verifiable_model import VerifiableModel
+        from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+        
         torch_layers = []
-        has_input_spec = False
-        has_output_spec = False
+        input_spec = None
+        output_spec = None
+        input_shape = None
+        input_dtype = None
+        labeled_input = None
         
         # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
@@ -126,40 +132,34 @@ class ACTToTorch:
             kind = act_layer.kind
             meta = act_layer.meta
             
-            # Handle wrapper layers specially
+            # Extract metadata from INPUT layer
             if kind == 'INPUT':
-                continue  # Skip INPUT layer (no-op)
+                input_shape = tuple(meta['shape'])
+                dtype_str = meta.get('dtype', 'torch.float32')
+                # Parse dtype string (e.g., "torch.float64" -> torch.float64)
+                input_dtype = getattr(torch, dtype_str.replace('torch.', ''))
+                labeled_input = act_layer.params.get('labeled_input')
+                continue
             
+            # Extract InputSpec from INPUT_SPEC layer
             if kind == 'INPUT_SPEC':
-                # Create InputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import InputSpecLayer
-                from act.front_end.specs import InputSpec, InKind
-                
-                # Build InputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
                 if 'eps' in meta:
                     spec_dict['eps'] = meta['eps']
                 
-                # Convert parameter tensors to device_manager dtype for consistency
+                # Convert parameter tensors to target dtype/device
                 for param_key in ['lb', 'ub', 'center', 'A', 'b']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
                 
-                spec = InputSpec(**spec_dict)
-                # InputSpecLayer now always returns tuples
-                torch_layers.append(InputSpecLayer(spec))
-                has_input_spec = True
+                input_spec = InputSpec(**spec_dict)
                 continue
             
+            # Extract OutputSpec from ASSERT layer
             elif kind == 'ASSERT':
-                # Create OutputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import OutputSpecLayer
-                from act.front_end.specs import OutputSpec, OutKind
-                
-                # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
@@ -170,16 +170,13 @@ class ACTToTorch:
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
                 
-                # Convert parameter tensors to device_manager dtype for consistency
+                # Convert parameter tensors to target dtype/device
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
                 
-                spec = OutputSpec(**spec_dict)
-                # OutputSpecLayer now always returns tuples
-                torch_layers.append(OutputSpecLayer(spec))
-                has_output_spec = True
+                output_spec = OutputSpec(**spec_dict)
                 continue
             
             # Build PyTorch layer from ACT layer (includes weight transfer)
@@ -191,13 +188,19 @@ class ACTToTorch:
         if not torch_layers:
             raise ValueError("No valid PyTorch layers found in ACT Net")
         
-        # Return VerifiableModel for automatic constraint checking
-        from act.front_end.verifiable_model import VerifiableModel
-        model = VerifiableModel(*torch_layers)
-        model.eval()  # Set to evaluation mode by default
+        # Create VerifiableModel with layer list
+        model = VerifiableModel(
+            layers=torch_layers,
+            input_spec=input_spec,
+            output_spec=output_spec,
+            input_shape=input_shape or (1,),  # Fallback if INPUT layer missing
+            labeled_input=labeled_input,
+            dtype=input_dtype or target_dtype,
+        )
+        model.eval()  # Set to evaluation mode
         
         logger.info(f"Created VerifiableModel with {len(torch_layers)} layers "
-                   f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
+                   f"(input_spec={input_spec is not None}, output_spec={output_spec is not None})")
         
         return model
     

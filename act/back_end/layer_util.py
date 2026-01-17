@@ -13,7 +13,7 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union, Tuple
 import difflib
 
 # Import validation components
@@ -301,3 +301,17 @@ if __name__ == "__main__":
         print("OK — wrapper model passes with", len(layers), "layers.")
     except Exception as e:
         print("Example failed:\n", e)
+
+def normalize_to_tuple(value: Union[int, Tuple[int, ...]], n: int = 2) -> Tuple[int, ...]:
+    """Convert int to n-tuple, pass through existing tuples.
+    
+    Args:
+        value: Integer or tuple to normalize
+        n: Number of dimensions (1 for Conv1d, 2 for Conv2d, 3 for Conv3d)
+    
+    Returns:
+        Tuple of n integers
+    """
+    if isinstance(value, int):
+        return (value,) * n
+    return tuple(value)

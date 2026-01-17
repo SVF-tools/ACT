@@ -25,51 +25,17 @@ if __name__ == "__main__" and __package__ is None:
 
 import torch
 import torch.nn as nn
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 # Import ACT components
-from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.spec_creator_base import LabeledInputTensor
-from act.front_end.verifiable_model import (
-    InputLayer,
-    InputSpecLayer,
-    OutputSpecLayer,
-    VerifiableModel,
-)
+from act.front_end.verifiable_model import VerifiableModel
 
 
 # -----------------------------------------------------------------------------
-# 2) Small utilities
-# -----------------------------------------------------------------------------
-def prod(seq: Tuple[int, ...]) -> int:
-    """Calculate product of sequence elements."""
-    p = 1
-    for s in seq:
-        p *= s
-    return p
-
-
-def infer_layout_from_tensor(x: torch.Tensor) -> str:
-    """Infer tensor layout (HWC, CHW, or FLAT) from shape."""
-    if x.dim() == 4 and x.shape[-1] in (1, 3, 4):
-        return "HWC"
-    elif x.dim() == 4:
-        return "CHW"
-    return "FLAT"
-
-
-def needs_flatten_before_model(model: nn.Module) -> bool:
-    """Check if model needs flattening layer before first Linear layer."""
-    children = list(model.children())
-    if not children:
-        return isinstance(model, nn.Linear)
-    first = children[0]
-    return isinstance(first, nn.Linear)
-
-
-# -----------------------------------------------------------------------------
-# 3) Model synthesis from spec creators
+# Model synthesis from spec creators
 # -----------------------------------------------------------------------------
 @dataclass
 class WrapReport:
@@ -87,7 +53,7 @@ def synthesize_single_model_from_spec(
     pytorch_model: nn.Module,
     labeled_tensor: LabeledInputTensor,
     input_spec: InputSpec,
-    output_spec: OutputSpec
+    output_spec: OutputSpec,
 ) -> Tuple[VerifiableModel, WrapReport]:
     """
     Synthesize a single wrapped model from a spec pair.
@@ -104,56 +70,10 @@ def synthesize_single_model_from_spec(
         wrapped_model: VerifiableModel instance
         report: WrapReport metadata
     """
-    # Extract tensor with batch dimension (1, C, H, W)
     x = labeled_tensor.tensor
     input_shape = tuple(x.shape)
-    
-    # Infer metadata from tensor
-    layout = infer_layout_from_tensor(x)
     dtype = x.dtype
     
-    # Infer domain and channels
-    if x.dim() == 4:
-        domain = "vision"
-        channels = x.shape[1]  # (B,C,H,W)
-    else:
-        domain = "tabular"
-        channels = None
-    
-    # Compute value range
-    value_range = (float(x.min().item()), float(x.max().item())) if x.numel() > 0 else None
-    
-    # Build layer stack
-    layers: List[nn.Module] = [
-        InputLayer(
-            labeled_input=labeled_tensor,
-            shape=input_shape,
-            dtype=dtype,
-            layout=layout,
-            dataset_name=data_source,
-            num_classes=None,
-            value_range=value_range,
-            scale_hint="normalized" if domain == "vision" else "unknown",
-            distribution="normalized" if domain == "vision" else "unknown",
-            sample_id=None,
-            domain=domain,
-            channels=channels,
-        ),
-        InputSpecLayer(spec=input_spec),
-    ]
-    
-    # Add flatten if needed
-    if needs_flatten_before_model(pytorch_model) and len(input_shape) > 2:
-        layers.append(nn.Flatten())
-    
-    # Add model and output spec
-    layers.append(pytorch_model)
-    layers.append(OutputSpecLayer(spec=output_spec))
-    
-    # Create VerifiableModel
-    wrapped = VerifiableModel(*layers)
-    
-    # Create report
     report = WrapReport(
         input_shape=input_shape,
         in_spec_kind=input_spec.kind,
@@ -162,12 +82,22 @@ def synthesize_single_model_from_spec(
         model_name=model_name,
     )
     
+    # Create VerifiableModel (unified API)
+    wrapped = VerifiableModel(
+        model=pytorch_model,
+        input_spec=input_spec,
+        output_spec=output_spec,
+        input_shape=input_shape,
+        labeled_input=labeled_tensor,
+        dtype=dtype,
+    )
+    
     return wrapped, report
 
 
 def synthesize_models_from_specs(
-    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]
-) -> Tuple[Dict[str, nn.Sequential], Dict[str, WrapReport]]:
+    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]],
+) -> Tuple[Dict[str, nn.Module], Dict[str, WrapReport]]:
     """
     Synthesize wrapped models directly from spec creator results.
     
@@ -185,12 +115,12 @@ def synthesize_models_from_specs(
             - spec_pairs: List of (InputSpec, OutputSpec) tuples
     
     Returns:
-        wrapped_models: Dict[combo_id, nn.Sequential] - Synthesized VerifiableModel instances
+        wrapped_models: Dict[combo_id, model] - Synthesized VerifiableModel instances
         reports: Dict[combo_id, WrapReport] - Metadata for each wrapped model
         
     combo_id format: "m:<model_name>|x:<data_source>|s:<spec_index>|is:<input_kind>|os:<output_kind>_m<margin>"
     """
-    wrapped_models: Dict[str, nn.Sequential] = {}
+    wrapped_models: Dict[str, nn.Module] = {}
     reports: Dict[str, WrapReport] = {}
     
     print(f"\n🧬 Synthesizing models from {len(spec_results)} spec result(s)...")
@@ -221,7 +151,7 @@ def synthesize_models_from_specs(
                 pytorch_model=pytorch_model,
                 labeled_tensor=labeled_tensor,
                 input_spec=input_spec,
-                output_spec=output_spec
+                output_spec=output_spec,
             )
             
             # Create unique combo_id with spec index to avoid overwrites
@@ -239,9 +169,9 @@ def synthesize_models_from_specs(
 
 
 # -----------------------------------------------------------------------------
-# 4) Model synthesis main function
+# Main model synthesis function
 # -----------------------------------------------------------------------------
-def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Sequential]:
+def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Module]:
     """
     Main model synthesis function using new spec creators.
     
@@ -252,7 +182,7 @@ def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Sequential]:
         creator: Creator to use ('torchvision' or 'vnnlib'). Defaults to 'torchvision'.
     
     Returns:
-        wrapped_models: Dict[combo_id, nn.Sequential] - All synthesized wrapped models
+        wrapped_models: Dict[combo_id, model] - All synthesized VerifiableModel instances
         
     Raises:
         RuntimeError: If no spec creator can load data-model pairs or create specs

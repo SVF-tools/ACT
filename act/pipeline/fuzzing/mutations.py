@@ -227,7 +227,7 @@ class PGDMutation(MutationStrategy):
             # Forward pass
             output = model(x_adv)
 
-            # Extract output tensor if dict (from VerifiableModel)
+        # Extract output tensor if dict (from VerifiableModel)
             if isinstance(output, dict):
                 output = output['output']
 

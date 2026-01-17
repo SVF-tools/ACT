@@ -597,8 +597,13 @@ def cmd_verify(target: str, args):
         elif test_name == 'torch2act':
             print(f"VERIFICATION TEST: PyTorch→ACT Conversion")
             print(f"{'='*80}\n")
+            
+            # Check for dataset and model filters
+            dataset_filter = getattr(args, 'dataset', None)
+            model_filter = getattr(args, 'model', None)
+            
             try:
-                torch2act.main()
+                _run_torch2act_with_filter(dataset_filter=dataset_filter, model_filter=model_filter)
                 results[test_name] = 'PASSED'
             except Exception as e:
                 print(f"\n❌ Test failed: {e}")
@@ -618,6 +623,111 @@ def cmd_verify(target: str, args):
     # Exit with error if any test failed
     if any(r == 'FAILED' for r in results.values()):
         sys.exit(1)
+
+
+def _run_torch2act_with_filter(dataset_filter: Optional[str] = None, model_filter: Optional[str] = None):
+    """
+    Run torch2act verification with optional dataset and model filtering.
+    
+    This CLI-specific wrapper reuses torch2act helper functions but allows
+    filtering which datasets/models to test by filtering synthesized model IDs.
+    
+    Args:
+        dataset_filter: Dataset name to filter (e.g., 'MNIST', 'CIFAR10', 'acasxu_2023')
+        model_filter: Model name to filter (e.g., 'resnet18', 'vgg16', 'simple_cnn')
+        If both None, tests all datasets and models (backward compatible)
+    
+    Model ID formats:
+      - TorchVision: m:{model}|x:{dataset}|s:{idx}|is:{inkind}|os:{outkind}
+        Example: m:resnet18|x:MNIST|s:0|is:BOX|os:MARGIN_ROBUST_m0.0
+      - VNNLib: {category}+{model}
+        Example: acasxu_2023+ACASXU_run2a_1_1_batch_2000
+    """
+    # Import torch2act helpers
+    from act.pipeline.verification.torch2act import (
+        _setup_debug_logging,
+        _initialize_solvers,
+        _process_models,
+        _print_summary
+    )
+    from act.front_end.model_synthesis import model_synthesis
+    from act.util.model_inference import model_inference
+    
+    _setup_debug_logging()
+    
+    if dataset_filter or model_filter:
+        print(f"\n{'='*80}")
+        filters = []
+        if dataset_filter:
+            filters.append(f"DATASET: {dataset_filter}")
+        if model_filter:
+            filters.append(f"MODEL: {model_filter}")
+        print(f"FILTERING TO {' + '.join(filters)}")
+        print(f"{'='*80}\n")
+    
+    # Step 1: Synthesize all models
+    print("\n[Step 1] Synthesizing wrapped models...")
+    wrapped = model_synthesis(creator='torchvision')  # Default to torchvision
+    print(f"  Generated {len(wrapped)} wrapped models")
+    
+    # Step 2: Filter by dataset and/or model if specified
+    if dataset_filter or model_filter:
+        filtered = {}
+        for model_id, model in wrapped.items():
+            # Check dataset match
+            dataset_match = True
+            if dataset_filter:
+                dataset_match = f"|x:{dataset_filter}|" in model_id or model_id.startswith(f"{dataset_filter}+")
+            
+            # Check model match
+            model_match = True
+            if model_filter:
+                model_match = model_id.startswith(f"m:{model_filter}|") or f"+{model_filter}" in model_id
+            
+            # Keep if both filters match
+            if dataset_match and model_match:
+                filtered[model_id] = model
+        
+        filter_desc = []
+        if dataset_filter:
+            filter_desc.append(f"dataset '{dataset_filter}'")
+        if model_filter:
+            filter_desc.append(f"model '{model_filter}'")
+        
+        print(f"  Filtered to {len(filtered)} models for {' + '.join(filter_desc)}")
+        
+        if not filtered:
+            # Show available options
+            available_datasets = sorted(set(
+                mid.split('|x:')[1].split('|')[0] if '|x:' in mid 
+                else mid.split('+')[0]
+                for mid in wrapped.keys()
+            ))
+            available_models = sorted(set(
+                mid.split('m:')[1].split('|')[0] if mid.startswith('m:') 
+                else mid.split('+')[1] if '+' in mid else 'unknown'
+                for mid in wrapped.keys()
+            ))
+            
+            error_msg = f"No models found for {' + '.join(filter_desc)}\n"
+            error_msg += f"Available datasets: {', '.join(available_datasets)}\n"
+            error_msg += f"Available models: {', '.join(available_models)}"
+            raise RuntimeError(error_msg)
+        
+        wrapped = filtered
+    
+    # Step 3: Test inference
+    print("\n[Step 2] Testing model inference...")
+    successful = model_inference(wrapped)
+    print(f"  {len(successful)} models passed inference tests")
+    
+    if not successful:
+        raise RuntimeError("No models passed inference tests")
+    
+    # Step 4-6: Use torch2act helpers
+    solvers = _initialize_solvers()
+    results = _process_models(successful, solvers)
+    _print_summary(results, len(successful))
 
 
 def cmd_validate_verifier(args):
@@ -714,6 +824,14 @@ Examples:
   python -m act.pipeline --verify act2torch --device cpu
   python -m act.pipeline --verify torch2act --device cpu
   python -m act.pipeline --verify all --device cpu
+  
+  # Run torch2act with dataset filtering
+  python -m act.pipeline --verify torch2act --device cpu --dataset MNIST
+  python -m act.pipeline --verify torch2act --device cpu --dataset CIFAR10
+  
+  # Run torch2act with dataset + model filtering
+  python -m act.pipeline --verify torch2act --device cpu --dataset MNIST --model resnet18
+  python -m act.pipeline --verify torch2act --device cpu --dataset CIFAR10 --model vgg16
   
   # Run verifier validation (comprehensive by default)
   python -m act.pipeline --validate-verifier --device cpu --dtype float64
