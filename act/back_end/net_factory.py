@@ -355,22 +355,9 @@ class NetFactory:
                 raise ValueError(f"Layer '{kind}' cannot be the first layer in network")
 
         else:
-            supported_types = [
-                "INPUT",
-                "DENSE",
-                "RELU",
-                "SIGMOID",
-                "TANH",
-                "CONV1D",
-                "CONV2D",
-                "CONV3D",
-                "MAXPOOL2D",
-                "AVGPOOL2D",
-                "ADAPTIVEAVGPOOL2D",
-                "FLATTEN",
-                "INPUT_SPEC",
-                "ASSERT",
-            ]
+            supported_types = ["INPUT", "DENSE", "RELU", "SIGMOID", "TANH",
+                "CONV1D", "CONV2D", "CONV3D", "MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D",
+                "FLATTEN", "INPUT_SPEC","ASSERT",]
             raise NotImplementedError(
                 f"Layer type '{kind}' is not supported for variable generation. "
                 f"Supported types: {supported_types}. "
