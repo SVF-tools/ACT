@@ -15,7 +15,6 @@
 import json
 import tempfile
 import os
-import contextlib
 from pathlib import Path
 
 try:
@@ -51,26 +50,10 @@ def create_test_networks():
 
     # Use proper ACT serialization for loading
     from act.back_end.serialization.serialization import load_net_from_file
-    original_dtype = torch.get_default_dtype() if HAS_TORCH else None
-
-    def _extract_input_dtype(net_dict):
-        layers = net_dict.get("act_net", {}).get("layers", [])
-        for layer in layers:
-            if layer.get("kind") == "INPUT":
-                return (layer.get("meta") or {}).get("dtype")
-        return None
 
     for json_file in json_files:
         net_name = json_file.stem
         try:
-            if HAS_TORCH:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    net_dict = json.load(f)
-                dtype_str = _extract_input_dtype(net_dict)
-                if dtype_str == "torch.float32":
-                    torch.set_default_dtype(torch.float32)
-                elif dtype_str == "torch.float64":
-                    torch.set_default_dtype(torch.float64)
             # Use proper deserialization which handles tensor decoding and validation gracefully
             # Force CPU device for CI environments that don't have CUDA
             net, metadata = load_net_from_file(str(json_file), target_device='cpu')
@@ -85,40 +68,12 @@ def create_test_networks():
             print(f"  ❌ Failed to load {net_name}: {e}")
             # For testing purposes, we'll skip failed networks but continue
             continue
-        finally:
-            if HAS_TORCH and original_dtype is not None:
-                torch.set_default_dtype(original_dtype)
 
     if not test_nets:
         raise RuntimeError("No networks could be loaded successfully")
 
     print(f"Successfully loaded {len(test_nets)} test networks")
     return test_nets
-
-
-@contextlib.contextmanager
-def _set_default_dtype_for_net(net):
-    if not HAS_TORCH:
-        yield
-        return
-    dtype_str = None
-    for layer in net.layers:
-        if layer.kind == "INPUT":
-            dtype_str = (layer.meta or {}).get("dtype")
-            break
-    if dtype_str == "torch.float32":
-        target_dtype = torch.float32
-    elif dtype_str == "torch.float64":
-        target_dtype = torch.float64
-    else:
-        yield
-        return
-    prev_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(target_dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(prev_dtype)
 
 
 def test_basic_serialization():
@@ -145,8 +100,7 @@ def test_basic_serialization():
             print(f"    Serialized to {len(json_str)} characters")
             
             # Test deserialization
-            with _set_default_dtype_for_net(net):
-                deserialized_net, metadata = NetSerializer.deserialize_net(serialized_dict)
+            deserialized_net, metadata = NetSerializer.deserialize_net(serialized_dict)
             print(f"    Deserialized network with {len(deserialized_net.layers)} layers")
             
             # Verify structure
@@ -216,8 +170,7 @@ def test_file_io():
             print(f"    File size: {file_size:,} bytes")
             
             # Load from file
-            with _set_default_dtype_for_net(net):
-                net_restored, loaded_metadata = load_net_from_file(filepath)
+            net_restored, loaded_metadata = load_net_from_file(filepath)
             
             # Verify metadata preservation
             assert loaded_metadata["description"] == metadata["description"], f"Description mismatch for {net_name}"
@@ -258,8 +211,7 @@ def test_device_migration():
             # Test serialization and deserialization
             metadata = {"test": "device_migration", "network_name": net_name}
             serialized = save_net_to_string(net, metadata)
-            with _set_default_dtype_for_net(net):
-                net_restored, loaded_metadata = load_net_from_string(serialized)
+            net_restored, loaded_metadata = load_net_from_string(serialized)
             
             # Verify metadata and structure
             assert loaded_metadata["test"] == "device_migration", f"Metadata mismatch for {net_name}"
@@ -359,8 +311,7 @@ def test_complex_metadata():
             }
             
             json_str = save_net_to_string(net, complex_metadata)
-            with _set_default_dtype_for_net(net):
-                net_restored, metadata_restored = load_net_from_string(json_str)
+            net_restored, metadata_restored = load_net_from_string(json_str)
             
             # Verify complex metadata preservation
             assert metadata_restored["network_name"] == net_name, f"Network name mismatch for {net_name}"
