@@ -56,6 +56,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "block_count_range": [2, 6],
         "block_width_choices": [32, 64, 128],
         "post_block_activation_p": 0.8,
+        "residual_p": 0.2,
+        "residual_blocks_range": [1, 3],
+        "residual_width_choices": [32, 64, 128],
     },
     "cnn": {
         "input_shapes": [[1, 1, 28, 28], [1, 3, 32, 32]],
@@ -263,21 +266,22 @@ def _append_pool2d(
     return out_H, out_W
 
 
-def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
-    shape = _ensure_batch1(tuple(cfg["input_shape"]))
-    in_features = int(shape[1]) if len(shape) == 2 else _prod(shape[1:])
+    def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
+        shape = _ensure_batch1(tuple(cfg["input_shape"]))
+        in_features = int(shape[1]) if len(shape) == 2 else _prod(shape[1:])
 
-    if len(shape) > 2:
-        layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
+        if len(shape) > 2:
+            layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
 
-    act_kind = _activation_kind(cfg.get("activation", "relu"))
+        act_kind = _activation_kind(cfg.get("activation", "relu"))
 
-    if cfg.get("variant", "plain") == "plain":
-        for h in cfg["hidden_sizes"]:
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
+        variant = cfg.get("variant", "plain")
+        if variant == "plain":
+            for h in cfg["hidden_sizes"]:
+                layers.append(
+                    {
+                        "kind": "DENSE",
+                        "params": {},
                     "meta": {
                         "in_features": int(in_features),
                         "out_features": int(h),
@@ -329,11 +333,67 @@ def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> N
             )
             if cfg.get("post_block_activation", True):
                 layers.append({"kind": act_kind, "params": {}, "meta": {}})
+        elif variant == "residual":
+            width = int(cfg.get("residual_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else in_features))
+            if in_features != width:
+                layers.append(
+                    {
+                        "kind": "DENSE",
+                        "params": {},
+                        "meta": {
+                            "in_features": int(in_features),
+                            "out_features": int(width),
+                            "bias_enabled": bool(cfg.get("use_bias", True)),
+                        },
+                    }
+                )
+                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                in_features = int(width)
 
-    layers.append(
-        {
-            "kind": "DENSE",
-            "params": {},
+            num_blocks = int(cfg.get("num_residual_blocks", cfg.get("num_blocks", 1)))
+            for _ in range(num_blocks):
+                skip_idx = len(layers) - 1
+                layers.append(
+                    {
+                        "kind": "DENSE",
+                        "params": {},
+                        "meta": {
+                            "in_features": int(in_features),
+                            "out_features": int(in_features),
+                            "bias_enabled": bool(cfg.get("use_bias", True)),
+                        },
+                    }
+                )
+                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                layers.append(
+                    {
+                        "kind": "DENSE",
+                        "params": {},
+                        "meta": {
+                            "in_features": int(in_features),
+                            "out_features": int(in_features),
+                            "bias_enabled": bool(cfg.get("use_bias", True)),
+                        },
+                    }
+                )
+                main_idx = len(layers) - 1
+                layers.append(
+                    {
+                        "kind": "ADD",
+                        "params": {},
+                        "meta": {},
+                        "inputs": {"x": skip_idx, "y": main_idx},
+                        "preds": [skip_idx, main_idx],
+                    }
+                )
+                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+        else:
+            raise ValueError(f"Unsupported MLP variant '{variant}'")
+
+        layers.append(
+            {
+                "kind": "DENSE",
+                "params": {},
             "meta": {
                 "in_features": int(in_features),
                 "out_features": int(cfg["num_classes"]),
@@ -721,6 +781,18 @@ class NetFactory:
                 return in_vars, out_vars, var_counter
             raise ValueError("Flatten layer cannot be the first layer in network")
 
+        if kind in ["ADD", "SUB", "MUL", "DIV"]:
+            x_vars = meta.get("x_vars")
+            y_vars = meta.get("y_vars")
+            if x_vars is None or y_vars is None:
+                raise ValueError(f"{kind} layer requires meta['x_vars'] and meta['y_vars']")
+            if len(x_vars) != len(y_vars):
+                raise ValueError(f"{kind} layer expects x_vars and y_vars of same length")
+            in_vars = list(x_vars) + list(y_vars)
+            out_vars = list(range(var_counter, var_counter + len(x_vars)))
+            var_counter += len(x_vars)
+            return in_vars, out_vars, var_counter
+
         if kind in ["INPUT_SPEC", "ASSERT"]:
             if layers and layer_index > 0:
                 prev_vars = layers[layer_index - 1].out_vars
@@ -740,6 +812,10 @@ class NetFactory:
             "AVGPOOL2D",
             "ADAPTIVEAVGPOOL2D",
             "FLATTEN",
+            "ADD",
+            "SUB",
+            "MUL",
+            "DIV",
             "INPUT_SPEC",
             "ASSERT",
         ]
@@ -774,10 +850,20 @@ class NetFactory:
         activation = str(_choose(rng, cfg.get("activation_choices", []), name="mlp.activation_choices"))
         dropout_p = float(_choose(rng, cfg.get("dropout_p_choices", []), name="mlp.dropout_p_choices"))
 
-        variant = "block" if (rng.random() < float(cfg.get("block_p", 0.0))) else "plain"
+        block_p = float(cfg.get("block_p", 0.0))
+        residual_p = float(cfg.get("residual_p", 0.0))
+        r = rng.random()
+        if r < residual_p:
+            variant = "residual"
+        elif r < residual_p + block_p:
+            variant = "block"
+        else:
+            variant = "plain"
         num_blocks = _randint_inclusive(rng, cfg.get("block_count_range", [2, 4]))
         block_width = int(_choose(rng, cfg.get("block_width_choices", []), name="mlp.block_width_choices"))
         post_block_activation = bool(rng.random() < float(cfg.get("post_block_activation_p", 0.5)))
+        residual_blocks = _randint_inclusive(rng, cfg.get("residual_blocks_range", [1, 2]))
+        residual_width = int(_choose(rng, cfg.get("residual_width_choices", []), name="mlp.residual_width_choices"))
 
         if variant == "block":
             dropout_p = 0.0
@@ -789,6 +875,8 @@ class NetFactory:
             "num_blocks": int(num_blocks),
             "block_width": int(block_width),
             "post_block_activation": bool(post_block_activation),
+            "num_residual_blocks": int(residual_blocks),
+            "residual_width": int(residual_width),
             "activation": activation,
             "use_bias": True,
             "dropout_p": float(dropout_p),
@@ -801,6 +889,8 @@ class NetFactory:
             "num_blocks": int(num_blocks),
             "block_width": int(block_width),
             "post_block_activation": bool(post_block_activation),
+            "num_residual_blocks": int(residual_blocks),
+            "residual_width": int(residual_width),
             "activation": activation,
             "dropout_p": float(dropout_p),
             "input_shape": list(model_cfg["input_shape"]),
@@ -1147,10 +1237,22 @@ class NetFactory:
         layers = []
         var_counter = 0
 
-        for i, layer_spec in enumerate(spec["layers"]):
+        layer_specs = list(spec["layers"])
+        for i, layer_spec in enumerate(layer_specs):
             params = layer_spec.get("params", {}).copy()
             meta = layer_spec.get("meta", {}).copy()
             kind = layer_spec["kind"]
+
+            if kind in ["ADD", "SUB", "MUL", "DIV"]:
+                inputs = layer_spec.get("inputs") or {}
+                x_src = inputs.get("x")
+                y_src = inputs.get("y")
+                if x_src is None or y_src is None:
+                    raise ValueError(f"{kind} layer requires inputs {{'x': idx, 'y': idx}} in spec")
+                if x_src >= len(layers) or y_src >= len(layers):
+                    raise ValueError(f"{kind} inputs must reference earlier layers (x={x_src}, y={y_src})")
+                meta["x_vars"] = list(layers[x_src].out_vars)
+                meta["y_vars"] = list(layers[y_src].out_vars)
 
             in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
 
@@ -1197,8 +1299,18 @@ class NetFactory:
             )
             layers.append(layer)
 
-        preds = {i: [i - 1] if i > 0 else [] for i in range(len(layers))}
-        succs = {i: [i + 1] if i < len(layers) - 1 else [] for i in range(len(layers))}
+        preds: Dict[int, List[int]] = {}
+        for i, layer_spec in enumerate(layer_specs):
+            spec_preds = layer_spec.get("preds")
+            if spec_preds is None:
+                preds[i] = [i - 1] if i > 0 else []
+            else:
+                preds[i] = list(spec_preds)
+
+        succs: Dict[int, List[int]] = {i: [] for i in range(len(layers))}
+        for i, p_list in preds.items():
+            for p in p_list:
+                succs[p].append(i)
 
         net = Net(layers=layers, preds=preds, succs=succs)
         net.meta = {

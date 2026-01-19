@@ -20,6 +20,9 @@ mlp:
   block_count_range: [2, 6]
   block_width_choices: [32, 64, 128]
   post_block_activation_p: 0.8
+  residual_p: 0.0
+  residual_blocks_range: [1, 3]
+  residual_width_choices: [32, 64, 128]
 
 cnn:
   input_shapes: [[1, 1, 28, 28], [1, 3, 32, 32]]
