@@ -50,10 +50,26 @@ def create_test_networks():
 
     # Use proper ACT serialization for loading
     from act.back_end.serialization.serialization import load_net_from_file
+    original_dtype = torch.get_default_dtype() if HAS_TORCH else None
+
+    def _extract_input_dtype(net_dict):
+        layers = net_dict.get("act_net", {}).get("layers", [])
+        for layer in layers:
+            if layer.get("kind") == "INPUT":
+                return (layer.get("meta") or {}).get("dtype")
+        return None
 
     for json_file in json_files:
         net_name = json_file.stem
         try:
+            if HAS_TORCH:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    net_dict = json.load(f)
+                dtype_str = _extract_input_dtype(net_dict)
+                if dtype_str == "torch.float32":
+                    torch.set_default_dtype(torch.float32)
+                elif dtype_str == "torch.float64":
+                    torch.set_default_dtype(torch.float64)
             # Use proper deserialization which handles tensor decoding and validation gracefully
             # Force CPU device for CI environments that don't have CUDA
             net, metadata = load_net_from_file(str(json_file), target_device='cpu')
@@ -68,6 +84,9 @@ def create_test_networks():
             print(f"  ❌ Failed to load {net_name}: {e}")
             # For testing purposes, we'll skip failed networks but continue
             continue
+        finally:
+            if HAS_TORCH and original_dtype is not None:
+                torch.set_default_dtype(original_dtype)
 
     if not test_nets:
         raise RuntimeError("No networks could be loaded successfully")
