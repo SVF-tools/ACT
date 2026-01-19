@@ -112,18 +112,32 @@ def run_network_factory(args):
     
     from act.back_end.net_factory import NetFactory
     
-    config_file = args.config if args.config else "act/back_end/examples/examples_config.yaml"
+    config_file = args.config if args.config else "act/back_end/examples/config_gen_act_net.yaml"
     
     print(f"Configuration: {config_file}")
-    print(f"Output directory: act/back_end/examples/nets (fixed)\n")
-    
     if args.output:
-        print(f"⚠️  Note: Custom output directory not supported by NetFactory")
-        print(f"   Networks will be saved to: act/back_end/examples/nets\n")
+        print(f"Output directory override: {args.output}")
+    if args.num is not None:
+        print(f"Instance count override: {args.num}")
+    if args.base_seed is not None:
+        print(f"Base seed override: {args.base_seed}")
+    if args.name_prefix is not None:
+        print(f"Name prefix override: {args.name_prefix}")
+    if args.no_manifest:
+        print("Manifest writing disabled via CLI override")
+    print()
     
     try:
-        factory = NetFactory(config_file)
-        factory.generate_all()
+        factory = NetFactory(
+            gen_config_path=config_file,
+            output_dir=args.output,
+            base_seed=args.base_seed,
+            num_instances=args.num,
+            name_prefix=args.name_prefix,
+            write_manifest=False if args.no_manifest else None,
+            manifest_path=args.manifest_path,
+        )
+        factory.generate()
         
         print(f"\n{'='*80}")
         print(f"✓ Network generation complete")
@@ -222,27 +236,29 @@ def list_examples(args):
     print(f"\n{'='*80}")
     print(f"AVAILABLE EXAMPLE NETWORKS")
     print(f"{'='*80}\n")
-    
-    import yaml
+
     from pathlib import Path
-    
-    config_file = "act/back_end/examples/examples_config.yaml"
-    
-    if not Path(config_file).exists():
-        print(f"❌ Configuration file not found: {config_file}")
+    from act.pipeline.verification.model_factory import ModelFactory
+
+    nets_dir = Path("act/back_end/examples/nets")
+
+    if not nets_dir.exists():
+        print(f"❌ Nets directory not found: {nets_dir}")
         return 1
-    
-    with open(config_file, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    networks = config.get('networks', {})
-    
-    print(f"Total networks: {len(networks)}\n")
-    
+
+    factory = ModelFactory(nets_dir=str(nets_dir))
+    network_names = factory.list_networks()
+
+    print(f"Total networks: {len(network_names)}\n")
+
     # Group by category
     categories = {}
-    for net_name, net_config in networks.items():
-        desc = net_config.get('description', 'No description')
+    for net_name in network_names:
+        try:
+            desc = factory.get_network_info(net_name).get("description", "No description")
+        except Exception:
+            desc = "No description"
+
         # Try to infer category from name
         if 'mnist' in net_name.lower():
             cat = 'MNIST Classification'
@@ -254,7 +270,7 @@ def list_examples(args):
             cat = 'Reachability Analysis'
         else:
             cat = 'Other'
-        
+
         if cat not in categories:
             categories[cat] = []
         categories[cat].append((net_name, desc))
@@ -293,16 +309,6 @@ Examples:
   # List available example networks
   python -m act.back_end --list-examples
   
-  # ============================================================================
-  # CONFIGNET - Sample and materialize networks
-  # ============================================================================
-
-  # Sample instance specs only
-  python -m act.back_end --confignet sample --num 3
-
-  # Generate and materialize into examples_config.yaml
-  python -m act.back_end --confignet generate --num 2 --device cpu --dtype float64
-
   # ============================================================================
   # VERIFICATION - Run verification on networks
   # ============================================================================
@@ -375,11 +381,6 @@ Examples:
         help="List available example networks"
     )
     cmd_group.add_argument(
-        "--confignet",
-        action="store_true",
-        help="Run Confignet subcommands (sample/generate)"
-    )
-    cmd_group.add_argument(
         "--test-serialization",
         action="store_true",
         dest="test_serialization",
@@ -391,12 +392,41 @@ Examples:
     factory_group.add_argument(
         "--config", "-c",
         type=str,
-        help="Path to YAML configuration file (default: act/back_end/examples/examples_config.yaml)"
+        help="Path to generator YAML configuration file (default: act/back_end/examples/config_gen_act_net.yaml)"
     )
     factory_group.add_argument(
         "--output", "-o",
         type=str,
-        help="Output directory for generated networks (default: act/back_end/examples/nets)"
+        help="Output directory override for generated networks (default: from config)"
+    )
+    factory_group.add_argument(
+        "--num",
+        type=int,
+        help="Override number of instances to generate"
+    )
+    factory_group.add_argument(
+        "--base-seed",
+        type=int,
+        dest="base_seed",
+        help="Override generator base seed (default: from config)"
+    )
+    factory_group.add_argument(
+        "--name-prefix",
+        type=str,
+        dest="name_prefix",
+        help="Override generator name prefix (default: from config)"
+    )
+    factory_group.add_argument(
+        "--manifest-path",
+        type=str,
+        dest="manifest_path",
+        help="Override manifest path (default: from config)"
+    )
+    factory_group.add_argument(
+        "--no-manifest",
+        action="store_true",
+        dest="no_manifest",
+        help="Disable manifest writing (default: from config)"
     )
     
     # Verification options
@@ -451,10 +481,6 @@ Examples:
     
     args, unknown = parser.parse_known_args()
     
-    if args.confignet:
-        from act.back_end import confignet
-        return confignet.main(unknown)
-
     if unknown:
         parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
 

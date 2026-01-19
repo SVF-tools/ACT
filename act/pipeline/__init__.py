@@ -27,7 +27,7 @@ Key Components:
 All verification utilities are located in the verification/ submodule.
 
 Example:
-    # Create PyTorch model from examples_config.yaml
+    # Create PyTorch model from ACT Net JSONs (generated via config_gen_act_net.yaml)
     from act.pipeline import ModelFactory, TorchToACT
     
     factory = ModelFactory()

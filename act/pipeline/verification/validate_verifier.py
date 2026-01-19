@@ -344,7 +344,7 @@ class VerificationValidator:
         Validate verifier correctness for a single network (Level 1).
         
         Args:
-            name: Network name from examples_config.yaml
+            name: Network name from ACT Net JSON files
             solver: 'gurobi' or 'torchlp'
             
         Returns:

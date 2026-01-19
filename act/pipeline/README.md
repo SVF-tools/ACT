@@ -88,7 +88,7 @@ After cleanup, only these production-ready files remain:    └── ci_setup.p
 
 - **Flexible Mock Generation**: Generate diverse test inputs from configuration templates
 
-Create PyTorch models from `examples_config.yaml` with exact weight equivalence to ACT Nets:- **Scenario Composition**: Combine different components into complete test scenarios
+Create PyTorch models from `config_gen_act_net.yaml` with exact weight equivalence to ACT Nets:- **Scenario Composition**: Combine different components into complete test scenarios
 
 
 
@@ -502,7 +502,7 @@ results = executor.run_parallel(tasks)    enabled: true
 
 
 
-### examples_config.yaml## Testing Workflow
+### config_gen_act_net.yaml## Testing Workflow
 
 
 
@@ -548,7 +548,7 @@ networks:from act.pipeline import quick_validate
 
 ### 4. **CI/CD Integration**
 
-**Location**: `act/back_end/examples/examples_config.yaml````bash
+**Location**: `act/back_end/examples/config_gen_act_net.yaml````bash
 
 # In CI pipelines - fast, reliable tests
 
@@ -578,7 +578,7 @@ python act/pipeline/model_factory.py    def validate(self, test_case: TestCase) 
 
 ```# Register with framework
 
-Testing ModelFactory with all 4 networks from examples_config.yaml...validator.register_custom_validator("my_test", CustomValidator())
+Testing ModelFactory with all 4 networks from config_gen_act_net.yaml...validator.register_custom_validator("my_test", CustomValidator())
 
 ```
 

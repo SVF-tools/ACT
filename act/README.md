@@ -62,7 +62,7 @@ act/
 │   ├── analyze.py                  # Network analysis and bounds propagation
 │   ├── cons_exportor.py            # Constraint export to solvers
 │   ├── transfer_functions.py       # Transfer function interface and dispatch
-│   ├── net_factory.py              # YAML-driven network factory for examples
+│   ├── net_factory.py              # Generator-driven network factory for examples
 │   ├── solver/                     # MILP/LP optimization solvers
 │   │   ├── solver_base.py          # Base solver interface
 │   │   ├── solver_gurobi.py        # Gurobi MILP solver integration
@@ -83,7 +83,7 @@ act/
 │   │   ├── serialization.py        # NetSerializer with tensor encoding
 │   │   └── test_serialization.py   # Serialization correctness tests
 │   ├── examples/                   # Example networks and configurations
-│   │   ├── examples_config.yaml    # YAML network definitions
+│   │   ├── config_gen_act_net.yaml # Generator configuration for random nets
 │   │   ├── nets/                   # Generated ACT Net JSON files
 │   │   └── README.md               # Examples documentation
 │   └── README.md                   # Back-end documentation
@@ -271,7 +271,7 @@ All ACT modules now have unified CLI architecture with consistent device/dtype h
   - **`test_serialization.py`**: Serialization correctness validation
 
 - **`examples/`**: Example networks and test cases
-  - **`examples_config.yaml`**: YAML definitions for example networks
+  - **`config_gen_act_net.yaml`**: Generator configuration for example networks
   - **`nets/`**: Generated ACT Net JSON files (MNIST, CIFAR, control, reachability)
   - Networks include embedded INPUT_SPEC and ASSERT layers for spec-free verification
 
@@ -503,15 +503,16 @@ python act/wrapper_exts/ext_runner.py --verifier abcrown --model model.onnx --da
 
 ## Examples and Network Generation
 Example ACT networks are stored as JSON under `act/back_end/examples/nets/`.
-These files are generated from the YAML configuration `act/back_end/examples/examples_config.yaml`
-using the YAML-driven network factory. The test suite and serializer load networks
-from the `examples/nets` directory. When authoring new example networks prefer the
-YAML configuration and the factory rather than hand-editing the JSON files.
+These files are generated from the generator configuration
+`act/back_end/examples/config_gen_act_net.yaml` using the network factory.
+The test suite and serializer load networks from the `examples/nets` directory.
+When authoring new example networks prefer the generator configuration and the
+factory rather than hand-editing the JSON files.
 
 ### Using the Back-End CLI for Network Generation
 The back-end CLI provides comprehensive tools for working with ACT networks:
 
-1. **Generate Networks**: `--generate` creates all networks defined in `examples_config.yaml`
+1. **Generate Networks**: `--generate` creates networks defined in `config_gen_act_net.yaml`
 2. **List Networks**: `--list-examples` shows all available networks organized by category
 3. **Inspect Networks**: `--info` displays structure, use `--verbose` for detailed layer information
 4. **Verify Networks**: `--verify` runs verification with optional `--bab` for branch-and-bound
