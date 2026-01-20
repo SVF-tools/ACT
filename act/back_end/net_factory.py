@@ -148,6 +148,7 @@ import yaml
 
 from act.back_end.core import Layer, Net
 from act.back_end.serialization.serialization import NetSerializer
+from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
 
 DEFAULT_GEN_CONFIG = "act/back_end/examples/config_gen_act_net.yaml"
@@ -710,47 +711,76 @@ class NetFactory:
         return None
 
     def _generate_input_spec_params(self, params: Dict[str, Any], meta: Dict[str, Any], input_shape: Optional[List[int]]) -> None:
+        """Generate INPUT_SPEC params based on kind and meta values."""
         if not input_shape:
             raise ValueError("Cannot generate INPUT_SPEC params: input shape is required but not provided")
-
-        spec_kind = str(meta.get("kind"))
-        if spec_kind == "BOX":
+        
+        spec_kind = meta.get("kind")
+        
+        # Compare with enum class variables (these are strings, not Enum objects)
+        if spec_kind == InKind.BOX:
+            # Generate lb/ub from meta values
             lb_val = meta.get("lb_val", 0.0)
             ub_val = meta.get("ub_val", 1.0)
             params["lb"] = torch.full(input_shape, lb_val)
             params["ub"] = torch.full(input_shape, ub_val)
-        elif spec_kind == "LINF_BALL":
+        
+        elif spec_kind == InKind.LINF_BALL:
+            # Generate center + lb/ub from center_val and eps
             eps = meta.get("eps")
             if eps is None:
                 raise ValueError("LINF_BALL requires 'eps' in meta")
-            center_val = meta.get("center_val", 0.5)
+            
+            center_val = meta.get("center_val", 0.5)  # Default to 0.5 for normalized inputs
             params["center"] = torch.full(input_shape, center_val)
             params["lb"] = params["center"] - eps
             params["ub"] = params["center"] + eps
+        
+        # LIN_POLY: skip (too complex, user must provide A and b matrices)
 
     def _generate_assert_params(self, params: Dict[str, Any], meta: Dict[str, Any], output_shape: Optional[List[int]]) -> None:
+        """Generate ASSERT (OutputSpec) params based on kind and meta values.
+        
+        Supports four ASSERT kinds: TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, and RANGE.
+        See file header for detailed documentation of each kind.
+        """
         if not output_shape:
             raise ValueError("Cannot generate ASSERT params: output shape is required but not provided")
-
-        assert_kind = str(meta.get("kind"))
-        if assert_kind == "TOP1_ROBUST":
+        
+        assert_kind = meta.get("kind")
+        
+        # Compare with OutKind class variables (these are strings, not Enum objects)
+        if assert_kind == OutKind.TOP1_ROBUST:
+            # No params to generate (y_true already in meta)
+            # Just validate y_true is present
             if "y_true" not in meta:
                 raise ValueError("TOP1_ROBUST requires 'y_true' in meta")
-        elif assert_kind == "MARGIN_ROBUST":
+        
+        elif assert_kind == OutKind.MARGIN_ROBUST:
+            # No params to generate (y_true and margin already in meta)
+            # Just validate they are present
             if "y_true" not in meta:
                 raise ValueError("MARGIN_ROBUST requires 'y_true' in meta")
             if "margin" not in meta:
                 raise ValueError("MARGIN_ROBUST requires 'margin' in meta")
-        elif assert_kind == "LINEAR_LE":
+        
+        elif assert_kind == OutKind.LINEAR_LE:
+            # Convert c from list to tensor if present
             if "c" in params and isinstance(params["c"], list):
                 params["c"] = torch.tensor(params["c"], dtype=torch.float32)
+            
+            # Validate d is present in meta
             if "d" not in meta:
                 raise ValueError("LINEAR_LE requires 'd' in meta")
-        elif assert_kind == "RANGE":
+        
+        elif assert_kind == OutKind.RANGE:
+            # Convert lb/ub from lists to tensors if present
             if "lb" in params and isinstance(params["lb"], list):
                 params["lb"] = torch.tensor(params["lb"], dtype=torch.float32)
             if "ub" in params and isinstance(params["ub"], list):
                 params["ub"] = torch.tensor(params["ub"], dtype=torch.float32)
+            
+            # Validate both are present
             if "lb" not in params or "ub" not in params:
                 raise ValueError("RANGE requires both 'lb' and 'ub' in params")
 
