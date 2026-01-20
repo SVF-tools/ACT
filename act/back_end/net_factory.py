@@ -799,7 +799,7 @@ class NetFactory:
             var_counter += out_num_vars
             return [], out_vars, var_counter
 
-        if kind == "DENSE":
+        elif kind == "DENSE":
             in_features = meta.get("in_features", 1)
             out_features = meta.get("out_features", 1)
             if layers and layer_index > 0:
@@ -813,7 +813,7 @@ class NetFactory:
             var_counter += out_features
             return in_vars, out_vars, var_counter
 
-        if kind in ["RELU", "SIGMOID", "TANH"]:
+        elif kind in ["RELU", "SIGMOID", "TANH"]:
             if layers and layer_index > 0:
                 in_vars = layers[layer_index - 1].out_vars
                 out_vars = list(range(var_counter, var_counter + len(in_vars)))
@@ -821,7 +821,7 @@ class NetFactory:
                 return in_vars, out_vars, var_counter
             raise ValueError(f"Activation layer '{kind}' cannot be the first layer in network")
 
-        if kind.startswith("CONV"):
+        elif kind.startswith("CONV"):
             if layers and layer_index > 0:
                 in_vars = layers[layer_index - 1].out_vars
             else:
@@ -837,7 +837,7 @@ class NetFactory:
             var_counter += out_num_vars
             return in_vars, out_vars, var_counter
 
-        if kind in ["MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D"]:
+        elif kind in ["MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D"]:
             if layers and layer_index > 0:
                 in_vars = layers[layer_index - 1].out_vars
             else:
@@ -853,7 +853,7 @@ class NetFactory:
             var_counter += out_num_vars
             return in_vars, out_vars, var_counter
 
-        if kind == "FLATTEN":
+        elif kind == "FLATTEN":
             if layers and layer_index > 0:
                 in_vars = layers[layer_index - 1].out_vars
                 out_vars = list(range(var_counter, var_counter + len(in_vars)))
@@ -861,7 +861,7 @@ class NetFactory:
                 return in_vars, out_vars, var_counter
             raise ValueError("Flatten layer cannot be the first layer in network")
 
-        if kind in ["ADD", "SUB", "MUL", "DIV"]:
+        elif kind in ["ADD", "SUB", "MUL", "DIV"]:
             x_vars = meta.get("x_vars")
             y_vars = meta.get("y_vars")
             if x_vars is None or y_vars is None:
@@ -873,31 +873,16 @@ class NetFactory:
             var_counter += len(x_vars)
             return in_vars, out_vars, var_counter
 
-        if kind in ["INPUT_SPEC", "ASSERT"]:
+        elif kind in ["INPUT_SPEC", "ASSERT"]:
             if layers and layer_index > 0:
                 prev_vars = layers[layer_index - 1].out_vars
                 return prev_vars, prev_vars.copy(), var_counter
             raise ValueError(f"Layer '{kind}' cannot be the first layer in network")
 
         supported_types = [
-            "INPUT",
-            "DENSE",
-            "RELU",
-            "SIGMOID",
-            "TANH",
-            "CONV1D",
-            "CONV2D",
-            "CONV3D",
-            "MAXPOOL2D",
-            "AVGPOOL2D",
-            "ADAPTIVEAVGPOOL2D",
-            "FLATTEN",
-            "ADD",
-            "SUB",
-            "MUL",
-            "DIV",
-            "INPUT_SPEC",
-            "ASSERT",
+            "INPUT", "DENSE", "RELU", "SIGMOID", "TANH", "CONV1D", "CONV2D",
+            "CONV3D", "MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D", "FLATTEN",
+            "ADD", "SUB", "MUL", "DIV", "INPUT_SPEC", "ASSERT",
         ]
         raise NotImplementedError(
             f"Layer type '{kind}' is not supported. Supported types: {supported_types}."
