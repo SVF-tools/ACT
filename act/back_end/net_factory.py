@@ -1,4 +1,4 @@
-#===- act/back_end/net_factory.py - Generator-Driven Network Factory -----====#
+#===- act/back_end/net_factory.py - YAML-Driven ACT Net Factory ----------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -7,14 +7,135 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   Random network generator for ACT Net JSONs driven by a generator config
-#   (config_gen_act_net.yaml). Removes runtime dependency on examples_config.yaml.
+#   Generator-driven ACT Net generator. Samples MLP/CNN2D
+#   configs, fills INPUT_SPEC/ASSERT params, builds layer vars/weights, and
+#   writes Net JSONs + optional manifest for downstream verification.
+#   Runtime uses JSON nets under act/back_end/examples/nets; YAML is config-only.
+#   CLI entry: python -m act.back_end --generate (see act/back_end/cli.py).
+#   INPUT.meta.dtype is set from device_manager default (get_default_dtype()).
+#
+#===---------------------------------------------------------------------===#
+#
+# ASSERT Layer Specification Guide
+# =================================
+#
+# ASSERT layers define verification properties that the network output must satisfy.
+# They are used for spec-free verification where constraints are embedded directly
+# in the model, enabling single-call checking:
+#
+#     results = model(input)  # Returns dict with satisfaction status
+#
+# Four ASSERT kinds are supported, each with distinct verification semantics:
+#
+# 1. TOP1_ROBUST (Classification Robustness)
+#    -----------------------------------------------
+#    Purpose: Verify that the true class has the highest score
+#    Verification: argmax(y) == y_true
+#    
+#    Required meta:
+#    - y_true: Index of the ground truth class (int)
+#    
+#    Use cases:
+#    - Adversarial robustness: Ensure predictions remain correct under perturbations
+#    - Safety-critical classification: Verify correct class prediction
+#    - MNIST/CIFAR robustness benchmarks
+#    
+#    Expected outcome:
+#    - PASS: True class has highest logit/probability
+#    - FAIL: Different class has higher score (misclassification)
+#    
+#    Example:
+#    meta:
+#      kind: "TOP1_ROBUST"
+#      y_true: 7  # Verify output predicts class 7
+#
+# 2. MARGIN_ROBUST (Classification with Safety Margin)
+#    -----------------------------------------------
+#    Purpose: Verify true class exceeds others by a safety margin
+#    Verification: y[y_true] - max(y[i≠y_true]) >= margin
+#    
+#    Required meta:
+#    - y_true: Index of the ground truth class (int)
+#    - margin: Minimum required separation from other classes (float)
+#    
+#    Use cases:
+#    - High-confidence verification: Ensure robust predictions with buffer
+#    - Safety margins for critical applications
+#    - Confidence-based filtering
+#    
+#    Expected outcome:
+#    - PASS: True class exceeds others by at least margin
+#    - FAIL: Margin too small (weak confidence) or misclassification
+#    
+#    Example:
+#    meta:
+#      kind: "MARGIN_ROBUST"
+#      y_true: 3
+#      margin: 0.5  # Require 0.5 separation from other classes
+#
+# 3. LINEAR_LE (Linear Inequality Constraint)
+#    -----------------------------------------------
+#    Purpose: Verify linear combination of outputs satisfies inequality
+#    Verification: c^T · y <= d
+#    
+#    Required params:
+#    - c: Coefficient vector (list/tensor, shape matches output)
+#    - d: Threshold scalar (float)
+#    
+#    Use cases:
+#    - Control systems: Verify output stays within operational limits
+#    - Resource constraints: Total output bounded (e.g., sum of activations)
+#    - Custom safety properties: Linear combination constraints
+#    - Reachability analysis: Verify state space boundaries
+#    
+#    Expected outcome:
+#    - PASS: c^T · y <= d (constraint satisfied)
+#    - FAIL: c^T · y > d (constraint violated)
+#    
+#    Example (verify sum of outputs ≤ 5.0):
+#    params:
+#      c: [1.0, 1.0, 1.0, 1.0, 1.0]  # Sum all 5 outputs
+#    meta:
+#      kind: "LINEAR_LE"
+#      d: 5.0  # Upper bound
+#
+# 4. RANGE (Box Constraint on Outputs)
+#    -----------------------------------------------
+#    Purpose: Verify all outputs lie within specified bounds
+#    Verification: lb <= y <= ub (element-wise)
+#    
+#    Required params:
+#    - lb: Lower bound vector (list/tensor, shape matches output)
+#    - ub: Upper bound vector (list/tensor, shape matches output)
+#    
+#    Use cases:
+#    - Output range safety: Ensure values stay within physical limits
+#    - Control systems: Verify actuator outputs within safe range
+#    - Regression verification: Output predictions within expected bounds
+#    - Reachability: Verify state remains in safe region
+#    
+#    Expected outcome:
+#    - PASS: All elements satisfy lb <= y[i] <= ub (safe region)
+#    - FAIL: One or more elements outside bounds (unsafe region)
+#    
+#    Example (verify regression output in [0, 10]):
+#    params:
+#      lb: [0.0, 0.0, 0.0]  # 3 outputs, all >= 0
+#      ub: [10.0, 10.0, 10.0]  # All <= 10
+#    meta:
+#      kind: "RANGE"
+#
+# Notes:
+# - All params specified as lists in YAML are automatically converted to tensors
+# - TOP1_ROBUST and MARGIN_ROBUST are classification-specific (discrete classes)
+# - LINEAR_LE and RANGE are general (work with any output shape)
+# - Verification happens automatically in OutputSpecLayer.forward()
+# - Results returned in dict: {output, output_satisfied, output_explanation}
 #
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import random
@@ -33,84 +154,14 @@ DEFAULT_GEN_CONFIG = "act/back_end/examples/config_gen_act_net.yaml"
 DEFAULT_NETS_DIR = "act/back_end/examples/nets"
 DEFAULT_NAME_PREFIX = "cfg_seed"
 
-_DEFAULT_CONFIG: Dict[str, Any] = {
-    "generator": {
-        "num_instances": 5,
-        "base_seed": None,
-        "name_prefix": DEFAULT_NAME_PREFIX,
-        "output_dir": DEFAULT_NETS_DIR,
-        "write_manifest": True,
-        "manifest_path": None,
-        "families": ["mlp", "cnn2d"],
-        "p_mlp": 0.5,
-        "num_classes_choices": [10],
-        "dtype": "torch.float64",
-    },
-    "mlp": {
-        "input_shapes": [[1, 784], [1, 1, 28, 28]],
-        "depth_range": [2, 4],
-        "width_choices": [32, 64, 128],
-        "activation_choices": ["relu", "tanh", "sigmoid"],
-        "dropout_p_choices": [0.0],
-        "block_p": 0.6,
-        "block_count_range": [2, 6],
-        "block_width_choices": [32, 64, 128],
-        "post_block_activation_p": 0.8,
-        "residual_p": 0.2,
-        "residual_blocks_range": [1, 3],
-        "residual_width_choices": [32, 64, 128],
-    },
-    "cnn": {
-        "input_shapes": [[1, 1, 28, 28], [1, 3, 32, 32]],
-        "num_blocks_range": [1, 3],
-        "channels_choices": [8, 16, 32],
-        "kernel_choices": [3],
-        "stride_choices": [1],
-        "padding_choices": [1],
-        "use_maxpool_p": 0.3,
-        "fc_hidden_choices": [32, 64, 128],
-        "activation_choices": ["relu", "tanh", "sigmoid"],
-        "stage_variant_p": 0.5,
-        "stages_range": [1, 3],
-        "blocks_per_stage_range": [1, 2],
-        "base_channels_choices": [8, 16, 32],
-        "channel_mult_choices": [2],
-        "downsample_choices": ["maxpool", "avgpool", "stride2_conv"],
-        "double_conv_p_choices": [0.5, 0.7],
-    },
-    "input_spec": {
-        "kind_choices": ["BOX", "LINF_BALL"],
-        "p_box": 0.5,
-        "value_range_choices": [[0.0, 1.0]],
-        "eps_choices": [0.03, 0.05, 0.1],
-    },
-    "output_spec": {
-        "kind_choices": ["TOP1_ROBUST", "MARGIN_ROBUST", "LINEAR_LE", "RANGE"],
-        "p_top1": 0.5,
-        "margin_choices": [0.0, 0.1, 1.0],
-        "linear_le_c_range": [-1.0, 1.0],
-        "linear_le_d_range": [-1.0, 1.0],
-        "range_choices": [[-1.0, 1.0]],
-    },
-}
-
-
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    result = copy.deepcopy(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
 def _load_gen_config(path: str) -> Dict[str, Any]:
-    data: Dict[str, Any] = {}
     cfg_path = Path(path)
-    if cfg_path.exists():
-        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    return _deep_merge(_DEFAULT_CONFIG, data)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must be a mapping: {cfg_path}")
+    return data
 
 
 def _stable_u32_from_bytes(data: bytes) -> int:

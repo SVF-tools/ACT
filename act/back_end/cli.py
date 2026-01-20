@@ -237,7 +237,6 @@ def list_examples(args):
     print(f"AVAILABLE EXAMPLE NETWORKS")
     print(f"{'='*80}\n")
 
-    from pathlib import Path
     from act.pipeline.verification.model_factory import ModelFactory
 
     nets_dir = Path("act/back_end/examples/nets")
@@ -270,7 +269,7 @@ def list_examples(args):
             cat = 'Reachability Analysis'
         else:
             cat = 'Other'
-
+        
         if cat not in categories:
             categories[cat] = []
         categories[cat].append((net_name, desc))
