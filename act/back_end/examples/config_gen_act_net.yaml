@@ -1,57 +1,65 @@
+# ACT Net generation config (YAML is used only at generation time).
+# Principle: describe the sampling space for architectures/specs; NetFactory writes JSON nets.
+# Determinism: base_seed controls reproducible sampling; null uses a random seed.
+# Coverage: families select MLP/CNN2D; choices/ranges define widths, depths, and specs.
+# Specs: input_spec/output_spec encode verification properties (BOX/LINF_BALL, TOP1/MARGIN/LINEAR/RANGE).
+# Output: JSON nets are written to output_dir; optional manifest records names and config path.
+# Notes: probabilities (p_*) apply only when multiple kinds are available.
+
 generator:
-  num_instances: 5
-  base_seed: null
-  name_prefix: cfg_seed
-  output_dir: act/back_end/examples/nets
-  write_manifest: true
-  manifest_path: null
-  families: [mlp, cnn2d]
-  p_mlp: 0.5
-  num_classes_choices: [10]
-  dtype: torch.float64
+  num_instances: 5            # Number of nets to generate per run.
+  base_seed: null             # int for reproducible sampling; null = random seed.
+  name_prefix: cfg_seed       # Filename prefix (net name becomes f"{prefix}{seed}_idxXXXXX").
+  output_dir: act/back_end/examples/nets  # Output directory for generated JSON nets.
+  write_manifest: true        # Write manifest.json with generated net names.
+  manifest_path: null         # null = output_dir/manifest.json; or explicit path.
+  families: [mlp, cnn2d]      # Allowed model families to sample from.
+  p_mlp: 0.5                  # When all families exist, probability to choose MLP.
+  num_classes_choices: [10]   # Choices for output class count.
+  dtype: torch.float64        # Dtype recorded in INPUT meta and used for weights.
 
 mlp:
-  input_shapes: [[1, 6], [1, 16], [1, 3, 8]]
-  depth_range: [2, 4]
-  width_choices: [32, 64, 128]
-  activation_choices: [relu, tanh, sigmoid]
-  dropout_p_choices: [0.0]
-  block_p: 0.6
-  block_count_range: [2, 6]
-  block_width_choices: [32, 64, 128]
-  post_block_activation_p: 0.8
-  residual_p: 0.0
-  residual_blocks_range: [1, 3]
-  residual_width_choices: [32, 64, 128]
+  input_shapes: [[1, 6], [1, 16], [1, 3, 8]]  # Candidate input shapes (batch=1).
+  depth_range: [2, 4]          # Hidden-layer count for plain MLP.
+  width_choices: [32, 64, 128] # Hidden width choices.
+  activation_choices: [relu, tanh, sigmoid]  # Activation candidates.
+  dropout_p_choices: [0.0]     # Reserved (dropout not emitted by NetFactory).
+  block_p: 0.6                 # Probability of "block" variant.
+  block_count_range: [2, 6]    # Number of blocks in block variant.
+  block_width_choices: [32, 64, 128]  # Width for block variant.
+  post_block_activation_p: 0.8 # Activation after each block.
+  residual_p: 0.0              # Probability of residual variant.
+  residual_blocks_range: [1, 3]  # Residual block count.
+  residual_width_choices: [32, 64, 128]  # Residual block width.
 
 cnn:
-  input_shapes: [[1, 1, 8, 8], [1, 3, 16, 16]]
-  num_blocks_range: [1, 3]
-  channels_choices: [8, 16, 32]
-  kernel_choices: [3]
-  stride_choices: [1]
-  padding_choices: [1]
-  use_maxpool_p: 0.3
-  fc_hidden_choices: [32, 64, 128]
-  activation_choices: [relu, tanh, sigmoid]
-  stage_variant_p: 0.5
-  stages_range: [1, 3]
-  blocks_per_stage_range: [1, 2]
-  base_channels_choices: [8, 16, 32]
-  channel_mult_choices: [2]
-  downsample_choices: [maxpool, avgpool, stride2_conv]
-  double_conv_p_choices: [0.5, 0.7]
+  input_shapes: [[1, 1, 8, 8], [1, 3, 16, 16]]  # Candidate input shapes (batch=1).
+  num_blocks_range: [1, 3]     # Number of conv blocks in plain variant.
+  channels_choices: [8, 16, 32]  # Channels per conv block (plain variant).
+  kernel_choices: [3]          # Conv kernel sizes.
+  stride_choices: [1]          # Conv strides.
+  padding_choices: [1]         # Conv paddings.
+  use_maxpool_p: 0.3           # MaxPool after conv in plain variant.
+  fc_hidden_choices: [32, 64, 128]  # FC hidden width (plain variant).
+  activation_choices: [relu, tanh, sigmoid]  # Activation candidates.
+  stage_variant_p: 0.5         # Probability to use staged CNN variant.
+  stages_range: [1, 3]         # Stage count in staged variant.
+  blocks_per_stage_range: [1, 2]  # Blocks per stage.
+  base_channels_choices: [8, 16, 32]  # Base channels for staged variant.
+  channel_mult_choices: [2]    # Channel multiplier per stage.
+  downsample_choices: [maxpool, avgpool, stride2_conv]  # Stage downsample types.
+  double_conv_p_choices: [0.5, 0.7]  # Probability of double conv within a block.
 
 input_spec:
-  kind_choices: [BOX, LINF_BALL]
-  p_box: 0.5
-  value_range_choices: [[0.0, 1.0]]
-  eps_choices: [0.03, 0.05, 0.1]
+  kind_choices: [BOX, LINF_BALL]  # Input spec kinds to sample.
+  p_box: 0.5                   # Probability of BOX when both kinds exist.
+  value_range_choices: [[0.0, 1.0]]  # Allowed input value ranges.
+  eps_choices: [0.03, 0.05, 0.1]  # LINF_BALL epsilon choices.
 
 output_spec:
-  kind_choices: [TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, RANGE]
-  p_top1: 0.5
-  margin_choices: [0.0, 0.1, 1.0]
-  linear_le_c_range: [-1.0, 1.0]
-  linear_le_d_range: [-1.0, 1.0]
-  range_choices: [[-1.0, 1.0]]
+  kind_choices: [TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, RANGE]  # Output spec kinds.
+  p_top1: 0.5                # Probability of TOP1 when both top1/margin exist.
+  margin_choices: [0.0, 0.1, 1.0]  # Margin choices for MARGIN_ROBUST.
+  linear_le_c_range: [-1.0, 1.0]  # Range for LINEAR_LE coefficient c.
+  linear_le_d_range: [-1.0, 1.0]  # Range for LINEAR_LE threshold d.
+  range_choices: [[-1.0, 1.0]]    # Range bounds for RANGE output spec.
