@@ -25,10 +25,9 @@ from act.back_end.core import Net
 from act.back_end.serialization.serialization import NetSerializer
 from act.pipeline.verification.act2torch import ACTToTorch
 from act.util.device_manager import get_default_dtype, get_default_device
+from act.util.path_config import get_examples_nets_dir
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_NETS_DIR = "act/back_end/examples/nets"
 
 
 def _load_manifest(manifest_path: Path) -> List[str]:
@@ -66,7 +65,7 @@ class ModelFactory:
 
     def __init__(
         self,
-        nets_dir: str = DEFAULT_NETS_DIR,
+        nets_dir: str = get_examples_nets_dir(),
         manifest_path: Optional[str] = None,
     ):
         self.nets_dir = Path(nets_dir)

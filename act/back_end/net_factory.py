@@ -15,123 +15,7 @@
 #   INPUT.meta.dtype is set from device_manager default (get_default_dtype()).
 #
 #===---------------------------------------------------------------------===#
-#
-# ASSERT Layer Specification Guide
-# =================================
-#
-# ASSERT layers define verification properties that the network output must satisfy.
-# They are used for spec-free verification where constraints are embedded directly
-# in the model, enabling single-call checking:
-#
-#     results = model(input)  # Returns dict with satisfaction status
-#
-# Four ASSERT kinds are supported, each with distinct verification semantics:
-#
-# 1. TOP1_ROBUST (Classification Robustness)
-#    -----------------------------------------------
-#    Purpose: Verify that the true class has the highest score
-#    Verification: argmax(y) == y_true
-#    
-#    Required meta:
-#    - y_true: Index of the ground truth class (int)
-#    
-#    Use cases:
-#    - Adversarial robustness: Ensure predictions remain correct under perturbations
-#    - Safety-critical classification: Verify correct class prediction
-#    - MNIST/CIFAR robustness benchmarks
-#    
-#    Expected outcome:
-#    - PASS: True class has highest logit/probability
-#    - FAIL: Different class has higher score (misclassification)
-#    
-#    Example:
-#    meta:
-#      kind: "TOP1_ROBUST"
-#      y_true: 7  # Verify output predicts class 7
-#
-# 2. MARGIN_ROBUST (Classification with Safety Margin)
-#    -----------------------------------------------
-#    Purpose: Verify true class exceeds others by a safety margin
-#    Verification: y[y_true] - max(y[i≠y_true]) >= margin
-#    
-#    Required meta:
-#    - y_true: Index of the ground truth class (int)
-#    - margin: Minimum required separation from other classes (float)
-#    
-#    Use cases:
-#    - High-confidence verification: Ensure robust predictions with buffer
-#    - Safety margins for critical applications
-#    - Confidence-based filtering
-#    
-#    Expected outcome:
-#    - PASS: True class exceeds others by at least margin
-#    - FAIL: Margin too small (weak confidence) or misclassification
-#    
-#    Example:
-#    meta:
-#      kind: "MARGIN_ROBUST"
-#      y_true: 3
-#      margin: 0.5  # Require 0.5 separation from other classes
-#
-# 3. LINEAR_LE (Linear Inequality Constraint)
-#    -----------------------------------------------
-#    Purpose: Verify linear combination of outputs satisfies inequality
-#    Verification: c^T · y <= d
-#    
-#    Required params:
-#    - c: Coefficient vector (list/tensor, shape matches output)
-#    - d: Threshold scalar (float)
-#    
-#    Use cases:
-#    - Control systems: Verify output stays within operational limits
-#    - Resource constraints: Total output bounded (e.g., sum of activations)
-#    - Custom safety properties: Linear combination constraints
-#    - Reachability analysis: Verify state space boundaries
-#    
-#    Expected outcome:
-#    - PASS: c^T · y <= d (constraint satisfied)
-#    - FAIL: c^T · y > d (constraint violated)
-#    
-#    Example (verify sum of outputs ≤ 5.0):
-#    params:
-#      c: [1.0, 1.0, 1.0, 1.0, 1.0]  # Sum all 5 outputs
-#    meta:
-#      kind: "LINEAR_LE"
-#      d: 5.0  # Upper bound
-#
-# 4. RANGE (Box Constraint on Outputs)
-#    -----------------------------------------------
-#    Purpose: Verify all outputs lie within specified bounds
-#    Verification: lb <= y <= ub (element-wise)
-#    
-#    Required params:
-#    - lb: Lower bound vector (list/tensor, shape matches output)
-#    - ub: Upper bound vector (list/tensor, shape matches output)
-#    
-#    Use cases:
-#    - Output range safety: Ensure values stay within physical limits
-#    - Control systems: Verify actuator outputs within safe range
-#    - Regression verification: Output predictions within expected bounds
-#    - Reachability: Verify state remains in safe region
-#    
-#    Expected outcome:
-#    - PASS: All elements satisfy lb <= y[i] <= ub (safe region)
-#    - FAIL: One or more elements outside bounds (unsafe region)
-#    
-#    Example (verify regression output in [0, 10]):
-#    params:
-#      lb: [0.0, 0.0, 0.0]  # 3 outputs, all >= 0
-#      ub: [10.0, 10.0, 10.0]  # All <= 10
-#    meta:
-#      kind: "RANGE"
-#
-# Notes:
-# - All params specified as lists in YAML are automatically converted to tensors
-# - TOP1_ROBUST and MARGIN_ROBUST are classification-specific (discrete classes)
-# - LINEAR_LE and RANGE are general (work with any output shape)
-# - Verification happens automatically in OutputSpecLayer.forward()
-# - Results returned in dict: {output, output_satisfied, output_explanation}
-#
+# ASSERT semantics are documented in act/back_end/README.md.
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
@@ -150,10 +34,8 @@ from act.back_end.core import Layer, Net
 from act.back_end.serialization.serialization import NetSerializer
 from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
+from act.util.path_config import get_examples_gen_config_path
 
-DEFAULT_GEN_CONFIG = "act/back_end/examples/config_gen_act_net.yaml"
-DEFAULT_NETS_DIR = "act/back_end/examples/nets"
-DEFAULT_NAME_PREFIX = "cfg_seed"
 
 def _load_gen_config(path: str) -> Dict[str, Any]:
     cfg_path = Path(path)
@@ -317,6 +199,42 @@ def _append_pool2d(
     )
     return out_H, out_W
 
+
+def _append_dense(
+    layers: List[Dict[str, Any]],
+    *,
+    in_features: int,
+    out_features: int,
+    use_bias: bool,
+) -> None:
+    layers.append(
+        {
+            "kind": "DENSE",
+            "params": {},
+            "meta": {
+                "in_features": int(in_features),
+                "out_features": int(out_features),
+                "bias_enabled": bool(use_bias),
+            },
+        }
+    )
+
+
+def _append_act(layers: List[Dict[str, Any]], act_kind: str) -> None:
+    layers.append({"kind": act_kind, "params": {}, "meta": {}})
+
+
+def _append_add(layers: List[Dict[str, Any]], *, skip_idx: int, main_idx: int) -> None:
+    layers.append(
+        {
+            "kind": "ADD",
+            "params": {},
+            "meta": {},
+            "inputs": {"x": skip_idx, "y": main_idx},
+            "preds": [skip_idx, main_idx],
+        }
+    )
+
 def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
     shape = _ensure_batch1(tuple(cfg["input_shape"]))
     in_features = int(shape[1]) if len(shape) == 2 else _prod(shape[1:])
@@ -324,134 +242,46 @@ def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> N
     if len(shape) > 2:
         layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
 
-    act_kind = _activation_kind(cfg.get("activation", "relu"))
-
-    variant = cfg.get("variant", "plain")
+    act_kind = _activation_kind(cfg["activation"])
+    use_bias = bool(cfg["use_bias"])
+    variant = cfg["variant"]
     if variant == "plain":
         for h in cfg["hidden_sizes"]:
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(h),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            _append_dense(layers, in_features=in_features, out_features=int(h), use_bias=use_bias)
+            _append_act(layers, act_kind)
             in_features = int(h)
     elif variant == "block":
-        width = int(cfg.get("block_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else 64))
-        layers.append(
-            {
-                "kind": "DENSE",
-                "params": {},
-                "meta": {
-                    "in_features": int(in_features),
-                    "out_features": int(width),
-                    "bias_enabled": bool(cfg.get("use_bias", True)),
-                },
-            }
-        )
-        layers.append({"kind": act_kind, "params": {}, "meta": {}})
+        width = int(cfg["block_width"])
+        _append_dense(layers, in_features=in_features, out_features=width, use_bias=use_bias)
+        _append_act(layers, act_kind)
         in_features = int(width)
 
-        for _ in range(int(cfg.get("num_blocks", 1))):
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(in_features),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(in_features),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
-            if cfg.get("post_block_activation", True):
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+        for _ in range(int(cfg["num_blocks"])):
+            _append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
+            _append_act(layers, act_kind)
+            _append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
+            if cfg["post_block_activation"]:
+                _append_act(layers, act_kind)
     elif variant == "residual":
-        width = int(cfg.get("residual_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else in_features))
+        width = int(cfg["residual_width"])
         if in_features != width:
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(width),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            _append_dense(layers, in_features=in_features, out_features=width, use_bias=use_bias)
+            _append_act(layers, act_kind)
             in_features = int(width)
 
-        num_blocks = int(cfg.get("num_residual_blocks", cfg.get("num_blocks", 1)))
+        num_blocks = int(cfg["num_residual_blocks"])
         for _ in range(num_blocks):
             skip_idx = len(layers) - 1
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(in_features),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
-            layers.append(
-                {
-                    "kind": "DENSE",
-                    "params": {},
-                    "meta": {
-                        "in_features": int(in_features),
-                        "out_features": int(in_features),
-                        "bias_enabled": bool(cfg.get("use_bias", True)),
-                    },
-                }
-            )
+            _append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
+            _append_act(layers, act_kind)
+            _append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
             main_idx = len(layers) - 1
-            layers.append(
-                {
-                    "kind": "ADD",
-                    "params": {},
-                    "meta": {},
-                    "inputs": {"x": skip_idx, "y": main_idx},
-                    "preds": [skip_idx, main_idx],
-                }
-            )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            _append_add(layers, skip_idx=skip_idx, main_idx=main_idx)
+            _append_act(layers, act_kind)
     else:
         raise ValueError(f"Unsupported MLP variant '{variant}'")
 
-    layers.append(
-        {
-            "kind": "DENSE",
-            "params": {},
-            "meta": {
-                "in_features": int(in_features),
-                "out_features": int(cfg["num_classes"]),
-                "bias_enabled": True,
-            },
-        }
-    )
+    _append_dense(layers, in_features=in_features, out_features=int(cfg["num_classes"]), use_bias=True)
 
 
 def _build_cnn_layers(
@@ -465,9 +295,9 @@ def _build_cnn_layers(
         raise ValueError(f"CNN2D expects input_shape=(1,C,H,W), got {shape}")
     _, in_ch, H, W = shape
     in_ch = int(in_ch)
-    act_kind = _activation_kind(cfg.get("activation", "relu"))
+    act_kind = _activation_kind(cfg["activation"])
 
-    if cfg.get("variant", "plain") == "plain":
+    if cfg["variant"] == "plain":
         n_blocks = len(cfg["conv_channels"])
         for i, out_ch in enumerate(cfg["conv_channels"]):
             k = _as_block_param(cfg["kernel_sizes"], i, n_blocks, "kernel_sizes")
@@ -484,46 +314,26 @@ def _build_cnn_layers(
                 stride=int(s),
                 padding=int(p),
             )
-            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            _append_act(layers, act_kind)
             in_ch = int(out_ch)
 
-            if cfg.get("use_maxpool", False):
+            if cfg["use_maxpool"]:
                 H, W = _append_pool2d(
                     layers,
                     kind="MAXPOOL2D",
                     in_ch=in_ch,
                     H=H,
                     W=W,
-                    kernel=int(cfg.get("maxpool_kernel", 2)),
-                    stride=int(cfg.get("maxpool_stride", 2)),
+                    kernel=int(cfg["maxpool_kernel"]),
+                    stride=int(cfg["maxpool_stride"]),
                     padding=0,
                 )
 
         layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
         feat = int(in_ch * H * W)
-        layers.append(
-            {
-                "kind": "DENSE",
-                "params": {},
-                "meta": {
-                    "in_features": int(feat),
-                    "out_features": int(cfg["fc_hidden"]),
-                    "bias_enabled": True,
-                },
-            }
-        )
-        layers.append({"kind": act_kind, "params": {}, "meta": {}})
-        layers.append(
-            {
-                "kind": "DENSE",
-                "params": {},
-                "meta": {
-                    "in_features": int(cfg["fc_hidden"]),
-                    "out_features": int(cfg["num_classes"]),
-                    "bias_enabled": True,
-                },
-            }
-        )
+        _append_dense(layers, in_features=int(feat), out_features=int(cfg["fc_hidden"]), use_bias=True)
+        _append_act(layers, act_kind)
+        _append_dense(layers, in_features=int(cfg["fc_hidden"]), out_features=int(cfg["num_classes"]), use_bias=True)
         return
 
     ch = int(cfg["base_channels"])
@@ -537,7 +347,7 @@ def _build_cnn_layers(
         stride=1,
         padding=1,
     )
-    layers.append({"kind": act_kind, "params": {}, "meta": {}})
+    _append_act(layers, act_kind)
 
     for stage in range(int(cfg["stages"])):
         if stage > 0:
@@ -553,7 +363,7 @@ def _build_cnn_layers(
                     stride=2,
                     padding=1,
                 )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                _append_act(layers, act_kind)
                 ch = next_ch
             else:
                 pool_kind = "MAXPOOL2D" if cfg["downsample"] == "maxpool" else "AVGPOOL2D"
@@ -578,7 +388,7 @@ def _build_cnn_layers(
                         stride=1,
                         padding=0,
                     )
-                    layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                    _append_act(layers, act_kind)
                     ch = next_ch
 
         for _ in range(int(cfg["blocks_per_stage"])):
@@ -594,7 +404,7 @@ def _build_cnn_layers(
                     stride=1,
                     padding=1,
                 )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                _append_act(layers, act_kind)
                 H, W = _append_conv2d(
                     layers,
                     in_ch=ch,
@@ -605,7 +415,7 @@ def _build_cnn_layers(
                     stride=1,
                     padding=1,
                 )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                _append_act(layers, act_kind)
             else:
                 H, W = _append_conv2d(
                     layers,
@@ -617,9 +427,9 @@ def _build_cnn_layers(
                     stride=1,
                     padding=1,
                 )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
+                _append_act(layers, act_kind)
 
-    while cfg.get("head_pool_to_1x1", True) and (H > 1 or W > 1):
+    while cfg["head_pool_to_1x1"] and (H > 1 or W > 1):
         H, W = _append_pool2d(
             layers,
             kind="AVGPOOL2D",
@@ -635,17 +445,7 @@ def _build_cnn_layers(
 
     layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
     feat = int(ch * H * W)
-    layers.append(
-        {
-            "kind": "DENSE",
-            "params": {},
-            "meta": {
-                "in_features": int(feat),
-                "out_features": int(cfg["num_classes"]),
-                "bias_enabled": True,
-            },
-        }
-    )
+    _append_dense(layers, in_features=int(feat), out_features=int(cfg["num_classes"]), use_bias=True)
 
 
 class NetFactory:
@@ -653,7 +453,7 @@ class NetFactory:
 
     def __init__(
         self,
-        gen_config_path: str = DEFAULT_GEN_CONFIG,
+        gen_config_path: str = get_examples_gen_config_path(),
         *,
         output_dir: Optional[str] = None,
         base_seed: Optional[int] = None,
@@ -664,125 +464,74 @@ class NetFactory:
     ):
         self.config_path = str(gen_config_path)
         self.config = _load_gen_config(self.config_path)
-        gen = self.config.get("generator", {})
+        gen = self.config["generator"]
 
-        self.base_seed = int(base_seed) if base_seed is not None else gen.get("base_seed")
-        if self.base_seed is None:
-            self.base_seed = int(secrets.randbits(32))
+        base_seed = base_seed if base_seed is not None else gen.get("base_seed")
+        self.base_seed = int(base_seed) if base_seed is not None else int(secrets.randbits(32))
+        self.num_instances = int(num_instances) if num_instances is not None else int(gen["num_instances"])
+        self.name_prefix = str(name_prefix) if name_prefix is not None else str(gen["name_prefix"])
 
-        self.num_instances = int(num_instances) if num_instances is not None else int(gen.get("num_instances", 0))
-        self.name_prefix = str(name_prefix) if name_prefix is not None else str(gen.get("name_prefix", DEFAULT_NAME_PREFIX))
-
-        output_dir = output_dir or gen.get("output_dir", DEFAULT_NETS_DIR)
+        output_dir = output_dir or gen["output_dir"]
         self.output_dir = Path(str(output_dir))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.write_manifest = bool(write_manifest) if write_manifest is not None else bool(gen.get("write_manifest", True))
-        manifest_default = gen.get("manifest_path")
+        self.write_manifest = bool(write_manifest) if write_manifest is not None else bool(gen["write_manifest"])
         if manifest_path is None:
-            manifest_path = manifest_default
+            manifest_path = gen.get("manifest_path")
         self.manifest_path = Path(manifest_path) if manifest_path else (self.output_dir / "manifest.json")
 
     def generate_weight_tensor(self, kind: str, meta: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Generate minimal weight tensors that satisfy schema requirements."""
         if kind == "DENSE":
-            in_features = meta.get("in_features", 10)
-            out_features = meta.get("out_features", 10)
+            in_features = meta.get("in_features", 1)
+            out_features = meta.get("out_features", 1)
             return torch.randn(out_features, in_features) * 0.1
-        if kind in ["CONV2D", "CONV1D", "CONV3D"]:
+        if kind == "CONV2D":
             in_channels = meta.get("in_channels", 1)
             out_channels = meta.get("out_channels", 1)
             kernel_size = meta.get("kernel_size", 3)
             if isinstance(kernel_size, int):
-                if kind == "CONV1D":
-                    weight_shape = (out_channels, in_channels, kernel_size)
-                elif kind == "CONV2D":
-                    weight_shape = (out_channels, in_channels, kernel_size, kernel_size)
-                else:
-                    weight_shape = (out_channels, in_channels, kernel_size, kernel_size, kernel_size)
+                weight_shape = (out_channels, in_channels, kernel_size, kernel_size)
             else:
-                if kind == "CONV1D":
-                    weight_shape = (out_channels, in_channels, kernel_size[0])
-                elif kind == "CONV2D":
-                    weight_shape = (out_channels, in_channels, kernel_size[0], kernel_size[1])
-                else:
-                    weight_shape = (out_channels, in_channels, kernel_size[0], kernel_size[1], kernel_size[2])
+                weight_shape = (out_channels, in_channels, kernel_size[0], kernel_size[1])
             return torch.randn(*weight_shape) * 0.1
         return None
 
-    def _generate_input_spec_params(self, params: Dict[str, Any], meta: Dict[str, Any], input_shape: Optional[List[int]]) -> None:
-        """Generate INPUT_SPEC params based on kind and meta values."""
-        if not input_shape:
-            raise ValueError("Cannot generate INPUT_SPEC params: input shape is required but not provided")
-        
-        spec_kind = meta.get("kind")
-        
-        # Compare with enum class variables (these are strings, not Enum objects)
-        if spec_kind == InKind.BOX:
-            # Generate lb/ub from meta values
-            lb_val = meta.get("lb_val", 0.0)
-            ub_val = meta.get("ub_val", 1.0)
-            params["lb"] = torch.full(input_shape, lb_val)
-            params["ub"] = torch.full(input_shape, ub_val)
-        
-        elif spec_kind == InKind.LINF_BALL:
-            # Generate center + lb/ub from center_val and eps
-            eps = meta.get("eps")
-            if eps is None:
-                raise ValueError("LINF_BALL requires 'eps' in meta")
-            
-            center_val = meta.get("center_val", 0.5)  # Default to 0.5 for normalized inputs
-            params["center"] = torch.full(input_shape, center_val)
-            params["lb"] = params["center"] - eps
-            params["ub"] = params["center"] + eps
-        
-        # LIN_POLY: skip (too complex, user must provide A and b matrices)
+    def _input_spec_params(
+        self,
+        meta: Dict[str, Any],
+        input_shape: List[int],
+        dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        if meta["kind"] == InKind.BOX:
+            lb_val = float(meta.get("lb_val", 0.0))
+            ub_val = float(meta.get("ub_val", 1.0))
+            return {
+                "lb": torch.full(input_shape, lb_val, dtype=dtype),
+                "ub": torch.full(input_shape, ub_val, dtype=dtype),
+            }
+        if meta["kind"] == InKind.LINF_BALL:
+            center_val = float(meta.get("center_val", 0.5))
+            eps = float(meta.get("eps", 0.0))
+            center = torch.full(input_shape, center_val, dtype=dtype)
+            return {"center": center, "lb": center - eps, "ub": center + eps}
+        raise ValueError(f"Unsupported INPUT_SPEC kind '{meta.get('kind')}'")
 
-    def _generate_assert_params(self, params: Dict[str, Any], meta: Dict[str, Any], output_shape: Optional[List[int]]) -> None:
-        """Generate ASSERT (OutputSpec) params based on kind and meta values.
-        
-        Supports four ASSERT kinds: TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, and RANGE.
-        See file header for detailed documentation of each kind.
-        """
-        if not output_shape:
-            raise ValueError("Cannot generate ASSERT params: output shape is required but not provided")
-        
-        assert_kind = meta.get("kind")
-        
-        # Compare with OutKind class variables (these are strings, not Enum objects)
-        if assert_kind == OutKind.TOP1_ROBUST:
-            # No params to generate (y_true already in meta)
-            # Just validate y_true is present
-            if "y_true" not in meta:
-                raise ValueError("TOP1_ROBUST requires 'y_true' in meta")
-        
-        elif assert_kind == OutKind.MARGIN_ROBUST:
-            # No params to generate (y_true and margin already in meta)
-            # Just validate they are present
-            if "y_true" not in meta:
-                raise ValueError("MARGIN_ROBUST requires 'y_true' in meta")
-            if "margin" not in meta:
-                raise ValueError("MARGIN_ROBUST requires 'margin' in meta")
-        
-        elif assert_kind == OutKind.LINEAR_LE:
-            # Convert c from list to tensor if present
-            if "c" in params and isinstance(params["c"], list):
-                params["c"] = torch.tensor(params["c"], dtype=torch.float32)
-            
-            # Validate d is present in meta
-            if "d" not in meta:
-                raise ValueError("LINEAR_LE requires 'd' in meta")
-        
-        elif assert_kind == OutKind.RANGE:
-            # Convert lb/ub from lists to tensors if present
-            if "lb" in params and isinstance(params["lb"], list):
-                params["lb"] = torch.tensor(params["lb"], dtype=torch.float32)
-            if "ub" in params and isinstance(params["ub"], list):
-                params["ub"] = torch.tensor(params["ub"], dtype=torch.float32)
-            
-            # Validate both are present
-            if "lb" not in params or "ub" not in params:
-                raise ValueError("RANGE requires both 'lb' and 'ub' in params")
+    def _assert_params(
+        self,
+        params: Dict[str, Any],
+        meta: Dict[str, Any],
+        dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        kind = meta.get("kind")
+        if kind == OutKind.LINEAR_LE and isinstance(params.get("c"), list):
+            params["c"] = torch.as_tensor(params["c"], dtype=dtype)
+        elif kind == OutKind.RANGE:
+            if isinstance(params.get("lb"), list):
+                params["lb"] = torch.as_tensor(params["lb"], dtype=dtype)
+            if isinstance(params.get("ub"), list):
+                params["ub"] = torch.as_tensor(params["ub"], dtype=dtype)
+        return params
 
     def _generate_layer_variables(
         self,
@@ -793,130 +542,64 @@ class NetFactory:
         layers: List[Layer],
     ) -> Tuple[List[int], List[int], int]:
         if kind == "INPUT":
-            shape = meta.get("shape", [])
-            out_num_vars = torch.Size(shape).numel() if shape else 1
+            out_num_vars = torch.Size(meta["shape"]).numel()
             out_vars = list(range(var_counter, var_counter + out_num_vars))
-            var_counter += out_num_vars
-            return [], out_vars, var_counter
-
-        elif kind == "DENSE":
-            in_features = meta.get("in_features", 1)
-            out_features = meta.get("out_features", 1)
-            if layers and layer_index > 0:
-                prev_out_vars = layers[layer_index - 1].out_vars
-                if len(prev_out_vars) != in_features:
-                    raise ValueError(f"DENSE layer expects {in_features} inputs but got {len(prev_out_vars)}")
-                in_vars = prev_out_vars
-            else:
-                in_vars = []
+            return [], out_vars, var_counter + out_num_vars
+        if kind == "DENSE":
+            in_vars = layers[layer_index - 1].out_vars
+            out_features = int(meta["out_features"])
             out_vars = list(range(var_counter, var_counter + out_features))
-            var_counter += out_features
-            return in_vars, out_vars, var_counter
-
-        elif kind in ["RELU", "SIGMOID", "TANH"]:
-            if layers and layer_index > 0:
-                in_vars = layers[layer_index - 1].out_vars
-                out_vars = list(range(var_counter, var_counter + len(in_vars)))
-                var_counter += len(in_vars)
-                return in_vars, out_vars, var_counter
-            raise ValueError(f"Activation layer '{kind}' cannot be the first layer in network")
-
-        elif kind.startswith("CONV"):
-            if layers and layer_index > 0:
-                in_vars = layers[layer_index - 1].out_vars
-            else:
-                raise ValueError(f"Convolutional layer '{kind}' cannot be the first layer in network")
-
-            output_shape = meta.get("output_shape")
-            if output_shape:
-                out_num_vars = torch.Size(output_shape).numel()
-            else:
-                raise ValueError(f"Convolutional layer '{kind}' requires 'output_shape' in meta")
-
+            return in_vars, out_vars, var_counter + out_features
+        if kind in ["RELU", "SIGMOID", "TANH"]:
+            in_vars = layers[layer_index - 1].out_vars
+            out_vars = list(range(var_counter, var_counter + len(in_vars)))
+            return in_vars, out_vars, var_counter + len(in_vars)
+        if kind in ["CONV2D", "MAXPOOL2D", "AVGPOOL2D"]:
+            in_vars = layers[layer_index - 1].out_vars
+            out_num_vars = torch.Size(meta["output_shape"]).numel()
             out_vars = list(range(var_counter, var_counter + out_num_vars))
-            var_counter += out_num_vars
-            return in_vars, out_vars, var_counter
-
-        elif kind in ["MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D"]:
-            if layers and layer_index > 0:
-                in_vars = layers[layer_index - 1].out_vars
-            else:
-                raise ValueError(f"Pooling layer '{kind}' cannot be the first layer in network")
-
-            output_shape = meta.get("output_shape")
-            if output_shape:
-                out_num_vars = torch.Size(output_shape).numel()
-            else:
-                raise ValueError(f"Pooling layer '{kind}' requires 'output_shape' in meta")
-
-            out_vars = list(range(var_counter, var_counter + out_num_vars))
-            var_counter += out_num_vars
-            return in_vars, out_vars, var_counter
-
-        elif kind == "FLATTEN":
-            if layers and layer_index > 0:
-                in_vars = layers[layer_index - 1].out_vars
-                out_vars = list(range(var_counter, var_counter + len(in_vars)))
-                var_counter += len(in_vars)
-                return in_vars, out_vars, var_counter
-            raise ValueError("Flatten layer cannot be the first layer in network")
-
-        elif kind in ["ADD", "SUB", "MUL", "DIV"]:
-            x_vars = meta.get("x_vars")
-            y_vars = meta.get("y_vars")
-            if x_vars is None or y_vars is None:
-                raise ValueError(f"{kind} layer requires meta['x_vars'] and meta['y_vars']")
-            if len(x_vars) != len(y_vars):
-                raise ValueError(f"{kind} layer expects x_vars and y_vars of same length")
+            return in_vars, out_vars, var_counter + out_num_vars
+        if kind == "FLATTEN":
+            in_vars = layers[layer_index - 1].out_vars
+            out_vars = list(range(var_counter, var_counter + len(in_vars)))
+            return in_vars, out_vars, var_counter + len(in_vars)
+        if kind == "ADD":
+            x_vars = meta["x_vars"]
+            y_vars = meta["y_vars"]
             in_vars = list(x_vars) + list(y_vars)
             out_vars = list(range(var_counter, var_counter + len(x_vars)))
-            var_counter += len(x_vars)
-            return in_vars, out_vars, var_counter
-
-        elif kind in ["INPUT_SPEC", "ASSERT"]:
-            if layers and layer_index > 0:
-                prev_vars = layers[layer_index - 1].out_vars
-                return prev_vars, prev_vars.copy(), var_counter
-            raise ValueError(f"Layer '{kind}' cannot be the first layer in network")
-
-        supported_types = [
-            "INPUT", "DENSE", "RELU", "SIGMOID", "TANH", "CONV1D", "CONV2D",
-            "CONV3D", "MAXPOOL2D", "AVGPOOL2D", "ADAPTIVEAVGPOOL2D", "FLATTEN",
-            "ADD", "SUB", "MUL", "DIV", "INPUT_SPEC", "ASSERT",
-        ]
-        raise NotImplementedError(
-            f"Layer type '{kind}' is not supported. Supported types: {supported_types}."
-        )
+            return in_vars, out_vars, var_counter + len(x_vars)
+        if kind in ["INPUT_SPEC", "ASSERT"]:
+            prev_vars = layers[layer_index - 1].out_vars
+            return prev_vars, list(prev_vars), var_counter
+        raise NotImplementedError(f"Unsupported layer kind '{kind}'")
 
     def _sample_family(self, rng: random.Random) -> str:
-        gen = self.config.get("generator", {})
-        fams = list(gen.get("families", []))
-        if not fams:
-            raise ValueError("generator.families must be non-empty")
+        gen = self.config["generator"]
+        fams = list(gen["families"])
         if len(fams) == 1:
             return str(fams[0])
 
         has_mlp = "mlp" in fams
         has_cnn = "cnn2d" in fams
         if has_mlp and has_cnn:
-            return "mlp" if (rng.random() < float(gen.get("p_mlp", 0.5))) else "cnn2d"
+            return "mlp" if (rng.random() < float(gen["p_mlp"])) else "cnn2d"
         return str(rng.choice(fams))
 
-    def _sample_mlp(self, rng: random.Random, *, num_classes: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        cfg = self.config.get("mlp", {})
-        input_shape = _choose(rng, cfg.get("input_shapes", []), name="mlp.input_shapes")
-        depth = _randint_inclusive(rng, cfg.get("depth_range", [2, 4]))
+    def _sample_mlp(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
+        cfg = self.config["mlp"]
+        input_shape = _choose(rng, cfg["input_shapes"], name="mlp.input_shapes")
+        depth = _randint_inclusive(rng, cfg["depth_range"])
         if depth <= 0:
             raise ValueError(f"mlp.depth_range produced non-positive depth={depth}")
 
-        widths = [int(_choose(rng, cfg.get("width_choices", []), name="mlp.width_choices")) for _ in range(depth)]
+        widths = [int(_choose(rng, cfg["width_choices"], name="mlp.width_choices")) for _ in range(depth)]
         hidden_sizes = tuple(widths)
 
-        activation = str(_choose(rng, cfg.get("activation_choices", []), name="mlp.activation_choices"))
-        dropout_p = float(_choose(rng, cfg.get("dropout_p_choices", []), name="mlp.dropout_p_choices"))
+        activation = str(_choose(rng, cfg["activation_choices"], name="mlp.activation_choices"))
 
-        block_p = float(cfg.get("block_p", 0.0))
-        residual_p = float(cfg.get("residual_p", 0.0))
+        block_p = float(cfg["block_p"])
+        residual_p = float(cfg["residual_p"])
         r = rng.random()
         if r < residual_p:
             variant = "residual"
@@ -924,14 +607,11 @@ class NetFactory:
             variant = "block"
         else:
             variant = "plain"
-        num_blocks = _randint_inclusive(rng, cfg.get("block_count_range", [2, 4]))
-        block_width = int(_choose(rng, cfg.get("block_width_choices", []), name="mlp.block_width_choices"))
-        post_block_activation = bool(rng.random() < float(cfg.get("post_block_activation_p", 0.5)))
-        residual_blocks = _randint_inclusive(rng, cfg.get("residual_blocks_range", [1, 2]))
-        residual_width = int(_choose(rng, cfg.get("residual_width_choices", []), name="mlp.residual_width_choices"))
-
-        if variant == "block":
-            dropout_p = 0.0
+        num_blocks = _randint_inclusive(rng, cfg["block_count_range"])
+        block_width = int(_choose(rng, cfg["block_width_choices"], name="mlp.block_width_choices"))
+        post_block_activation = bool(rng.random() < float(cfg["post_block_activation_p"]))
+        residual_blocks = _randint_inclusive(rng, cfg["residual_blocks_range"])
+        residual_width = int(_choose(rng, cfg["residual_width_choices"], name="mlp.residual_width_choices"))
 
         model_cfg = {
             "input_shape": tuple(int(x) for x in input_shape),
@@ -944,56 +624,41 @@ class NetFactory:
             "residual_width": int(residual_width),
             "activation": activation,
             "use_bias": True,
-            "dropout_p": float(dropout_p),
             "num_classes": int(num_classes),
         }
-        meta = {
-            "depth": int(depth),
-            "hidden_sizes": list(hidden_sizes),
-            "variant": variant,
-            "num_blocks": int(num_blocks),
-            "block_width": int(block_width),
-            "post_block_activation": bool(post_block_activation),
-            "num_residual_blocks": int(residual_blocks),
-            "residual_width": int(residual_width),
-            "activation": activation,
-            "dropout_p": float(dropout_p),
-            "input_shape": list(model_cfg["input_shape"]),
-            "num_classes": int(num_classes),
-        }
-        return model_cfg, meta
+        return model_cfg
 
-    def _sample_cnn2d(self, rng: random.Random, *, num_classes: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        cfg = self.config.get("cnn", {})
-        input_shape = _choose(rng, cfg.get("input_shapes", []), name="cnn.input_shapes")
+    def _sample_cnn2d(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
+        cfg = self.config["cnn"]
+        input_shape = _choose(rng, cfg["input_shapes"], name="cnn.input_shapes")
         if int(input_shape[2]) > 32 or int(input_shape[3]) > 32:
             raise ValueError(f"cnn.input_shapes must have H,W <= 32, got {input_shape}")
 
-        variant = "stage" if (rng.random() < float(cfg.get("stage_variant_p", 0.0))) else "plain"
-        blocks = _randint_inclusive(rng, cfg.get("num_blocks_range", [1, 2]))
+        variant = "stage" if (rng.random() < float(cfg["stage_variant_p"])) else "plain"
+        blocks = _randint_inclusive(rng, cfg["num_blocks_range"])
         if blocks <= 0:
             raise ValueError(f"cnn.num_blocks_range produced non-positive blocks={blocks}")
 
         conv_channels: List[int] = []
-        prev = int(_choose(rng, cfg.get("channels_choices", []), name="cnn.channels_choices"))
+        prev = int(_choose(rng, cfg["channels_choices"], name="cnn.channels_choices"))
         conv_channels.append(prev)
         for _ in range(1, blocks):
-            prev = int(_choose(rng, cfg.get("channels_choices", []), name="cnn.channels_choices"))
+            prev = int(_choose(rng, cfg["channels_choices"], name="cnn.channels_choices"))
             conv_channels.append(prev)
 
-        kernel_sizes = int(_choose(rng, cfg.get("kernel_choices", []), name="cnn.kernel_choices"))
-        strides = int(_choose(rng, cfg.get("stride_choices", []), name="cnn.stride_choices"))
-        paddings = int(_choose(rng, cfg.get("padding_choices", []), name="cnn.padding_choices"))
-        activation = str(_choose(rng, cfg.get("activation_choices", []), name="cnn.activation_choices"))
-        use_maxpool = bool(rng.random() < float(cfg.get("use_maxpool_p", 0.0)))
-        fc_hidden = int(_choose(rng, cfg.get("fc_hidden_choices", []), name="cnn.fc_hidden_choices"))
+        kernel_sizes = int(_choose(rng, cfg["kernel_choices"], name="cnn.kernel_choices"))
+        strides = int(_choose(rng, cfg["stride_choices"], name="cnn.stride_choices"))
+        paddings = int(_choose(rng, cfg["padding_choices"], name="cnn.padding_choices"))
+        activation = str(_choose(rng, cfg["activation_choices"], name="cnn.activation_choices"))
+        use_maxpool = bool(rng.random() < float(cfg["use_maxpool_p"]))
+        fc_hidden = int(_choose(rng, cfg["fc_hidden_choices"], name="cnn.fc_hidden_choices"))
 
-        stages = _randint_inclusive(rng, cfg.get("stages_range", [1, 3]))
-        blocks_per_stage = _randint_inclusive(rng, cfg.get("blocks_per_stage_range", [1, 2]))
-        base_channels = int(_choose(rng, cfg.get("base_channels_choices", []), name="cnn.base_channels_choices"))
-        channel_mult = int(_choose(rng, cfg.get("channel_mult_choices", []), name="cnn.channel_mult_choices"))
-        downsample = str(_choose(rng, cfg.get("downsample_choices", []), name="cnn.downsample_choices"))
-        double_conv_p = float(_choose(rng, cfg.get("double_conv_p_choices", []), name="cnn.double_conv_p_choices"))
+        stages = _randint_inclusive(rng, cfg["stages_range"])
+        blocks_per_stage = _randint_inclusive(rng, cfg["blocks_per_stage_range"])
+        base_channels = int(_choose(rng, cfg["base_channels_choices"], name="cnn.base_channels_choices"))
+        channel_mult = int(_choose(rng, cfg["channel_mult_choices"], name="cnn.channel_mult_choices"))
+        downsample = str(_choose(rng, cfg["downsample_choices"], name="cnn.downsample_choices"))
+        double_conv_p = float(_choose(rng, cfg["double_conv_p_choices"], name="cnn.double_conv_p_choices"))
 
         max_channels = base_channels * (channel_mult ** (stages - 1))
         if max_channels > 64:
@@ -1026,49 +691,25 @@ class NetFactory:
             "num_classes": int(num_classes),
             "fc_hidden": int(fc_hidden),
         }
-        meta = {
-            "blocks": int(blocks),
-            "conv_channels": conv_channels,
-            "variant": variant,
-            "stages": int(stages),
-            "blocks_per_stage": int(blocks_per_stage),
-            "base_channels": int(base_channels),
-            "channel_mult": int(channel_mult),
-            "downsample": str(downsample),
-            "double_conv_p": float(double_conv_p),
-            "kernel_sizes": kernel_sizes,
-            "strides": strides,
-            "paddings": paddings,
-            "activation": activation,
-            "use_maxpool": use_maxpool,
-            "fc_hidden": int(fc_hidden),
-            "input_shape": list(model_cfg["input_shape"]),
-            "num_classes": int(num_classes),
-        }
-        return model_cfg, meta
+        return model_cfg
 
     def _sample_input_spec(
         self,
         rng: random.Random,
-        *,
-        input_shape: Tuple[int, ...],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        cfg = self.config.get("input_spec", {})
-        kinds = list(cfg.get("kind_choices", []))
-        if not kinds:
-            raise ValueError("input_spec.kind_choices must be non-empty")
-
+    ) -> Dict[str, Any]:
+        cfg = self.config["input_spec"]
+        kinds = list(cfg["kind_choices"])
         if len(kinds) == 1:
             kind = kinds[0]
         else:
             has_box = "BOX" in kinds
             has_linf = "LINF_BALL" in kinds
             if has_box and has_linf and len(kinds) == 2:
-                kind = "BOX" if (rng.random() < float(cfg.get("p_box", 0.5))) else "LINF_BALL"
+                kind = "BOX" if (rng.random() < float(cfg["p_box"])) else "LINF_BALL"
             else:
                 kind = rng.choice(kinds)
 
-        value_range = _choose(rng, cfg.get("value_range_choices", []), name="input_spec.value_range_choices")
+        value_range = _choose(rng, cfg["value_range_choices"], name="input_spec.value_range_choices")
         lo, hi = float(value_range[0]), float(value_range[1])
         if hi < lo:
             lo, hi = hi, lo
@@ -1082,96 +723,63 @@ class NetFactory:
             if ub_val < lb_val:
                 lb_val, ub_val = lo, hi
 
-            in_cfg = {
-                "kind": "BOX",
-                "value_range": (lo, hi),
-                "lb_val": float(lb_val),
-                "ub_val": float(ub_val),
-                "meta": {"sampled": {"shape": list(input_shape)}},
-            }
-            meta = {
+            return {
                 "kind": "BOX",
                 "value_range": (lo, hi),
                 "lb_val": float(lb_val),
                 "ub_val": float(ub_val),
             }
-            return in_cfg, meta
 
         if kind == "LINF_BALL":
             center_val = lo + (hi - lo) * rng.random()
-            eps = float(_choose(rng, cfg.get("eps_choices", []), name="input_spec.eps_choices"))
+            eps = float(_choose(rng, cfg["eps_choices"], name="input_spec.eps_choices"))
             eps = min(eps, 0.5 * (hi - lo)) if (hi > lo) else 0.0
 
-            in_cfg = {
-                "kind": "LINF_BALL",
-                "value_range": (lo, hi),
-                "center_val": float(center_val),
-                "eps": float(eps),
-                "meta": {"sampled": {"shape": list(input_shape)}},
-            }
-            meta = {
+            return {
                 "kind": "LINF_BALL",
                 "value_range": (lo, hi),
                 "center_val": float(center_val),
                 "eps": float(eps),
             }
-            return in_cfg, meta
 
-        in_cfg = {
-            "kind": "BOX",
-            "value_range": (lo, hi),
-            "lb_val": float(lo),
-            "ub_val": float(hi),
-            "meta": {"fallback": True, "reason": f"unsupported kind={kind}"},
-        }
-        meta = {"kind": "FALLBACK_BOX", "value_range": (lo, hi), "lb_val": lo, "ub_val": hi}
-        return in_cfg, meta
+        raise ValueError(f"Unsupported input_spec kind '{kind}'")
 
     def _sample_output_spec(
         self,
         rng: random.Random,
         *,
         num_classes: int,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        cfg = self.config.get("output_spec", {})
-        kinds = list(cfg.get("kind_choices", []))
-        if not kinds:
-            raise ValueError("output_spec.kind_choices must be non-empty")
-
+    ) -> Dict[str, Any]:
+        cfg = self.config["output_spec"]
+        kinds = list(cfg["kind_choices"])
         if len(kinds) == 1:
             kind = kinds[0]
         else:
             has_top1 = "TOP1_ROBUST" in kinds
             has_margin = "MARGIN_ROBUST" in kinds
             if has_top1 and has_margin and len(kinds) == 2:
-                kind = "TOP1_ROBUST" if (rng.random() < float(cfg.get("p_top1", 0.5))) else "MARGIN_ROBUST"
+                kind = "TOP1_ROBUST" if (rng.random() < float(cfg["p_top1"])) else "MARGIN_ROBUST"
             else:
                 kind = rng.choice(kinds)
 
         y_true = int(rng.randrange(int(num_classes)))
 
         if kind == "TOP1_ROBUST":
-            out_cfg = {"kind": "TOP1_ROBUST", "y_true": y_true, "margin": 0.0, "meta": {}}
-            meta = {"kind": "TOP1_ROBUST", "y_true": y_true, "margin": 0.0}
-            return out_cfg, meta
+            return {"kind": "TOP1_ROBUST", "y_true": y_true}
 
         if kind == "MARGIN_ROBUST":
-            margin = float(_choose(rng, cfg.get("margin_choices", []), name="output_spec.margin_choices"))
-            out_cfg = {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin), "meta": {}}
-            meta = {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin)}
-            return out_cfg, meta
+            margin = float(_choose(rng, cfg["margin_choices"], name="output_spec.margin_choices"))
+            return {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin)}
 
         if kind == "LINEAR_LE":
-            c_lo, c_hi = cfg.get("linear_le_c_range", [-1.0, 1.0])
-            d_lo, d_hi = cfg.get("linear_le_d_range", [-1.0, 1.0])
+            c_lo, c_hi = cfg["linear_le_c_range"]
+            d_lo, d_hi = cfg["linear_le_d_range"]
             c_vals = [c_lo + (c_hi - c_lo) * rng.random() for _ in range(int(num_classes))]
             d_val = d_lo + (d_hi - d_lo) * rng.random()
-            out_cfg = {"kind": "LINEAR_LE", "c": [float(x) for x in c_vals], "d": float(d_val), "meta": {}}
-            meta = {"kind": "LINEAR_LE", "c": list(c_vals), "d": float(d_val)}
-            return out_cfg, meta
+            return {"kind": "LINEAR_LE", "c": [float(x) for x in c_vals], "d": float(d_val)}
 
         if kind == "RANGE":
-            lo, hi = _choose(rng, cfg.get("range_choices", []), name="output_spec.range_choices")
+            lo, hi = _choose(rng, cfg["range_choices"], name="output_spec.range_choices")
             lb_vals = []
             ub_vals = []
             for _ in range(int(num_classes)):
@@ -1179,18 +787,13 @@ class NetFactory:
                 b = lo + (hi - lo) * rng.random()
                 lb_vals.append(min(a, b))
                 ub_vals.append(max(a, b))
-            out_cfg = {
+            return {
                 "kind": "RANGE",
                 "lb": [float(x) for x in lb_vals],
                 "ub": [float(x) for x in ub_vals],
-                "meta": {},
             }
-            meta = {"kind": "RANGE", "lb": list(lb_vals), "ub": list(ub_vals)}
-            return out_cfg, meta
 
-        out_cfg = {"kind": "TOP1_ROBUST", "y_true": y_true, "margin": 0.0, "meta": {"fallback": True}}
-        meta = {"kind": "FALLBACK_TOP1_ROBUST", "y_true": y_true, "margin": 0.0}
-        return out_cfg, meta
+        raise ValueError(f"Unsupported output_spec kind '{kind}'")
 
     def _build_network_spec(self, instance: Dict[str, Any], *, dtype: str) -> Dict[str, Any]:
         model_cfg = instance["model_cfg"]
@@ -1202,7 +805,6 @@ class NetFactory:
         input_meta: Dict[str, Any] = {
             "shape": input_shape,
             "dtype": str(dtype),
-            "desc": "Generated by NetFactory",
             "num_classes": num_classes,
             "value_range": list(instance["input_spec"]["value_range"]),
         }
@@ -1211,11 +813,11 @@ class NetFactory:
         in_kind = str(instance["input_spec"]["kind"])
         spec_meta: Dict[str, Any] = {"kind": in_kind}
         if in_kind == "BOX":
-            spec_meta["lb_val"] = float(instance["input_spec"].get("lb_val", instance["input_spec"]["value_range"][0]))
-            spec_meta["ub_val"] = float(instance["input_spec"].get("ub_val", instance["input_spec"]["value_range"][1]))
+            spec_meta["lb_val"] = float(instance["input_spec"]["lb_val"])
+            spec_meta["ub_val"] = float(instance["input_spec"]["ub_val"])
         elif in_kind == "LINF_BALL":
-            spec_meta["center_val"] = float(instance["input_spec"].get("center_val", sum(instance["input_spec"]["value_range"]) / 2.0))
-            spec_meta["eps"] = float(instance["input_spec"].get("eps", 0.0))
+            spec_meta["center_val"] = float(instance["input_spec"]["center_val"])
+            spec_meta["eps"] = float(instance["input_spec"]["eps"])
         else:
             raise ValueError(f"Input spec kind '{in_kind}' is not supported")
 
@@ -1223,11 +825,9 @@ class NetFactory:
 
         if instance["family"] == "mlp":
             _build_mlp_layers(layers, cfg=model_cfg)
-            arch = "mlp"
         elif instance["family"] == "cnn2d":
             rng = random.Random(int(instance["seed"]))
             _build_cnn_layers(layers, cfg=model_cfg, rng=rng)
-            arch = "cnn"
         else:
             raise ValueError(f"Unsupported model family: {instance['family']}")
 
@@ -1236,55 +836,41 @@ class NetFactory:
         out_params: Dict[str, Any] = {}
 
         if out_kind == "TOP1_ROBUST":
-            out_meta["y_true"] = int(instance["output_spec"].get("y_true", 0))
+            out_meta["y_true"] = int(instance["output_spec"]["y_true"])
         elif out_kind == "MARGIN_ROBUST":
-            out_meta["y_true"] = int(instance["output_spec"].get("y_true", 0))
-            out_meta["margin"] = float(instance["output_spec"].get("margin", 0.0))
+            out_meta["y_true"] = int(instance["output_spec"]["y_true"])
+            out_meta["margin"] = float(instance["output_spec"]["margin"])
         elif out_kind == "LINEAR_LE":
-            out_params["c"] = list(instance["output_spec"].get("c", [1.0] * num_classes))
-            out_meta["d"] = float(instance["output_spec"].get("d", 0.0))
+            out_params["c"] = list(instance["output_spec"]["c"])
+            out_meta["d"] = float(instance["output_spec"]["d"])
         elif out_kind == "RANGE":
-            out_params["lb"] = list(instance["output_spec"].get("lb", [0.0] * num_classes))
-            out_params["ub"] = list(instance["output_spec"].get("ub", [0.0] * num_classes))
+            out_params["lb"] = list(instance["output_spec"]["lb"])
+            out_params["ub"] = list(instance["output_spec"]["ub"])
         else:
-            out_meta["y_true"] = int(instance["output_spec"].get("y_true", 0))
+            raise ValueError(f"Output spec kind '{out_kind}' is not supported")
 
         layers.append({"kind": "ASSERT", "params": out_params, "meta": out_meta})
 
-        return {
-            "description": f"Generated ({instance['instance_id']})",
-            "architecture_type": arch,
-            "input_shape": input_shape,
-            "layers": layers,
-        }
+        return {"layers": layers}
 
     def _sample_instance(self, idx: int) -> Dict[str, Any]:
-        gen = self.config.get("generator", {})
+        gen = self.config["generator"]
         instance_id = f"{self.name_prefix}{int(self.base_seed)}_idx{int(idx):05d}"
         seed = int(_derive_seed(int(self.base_seed), int(idx), instance_id))
         rng = random.Random(seed)
 
         family = self._sample_family(rng)
-        num_classes = int(_choose(rng, gen.get("num_classes_choices", []), name="generator.num_classes_choices"))
+        num_classes = int(_choose(rng, gen["num_classes_choices"], name="generator.num_classes_choices"))
 
         if family == "mlp":
-            model_cfg, model_meta = self._sample_mlp(rng, num_classes=num_classes)
+            model_cfg = self._sample_mlp(rng, num_classes=num_classes)
         elif family == "cnn2d":
-            model_cfg, model_meta = self._sample_cnn2d(rng, num_classes=num_classes)
+            model_cfg = self._sample_cnn2d(rng, num_classes=num_classes)
         else:
             raise ValueError(f"Unknown family: {family}")
 
-        input_spec, in_meta = self._sample_input_spec(rng, input_shape=tuple(model_cfg["input_shape"]))
-        output_spec, out_meta = self._sample_output_spec(rng, num_classes=num_classes)
-
-        meta: Dict[str, Any] = {
-            "base_seed": int(self.base_seed),
-            "idx": int(idx),
-            "seed": int(seed),
-            "model": model_meta,
-            "input_spec": in_meta,
-            "output_spec": out_meta,
-        }
+        input_spec = self._sample_input_spec(rng)
+        output_spec = self._sample_output_spec(rng, num_classes=num_classes)
 
         return {
             "instance_id": instance_id,
@@ -1293,11 +879,11 @@ class NetFactory:
             "model_cfg": model_cfg,
             "input_spec": input_spec,
             "output_spec": output_spec,
-            "meta": meta,
         }
 
     def create_network(self, name: str, spec: Dict[str, Any]) -> Net:
-        current_dtype = str(get_default_dtype())
+        dtype = get_default_dtype()
+        dtype_str = str(dtype)
 
         layers = []
         var_counter = 0
@@ -1308,7 +894,7 @@ class NetFactory:
             meta = layer_spec.get("meta", {}).copy()
             kind = layer_spec["kind"]
 
-            if kind in ["ADD", "SUB", "MUL", "DIV"]:
+            if kind == "ADD":
                 inputs = layer_spec.get("inputs") or {}
                 x_src = inputs.get("x")
                 y_src = inputs.get("y")
@@ -1321,35 +907,20 @@ class NetFactory:
 
             in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
 
-            if kind == "INPUT" and "dtype" in meta:
-                meta["dtype"] = current_dtype
-
-            input_shape = None
-            if i > 0 and layers[i - 1].kind == "INPUT":
-                input_shape = layers[i - 1].meta.get("shape")
-
-            output_shape = None
-            if i > 0:
-                for j in range(i - 1, -1, -1):
-                    prev_layer = layers[j]
-                    if prev_layer.kind == "DENSE":
-                        out_features = prev_layer.meta.get("out_features")
-                        if out_features:
-                            output_shape = [1, out_features]
-                            break
-
-            if kind == "INPUT_SPEC":
-                self._generate_input_spec_params(params, meta, input_shape)
+            if kind == "INPUT":
+                meta["dtype"] = dtype_str
+            elif kind == "INPUT_SPEC":
+                params.update(self._input_spec_params(meta, layers[0].meta["shape"], dtype))
             elif kind == "ASSERT":
-                self._generate_assert_params(params, meta, output_shape)
+                params = self._assert_params(params, meta, dtype)
             elif kind == "DENSE" and "W" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
                     params["W"] = weight
                 if meta.get("bias_enabled", False):
                     out_features = meta.get("out_features", 10)
-                    params["b"] = torch.zeros(out_features)
-            elif kind.startswith("CONV") and "weight" not in params:
+                    params["b"] = torch.zeros(out_features, dtype=dtype)
+            elif kind == "CONV2D" and "weight" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
                     params["weight"] = weight
@@ -1378,12 +949,7 @@ class NetFactory:
                 succs[p].append(i)
 
         net = Net(layers=layers, preds=preds, succs=succs)
-        net.meta = {
-            "name": name,
-            "description": spec.get("description", ""),
-            "architecture_type": spec.get("architecture_type", ""),
-            "input_shape": spec.get("input_shape", []),
-        }
+        net.meta = {"name": name}
         return net
 
     def save_network(self, net: Net, name: str) -> None:
@@ -1406,8 +972,8 @@ class NetFactory:
 
     def generate(self) -> List[str]:
         print(f"Generating {self.num_instances} networks...")
-        gen = self.config.get("generator", {})
-        dtype = str(gen.get("dtype", "torch.float64"))
+        gen = self.config["generator"]
+        dtype = str(gen["dtype"])
 
         names: List[str] = []
         for idx in range(self.num_instances):
