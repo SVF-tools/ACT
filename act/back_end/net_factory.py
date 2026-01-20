@@ -265,23 +265,22 @@ def _append_pool2d(
     )
     return out_H, out_W
 
+def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
+    shape = _ensure_batch1(tuple(cfg["input_shape"]))
+    in_features = int(shape[1]) if len(shape) == 2 else _prod(shape[1:])
 
-    def _build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
-        shape = _ensure_batch1(tuple(cfg["input_shape"]))
-        in_features = int(shape[1]) if len(shape) == 2 else _prod(shape[1:])
+    if len(shape) > 2:
+        layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
 
-        if len(shape) > 2:
-            layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
+    act_kind = _activation_kind(cfg.get("activation", "relu"))
 
-        act_kind = _activation_kind(cfg.get("activation", "relu"))
-
-        variant = cfg.get("variant", "plain")
-        if variant == "plain":
-            for h in cfg["hidden_sizes"]:
-                layers.append(
-                    {
-                        "kind": "DENSE",
-                        "params": {},
+    variant = cfg.get("variant", "plain")
+    if variant == "plain":
+        for h in cfg["hidden_sizes"]:
+            layers.append(
+                {
+                    "kind": "DENSE",
+                    "params": {},
                     "meta": {
                         "in_features": int(in_features),
                         "out_features": int(h),
@@ -291,7 +290,7 @@ def _append_pool2d(
             )
             layers.append({"kind": act_kind, "params": {}, "meta": {}})
             in_features = int(h)
-    else:
+    elif variant == "block":
         width = int(cfg.get("block_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else 64))
         layers.append(
             {
@@ -333,67 +332,67 @@ def _append_pool2d(
             )
             if cfg.get("post_block_activation", True):
                 layers.append({"kind": act_kind, "params": {}, "meta": {}})
-        elif variant == "residual":
-            width = int(cfg.get("residual_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else in_features))
-            if in_features != width:
-                layers.append(
-                    {
-                        "kind": "DENSE",
-                        "params": {},
-                        "meta": {
-                            "in_features": int(in_features),
-                            "out_features": int(width),
-                            "bias_enabled": bool(cfg.get("use_bias", True)),
-                        },
-                    }
-                )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
-                in_features = int(width)
+    elif variant == "residual":
+        width = int(cfg.get("residual_width") or (cfg["hidden_sizes"][0] if cfg["hidden_sizes"] else in_features))
+        if in_features != width:
+            layers.append(
+                {
+                    "kind": "DENSE",
+                    "params": {},
+                    "meta": {
+                        "in_features": int(in_features),
+                        "out_features": int(width),
+                        "bias_enabled": bool(cfg.get("use_bias", True)),
+                    },
+                }
+            )
+            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            in_features = int(width)
 
-            num_blocks = int(cfg.get("num_residual_blocks", cfg.get("num_blocks", 1)))
-            for _ in range(num_blocks):
-                skip_idx = len(layers) - 1
-                layers.append(
-                    {
-                        "kind": "DENSE",
-                        "params": {},
-                        "meta": {
-                            "in_features": int(in_features),
-                            "out_features": int(in_features),
-                            "bias_enabled": bool(cfg.get("use_bias", True)),
-                        },
-                    }
-                )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
-                layers.append(
-                    {
-                        "kind": "DENSE",
-                        "params": {},
-                        "meta": {
-                            "in_features": int(in_features),
-                            "out_features": int(in_features),
-                            "bias_enabled": bool(cfg.get("use_bias", True)),
-                        },
-                    }
-                )
-                main_idx = len(layers) - 1
-                layers.append(
-                    {
-                        "kind": "ADD",
-                        "params": {},
-                        "meta": {},
-                        "inputs": {"x": skip_idx, "y": main_idx},
-                        "preds": [skip_idx, main_idx],
-                    }
-                )
-                layers.append({"kind": act_kind, "params": {}, "meta": {}})
-        else:
-            raise ValueError(f"Unsupported MLP variant '{variant}'")
+        num_blocks = int(cfg.get("num_residual_blocks", cfg.get("num_blocks", 1)))
+        for _ in range(num_blocks):
+            skip_idx = len(layers) - 1
+            layers.append(
+                {
+                    "kind": "DENSE",
+                    "params": {},
+                    "meta": {
+                        "in_features": int(in_features),
+                        "out_features": int(in_features),
+                        "bias_enabled": bool(cfg.get("use_bias", True)),
+                    },
+                }
+            )
+            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+            layers.append(
+                {
+                    "kind": "DENSE",
+                    "params": {},
+                    "meta": {
+                        "in_features": int(in_features),
+                        "out_features": int(in_features),
+                        "bias_enabled": bool(cfg.get("use_bias", True)),
+                    },
+                }
+            )
+            main_idx = len(layers) - 1
+            layers.append(
+                {
+                    "kind": "ADD",
+                    "params": {},
+                    "meta": {},
+                    "inputs": {"x": skip_idx, "y": main_idx},
+                    "preds": [skip_idx, main_idx],
+                }
+            )
+            layers.append({"kind": act_kind, "params": {}, "meta": {}})
+    else:
+        raise ValueError(f"Unsupported MLP variant '{variant}'")
 
-        layers.append(
-            {
-                "kind": "DENSE",
-                "params": {},
+    layers.append(
+        {
+            "kind": "DENSE",
+            "params": {},
             "meta": {
                 "in_features": int(in_features),
                 "out_features": int(cfg["num_classes"]),
