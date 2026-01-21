@@ -53,6 +53,7 @@ jobs:
       - name: Generate Networks (float64)
         run: |
           cd ${{ github.workspace }}
+          rm -f act/back_end/examples/nets/*.json act/back_end/examples/nets/manifest.json
           python -m act.back_end --generate --device cpu --dtype float64
       
       - name: Run Serialization Tests (float64)
@@ -77,6 +78,7 @@ jobs:
       - name: Generate Networks (float32)
         run: |
           cd ${{ github.workspace }}
+          rm -f act/back_end/examples/nets/*.json act/back_end/examples/nets/manifest.json
           python -m act.back_end --generate --device cpu --dtype float32
       
       - name: Run Serialization Tests (float32)
