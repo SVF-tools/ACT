@@ -18,7 +18,6 @@ from typing import Tuple, Optional, Dict
 from act.back_end.core import Bounds
 
 # -------- LSTM --------
-@torch.no_grad()
 def dual_lstm_backward(
     nu: torch.Tensor, weight_ih: torch.Tensor, weight_hh: torch.Tensor,
     bias_ih: Optional[torch.Tensor] = None, bias_hh: Optional[torch.Tensor] = None,
@@ -29,7 +28,6 @@ def dual_lstm_backward(
     raise NotImplementedError("dual_lstm_backward: pending")
 
 # -------- GRU --------
-@torch.no_grad()
 def dual_gru_backward(
     nu: torch.Tensor, weight_ih: torch.Tensor, weight_hh: torch.Tensor,
     bias_ih: Optional[torch.Tensor] = None, bias_hh: Optional[torch.Tensor] = None,

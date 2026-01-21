@@ -18,7 +18,6 @@ from typing import Tuple, Optional, Dict
 from act.back_end.core import Bounds
 
 # -------- Multi-Head Attention --------
-@torch.no_grad()
 def dual_attention_backward(
     nu: torch.Tensor, W_Q: torch.Tensor, W_K: torch.Tensor, W_V: torch.Tensor,
     W_O: Optional[torch.Tensor] = None,
@@ -31,7 +30,6 @@ def dual_attention_backward(
     raise NotImplementedError("dual_attention_backward: pending")
 
 # -------- LayerNorm --------
-@torch.no_grad()
 def dual_layernorm_backward(
     nu: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = 1e-5,
     normalized_shape: Optional[Tuple[int, ...]] = None, bounds: Optional[Bounds] = None,
@@ -41,7 +39,6 @@ def dual_layernorm_backward(
     raise NotImplementedError("dual_layernorm_backward: pending")
 
 # -------- GELU --------
-@torch.no_grad()
 def dual_gelu_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
     """GELU backward: uses linear relaxation similar to smooth activations. (Pending)"""
     raise NotImplementedError("dual_gelu_backward: pending")

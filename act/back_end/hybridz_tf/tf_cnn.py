@@ -20,7 +20,6 @@ from typing import List, Tuple
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
-@torch.no_grad()
 def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for 2D convolution with enhanced precision."""
     # Extract convolution parameters
@@ -91,7 +90,6 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for 2D max pooling."""
     kernel_size = L.meta.get("kernel_size", 2)
@@ -127,7 +125,6 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for 2D average pooling."""
     kernel_size = L.meta.get("kernel_size", 2)
@@ -160,7 +157,6 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for tensor flattening."""
     # Flattening is just reshaping - bounds remain the same
@@ -178,7 +174,6 @@ def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_reshape(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for general tensor reshaping."""
     target_shape = L.meta.get("target_shape")

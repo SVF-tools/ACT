@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.layer_schema import LayerKind
 from act.back_end.transfer_functions import TransferFunction
+from act.back_end.utils import BackendMode, _backend_mode
 from .tf_mlp import (dual_relu_backward, dual_dense_backward, dual_bias_backward,
                      dual_scale_backward, dual_bn_backward, dual_identity_backward)
 from .tf_cnn import dual_conv2d_backward
@@ -48,8 +49,15 @@ class DualTF(TransferFunction):
         "ADD": "_backward_add",
     }
     
-    def __init__(self):
-        """Initialize DualTF with empty cache for forward bounds."""
+    def __init__(self, solving_mode: BackendMode = BackendMode.V):
+        """Initialize DualTF with solving mode and empty cache.
+        
+        Args:
+            solving_mode: Backend solving mode.
+                - BackendMode.V: Verification (default), no gradients
+                - BackendMode.T: Training, gradients enabled for provable training
+        """
+        self.solving_mode = solving_mode
         self._forward_bounds_cache: Dict[int, Bounds] = {}
         self._cache_net_id: Optional[int] = None  # Track which net the cache is for
     
@@ -61,6 +69,7 @@ class DualTF(TransferFunction):
         return layer_kind.upper() in self._BACKWARD_REGISTRY
     
     # -------- TransferFunction Interface (for analyze()) --------
+    @_backend_mode
     def apply(self, L: Layer, input_bounds: Bounds, net: Net,
               before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
         """
@@ -107,7 +116,7 @@ class DualTF(TransferFunction):
         self._forward_bounds_cache.clear()
         self._cache_net_id = None
     
-    @torch.no_grad()
+    @_backend_mode
     def compute_bound(self, net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
                       return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Compute certified lower bound on c^T @ output."""
@@ -134,7 +143,7 @@ class DualTF(TransferFunction):
         obj = obj + input_contrib
         return (obj, sce) if return_sce else obj
     
-    @torch.no_grad()
+    @_backend_mode
     def compute_robust_bound(self, net: Net, bounds_dict: Dict[int, Bounds],
                              y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
         """Compute min margin: output[y_true] - output[j] for all j != y_true."""
@@ -261,11 +270,13 @@ class DualTF(TransferFunction):
 
 # -------- Convenience Functions --------
 def compute_dual_bound(net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
-                       return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                       return_sce: bool = False,
+                       solving_mode: BackendMode = BackendMode.V) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute certified lower bound on c^T @ output."""
-    return DualTF().compute_bound(net, bounds_dict, c, return_sce=return_sce)
+    return DualTF(solving_mode=solving_mode).compute_bound(net, bounds_dict, c, return_sce=return_sce)
 
 def compute_robust_loss_bound(net: Net, bounds_dict: Dict[int, Bounds],
-                              y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
+                              y_true: int, num_classes: int,
+                              solving_mode: BackendMode = BackendMode.V) -> Tuple[torch.Tensor, bool]:
     """Compute robust classification bound (min margin, is_certified)."""
-    return DualTF().compute_robust_bound(net, bounds_dict, y_true, num_classes)
+    return DualTF(solving_mode=solving_mode).compute_robust_bound(net, bounds_dict, y_true, num_classes)

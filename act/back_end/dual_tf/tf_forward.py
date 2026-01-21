@@ -26,7 +26,6 @@ from act.back_end.layer_schema import LayerKind
 # Main Entry Point
 # ============================================================================
 
-@torch.no_grad()
 def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
                            post_activation: bool = False) -> Dict[int, Bounds]:
     """

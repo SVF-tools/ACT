@@ -233,7 +233,6 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
 # Core solver workflow (shared by verify_once and BaB)
 # -----------------------------------------------------------------------------
 
-@torch.no_grad()
 def setup_and_solve(
     net,
     input_bounds: Bounds,
@@ -305,7 +304,6 @@ def setup_and_solve(
 # Single-shot verification
 # -----------------------------------------------------------------------------
 
-@torch.no_grad()
 def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> VerifResult:
     """
     Single-shot verification without refinement.

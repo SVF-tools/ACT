@@ -17,7 +17,6 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 # -------- Conv2D --------
-@torch.no_grad()
 def dual_conv2d_backward(
     nu: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
     stride: int = 1, padding: int = 0,
@@ -71,7 +70,6 @@ def dual_conv2d_backward(
     return v_out, contrib
 
 # -------- Pooling (placeholders) --------
-@torch.no_grad()
 def dual_maxpool2d_backward(
     nu: torch.Tensor, kernel_size: int = 2, stride: Optional[int] = None, padding: int = 0,
     input_shape: Optional[tuple] = None, output_shape: Optional[tuple] = None,
@@ -80,7 +78,6 @@ def dual_maxpool2d_backward(
     """MaxPool2d backward: distributes gradient to max locations. (Pending)"""
     raise NotImplementedError("dual_maxpool2d_backward: pending")
 
-@torch.no_grad()
 def dual_avgpool2d_backward(
     nu: torch.Tensor, kernel_size: int = 2, stride: Optional[int] = None, padding: int = 0,
     input_shape: Optional[tuple] = None, output_shape: Optional[tuple] = None

@@ -13,11 +13,57 @@
 #===---------------------------------------------------------------------===#
 
 import torch
+from enum import Enum
+from functools import wraps
 from typing import Dict, Any, Tuple, Optional
 from act.back_end.core import Bounds, ConSet
 from act.util.options import PerformanceOptions
 
 EPS = 1e-12
+
+
+# -------- Backend Solving Mode --------
+class BackendMode(Enum):
+    """Backend solving mode for transfer functions.
+    
+    The backend solving has two modes:
+        - V (Verification): Fast inference with @torch.no_grad(), used for
+          verifying neural network properties where gradients are not needed.
+        - T (Training): Gradients enabled for provable/certified training,
+          allowing backpropagation through bound computations to update weights.
+    
+    Usage:
+        tf = DualTF(solving_mode=BackendMode.V)  # Verification (default)
+        tf = DualTF(solving_mode=BackendMode.T)  # Training with gradients
+    """
+    V = 'v'  # Verification: @torch.no_grad(), no gradient computation
+    T = 't'  # Training: gradients enabled for provable training
+
+
+def _backend_mode(func):
+    """Decorator that applies torch.no_grad() based on self.solving_mode.
+    
+    The backend solving has two modes:
+        - BackendMode.V: Verification mode, runs with torch.no_grad()
+        - BackendMode.T: Training mode, gradients enabled for backprop
+    
+    Usage:
+        class DualTF:
+            def __init__(self, solving_mode: BackendMode = BackendMode.V):
+                self.solving_mode = solving_mode
+            
+            @_backend_mode
+            def compute_bound(self, ...):
+                ...
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if self.solving_mode == BackendMode.V:
+            with torch.no_grad():
+                return func(self, *args, **kwargs)
+        else:  # BackendMode.T
+            return func(self, *args, **kwargs)
+    return wrapper
 
 def box_join(a: Bounds, b: Bounds) -> Bounds:
     return Bounds(lb=torch.minimum(a.lb, b.lb), ub=torch.maximum(a.ub, b.ub))

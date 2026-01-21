@@ -17,7 +17,6 @@ from typing import Tuple
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
-@torch.no_grad()
 def hybridz_tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for LSTM cells."""
     # LSTM is complex with internal gates - conservative approximation
@@ -54,7 +53,6 @@ def hybridz_tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_gru(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for GRU cells."""
     # GRU is simpler than LSTM but still complex
@@ -81,7 +79,6 @@ def hybridz_tf_gru(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for basic RNN cells."""
     # Basic RNN: h_t = tanh(W_ih @ x_t + b_ih + W_hh @ h_{t-1} + b_hh)
@@ -111,7 +108,6 @@ def hybridz_tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for embedding lookup."""
     # Embedding lookup: discrete input indices -> continuous embeddings

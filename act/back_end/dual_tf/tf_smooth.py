@@ -36,7 +36,6 @@ def dtanh(x: torch.Tensor) -> torch.Tensor:
     return 1 - torch.tanh(x) ** 2
 
 # -------- Linear Relaxation --------
-@torch.no_grad()
 def compute_smooth_relaxation(
     l: torch.Tensor, u: torch.Tensor,
     func: Callable[[torch.Tensor], torch.Tensor],
@@ -78,7 +77,6 @@ def compute_smooth_relaxation(
     return k_lower, b_lower, k_upper, b_upper
 
 # -------- Smooth Backward --------
-@torch.no_grad()
 def dual_smooth_backward(
     nu: torch.Tensor, bounds: Bounds,
     func: Callable[[torch.Tensor], torch.Tensor],
@@ -104,12 +102,10 @@ def dual_smooth_backward(
     return v_out, contrib
 
 # -------- Sigmoid / Tanh --------
-@torch.no_grad()
 def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sigmoid backward: tangent-line relaxation for f(x) = 1/(1+exp(-x))."""
     return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid)
 
-@torch.no_grad()
 def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
     """Tanh backward: tangent-line relaxation for f(x) = tanh(x)."""
     return dual_smooth_backward(nu, bounds, tanh, dtanh)

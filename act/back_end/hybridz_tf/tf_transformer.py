@@ -19,7 +19,6 @@ from typing import Optional
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
-@torch.no_grad()
 def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for layer normalization with enhanced precision."""
     # Layer norm parameters
@@ -70,7 +69,6 @@ def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for GELU activation with piecewise linear approximation."""
     # GELU(x) = x * Φ(x) where Φ is CDF of standard normal
@@ -126,7 +124,6 @@ def gelu_approx(x: float) -> float:
     return 0.5 * x * (1.0 + math.tanh(inner))
 
 
-@torch.no_grad()
 def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for softmax with simplex constraints."""
     # Softmax output: exp(x_i) / sum(exp(x_j))
@@ -169,7 +166,6 @@ def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for positional encoding."""
     # Positional encoding adds fixed positional embeddings
@@ -193,7 +189,6 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_attention_scores(L: Layer, Q_bounds: Bounds, K_bounds: Bounds) -> Fact:
     """HybridZ transfer function for attention score computation: Q @ K^T / sqrt(d_k)."""
     d_k = L.meta.get("d_k", Q_bounds.lb.shape[-1])

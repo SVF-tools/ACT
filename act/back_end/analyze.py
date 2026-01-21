@@ -24,7 +24,6 @@ def initialize_tf_mode(mode: str = "interval"):
     """Initialize transfer function mode. Call this before using analyze()."""
     set_transfer_function_mode(mode)
 
-@torch.no_grad()
 def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple[Dict[int, Fact], Dict[int, Fact], ConSet]:
     """
     Perform abstract interpretation on the network starting from entry_fact.

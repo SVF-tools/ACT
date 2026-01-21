@@ -27,12 +27,10 @@ def _align(a: torch.Tensor, n: int) -> torch.Tensor:
     else: return a.flatten().repeat((n + a.numel() - 1) // a.numel())[:n]
 
 # -------- ReLU --------
-@torch.no_grad()
 def get_relu_masks(l: torch.Tensor, u: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get boolean masks: (on, off, amb) for ReLU neurons."""
     on, off = l >= 0, u <= 0; return on, off, ~(on | off)
 
-@torch.no_grad()
 def dual_relu_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     ReLU backward pass for dual bound computation (Wong-Kolter style).
@@ -87,7 +85,6 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, 
     return v_out, contrib
 
 # -------- Dense --------
-@torch.no_grad()
 def dual_dense_backward(nu: torch.Tensor, W: torch.Tensor, b: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dense backward: v_out = W^T @ v, contrib = -b^T @ v."""
     assert W.dim() == 2, f"W must be 2D, got shape {W.shape}"
@@ -98,19 +95,16 @@ def dual_dense_backward(nu: torch.Tensor, W: torch.Tensor, b: Optional[torch.Ten
     return v_out, contrib
 
 # -------- Bias / Scale / BatchNorm --------
-@torch.no_grad()
 def dual_bias_backward(nu: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Bias backward (y=x+c): v_out=v, contrib=-c^T@v."""
     v, c_flat = nu.flatten(), _align(c, nu.numel())
     return nu, -(c_flat @ v)
 
-@torch.no_grad()
 def dual_scale_backward(nu: torch.Tensor, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Scale backward (y=a*x): v_out=a*v, contrib=0."""
     a_aligned = _align(a, nu.numel()).view(nu.shape)
     return a_aligned * nu, torch.tensor(0.0, dtype=nu.dtype, device=nu.device)
 
-@torch.no_grad()
 def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """BatchNorm backward (y=A*x+c): v_out=A*v, contrib=-c^T@v."""
     v = nu.flatten()
@@ -119,7 +113,6 @@ def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor) -> Tupl
     return A_aligned * nu, -(c_aligned @ v)
 
 # -------- Identity-like --------
-@torch.no_grad()
 def dual_identity_backward(nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Identity backward (Flatten, Reshape, etc.): v_out=v, contrib=0."""
     return nu, torch.tensor(0.0, dtype=nu.dtype, device=nu.device)

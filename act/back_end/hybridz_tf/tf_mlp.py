@@ -18,7 +18,6 @@ from typing import Optional
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
-@torch.no_grad()
 def hybridz_tf_dense(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for dense/linear layers with zonotope precision."""
     # Extract parameters
@@ -55,7 +54,6 @@ def hybridz_tf_dense(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_bias(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for bias addition."""
     c = L.params["c"]
@@ -71,7 +69,6 @@ def hybridz_tf_bias(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_scale(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for element-wise scaling."""
     a = L.params["a"]
@@ -90,7 +87,6 @@ def hybridz_tf_scale(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_relu(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for ReLU activation with precise constraint handling."""
     # Determine ReLU phases
@@ -123,7 +119,6 @@ def hybridz_tf_relu(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for LeakyReLU."""
     alpha = float(L.meta.get("negative_slope", 0.01))
@@ -155,7 +150,6 @@ def hybridz_tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     
     return Fact(bounds=Bout, cons=cons)
 
-@torch.no_grad()
 def hybridz_tf_tanh(L: Layer, Bin: Bounds) -> Fact:
     lb = torch.tanh(Bin.lb)
     ub = torch.tanh(Bin.ub)
@@ -169,7 +163,6 @@ def hybridz_tf_tanh(L: Layer, Bin: Bounds) -> Fact:
 
     return Fact(bounds=Bout, cons=cons)
 
-@torch.no_grad()
 def hybridz_tf_sigmoid(L: Layer, Bin: Bounds) -> Fact:
     lb = torch.sigmoid(Bin.lb)
     ub = torch.sigmoid(Bin.ub)
@@ -182,7 +175,6 @@ def hybridz_tf_sigmoid(L: Layer, Bin: Bounds) -> Fact:
     cons.add_op(f"sigmoid:{L.id}", list(L.out_vars + L.in_vars))
     return Fact(bounds=Bout, cons=cons)
 
-@torch.no_grad()
 def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for absolute value."""
     # Determine phases
@@ -203,7 +195,6 @@ def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
 def hybridz_tf_add(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     """HybridZ transfer function for element-wise addition."""
     # Simple interval addition
@@ -217,7 +208,6 @@ def hybridz_tf_add(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()  
 def hybridz_tf_mul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     """HybridZ transfer function for element-wise multiplication with McCormick relaxation."""
     # McCormick envelope for bilinear terms
