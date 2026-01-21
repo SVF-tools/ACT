@@ -1,65 +1,157 @@
-# ACT Net generation config (YAML is used only at generation time).
-# Principle: describe the sampling space for architectures/specs; NetFactory writes JSON nets.
-# Determinism: base_seed controls reproducible sampling; null uses a random seed.
-# Coverage: families select MLP/CNN2D; choices/ranges define widths, depths, and specs.
-# Specs: input_spec/output_spec encode verification properties (BOX/LINF_BALL, TOP1/MARGIN/LINEAR/RANGE).
-# Output: JSON nets are written to output_dir; optional manifest records names and config path.
-# Notes: probabilities (p_*) apply only when multiple kinds are available.
+# ============================================================================
+# ACT Net Generation Config V2 (Categorized for Paper/Documentation)
+# ============================================================================
+# Design Principle: All sampling logic defined declaratively in YAML.
+# Rule Types: choice, range, weighted, repeat, probability, const.
+# Structure: Organized by configuration category for clear presentation.
+# ============================================================================
 
-generator:
-  num_instances: 5            # Number of nets to generate per run.
-  base_seed: null             # int for reproducible sampling; null = random seed.
-  name_prefix: cfg_seed       # Filename prefix (net name becomes f"{prefix}{seed}_idxXXXXX").
-  output_dir: act/back_end/examples/nets  # Output directory for generated JSON nets.
-  write_manifest: true        # Write manifest.json with generated net names.
-  manifest_path: null         # null = output_dir/manifest.json; or explicit path.
-  families: [mlp, cnn2d]      # Allowed model families to sample from.
-  p_mlp: 0.5                  # When all families exist, probability to choose MLP.
-  num_classes_choices: [10]   # Choices for output class count.
-  dtype: torch.float64        # Dtype recorded in INPUT meta and used for weights.
+# ============================================================================
+# 1. COMMON / GLOBAL SETTINGS
+# ============================================================================
+# These settings apply to all network types and control the generation process.
 
-mlp:
-  input_shapes: [[1, 6], [1, 16], [1, 3, 8]]  # Candidate input shapes (batch=1).
-  depth_range: [2, 4]          # Hidden-layer count for plain MLP.
-  width_choices: [32, 64, 128] # Hidden width choices.
-  activation_choices: [relu, tanh, sigmoid]  # Activation candidates.
-  dropout_p_choices: [0.0]     # Reserved (dropout not emitted by NetFactory).
-  block_p: 0.6                 # Probability of "block" variant.
-  block_count_range: [2, 6]    # Number of blocks in block variant.
-  block_width_choices: [32, 64, 128]  # Width for block variant.
-  post_block_activation_p: 0.8 # Activation after each block.
-  residual_p: 0.0              # Probability of residual variant.
-  residual_blocks_range: [1, 3]  # Residual block count.
-  residual_width_choices: [32, 64, 128]  # Residual block width.
+common:
+  num_instances: 5              # Number of networks to generate per run
+  base_seed: null               # Seed for reproducibility (null = random)
+  name_prefix: cfg_seed         # Prefix for generated network names
+  output_dir: act/back_end/examples/nets  # Output directory for JSON files
+  write_manifest: true          # Whether to write manifest.json
+  manifest_path: null           # Custom manifest path (null = auto)
+  dtype: torch.float64          # Data type for weights and computations
 
-cnn:
-  input_shapes: [[1, 1, 8, 8], [1, 3, 16, 16]]  # Candidate input shapes (batch=1).
-  num_blocks_range: [1, 3]     # Number of conv blocks in plain variant.
-  channels_choices: [8, 16, 32]  # Channels per conv block (plain variant).
-  kernel_choices: [3]          # Conv kernel sizes.
-  stride_choices: [1]          # Conv strides.
-  padding_choices: [1]         # Conv paddings.
-  use_maxpool_p: 0.3           # MaxPool after conv in plain variant.
-  fc_hidden_choices: [32, 64, 128]  # FC hidden width (plain variant).
-  activation_choices: [relu, tanh, sigmoid]  # Activation candidates.
-  stage_variant_p: 0.5         # Probability to use staged CNN variant.
-  stages_range: [1, 3]         # Stage count in staged variant.
-  blocks_per_stage_range: [1, 2]  # Blocks per stage.
-  base_channels_choices: [8, 16, 32]  # Base channels for staged variant.
-  channel_mult_choices: [2]    # Channel multiplier per stage.
-  downsample_choices: [maxpool, avgpool, stride2_conv]  # Stage downsample types.
-  double_conv_p_choices: [0.5, 0.7]  # Probability of double conv within a block.
+
+# ============================================================================
+# 2. FUNCTIONAL GROUPS (Validation & Specification)
+# ============================================================================
+# These configurations control input/output validation and constraints.
 
 input_spec:
-  kind_choices: [BOX, LINF_BALL]  # Input spec kinds to sample.
-  p_box: 0.5                   # Probability of BOX when both kinds exist.
-  value_range_choices: [[0.0, 1.0]]  # Allowed input value ranges.
-  eps_choices: [0.03, 0.05, 0.1]  # LINF_BALL epsilon choices.
+  # Input specification defines the domain of valid inputs
+  kind:
+    weighted:
+      BOX: 0.5                  # Box constraints (axis-aligned bounds)
+      LINF_BALL: 0.5            # L-infinity ball (epsilon around center)
+  value_range:
+    choice: [[0.0, 1.0]]        # Base value range for inputs
+  box_shrink_range: [0.0, 0.2]  # Shrinkage factor for BOX constraints
+  eps:
+    choice: [0.03, 0.05, 0.1]   # Epsilon values for LINF_BALL
 
 output_spec:
-  kind_choices: [TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, RANGE]  # Output spec kinds.
-  p_top1: 0.5                # Probability of TOP1 when both top1/margin exist.
-  margin_choices: [0.0, 0.1, 1.0]  # Margin choices for MARGIN_ROBUST.
-  linear_le_c_range: [-1.0, 1.0]  # Range for LINEAR_LE coefficient c.
-  linear_le_d_range: [-1.0, 1.0]  # Range for LINEAR_LE threshold d.
-  range_choices: [[-1.0, 1.0]]    # Range bounds for RANGE output spec.
+  # Output specification defines verification properties
+  kind:
+    weighted:
+      TOP1_ROBUST: 0.4          # Top-1 robustness (correct class wins)
+      MARGIN_ROBUST: 0.4        # Margin robustness (win by margin)
+      LINEAR_LE: 0.1            # Linear inequality constraint
+      RANGE: 0.1                # Output range constraint
+  margin:
+    choice: [0.0, 0.1, 1.0]     # Margin values for MARGIN_ROBUST
+  linear_le_c_range: [-1.0, 1.0]  # Coefficient range for LINEAR_LE
+  linear_le_d_range: [-1.0, 1.0]  # Constant range for LINEAR_LE
+  range_bounds:
+    choice: [[-1.0, 1.0]]       # Bounds for RANGE constraints
+
+
+# ============================================================================
+# 3. MODEL FAMILY SELECTION STRATEGY
+# ============================================================================
+# Defines how to sample from different network architectures.
+
+family_selection:
+  weighted:
+    mlp: 0.5                    # Multi-layer Perceptron weight
+    cnn2d: 0.5                  # 2D Convolutional Network weight
+
+
+# ============================================================================
+# 4. FAMILY-SPECIFIC PARAMETERS
+# ============================================================================
+# Each network family has unique structural parameters.
+
+families:
+  # --------------------------------------------------------------------------
+  # 4.1 MLP (Multi-Layer Perceptron) Family
+  # --------------------------------------------------------------------------
+  mlp:
+    input_shape:
+      choice: [[1, 6], [1, 16], [1, 3, 8]]  # Input tensor shapes
+    depth:
+      range: [2, 4]             # Number of hidden layers
+    hidden_sizes:
+      repeat:
+        count: { range: [2, 4] }
+        value: { choice: [32, 64, 128] }  # Width of each hidden layer
+    activation:
+      choice: [relu, tanh, sigmoid]  # Activation functions
+    variant:
+      weighted:
+        plain: 0.4              # Plain feedforward MLP
+        block: 0.6              # Block-structured MLP
+        residual: 0.0           # Residual MLP (disabled)
+    num_blocks:
+      range: [2, 6]             # Number of blocks (block variant)
+    block_width:
+      choice: [32, 64, 128]     # Width per block (block variant)
+    post_block_activation:
+      probability: 0.8          # Add activation after each block
+    num_residual_blocks:
+      range: [1, 3]             # Number of residual blocks
+    residual_width:
+      choice: [32, 64, 128]     # Width of residual blocks
+    use_bias:
+      const: true               # Enable bias terms in linear layers
+    num_classes:
+      choice: [10]              # Number of output classes
+
+  # --------------------------------------------------------------------------
+  # 4.2 CNN2D (2D Convolutional Network) Family
+  # --------------------------------------------------------------------------
+  cnn2d:
+    input_shape:
+      choice: [[1, 1, 8, 8], [1, 3, 16, 16]]  # Input shapes [B,C,H,W]
+    variant:
+      weighted:
+        plain: 0.5              # Plain sequential CNN
+        stage: 0.5              # Staged CNN (e.g., ResNet-like)
+    num_blocks:
+      range: [1, 3]             # Number of conv blocks (plain variant)
+    conv_channels:
+      repeat:
+        count: { range: [1, 3] }
+        value: { choice: [8, 16, 32] }  # Channels per conv block
+    kernel_sizes:
+      choice: [3]               # Convolution kernel sizes
+    strides:
+      choice: [1]               # Convolution strides
+    paddings:
+      choice: [1]               # Convolution padding
+    use_maxpool:
+      probability: 0.3          # Add max pooling layers
+    maxpool_kernel:
+      const: 2                  # Max pool kernel size
+    maxpool_stride:
+      const: 2                  # Max pool stride
+    fc_hidden:
+      choice: [32, 64, 128]     # Hidden units in FC head (plain variant)
+    stages:
+      range: [1, 3]             # Number of stages (stage variant)
+    blocks_per_stage:
+      range: [1, 2]             # Blocks per stage
+    base_channels:
+      choice: [8, 16, 32]       # Base channel count (stage variant)
+    channel_mult:
+      choice: [2]               # Channel multiplier between stages
+    downsample:
+      choice: [maxpool, avgpool, stride2_conv]  # Downsampling method
+    double_conv_p:
+      choice: [0.5, 0.7]        # Probability of double convolution
+    head_pool_to_1x1:
+      const: true               # Global pooling before FC head
+    activation:
+      choice: [relu, tanh, sigmoid]  # Activation functions
+    use_bias:
+      const: true               # Enable bias in conv/linear layers
+    num_classes:
+      choice: [10]              # Number of output classes

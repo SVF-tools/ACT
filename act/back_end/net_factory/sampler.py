@@ -1,4 +1,4 @@
-#===- act/back_end/net_factory/sampler.py - Config Sampling Logic --------===#
+#===- act/back_end/net_factory/sampler_v2.py - Generic YAML Sampler ------===#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -7,177 +7,146 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   Sampling-only module for NetFactory.
-#   - Reads config dicts and samples architecture/spec parameters.
-#   - Uses caller-provided RNG for deterministic runs.
-#   - Produces plain dicts consumed by layer_builder/factory.
-#   - No file I/O and no Net/Layer construction here.
+#   Generic rule-based sampler that reads YAML config and samples values.
+#   Eliminates model-specific sampling logic by using declarative rules:
+#   - choice: random selection from list
+#   - range: random integer in [lo, hi]
+#   - weighted: weighted random choice
+#   - repeat: repeat sampling N times
+#   - probability: boolean with probability p
+#   - const: constant value
 #
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List
-
-
-# ============================================================================
-# Internal Utility Functions
-# ============================================================================
-
-
-def _randint_inclusive(rng: random.Random, lo_hi: List[int]) -> int:
-    """Sample random int from [lo, hi] inclusive."""
-    lo, hi = int(lo_hi[0]), int(lo_hi[1])
-    if hi < lo:
-        lo, hi = hi, lo
-    return rng.randint(lo, hi)
-
-
-def _choose(rng: random.Random, items: List[Any], *, name: str) -> Any:
-    """Randomly _choose from items with error handling."""
-    if not items:
-        raise ValueError(f"Config.{name} must be non-empty")
-    return rng.choice(list(items))
+from typing import Any, Dict, List, Tuple, Union
 
 
 class ConfigSampler:
-    """Samples architecture and spec configs from YAML config."""
+    """Generic sampler that uses YAML-defined sampling rules."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
 
-    def sample_family(self, rng: random.Random) -> str:
-        """Sample model family (mlp or cnn2d)."""
-        gen = self.config["generator"]
-        fams = list(gen["families"])
-        if len(fams) == 1:
-            return str(fams[0])
+    def _sample_value(self, rng: random.Random, rule: Any) -> Any:
+        """
+        Sample a value based on a rule definition.
 
-        has_mlp = "mlp" in fams
-        has_cnn = "cnn2d" in fams
-        if has_mlp and has_cnn:
-            return "mlp" if (rng.random() < float(gen["p_mlp"])) else "cnn2d"
-        return str(rng.choice(fams))
+        Rules:
+        - {choice: [v1, v2, ...]} -> random choice
+        - {range: [lo, hi]} -> random int in [lo, hi]
+        - {weighted: {k1: w1, k2: w2, ...}} -> weighted choice
+        - {repeat: {count: rule, value: rule}} -> list of sampled values
+        - {probability: p} -> boolean (True with probability p)
+        - {const: v} -> constant value v
+        - plain value -> return as-is
+        """
+        if not isinstance(rule, dict):
+            return rule
 
-    def sample_mlp(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
-        """Sample MLP configuration."""
-        cfg = self.config["mlp"]
-        input_shape = _choose(rng, cfg["input_shapes"], name="mlp.input_shapes")
-        depth = _randint_inclusive(rng, cfg["depth_range"])
-        if depth <= 0:
-            raise ValueError(f"mlp.depth_range produced non-positive depth={depth}")
+        if "const" in rule:
+            return rule["const"]
 
-        widths = [int(_choose(rng, cfg["width_choices"], name="mlp.width_choices")) for _ in range(depth)]
-        activation = str(_choose(rng, cfg["activation_choices"], name="mlp.activation_choices"))
+        if "choice" in rule:
+            items = rule["choice"]
+            if not items:
+                raise ValueError("choice rule must have non-empty list")
+            return rng.choice(items)
 
-        # Determine variant
-        block_p = float(cfg["block_p"])
-        residual_p = float(cfg["residual_p"])
-        r = rng.random()
-        if r < residual_p:
-            variant = "residual"
-        elif r < residual_p + block_p:
-            variant = "block"
+        if "range" in rule:
+            lo, hi = rule["range"]
+            lo, hi = int(lo), int(hi)
+            if hi < lo:
+                lo, hi = hi, lo
+            return rng.randint(lo, hi)
+
+        if "weighted" in rule:
+            weights = rule["weighted"]
+            if not weights:
+                raise ValueError("weighted rule must have non-empty dict")
+            items = list(weights.keys())
+            probs = list(weights.values())
+            total = sum(probs)
+            if total <= 0:
+                raise ValueError("weighted rule must have positive total weight")
+            normalized = [p / total for p in probs]
+            return rng.choices(items, weights=normalized)[0]
+
+        if "repeat" in rule:
+            repeat_rule = rule["repeat"]
+            count = self._sample_value(rng, repeat_rule["count"])
+            value_rule = repeat_rule["value"]
+            return [self._sample_value(rng, value_rule) for _ in range(int(count))]
+
+        if "probability" in rule:
+            p = float(rule["probability"])
+            return rng.random() < p
+
+        raise ValueError(f"Unknown sampling rule: {rule}")
+
+    def _sample_dict(self, rng: random.Random, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively sample all values in a dict spec."""
+        result = {}
+        for key, value in spec.items():
+            if isinstance(value, dict):
+                # Check if it's a sampling rule or nested dict
+                is_rule = any(k in value for k in ["choice", "range", "weighted", "repeat", "probability", "const"])
+                if is_rule:
+                    result[key] = self._sample_value(rng, value)
+                else:
+                    result[key] = self._sample_dict(rng, value)
+            else:
+                result[key] = value
+        return result
+
+    def sample_family(self, rng: random.Random) -> Tuple[str, Dict[str, Any]]:
+        """
+        Sample a family and its parameters.
+        Returns: (family_name, sampled_params)
+        """
+        # Sample family from selection strategy
+        family_selection = self.config["family_selection"]
+        if "weighted" in family_selection:
+            weights = family_selection["weighted"]
+            family_names = list(weights.keys())
+            weight_values = list(weights.values())
+            total = sum(weight_values)
+            normalized = [w / total for w in weight_values]
+            family = rng.choices(family_names, weights=normalized)[0]
         else:
-            variant = "plain"
+            raise ValueError("family_selection must have 'weighted' strategy")
 
-        return {
-            "input_shape": tuple(int(x) for x in input_shape),
-            "hidden_sizes": tuple(widths),
-            "variant": variant,
-            "num_blocks": int(_randint_inclusive(rng, cfg["block_count_range"])),
-            "block_width": int(_choose(rng, cfg["block_width_choices"], name="mlp.block_width_choices")),
-            "post_block_activation": bool(rng.random() < float(cfg["post_block_activation_p"])),
-            "num_residual_blocks": int(_randint_inclusive(rng, cfg["residual_blocks_range"])),
-            "residual_width": int(_choose(rng, cfg["residual_width_choices"], name="mlp.residual_width_choices")),
-            "activation": activation,
-            "use_bias": True,
-            "num_classes": int(num_classes),
-        }
+        # Sample family parameters
+        families = self.config["families"]
+        params_spec = families[family]
+        params = self._sample_dict(rng, params_spec)
 
-    def sample_cnn2d(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
-        """Sample CNN configuration."""
-        cfg = self.config["cnn"]
-        input_shape = _choose(rng, cfg["input_shapes"], name="cnn.input_shapes")
-        if int(input_shape[2]) > 32 or int(input_shape[3]) > 32:
-            raise ValueError(f"cnn.input_shapes must have H,W <= 32, got {input_shape}")
+        # Convert types for compatibility with layer_builder
+        if "input_shape" in params:
+            params["input_shape"] = tuple(int(x) for x in params["input_shape"])
+        if "hidden_sizes" in params:
+            params["hidden_sizes"] = tuple(int(x) for x in params["hidden_sizes"])
+        if "conv_channels" in params:
+            params["conv_channels"] = tuple(int(x) for x in params["conv_channels"])
 
-        variant = "stage" if (rng.random() < float(cfg["stage_variant_p"])) else "plain"
-        blocks = _randint_inclusive(rng, cfg["num_blocks_range"])
-        if blocks <= 0:
-            raise ValueError(f"cnn.num_blocks_range produced non-positive blocks={blocks}")
-
-        # Sample conv channels
-        conv_channels: List[int] = []
-        for _ in range(blocks):
-            ch = int(_choose(rng, cfg["channels_choices"], name="cnn.channels_choices"))
-            conv_channels.append(ch)
-
-        # Sample stage parameters
-        stages = _randint_inclusive(rng, cfg["stages_range"])
-        base_channels = int(_choose(rng, cfg["base_channels_choices"], name="cnn.base_channels_choices"))
-        channel_mult = int(_choose(rng, cfg["channel_mult_choices"], name="cnn.channel_mult_choices"))
-
-        # Limit max channels to 64
-        max_channels = base_channels * (channel_mult ** (stages - 1))
-        if max_channels > 64:
-            stages = max(1, min(stages, 3))
-            while stages > 1 and base_channels * (channel_mult ** (stages - 1)) > 64:
-                stages -= 1
-            max_channels = base_channels * (channel_mult ** (stages - 1))
-            if max_channels > 64:
-                base_channels = min(base_channels, 64)
-
-        return {
-            "input_shape": tuple(int(x) for x in input_shape),
-            "conv_channels": tuple(conv_channels),
-            "variant": variant,
-            "stages": int(stages),
-            "blocks_per_stage": int(_randint_inclusive(rng, cfg["blocks_per_stage_range"])),
-            "base_channels": int(base_channels),
-            "channel_mult": int(channel_mult),
-            "downsample": str(_choose(rng, cfg["downsample_choices"], name="cnn.downsample_choices")),
-            "double_conv_p": float(_choose(rng, cfg["double_conv_p_choices"], name="cnn.double_conv_p_choices")),
-            "head_pool_to_1x1": True,
-            "kernel_sizes": int(_choose(rng, cfg["kernel_choices"], name="cnn.kernel_choices")),
-            "strides": int(_choose(rng, cfg["stride_choices"], name="cnn.stride_choices")),
-            "paddings": int(_choose(rng, cfg["padding_choices"], name="cnn.padding_choices")),
-            "activation": str(_choose(rng, cfg["activation_choices"], name="cnn.activation_choices")),
-            "use_bias": True,
-            "use_maxpool": bool(rng.random() < float(cfg["use_maxpool_p"])),
-            "maxpool_kernel": 2,
-            "maxpool_stride": 2,
-            "num_classes": int(num_classes),
-            "fc_hidden": int(_choose(rng, cfg["fc_hidden_choices"], name="cnn.fc_hidden_choices")),
-        }
+        return family, params
 
     def sample_input_spec(self, rng: random.Random) -> Dict[str, Any]:
         """Sample input specification."""
-        cfg = self.config["input_spec"]
-        kinds = list(cfg["kind_choices"])
-
-        # Choose kind
-        if len(kinds) == 1:
-            kind = kinds[0]
-        else:
-            has_box = "BOX" in kinds
-            has_linf = "LINF_BALL" in kinds
-            if has_box and has_linf and len(kinds) == 2:
-                kind = "BOX" if (rng.random() < float(cfg["p_box"])) else "LINF_BALL"
-            else:
-                kind = rng.choice(kinds)
-
-        # Sample value range
-        value_range = _choose(rng, cfg["value_range_choices"], name="input_spec.value_range_choices")
+        spec_config = self.config["input_spec"]
+        kind = self._sample_value(rng, spec_config["kind"])
+        value_range = self._sample_value(rng, spec_config["value_range"])
         lo, hi = float(value_range[0]), float(value_range[1])
         if hi < lo:
             lo, hi = hi, lo
 
         if kind == "BOX":
+            shrink_range = spec_config.get("box_shrink_range", [0.0, 0.2])
             span = hi - lo
-            shrink_a = rng.random() * 0.2
-            shrink_b = rng.random() * 0.2
+            shrink_a = rng.random() * shrink_range[1]
+            shrink_b = rng.random() * shrink_range[1]
             lb_val = lo + span * shrink_a
             ub_val = hi - span * shrink_b
             if ub_val < lb_val:
@@ -191,8 +160,8 @@ class ConfigSampler:
 
         if kind == "LINF_BALL":
             center_val = lo + (hi - lo) * rng.random()
-            eps = float(_choose(rng, cfg["eps_choices"], name="input_spec.eps_choices"))
-            eps = min(eps, 0.5 * (hi - lo)) if (hi > lo) else 0.0
+            eps = self._sample_value(rng, spec_config["eps"])
+            eps = min(float(eps), 0.5 * (hi - lo)) if (hi > lo) else 0.0
             return {
                 "kind": "LINF_BALL",
                 "value_range": (lo, hi),
@@ -204,38 +173,29 @@ class ConfigSampler:
 
     def sample_output_spec(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
         """Sample output specification."""
-        cfg = self.config["output_spec"]
-        kinds = list(cfg["kind_choices"])
-
-        # Choose kind
-        if len(kinds) == 1:
-            kind = kinds[0]
-        else:
-            has_top1 = "TOP1_ROBUST" in kinds
-            has_margin = "MARGIN_ROBUST" in kinds
-            if has_top1 and has_margin and len(kinds) == 2:
-                kind = "TOP1_ROBUST" if (rng.random() < float(cfg["p_top1"])) else "MARGIN_ROBUST"
-            else:
-                kind = rng.choice(kinds)
-
+        spec_config = self.config["output_spec"]
+        kind = self._sample_value(rng, spec_config["kind"])
         y_true = int(rng.randrange(int(num_classes)))
 
         if kind == "TOP1_ROBUST":
             return {"kind": "TOP1_ROBUST", "y_true": y_true}
 
         if kind == "MARGIN_ROBUST":
-            margin = float(_choose(rng, cfg["margin_choices"], name="output_spec.margin_choices"))
+            margin = self._sample_value(rng, spec_config["margin"])
             return {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin)}
 
         if kind == "LINEAR_LE":
-            c_lo, c_hi = cfg["linear_le_c_range"]
-            d_lo, d_hi = cfg["linear_le_d_range"]
+            c_range = spec_config["linear_le_c_range"]
+            d_range = spec_config["linear_le_d_range"]
+            c_lo, c_hi = c_range[0], c_range[1]
+            d_lo, d_hi = d_range[0], d_range[1]
             c_vals = [c_lo + (c_hi - c_lo) * rng.random() for _ in range(int(num_classes))]
             d_val = d_lo + (d_hi - d_lo) * rng.random()
             return {"kind": "LINEAR_LE", "c": [float(x) for x in c_vals], "d": float(d_val)}
 
         if kind == "RANGE":
-            lo, hi = _choose(rng, cfg["range_choices"], name="output_spec.range_choices")
+            bounds = self._sample_value(rng, spec_config["range_bounds"])
+            lo, hi = bounds[0], bounds[1]
             lb_vals = []
             ub_vals = []
             for _ in range(int(num_classes)):

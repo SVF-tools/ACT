@@ -81,25 +81,25 @@ class NetFactory:
     ):
         self.config_path = str(gen_config_path)
         self.config = self._load_config(self.config_path)
-        gen = self.config["generator"]
+        common = self.config["common"]
 
         # Initialize sampler
         self.sampler = ConfigSampler(self.config)
 
         # Setup generation parameters
-        base_seed = base_seed if base_seed is not None else gen.get("base_seed")
+        base_seed = base_seed if base_seed is not None else common.get("base_seed")
         self.base_seed = int(base_seed) if base_seed is not None else int(secrets.randbits(32))
-        self.num_instances = int(num_instances) if num_instances is not None else int(gen["num_instances"])
-        self.name_prefix = str(name_prefix) if name_prefix is not None else str(gen["name_prefix"])
+        self.num_instances = int(num_instances) if num_instances is not None else int(common["num_instances"])
+        self.name_prefix = str(name_prefix) if name_prefix is not None else str(common["name_prefix"])
 
         # Setup output paths
-        output_dir = output_dir or gen["output_dir"]
+        output_dir = output_dir or common["output_dir"]
         self.output_dir = Path(str(output_dir))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.write_manifest = bool(write_manifest) if write_manifest is not None else bool(gen["write_manifest"])
+        self.write_manifest = bool(write_manifest) if write_manifest is not None else bool(common["write_manifest"])
         if manifest_path is None:
-            manifest_path = gen.get("manifest_path")
+            manifest_path = common.get("manifest_path")
         self.manifest_path = Path(manifest_path) if manifest_path else (self.output_dir / "manifest.json")
 
     @staticmethod
@@ -206,20 +206,13 @@ class NetFactory:
 
     def _sample_instance(self, idx: int) -> Dict[str, Any]:
         """Sample a single network instance configuration."""
-        gen = self.config["generator"]
         instance_id = f"{self.name_prefix}{int(self.base_seed)}_idx{int(idx):05d}"
         seed = int(_derive_seed(int(self.base_seed), int(idx), instance_id))
         rng = random.Random(seed)
 
-        family = self.sampler.sample_family(rng)
-        num_classes = int(_choose(rng, gen["num_classes_choices"], name="generator.num_classes_choices"))
-
-        if family == "mlp":
-            model_cfg = self.sampler.sample_mlp(rng, num_classes=num_classes)
-        elif family == "cnn2d":
-            model_cfg = self.sampler.sample_cnn2d(rng, num_classes=num_classes)
-        else:
-            raise ValueError(f"Unknown family: {family}")
+        # Sampler returns (family, model_cfg) directly
+        family, model_cfg = self.sampler.sample_family(rng)
+        num_classes = int(model_cfg["num_classes"])
 
         input_spec = self.sampler.sample_input_spec(rng)
         output_spec = self.sampler.sample_output_spec(rng, num_classes=num_classes)
@@ -387,8 +380,8 @@ class NetFactory:
     def generate(self) -> List[str]:
         """Generate all network instances."""
         print(f"Generating {self.num_instances} networks...")
-        gen = self.config["generator"]
-        dtype = str(gen["dtype"])
+        common = self.config["common"]
+        dtype = str(common["dtype"])
 
         names: List[str] = []
         for idx in range(self.num_instances):
