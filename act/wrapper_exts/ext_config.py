@@ -13,7 +13,7 @@ import onnx
 import tensorflow as tf
 import torchvision
 import torchvision.transforms as transforms
-from onnx2pytorch import ConvertModel
+from onnx2torch import convert
 import subprocess
 
 from enum import Enum
@@ -206,8 +206,19 @@ class Model:
     def convert_onnx_to_pytorch(self):
         try:
             onnx_model = onnx.load(self.model_path)
-            self.pytorch_model = ConvertModel(onnx_model, experimental=True)
+            self.pytorch_model = convert(onnx_model)
             self.pytorch_model.eval()
+            
+            # Apply device and dtype settings
+            try:
+                from act.util.device_manager import get_default_device, get_default_dtype
+                target_device = get_default_device()
+                target_dtype = get_default_dtype()
+                self.pytorch_model = self.pytorch_model.to(dtype=target_dtype, device=target_device)
+            except Exception as dtype_e:
+                # Fallback: convert to float64 by default for ACT consistency
+                self.pytorch_model = self.pytorch_model.double()
+                print(f"[WARN] Could not apply device_manager settings: {dtype_e}, using float64")
         except Exception as e:
             raise RuntimeError(f"Failed to convert ONNX model to PyTorch: {e}")
 
@@ -242,8 +253,19 @@ class Model:
 
         try:
             onnx_model = onnx.load(onnx_path)
-            self.pytorch_model = ConvertModel(onnx_model, experimental=True)
+            self.pytorch_model = convert(onnx_model)
             self.pytorch_model.eval()
+            
+            # Apply device and dtype settings
+            try:
+                from act.util.device_manager import get_default_device, get_default_dtype
+                target_device = get_default_device()
+                target_dtype = get_default_dtype()
+                self.pytorch_model = self.pytorch_model.to(dtype=target_dtype, device=target_device)
+            except Exception as dtype_e:
+                # Fallback: convert to float64 by default for ACT consistency
+                self.pytorch_model = self.pytorch_model.double()
+                print(f"[WARN] Could not apply device_manager settings: {dtype_e}, using float64")
         except Exception as e:
             raise RuntimeError(f"Failed to convert TF/Keras model to PyTorch: {e}")
 

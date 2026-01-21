@@ -621,7 +621,16 @@ def cmd_verify(target: str, args):
 
 
 def cmd_validate_verifier(args):
-    """Run verifier validation with specified mode."""
+    """Run verifier validation with specified mode.
+    
+    Args:
+        mode: validation mode (counterexample, bounds, comprehensive)
+        networks: list of networks to validate (default: all)
+        solvers: list of solvers to use (default: gurobi torchlp)
+        tf_modes: list of transfer function modes to use (default: interval)
+        samples: number of samples to use (default: 10)
+        per_neuron_config: per-neuron configuration (default: default)
+    """
     import torch
     from act.pipeline.verification.validate_verifier import VerificationValidator
     
@@ -911,7 +920,7 @@ Examples:
         "--tf-modes",
         nargs='+',
         default=['interval'],
-        help="Transfer function modes for Level 3 (default: interval)"
+        help="Transfer function modes for Level 2 bounds validation: interval, hybridz, dual (default: interval)"
     )
     validation_group.add_argument(
         "--samples",

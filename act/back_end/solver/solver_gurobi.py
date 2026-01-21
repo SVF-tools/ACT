@@ -23,22 +23,22 @@ def setup_gurobi_license():
     if 'GRB_LICENSE_FILE' not in os.environ:
         if 'ACTHOME' in os.environ:
             license_path = os.path.join(os.environ['ACTHOME'], 'modules', 'gurobi', 'gurobi.lic')
-            print(f"[ACT] Using ACTHOME environment variable: {os.environ['ACTHOME']}")
+            print(f"[ACT] Using ACTHOME environment variable: {os.path.relpath(os.environ['ACTHOME'])}")
         else:
             project_root = get_project_root()
             license_path = os.path.join(project_root, 'modules', 'gurobi', 'gurobi.lic')
-            print(f"[ACT] Auto-detecting project root: {project_root}")
+            print(f"[ACT] Auto-detecting project root: {os.path.relpath(project_root)}")
         
         license_path = os.path.abspath(license_path)
         
         if os.path.exists(license_path):
             os.environ['GRB_LICENSE_FILE'] = license_path
-            print(f"[ACT] Gurobi license found and set: {license_path}")
+            print(f"[ACT] Gurobi license found: {os.path.relpath(license_path)}")
         else:
-            print(f"[WARN] Gurobi license not found at: {license_path}")
-            print(f"[INFO] Please ensure gurobi.lic is placed in: {os.path.dirname(license_path)}")
+            print(f"[WARN] Gurobi license not found: {os.path.relpath(license_path)}")
+            print(f"[INFO] Please place gurobi.lic in: {os.path.relpath(os.path.dirname(license_path))}")
     else:
-        print(f"[ACT] Using existing Gurobi license: {os.environ['GRB_LICENSE_FILE']}")
+        print(f"[ACT] Using existing Gurobi license: {os.path.relpath(os.environ['GRB_LICENSE_FILE'])}")
 
 setup_gurobi_license()
 

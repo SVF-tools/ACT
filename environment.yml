@@ -23,7 +23,7 @@ dependencies:
   - pip
   - pip:
       # ONNX ecosystem - for VNNLib benchmarks
-      - onnx2pytorch
+      - onnx2torch
       - onnxconverter-common
       - onnxscript
       - onnx-simplifier  # Optional optimizer, may have build issues on some systems

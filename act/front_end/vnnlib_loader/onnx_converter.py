@@ -50,7 +50,7 @@ def convert_onnx_to_pytorch(
     try:
         # Import here to avoid requiring onnx for non-VNNLIB workflows
         import onnx
-        from onnx2pytorch import ConvertModel
+        from onnx2torch import convert
         
         # Load ONNX model
         logger.info(f"Loading ONNX model from {onnx_path}")
@@ -71,7 +71,7 @@ def convert_onnx_to_pytorch(
         
         # Convert to PyTorch
         logger.info("Converting ONNX to PyTorch")
-        pytorch_model = ConvertModel(onnx_model)
+        pytorch_model = convert(onnx_model)
         pytorch_model.eval()
         
         # Convert model to match device_manager settings
@@ -81,7 +81,7 @@ def convert_onnx_to_pytorch(
             target_dtype = get_default_dtype()
             
             # Move model to target device and dtype
-            pytorch_model = pytorch_model.to(device=target_device, dtype=target_dtype)
+            pytorch_model = pytorch_model.to(dtype=target_dtype, device=target_device)
             logger.info(f"Converted model to device={target_device}, dtype={target_dtype}")
         except Exception as e:
             logger.warning(f"Could not apply device_manager settings: {e}")
@@ -92,7 +92,7 @@ def convert_onnx_to_pytorch(
     except ImportError as e:
         raise ONNXConversionError(
             f"Missing dependency for ONNX conversion: {e}\n"
-            "Install with: pip install onnx onnx2pytorch onnx-simplifier"
+            "Install with: pip install onnx onnx2torch onnx-simplifier"
         )
     except Exception as e:
         raise ONNXConversionError(f"Failed to convert {onnx_path}: {str(e)}")

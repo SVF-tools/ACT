@@ -117,7 +117,7 @@ def set_transfer_function_mode(mode: str = "interval") -> None:
     """Set transfer function implementation by mode name.
     
     Args:
-        mode: "interval" for IntervalTF, "hybridz" for HybridzTF
+        mode: "interval" for IntervalTF, "hybridz" for HybridzTF, "dual" for DualTF
     """
     if mode == "interval":
         from act.back_end.interval_tf import IntervalTF
@@ -125,8 +125,11 @@ def set_transfer_function_mode(mode: str = "interval") -> None:
     elif mode == "hybridz":
         from act.back_end.hybridz_tf import HybridzTF
         set_transfer_function(HybridzTF())
+    elif mode == "dual":
+        from act.back_end.dual_tf import DualTF
+        set_transfer_function(DualTF())
     else:
-        raise ValueError(f"Unknown transfer function mode: {mode}. Use 'interval' or 'hybridz'.")
+        raise ValueError(f"Unknown transfer function mode: {mode}. Use 'interval', 'hybridz', or 'dual'.")
 
 
 

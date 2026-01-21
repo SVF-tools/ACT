@@ -24,10 +24,15 @@ cd ACT
 cp /path/to/your/gurobi.lic ./modules/gurobi/gurobi.lic  # put gurobi.lic file in ./modules/gurobi/ directory
 ```
 
-# 3. Run ACT phases
+## 3. Run ACT phases
 ```
 python -m act.pipeline --help
 ```
+
+## 4. Small Jupyter notebook demos
+- [ACT Fuzzer example](https://github.com/SVF-tools/ACT/blob/main/ipynb/vnnlib_fuzzer.ipynb)
+- [ACT Verifier example](https://github.com/SVF-tools/ACT/blob/main/ipynb/vnnlib_verifier.ipynb)
+- [More](https://github.com/SVF-tools/ACT/tree/main/ipynb)
 
 ### License
 ACT is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).

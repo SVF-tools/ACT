@@ -27,6 +27,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# Shape utilities
+# -----------------------------------------------------------------------------
+
+def _prod(shape_tail: Tuple[int, ...]) -> int:
+    """Compute product of shape dimensions."""
+    result = 1
+    for s in shape_tail:
+        result *= int(s)
+    return result
+
+
+def _normalize_tuple(val: Any, default: Tuple[int, int] = (1, 1)) -> Tuple[int, int]:
+    """Normalize int or tuple to 2-tuple for kernel_size/stride/padding."""
+    if isinstance(val, tuple):
+        return val
+    return (val, val) if val is not None else default
+
+
 @dataclass
 class PerformanceMetrics:
     """Performance metrics for validation operations."""
