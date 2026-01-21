@@ -38,8 +38,7 @@ from act.back_end.serialization import (
 
 def create_test_networks():
     """Load all ACT networks from the examples folder using proper deserialization."""
-    from act.util.path_config import get_examples_nets_dir
-    examples_dir = Path(get_examples_nets_dir())
+    examples_dir = Path("act/back_end/examples/nets")
     test_nets = {}
 
     # Gather JSON files

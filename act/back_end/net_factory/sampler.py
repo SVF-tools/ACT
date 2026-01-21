@@ -101,10 +101,10 @@ class ConfigSampler:
                 result[key] = value
         return result
 
-    def sample_family(self, rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    def sample_family(self, rng: random.Random) -> Tuple[str, Dict[str, Any]]:
         """
         Sample a family and its parameters.
-        Returns: (family_name, family_type, sampled_params)
+        Returns: (family_name, sampled_params)
         """
         # Sample family from selection strategy
         family_selection = self.config["family_selection"]
@@ -114,22 +114,13 @@ class ConfigSampler:
             weight_values = list(weights.values())
             total = sum(weight_values)
             normalized = [w / total for w in weight_values]
-            family_name = rng.choices(family_names, weights=normalized)[0]
+            family = rng.choices(family_names, weights=normalized)[0]
         else:
             raise ValueError("family_selection must have 'weighted' strategy")
 
-        # Get family configuration and type
+        # Sample family parameters
         families = self.config["families"]
-        if family_name not in families:
-            raise ValueError(f"Family '{family_name}' not found in families section")
-
-        family_config = families[family_name]
-        family_type = family_config.get("type")
-        if not family_type:
-            raise ValueError(f"Family '{family_name}' missing required 'type' field")
-
-        # Sample family parameters (excluding 'type')
-        params_spec = {k: v for k, v in family_config.items() if k != "type"}
+        params_spec = families[family]
         params = self._sample_dict(rng, params_spec)
 
         # Convert types for compatibility with layer_builder
@@ -140,7 +131,7 @@ class ConfigSampler:
         if "conv_channels" in params:
             params["conv_channels"] = tuple(int(x) for x in params["conv_channels"])
 
-        return family_name, family_type, params
+        return family, params
 
     def sample_input_spec(self, rng: random.Random) -> Dict[str, Any]:
         """Sample input specification."""
