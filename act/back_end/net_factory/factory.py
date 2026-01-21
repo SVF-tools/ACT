@@ -38,7 +38,31 @@ from act.util.path_config import get_examples_gen_config_path
 
 from .layer_builder import build_cnn_layers, build_mlp_layers
 from .sampler import ConfigSampler
-from .utils import choose, derive_seed
+
+
+# ============================================================================
+# Internal Utility Functions
+# ============================================================================
+
+
+def _stable_u32_from_bytes(data: bytes) -> int:
+    """Extract stable u32 from bytes."""
+    return int.from_bytes(data[:4], byteorder="little", signed=False)
+
+
+def _derive_seed(base_seed: int, idx: int, instance_id: str) -> int:
+    """Derive deterministic seed from base_seed, index, and instance_id."""
+    import hashlib
+    payload = f"{base_seed}|{idx}|{instance_id}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return _stable_u32_from_bytes(digest)
+
+
+def _choose(rng: random.Random, items: List[Any], *, name: str) -> Any:
+    """Randomly choose from items with error handling."""
+    if not items:
+        raise ValueError(f"Config.{name} must be non-empty")
+    return rng.choice(list(items))
 
 
 class NetFactory:
@@ -184,11 +208,11 @@ class NetFactory:
         """Sample a single network instance configuration."""
         gen = self.config["generator"]
         instance_id = f"{self.name_prefix}{int(self.base_seed)}_idx{int(idx):05d}"
-        seed = int(derive_seed(int(self.base_seed), int(idx), instance_id))
+        seed = int(_derive_seed(int(self.base_seed), int(idx), instance_id))
         rng = random.Random(seed)
 
         family = self.sampler.sample_family(rng)
-        num_classes = int(choose(rng, gen["num_classes_choices"], name="generator.num_classes_choices"))
+        num_classes = int(_choose(rng, gen["num_classes_choices"], name="generator.num_classes_choices"))
 
         if family == "mlp":
             model_cfg = self.sampler.sample_mlp(rng, num_classes=num_classes)

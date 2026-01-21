@@ -20,7 +20,25 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, List
 
-from .utils import choose, randint_inclusive
+
+# ============================================================================
+# Internal Utility Functions
+# ============================================================================
+
+
+def _randint_inclusive(rng: random.Random, lo_hi: List[int]) -> int:
+    """Sample random int from [lo, hi] inclusive."""
+    lo, hi = int(lo_hi[0]), int(lo_hi[1])
+    if hi < lo:
+        lo, hi = hi, lo
+    return rng.randint(lo, hi)
+
+
+def _choose(rng: random.Random, items: List[Any], *, name: str) -> Any:
+    """Randomly _choose from items with error handling."""
+    if not items:
+        raise ValueError(f"Config.{name} must be non-empty")
+    return rng.choice(list(items))
 
 
 class ConfigSampler:
@@ -45,13 +63,13 @@ class ConfigSampler:
     def sample_mlp(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
         """Sample MLP configuration."""
         cfg = self.config["mlp"]
-        input_shape = choose(rng, cfg["input_shapes"], name="mlp.input_shapes")
-        depth = randint_inclusive(rng, cfg["depth_range"])
+        input_shape = _choose(rng, cfg["input_shapes"], name="mlp.input_shapes")
+        depth = _randint_inclusive(rng, cfg["depth_range"])
         if depth <= 0:
             raise ValueError(f"mlp.depth_range produced non-positive depth={depth}")
 
-        widths = [int(choose(rng, cfg["width_choices"], name="mlp.width_choices")) for _ in range(depth)]
-        activation = str(choose(rng, cfg["activation_choices"], name="mlp.activation_choices"))
+        widths = [int(_choose(rng, cfg["width_choices"], name="mlp.width_choices")) for _ in range(depth)]
+        activation = str(_choose(rng, cfg["activation_choices"], name="mlp.activation_choices"))
 
         # Determine variant
         block_p = float(cfg["block_p"])
@@ -68,11 +86,11 @@ class ConfigSampler:
             "input_shape": tuple(int(x) for x in input_shape),
             "hidden_sizes": tuple(widths),
             "variant": variant,
-            "num_blocks": int(randint_inclusive(rng, cfg["block_count_range"])),
-            "block_width": int(choose(rng, cfg["block_width_choices"], name="mlp.block_width_choices")),
+            "num_blocks": int(_randint_inclusive(rng, cfg["block_count_range"])),
+            "block_width": int(_choose(rng, cfg["block_width_choices"], name="mlp.block_width_choices")),
             "post_block_activation": bool(rng.random() < float(cfg["post_block_activation_p"])),
-            "num_residual_blocks": int(randint_inclusive(rng, cfg["residual_blocks_range"])),
-            "residual_width": int(choose(rng, cfg["residual_width_choices"], name="mlp.residual_width_choices")),
+            "num_residual_blocks": int(_randint_inclusive(rng, cfg["residual_blocks_range"])),
+            "residual_width": int(_choose(rng, cfg["residual_width_choices"], name="mlp.residual_width_choices")),
             "activation": activation,
             "use_bias": True,
             "num_classes": int(num_classes),
@@ -81,25 +99,25 @@ class ConfigSampler:
     def sample_cnn2d(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
         """Sample CNN configuration."""
         cfg = self.config["cnn"]
-        input_shape = choose(rng, cfg["input_shapes"], name="cnn.input_shapes")
+        input_shape = _choose(rng, cfg["input_shapes"], name="cnn.input_shapes")
         if int(input_shape[2]) > 32 or int(input_shape[3]) > 32:
             raise ValueError(f"cnn.input_shapes must have H,W <= 32, got {input_shape}")
 
         variant = "stage" if (rng.random() < float(cfg["stage_variant_p"])) else "plain"
-        blocks = randint_inclusive(rng, cfg["num_blocks_range"])
+        blocks = _randint_inclusive(rng, cfg["num_blocks_range"])
         if blocks <= 0:
             raise ValueError(f"cnn.num_blocks_range produced non-positive blocks={blocks}")
 
         # Sample conv channels
         conv_channels: List[int] = []
         for _ in range(blocks):
-            ch = int(choose(rng, cfg["channels_choices"], name="cnn.channels_choices"))
+            ch = int(_choose(rng, cfg["channels_choices"], name="cnn.channels_choices"))
             conv_channels.append(ch)
 
         # Sample stage parameters
-        stages = randint_inclusive(rng, cfg["stages_range"])
-        base_channels = int(choose(rng, cfg["base_channels_choices"], name="cnn.base_channels_choices"))
-        channel_mult = int(choose(rng, cfg["channel_mult_choices"], name="cnn.channel_mult_choices"))
+        stages = _randint_inclusive(rng, cfg["stages_range"])
+        base_channels = int(_choose(rng, cfg["base_channels_choices"], name="cnn.base_channels_choices"))
+        channel_mult = int(_choose(rng, cfg["channel_mult_choices"], name="cnn.channel_mult_choices"))
 
         # Limit max channels to 64
         max_channels = base_channels * (channel_mult ** (stages - 1))
@@ -116,22 +134,22 @@ class ConfigSampler:
             "conv_channels": tuple(conv_channels),
             "variant": variant,
             "stages": int(stages),
-            "blocks_per_stage": int(randint_inclusive(rng, cfg["blocks_per_stage_range"])),
+            "blocks_per_stage": int(_randint_inclusive(rng, cfg["blocks_per_stage_range"])),
             "base_channels": int(base_channels),
             "channel_mult": int(channel_mult),
-            "downsample": str(choose(rng, cfg["downsample_choices"], name="cnn.downsample_choices")),
-            "double_conv_p": float(choose(rng, cfg["double_conv_p_choices"], name="cnn.double_conv_p_choices")),
+            "downsample": str(_choose(rng, cfg["downsample_choices"], name="cnn.downsample_choices")),
+            "double_conv_p": float(_choose(rng, cfg["double_conv_p_choices"], name="cnn.double_conv_p_choices")),
             "head_pool_to_1x1": True,
-            "kernel_sizes": int(choose(rng, cfg["kernel_choices"], name="cnn.kernel_choices")),
-            "strides": int(choose(rng, cfg["stride_choices"], name="cnn.stride_choices")),
-            "paddings": int(choose(rng, cfg["padding_choices"], name="cnn.padding_choices")),
-            "activation": str(choose(rng, cfg["activation_choices"], name="cnn.activation_choices")),
+            "kernel_sizes": int(_choose(rng, cfg["kernel_choices"], name="cnn.kernel_choices")),
+            "strides": int(_choose(rng, cfg["stride_choices"], name="cnn.stride_choices")),
+            "paddings": int(_choose(rng, cfg["padding_choices"], name="cnn.padding_choices")),
+            "activation": str(_choose(rng, cfg["activation_choices"], name="cnn.activation_choices")),
             "use_bias": True,
             "use_maxpool": bool(rng.random() < float(cfg["use_maxpool_p"])),
             "maxpool_kernel": 2,
             "maxpool_stride": 2,
             "num_classes": int(num_classes),
-            "fc_hidden": int(choose(rng, cfg["fc_hidden_choices"], name="cnn.fc_hidden_choices")),
+            "fc_hidden": int(_choose(rng, cfg["fc_hidden_choices"], name="cnn.fc_hidden_choices")),
         }
 
     def sample_input_spec(self, rng: random.Random) -> Dict[str, Any]:
@@ -151,7 +169,7 @@ class ConfigSampler:
                 kind = rng.choice(kinds)
 
         # Sample value range
-        value_range = choose(rng, cfg["value_range_choices"], name="input_spec.value_range_choices")
+        value_range = _choose(rng, cfg["value_range_choices"], name="input_spec.value_range_choices")
         lo, hi = float(value_range[0]), float(value_range[1])
         if hi < lo:
             lo, hi = hi, lo
@@ -173,7 +191,7 @@ class ConfigSampler:
 
         if kind == "LINF_BALL":
             center_val = lo + (hi - lo) * rng.random()
-            eps = float(choose(rng, cfg["eps_choices"], name="input_spec.eps_choices"))
+            eps = float(_choose(rng, cfg["eps_choices"], name="input_spec.eps_choices"))
             eps = min(eps, 0.5 * (hi - lo)) if (hi > lo) else 0.0
             return {
                 "kind": "LINF_BALL",
@@ -206,7 +224,7 @@ class ConfigSampler:
             return {"kind": "TOP1_ROBUST", "y_true": y_true}
 
         if kind == "MARGIN_ROBUST":
-            margin = float(choose(rng, cfg["margin_choices"], name="output_spec.margin_choices"))
+            margin = float(_choose(rng, cfg["margin_choices"], name="output_spec.margin_choices"))
             return {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin)}
 
         if kind == "LINEAR_LE":
@@ -217,7 +235,7 @@ class ConfigSampler:
             return {"kind": "LINEAR_LE", "c": [float(x) for x in c_vals], "d": float(d_val)}
 
         if kind == "RANGE":
-            lo, hi = choose(rng, cfg["range_choices"], name="output_spec.range_choices")
+            lo, hi = _choose(rng, cfg["range_choices"], name="output_spec.range_choices")
             lb_vals = []
             ub_vals = []
             for _ in range(int(num_classes)):

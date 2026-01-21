@@ -9,10 +9,9 @@ The NetFactory package modules:
 ```
 net_factory/
 ├── __init__.py          # Package exports
-├── factory.py           # Main NetFactory class
-├── sampler.py           # Configuration sampling logic
-├── layer_builder.py     # Layer construction functions
-└── utils.py             # Utility functions
+├── factory.py           # Main NetFactory class (with internal utilities)
+├── sampler.py           # Configuration sampling logic (with internal utilities)
+└── layer_builder.py     # Layer construction functions (with internal utilities)
 ```
 
 ## Module Responsibilities
@@ -54,18 +53,27 @@ Layer-by-layer construction functions:
 - `append_act()`: Add activation layer
 - `append_add()`: Add ADD layer (for residual connections)
 
-### `utils.py` - Utility Functions
+### Internal Utility Functions
 
-Shared utility functions:
-- `derive_seed()`: Deterministic seed generation
-- `randint_inclusive()`: Sample from range
-- `choose()`: Random choice with error handling
-- `prod()`: Product of shape dimensions
-- `ensure_batch1()`: Validate batch dimension
-- `activation_kind()`: Map activation names to layer kinds
-- `infer_conv2d_output_hw()`: Compute Conv2D output shape
-- `infer_pool2d_output_hw()`: Compute Pool2D output shape
-- `as_block_param()`: Extract per-block parameters
+Each module contains its own internal utility functions (prefixed with `_`):
+
+**factory.py**:
+- `_derive_seed()`: Deterministic seed generation
+- `_choose()`: Random choice with error handling
+
+**sampler.py**:
+- `_choose()`: Random choice with error handling
+- `_randint_inclusive()`: Sample from range
+
+**layer_builder.py**:
+- `_activation_kind()`: Map activation names to layer kinds
+- `_infer_conv2d_output_hw()`: Compute Conv2D output shape
+- `_infer_pool2d_output_hw()`: Compute Pool2D output shape
+- `_ensure_batch1()`: Validate batch dimension
+- `_prod()`: Product of shape dimensions
+- `_as_block_param()`: Extract per-block parameters
+
+This design follows the principle: "If a utility is used only once, keep it with its usage site."
 
 ## Benefits
 
