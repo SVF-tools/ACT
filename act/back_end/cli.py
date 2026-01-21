@@ -112,7 +112,8 @@ def run_network_factory(args):
     
     from act.back_end.net_factory import NetFactory
     
-    config_file = args.config if args.config else "act/back_end/examples/config_gen_act_net.yaml"
+    from act.util.path_config import get_examples_gen_config_path
+    config_file = args.config if args.config else get_examples_gen_config_path()
     
     print(f"Configuration: {config_file}")
     if args.output:
@@ -239,7 +240,8 @@ def list_examples(args):
 
     from act.pipeline.verification.model_factory import ModelFactory
 
-    nets_dir = Path("act/back_end/examples/nets")
+    from act.util.path_config import get_examples_nets_dir
+    nets_dir = Path(get_examples_nets_dir())
 
     if not nets_dir.exists():
         print(f"❌ Nets directory not found: {nets_dir}")

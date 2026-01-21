@@ -36,6 +36,7 @@ from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
 from act.util.path_config import get_examples_gen_config_path
 
+from .config_validator import get_validation_summary, validate_config
 from .layer_builder import build_cnn_layers, build_mlp_layers
 from .sampler import ConfigSampler
 
@@ -81,6 +82,18 @@ class NetFactory:
     ):
         self.config_path = str(gen_config_path)
         self.config = self._load_config(self.config_path)
+
+        # Validate configuration with strict assertions
+        validate_config(self.config)
+
+        # Print validation summary
+        summary = get_validation_summary(self.config)
+        print(f"\n📋 Configuration Summary:")
+        print(f"  Total families: {summary['total_families']}")
+        for ftype, fnames in summary['families_by_type'].items():
+            print(f"  {ftype.upper()} families ({len(fnames)}): {', '.join(fnames)}")
+        print()
+
         common = self.config["common"]
 
         # Initialize sampler
@@ -210,8 +223,8 @@ class NetFactory:
         seed = int(_derive_seed(int(self.base_seed), int(idx), instance_id))
         rng = random.Random(seed)
 
-        # Sampler returns (family, model_cfg) directly
-        family, model_cfg = self.sampler.sample_family(rng)
+        # Sampler returns (family_name, family_type, model_cfg)
+        family_name, family_type, model_cfg = self.sampler.sample_family(rng)
         num_classes = int(model_cfg["num_classes"])
 
         input_spec = self.sampler.sample_input_spec(rng)
@@ -220,7 +233,8 @@ class NetFactory:
         return {
             "instance_id": instance_id,
             "seed": seed,
-            "family": family,
+            "family_name": family_name,
+            "family_type": family_type,
             "model_cfg": model_cfg,
             "input_spec": input_spec,
             "output_spec": output_spec,
@@ -256,14 +270,18 @@ class NetFactory:
             raise ValueError(f"Input spec kind '{in_kind}' is not supported")
         layers.append({"kind": "INPUT_SPEC", "params": {}, "meta": spec_meta})
 
-        # Model layers
-        if instance["family"] == "mlp":
+        # Model layers - use family_type to dispatch to correct builder
+        family_type = instance["family_type"]
+        if family_type == "mlp":
             build_mlp_layers(layers, cfg=model_cfg)
-        elif instance["family"] == "cnn2d":
+        elif family_type == "cnn2d":
             rng = random.Random(int(instance["seed"]))
             build_cnn_layers(layers, cfg=model_cfg, rng=rng)
         else:
-            raise ValueError(f"Unsupported model family: {instance['family']}")
+            raise ValueError(
+                f"Unsupported family type '{family_type}'. "
+                f"Supported types: mlp, cnn2d"
+            )
 
         # ASSERT layer
         out_kind = str(instance["output_spec"]["kind"])
@@ -365,14 +383,28 @@ class NetFactory:
             json.dump(net_dict, f, indent=2)
         print(f"Saved: {output_path}")
 
-    def _write_manifest(self, names: List[str]) -> None:
+    def _write_manifest(self, names: List[str], family_stats: Dict[str, Any]) -> None:
         """Write manifest file with generation metadata."""
+        from act.util.path_config import get_project_root
+
+        # Convert absolute path to relative path from project root for portability
+        config_path_abs = Path(self.config_path).resolve()
+        project_root = Path(get_project_root()).resolve()
+
+        try:
+            config_path_rel = config_path_abs.relative_to(project_root)
+            config_path_str = str(config_path_rel)
+        except ValueError:
+            # If config is outside project, use absolute path
+            config_path_str = str(config_path_abs)
+
         payload = {
             "base_seed": int(self.base_seed),
             "num_instances": int(self.num_instances),
             "name_prefix": self.name_prefix,
             "nets": list(names),
-            "config_path": self.config_path,
+            "config_path": config_path_str,
+            "family_statistics": family_stats,
         }
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -384,18 +416,33 @@ class NetFactory:
         dtype = str(common["dtype"])
 
         names: List[str] = []
+        family_stats: Dict[str, Any] = {
+            "by_name": {},
+            "by_type": {},
+        }
+
         for idx in range(self.num_instances):
             instance = self._sample_instance(idx)
             name = instance["instance_id"]
+            family_name = instance["family_name"]
+            family_type = instance["family_type"]
+
+            # Collect statistics
+            family_stats["by_name"][family_name] = family_stats["by_name"].get(family_name, 0) + 1
+            family_stats["by_type"][family_type] = family_stats["by_type"].get(family_type, 0) + 1
+
             spec = self._build_network_spec(instance, dtype=dtype)
             net = self.create_network(name, spec)
             self.save_network(net, name)
             names.append(name)
 
         if self.write_manifest:
-            self._write_manifest(names)
+            self._write_manifest(names, family_stats)
 
-        print(f"All networks generated in {self.output_dir}")
+        print(f"\n📊 Generation Statistics:")
+        print(f"  By type: {dict(family_stats['by_type'])}")
+        print(f"  By family: {dict(family_stats['by_name'])}")
+        print(f"\nAll networks generated in {self.output_dir}")
         return names
 
 

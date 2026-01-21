@@ -58,100 +58,553 @@ output_spec:
 # 3. MODEL FAMILY SELECTION STRATEGY
 # ============================================================================
 # Defines how to sample from different network architectures.
+# Each family is a preset configuration with specific characteristics:
+# - Scale: tiny (fast CI), small, medium, wide, deep
+# - Structure: plain, block, residual (MLP); plain, stage (CNN)
+# - Downsampling: maxpool, avgpool, stride2_conv (CNN)
 
 family_selection:
   weighted:
-    mlp: 0.5                    # Multi-layer Perceptron weight
-    cnn2d: 0.5                  # 2D Convolutional Network weight
+    # MLP Families (7 variants, total weight: 0.62)
+    mlp_tiny_plain: 0.08        # Tiny MLP for CI/fast testing
+    mlp_small_plain: 0.10       # Small standard MLP
+    mlp_medium_plain: 0.10      # Medium-sized MLP
+    mlp_wide_plain: 0.09        # Wide MLP (large hidden units)
+    mlp_deep_plain: 0.08        # Deep MLP (many layers)
+    mlp_block: 0.10             # Block-structured MLP
+    mlp_residual: 0.07          # MLP with residual connections
+
+    # CNN2D Families (6 variants, total weight: 0.45)
+    cnn_tiny_plain: 0.07        # Tiny CNN for small images
+    cnn_small_plain: 0.08       # Small standard CNN
+    cnn_plain_maxpool: 0.08     # Plain CNN with maxpool
+    cnn_stage_maxpool: 0.08     # Staged CNN with maxpool downsampling
+    cnn_stage_stride2: 0.07     # Staged CNN with strided conv downsampling
+    cnn_wide_stage: 0.07        # Wide staged CNN (more channels)
 
 
 # ============================================================================
 # 4. FAMILY-SPECIFIC PARAMETERS
 # ============================================================================
-# Each network family has unique structural parameters.
+# Each family has a 'type' (mlp or cnn2d) and specific parameter presets.
+# All families include all parameters (using 'const' for unused ones) to
+# ensure consistent sampling without special-case logic.
 
 families:
+  # ==========================================================================
+  # 4.1 MLP FAMILIES
+  # ==========================================================================
+
   # --------------------------------------------------------------------------
-  # 4.1 MLP (Multi-Layer Perceptron) Family
+  # MLP Tiny Plain - Fast, minimal MLP for CI/testing
   # --------------------------------------------------------------------------
-  mlp:
+  mlp_tiny_plain:
+    type: mlp                   # Builder type
     input_shape:
-      choice: [[1, 6], [1, 16], [1, 3, 8]]  # Input tensor shapes
-    depth:
-      range: [2, 4]             # Number of hidden layers
+      choice: [[1, 6], [1, 8]]  # Very small inputs
+    hidden_sizes:
+      repeat:
+        count: { const: 2 }
+        value: { choice: [16, 32] }  # Small hidden units
+    activation:
+      choice: [relu, tanh]
+    variant:
+      const: plain              # Plain variant only
+    num_blocks:
+      const: 1                  # Not used (plain variant)
+    block_width:
+      const: 32                 # Not used
+    post_block_activation:
+      const: false              # Not used
+    num_residual_blocks:
+      const: 1                  # Not used
+    residual_width:
+      const: 32                 # Not used
+    use_bias:
+      const: true
+    num_classes:
+      choice: [5, 10]           # Small number of classes
+
+  # --------------------------------------------------------------------------
+  # MLP Small Plain - Standard small MLP
+  # --------------------------------------------------------------------------
+  mlp_small_plain:
+    type: mlp
+    input_shape:
+      choice: [[1, 16], [1, 3, 8]]
+    hidden_sizes:
+      repeat:
+        count: { range: [2, 3] }
+        value: { choice: [32, 64] }
+    activation:
+      choice: [relu, tanh, sigmoid]
+    variant:
+      const: plain
+    num_blocks:
+      const: 1
+    block_width:
+      const: 32
+    post_block_activation:
+      const: false
+    num_residual_blocks:
+      const: 1
+    residual_width:
+      const: 32
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # MLP Medium Plain - Medium-sized standard MLP
+  # --------------------------------------------------------------------------
+  mlp_medium_plain:
+    type: mlp
+    input_shape:
+      choice: [[1, 16], [1, 32], [1, 3, 16]]
+    hidden_sizes:
+      repeat:
+        count: { range: [3, 4] }
+        value: { choice: [64, 128] }
+    activation:
+      choice: [relu, tanh]
+    variant:
+      const: plain
+    num_blocks:
+      const: 1
+    block_width:
+      const: 64
+    post_block_activation:
+      const: false
+    num_residual_blocks:
+      const: 1
+    residual_width:
+      const: 64
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # MLP Wide Plain - Wide MLP (large hidden units)
+  # --------------------------------------------------------------------------
+  mlp_wide_plain:
+    type: mlp
+    input_shape:
+      choice: [[1, 16], [1, 32]]
+    hidden_sizes:
+      repeat:
+        count: { range: [2, 3] }
+        value: { choice: [128, 256] }  # Large hidden units
+    activation:
+      choice: [relu, tanh]
+    variant:
+      const: plain
+    num_blocks:
+      const: 1
+    block_width:
+      const: 128
+    post_block_activation:
+      const: false
+    num_residual_blocks:
+      const: 1
+    residual_width:
+      const: 128
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # MLP Deep Plain - Deep MLP (many layers)
+  # --------------------------------------------------------------------------
+  mlp_deep_plain:
+    type: mlp
+    input_shape:
+      choice: [[1, 16], [1, 32]]
+    hidden_sizes:
+      repeat:
+        count: { range: [4, 6] }
+        value: { choice: [32, 64] }  # Moderate width
+    activation:
+      choice: [relu, tanh]
+    variant:
+      const: plain
+    num_blocks:
+      const: 1
+    block_width:
+      const: 64
+    post_block_activation:
+      const: false
+    num_residual_blocks:
+      const: 1
+    residual_width:
+      const: 64
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # MLP Block - Block-structured MLP
+  # --------------------------------------------------------------------------
+  mlp_block:
+    type: mlp
+    input_shape:
+      choice: [[1, 16], [1, 3, 8]]
     hidden_sizes:
       repeat:
         count: { range: [2, 4] }
-        value: { choice: [32, 64, 128] }  # Width of each hidden layer
+        value: { choice: [32, 64, 128] }
     activation:
-      choice: [relu, tanh, sigmoid]  # Activation functions
+      choice: [relu, tanh, sigmoid]
     variant:
-      weighted:
-        plain: 0.4              # Plain feedforward MLP
-        block: 0.6              # Block-structured MLP
-        residual: 0.0           # Residual MLP (disabled)
+      const: block              # Block variant
     num_blocks:
-      range: [2, 6]             # Number of blocks (block variant)
+      range: [2, 4]             # Active parameter
     block_width:
-      choice: [32, 64, 128]     # Width per block (block variant)
+      choice: [32, 64, 128]     # Active parameter
     post_block_activation:
-      probability: 0.8          # Add activation after each block
+      probability: 0.8          # Active parameter
     num_residual_blocks:
-      range: [1, 3]             # Number of residual blocks
+      const: 1                  # Not used
     residual_width:
-      choice: [32, 64, 128]     # Width of residual blocks
+      const: 32                 # Not used
     use_bias:
-      const: true               # Enable bias terms in linear layers
+      const: true
     num_classes:
-      choice: [10]              # Number of output classes
+      choice: [10]
 
   # --------------------------------------------------------------------------
-  # 4.2 CNN2D (2D Convolutional Network) Family
+  # MLP Residual - MLP with residual connections
   # --------------------------------------------------------------------------
-  cnn2d:
+  mlp_residual:
+    type: mlp
     input_shape:
-      choice: [[1, 1, 8, 8], [1, 3, 16, 16]]  # Input shapes [B,C,H,W]
+      choice: [[1, 16], [1, 32], [1, 3, 16]]
+    hidden_sizes:
+      repeat:
+        count: { range: [3, 5] }
+        value: { choice: [64, 128] }
+    activation:
+      choice: [relu, tanh]
     variant:
-      weighted:
-        plain: 0.5              # Plain sequential CNN
-        stage: 0.5              # Staged CNN (e.g., ResNet-like)
+      const: residual           # Residual variant
     num_blocks:
-      range: [1, 3]             # Number of conv blocks (plain variant)
+      const: 1                  # Not used
+    block_width:
+      const: 64                 # Not used
+    post_block_activation:
+      const: false              # Not used
+    num_residual_blocks:
+      range: [2, 4]             # Active: number of residual blocks
+    residual_width:
+      choice: [64, 128]         # Active: width of residual connections
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # ==========================================================================
+  # 4.2 CNN2D FAMILIES
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # CNN Tiny Plain - Minimal CNN for small images
+  # --------------------------------------------------------------------------
+  cnn_tiny_plain:
+    type: cnn2d                 # Builder type
+    input_shape:
+      choice: [[1, 1, 8, 8]]    # Very small images
+    variant:
+      const: plain              # Plain variant only
+    num_blocks:
+      const: 1                  # Single conv block
     conv_channels:
       repeat:
-        count: { range: [1, 3] }
-        value: { choice: [8, 16, 32] }  # Channels per conv block
+        count: { const: 1 }
+        value: { choice: [8, 16] }  # Small channels
     kernel_sizes:
-      choice: [3]               # Convolution kernel sizes
+      const: 3
     strides:
-      choice: [1]               # Convolution strides
+      const: 1
     paddings:
-      choice: [1]               # Convolution padding
+      const: 1
     use_maxpool:
-      probability: 0.3          # Add max pooling layers
+      const: false              # No pooling
     maxpool_kernel:
-      const: 2                  # Max pool kernel size
+      const: 2
     maxpool_stride:
-      const: 2                  # Max pool stride
+      const: 2
     fc_hidden:
-      choice: [32, 64, 128]     # Hidden units in FC head (plain variant)
+      choice: [16, 32]          # Small FC
     stages:
-      range: [1, 3]             # Number of stages (stage variant)
+      const: 1                  # Not used
     blocks_per_stage:
-      range: [1, 2]             # Blocks per stage
+      const: 1                  # Not used
     base_channels:
-      choice: [8, 16, 32]       # Base channel count (stage variant)
+      const: 8                  # Not used
     channel_mult:
-      choice: [2]               # Channel multiplier between stages
+      const: 2                  # Not used
     downsample:
-      choice: [maxpool, avgpool, stride2_conv]  # Downsampling method
+      const: maxpool            # Not used
     double_conv_p:
-      choice: [0.5, 0.7]        # Probability of double convolution
+      const: 0.5                # Not used
     head_pool_to_1x1:
-      const: true               # Global pooling before FC head
+      const: true
     activation:
-      choice: [relu, tanh, sigmoid]  # Activation functions
+      choice: [relu, tanh]
     use_bias:
-      const: true               # Enable bias in conv/linear layers
+      const: true
     num_classes:
-      choice: [10]              # Number of output classes
+      choice: [5, 10]
+
+  # --------------------------------------------------------------------------
+  # CNN Small Plain - Standard small CNN
+  # --------------------------------------------------------------------------
+  cnn_small_plain:
+    type: cnn2d
+    input_shape:
+      choice: [[1, 1, 8, 8], [1, 3, 16, 16]]
+    variant:
+      const: plain
+    num_blocks:
+      range: [1, 2]
+    conv_channels:
+      repeat:
+        count: { range: [1, 2] }
+        value: { choice: [8, 16, 32] }
+    kernel_sizes:
+      const: 3
+    strides:
+      const: 1
+    paddings:
+      const: 1
+    use_maxpool:
+      probability: 0.3
+    maxpool_kernel:
+      const: 2
+    maxpool_stride:
+      const: 2
+    fc_hidden:
+      choice: [32, 64]
+    stages:
+      const: 1
+    blocks_per_stage:
+      const: 1
+    base_channels:
+      const: 8
+    channel_mult:
+      const: 2
+    downsample:
+      const: maxpool
+    double_conv_p:
+      const: 0.5
+    head_pool_to_1x1:
+      const: true
+    activation:
+      choice: [relu, tanh, sigmoid]
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # CNN Plain Maxpool - Plain CNN with maxpool layers
+  # --------------------------------------------------------------------------
+  cnn_plain_maxpool:
+    type: cnn2d
+    input_shape:
+      choice: [[1, 1, 8, 8], [1, 3, 16, 16]]
+    variant:
+      const: plain
+    num_blocks:
+      range: [2, 3]
+    conv_channels:
+      repeat:
+        count: { range: [2, 3] }
+        value: { choice: [8, 16, 32] }
+    kernel_sizes:
+      const: 3
+    strides:
+      const: 1
+    paddings:
+      const: 1
+    use_maxpool:
+      const: true               # Always use maxpool
+    maxpool_kernel:
+      const: 2
+    maxpool_stride:
+      const: 2
+    fc_hidden:
+      choice: [32, 64, 128]
+    stages:
+      const: 1
+    blocks_per_stage:
+      const: 1
+    base_channels:
+      const: 16
+    channel_mult:
+      const: 2
+    downsample:
+      const: maxpool
+    double_conv_p:
+      const: 0.5
+    head_pool_to_1x1:
+      const: true
+    activation:
+      choice: [relu, tanh]
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # CNN Stage Maxpool - Staged CNN with maxpool downsampling
+  # --------------------------------------------------------------------------
+  cnn_stage_maxpool:
+    type: cnn2d
+    input_shape:
+      choice: [[1, 3, 16, 16], [1, 3, 32, 32]]
+    variant:
+      const: stage              # Stage variant
+    num_blocks:
+      const: 1                  # Not used (stage variant)
+    conv_channels:
+      repeat:
+        count: { const: 1 }
+        value: { const: 16 }    # Not used
+    kernel_sizes:
+      const: 3
+    strides:
+      const: 1
+    paddings:
+      const: 1
+    use_maxpool:
+      const: false              # Controlled by downsample
+    maxpool_kernel:
+      const: 2
+    maxpool_stride:
+      const: 2
+    fc_hidden:
+      const: 64                 # Not used (stage variant)
+    stages:
+      range: [2, 3]             # Active parameter
+    blocks_per_stage:
+      range: [1, 2]             # Active parameter
+    base_channels:
+      choice: [8, 16]           # Active parameter
+    channel_mult:
+      const: 2                  # Active parameter
+    downsample:
+      const: maxpool            # Active parameter
+    double_conv_p:
+      choice: [0.5, 0.7]        # Active parameter
+    head_pool_to_1x1:
+      const: true
+    activation:
+      choice: [relu, tanh]
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # CNN Stage Stride2 - Staged CNN with strided conv downsampling
+  # --------------------------------------------------------------------------
+  cnn_stage_stride2:
+    type: cnn2d
+    input_shape:
+      choice: [[1, 3, 16, 16], [1, 3, 32, 32]]
+    variant:
+      const: stage
+    num_blocks:
+      const: 1
+    conv_channels:
+      repeat:
+        count: { const: 1 }
+        value: { const: 16 }
+    kernel_sizes:
+      const: 3
+    strides:
+      const: 1
+    paddings:
+      const: 1
+    use_maxpool:
+      const: false
+    maxpool_kernel:
+      const: 2
+    maxpool_stride:
+      const: 2
+    fc_hidden:
+      const: 64
+    stages:
+      range: [2, 3]
+    blocks_per_stage:
+      range: [1, 2]
+    base_channels:
+      choice: [8, 16, 32]
+    channel_mult:
+      const: 2
+    downsample:
+      const: stride2_conv       # Strided conv downsampling
+    double_conv_p:
+      choice: [0.5, 0.7]
+    head_pool_to_1x1:
+      const: true
+    activation:
+      choice: [relu, tanh]
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
+
+  # --------------------------------------------------------------------------
+  # CNN Wide Stage - Wide staged CNN (more channels)
+  # --------------------------------------------------------------------------
+  cnn_wide_stage:
+    type: cnn2d
+    input_shape:
+      choice: [[1, 3, 16, 16], [1, 3, 32, 32]]
+    variant:
+      const: stage
+    num_blocks:
+      const: 1
+    conv_channels:
+      repeat:
+        count: { const: 1 }
+        value: { const: 32 }
+    kernel_sizes:
+      const: 3
+    strides:
+      const: 1
+    paddings:
+      const: 1
+    use_maxpool:
+      const: false
+    maxpool_kernel:
+      const: 2
+    maxpool_stride:
+      const: 2
+    fc_hidden:
+      const: 128
+    stages:
+      range: [2, 3]
+    blocks_per_stage:
+      range: [1, 2]
+    base_channels:
+      choice: [16, 32, 64]      # Wide base channels
+    channel_mult:
+      const: 2
+    downsample:
+      choice: [maxpool, stride2_conv]
+    double_conv_p:
+      choice: [0.5, 0.7]
+    head_pool_to_1x1:
+      const: true
+    activation:
+      choice: [relu, tanh]
+    use_bias:
+      const: true
+    num_classes:
+      choice: [10]
