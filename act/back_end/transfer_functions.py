@@ -113,26 +113,22 @@ def get_transfer_function() -> TransferFunction:
     return _current_tf
 
 
-def set_transfer_function_mode(mode: str = "interval", solving_mode = None) -> None:
+def set_transfer_function_mode(mode: str = "interval") -> None:
     """Set transfer function implementation by mode name.
     
     Args:
         mode: "interval" for IntervalTF, "hybridz" for HybridzTF, "dual" for DualTF
-        solving_mode: Backend solving mode (BackendMode.V or BackendMode.T), defaults to V
-    """
-    from act.back_end.utils import BackendMode
-    if solving_mode is None:
-        solving_mode = BackendMode.V
     
+    """
     if mode == "interval":
         from act.back_end.interval_tf import IntervalTF
-        set_transfer_function(IntervalTF(solving_mode=solving_mode))
+        set_transfer_function(IntervalTF())
     elif mode == "hybridz":
         from act.back_end.hybridz_tf import HybridzTF
-        set_transfer_function(HybridzTF(solving_mode=solving_mode))
+        set_transfer_function(HybridzTF())
     elif mode == "dual":
         from act.back_end.dual_tf import DualTF
-        set_transfer_function(DualTF(solving_mode=solving_mode))
+        set_transfer_function(DualTF())
     else:
         raise ValueError(f"Unknown transfer function mode: {mode}. Use 'interval', 'hybridz', or 'dual'.")
 
@@ -142,7 +138,6 @@ def dispatch_tf(L: Layer, before: Dict[int, Fact], after: Dict[int, Fact], net: 
     """Dispatch to current transfer function implementation.
     
     This is the main entry point called by analyze() for each layer.
-    Gradient control is handled by each TF's solving_mode (BackendMode.V/T).
     Optionally logs detailed debug information to file when debug_tf is enabled.
     """
     tf_impl = get_transfer_function()

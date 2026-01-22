@@ -3,7 +3,7 @@
 
 This file consolidates configuration utilities for external verifier usage.
 """
-from typing import Union, Optional, List, Tuple
+from typing import Union, Optional, List, Tuple, Dict, Any
 import os
 import numpy as np
 import torch
@@ -18,6 +18,9 @@ import subprocess
 
 from enum import Enum
 
+# Import verification types from canonical location (act/util/stats.py)
+from act.util.stats import VerifyStatus, VerifyResult
+
 
 class SplitType(Enum):
     INPUT = "input"
@@ -26,15 +29,6 @@ class SplitType(Enum):
     RELU_GRAD = "relu_grad"
     RELU_SR = "relu_babsr"
     RELU_CE = "relu_ce"
-
-
-class VerifyResult(Enum):
-    SAT = "satisfiable"
-    UNSAT = "unsatisfiable"
-    CLEAN_FAILURE = "clean_failure"
-    UNKNOWN = "unknown"
-    TIMEOUT = "timeout"
-    ERROR = "error"
 
 
 class SpecType(Enum):
@@ -820,7 +814,7 @@ class Dataset:
 
 
 class BaseSpec:
-    def __init__(self, dataset : Dataset = None, model : Model = None, status: VerifyResult = VerifyResult.UNKNOWN):
+    def __init__(self, dataset : Dataset = None, model : Model = None, status: VerifyStatus = VerifyStatus.UNKNOWN):
         self.dataset = dataset
         self.model = model
 

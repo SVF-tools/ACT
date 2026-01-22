@@ -60,9 +60,12 @@ from .analyze import dispatch_tf, analyze
 from .solver.solver_base import Solver, SolverCaps, SolveStatus
 from .solver.solver_gurobi import GurobiSolver
 
+# Verification types (canonical location: act/util/stats.py)
+from act.util.stats import VerifyStatus, VerifyResult
+
 # Note: TorchLPSolver and some verification functions are available 
 # via direct import to avoid circular dependencies:
-# from act.back_end.bab import VerifStatus, VerifResult, verify_once, etc.
+# from act.back_end.verifier import verify_once
 # from act.back_end.solver.solver_torch import TorchLPSolver
 
 __all__ = [
@@ -84,7 +87,7 @@ __all__ = [
     # Solvers
     'Solver', 'SolverCaps', 'SolveStatus', 'GurobiSolver', 'TorchLPSolver',
     # Specs
-    'InputSpec', 'OutputSpec', 'InKind', 'OutKind', 'VerifStatus', 'VerifResult',
+    'InputSpec', 'OutputSpec', 'InKind', 'OutKind', 'VerifyStatus', 'VerifyResult',
     'seed_from_input_spec', 'add_input_spec', 'verify_once',
     # BaB
     'BabNode', 'verify_bab'

@@ -18,12 +18,11 @@ from typing import Dict, Optional, Tuple
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.layer_schema import LayerKind
 from act.back_end.transfer_functions import TransferFunction
-from act.back_end.utils import BackendMode, _backend_mode
 from .tf_mlp import (dual_relu_backward, dual_dense_backward, dual_bias_backward,
                      dual_scale_backward, dual_bn_backward, dual_identity_backward)
 from .tf_cnn import dual_conv2d_backward
 from .tf_smooth import dual_sigmoid_backward, dual_tanh_backward
-from .tf_forward import compute_forward_bounds
+from .tf_forward import compute_forward_bounds, _compute_forward_bounds_impl
 
 
 class DualTF(TransferFunction):
@@ -49,15 +48,8 @@ class DualTF(TransferFunction):
         "ADD": "_backward_add",
     }
     
-    def __init__(self, solving_mode: BackendMode = BackendMode.V):
-        """Initialize DualTF with solving mode and empty cache.
-        
-        Args:
-            solving_mode: Backend solving mode.
-                - BackendMode.V: Verification (default), no gradients
-                - BackendMode.T: Training, gradients enabled for provable training
-        """
-        self.solving_mode = solving_mode
+    def __init__(self):
+        """Initialize DualTF with empty cache."""
         self._forward_bounds_cache: Dict[int, Bounds] = {}
         self._cache_net_id: Optional[int] = None  # Track which net the cache is for
     
@@ -69,7 +61,6 @@ class DualTF(TransferFunction):
         return layer_kind.upper() in self._BACKWARD_REGISTRY
     
     # -------- TransferFunction Interface (for analyze()) --------
-    @_backend_mode
     def apply(self, L: Layer, input_bounds: Bounds, net: Net,
               before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
         """
@@ -116,10 +107,15 @@ class DualTF(TransferFunction):
         self._forward_bounds_cache.clear()
         self._cache_net_id = None
     
-    @_backend_mode
-    def compute_bound(self, net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
-                      return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Compute certified lower bound on c^T @ output."""
+    def _compute_bound_impl(self, net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
+                            return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Core implementation - NO torch.no_grad().
+        
+        Used by:
+        - compute_bound(): Verification (wraps with no_grad)
+        - ProvableLoss: Training (calls directly for gradient flow)
+        """
         assert c.dim() == 1, f"c must be 1D, got shape {c.shape}"
         assert len(bounds_dict) > 0, "bounds_dict cannot be empty"
         
@@ -143,10 +139,23 @@ class DualTF(TransferFunction):
         obj = obj + input_contrib
         return (obj, sce) if return_sce else obj
     
-    @_backend_mode
-    def compute_robust_bound(self, net: Net, bounds_dict: Dict[int, Bounds],
-                             y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
-        """Compute min margin: output[y_true] - output[j] for all j != y_true."""
+    def compute_bound(self, net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
+                      return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute certified lower bound on c^T @ output.
+        
+        This is the verification API - runs with torch.no_grad().
+        For training with gradients, use _compute_bound_impl() directly.
+        """
+        with torch.no_grad():
+            return self._compute_bound_impl(net, bounds_dict, c, return_sce)
+    
+    def _compute_robust_bound_impl(self, net: Net, bounds_dict: Dict[int, Bounds],
+                                    y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
+        """
+        Core implementation - NO torch.no_grad().
+        Compute min margin: output[y_true] - output[j] for all j != y_true.
+        """
         sample = next(iter(bounds_dict.values()))
         device, dtype = sample.lb.device, sample.lb.dtype
         
@@ -155,10 +164,21 @@ class DualTF(TransferFunction):
             if j == y_true: continue
             c = torch.zeros(num_classes, dtype=dtype, device=device)
             c[y_true], c[j] = 1.0, -1.0
-            margins.append(self.compute_bound(net, bounds_dict, c))
+            margins.append(self._compute_bound_impl(net, bounds_dict, c))
         
         margins = torch.stack(margins)
         return margins.min(), (margins.min() > 0).item()
+    
+    def compute_robust_bound(self, net: Net, bounds_dict: Dict[int, Bounds],
+                             y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
+        """
+        Compute robust classification bound (min margin, is_certified).
+        
+        This is the verification API - runs with torch.no_grad().
+        For training with gradients, use _compute_robust_bound_impl() directly.
+        """
+        with torch.no_grad():
+            return self._compute_robust_bound_impl(net, bounds_dict, y_true, num_classes)
     
     # -------- Backward Handlers --------
     def _backward_dense(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -270,13 +290,19 @@ class DualTF(TransferFunction):
 
 # -------- Convenience Functions --------
 def compute_dual_bound(net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
-                       return_sce: bool = False,
-                       solving_mode: BackendMode = BackendMode.V) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Compute certified lower bound on c^T @ output."""
-    return DualTF(solving_mode=solving_mode).compute_bound(net, bounds_dict, c, return_sce=return_sce)
+                       return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Compute certified lower bound on c^T @ output.
+    
+    This is the verification API - runs with torch.no_grad().
+    """
+    return DualTF().compute_bound(net, bounds_dict, c, return_sce=return_sce)
 
 def compute_robust_loss_bound(net: Net, bounds_dict: Dict[int, Bounds],
-                              y_true: int, num_classes: int,
-                              solving_mode: BackendMode = BackendMode.V) -> Tuple[torch.Tensor, bool]:
-    """Compute robust classification bound (min margin, is_certified)."""
-    return DualTF(solving_mode=solving_mode).compute_robust_bound(net, bounds_dict, y_true, num_classes)
+                              y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
+    """
+    Compute robust classification bound (min margin, is_certified).
+    
+    This is the verification API - runs with torch.no_grad().
+    """
+    return DualTF().compute_robust_bound(net, bounds_dict, y_true, num_classes)

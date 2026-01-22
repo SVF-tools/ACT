@@ -395,20 +395,25 @@ import numpy as np
 import torch
 from act.back_end.solver.solver_base import Solver
 
-class VerifStatus: CERTIFIED="CERTIFIED"; COUNTEREXAMPLE="COUNTEREXAMPLE"; UNKNOWN="UNKNOWN"
+class VerifyStatus(Enum):
+    CERTIFIED = "certified"           # Property proven safe
+    FALSIFIED = "falsified"           # Property violated (counterexample found)
+    UNKNOWN = "unknown"               # Inconclusive result
+    TIMEOUT = "timeout"               # Time limit exceeded
+    VERIFIER_ERROR = "verifier_error" # Verifier error
+    MODEL_INFER_FAILURE = "model_infer_failure"  # Model inference failed
 
 @dataclass
-class VerifResult:
-    status: str
-    ce_x: Optional[np.ndarray]=None
-    ce_y: Optional[np.ndarray]=None
-    model_stats: Dict[str, Any]=field(default_factory=dict)
+class VerifyResult:
+    status: VerifyStatus
+    counterexample: Optional[torch.Tensor] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @torch.no_grad()
-def verify_once(net, solver: Solver, timelimit: Optional[float]=None, maximize_violation: bool=False) -> VerifResult: ...
+def verify_once(net, solver: Solver, timelimit: Optional[float]=None) -> VerifyResult: ...
 
-def verify_bab(net, solver: Solver, model_fn: Callable[[torch.Tensor], torch.Tensor],
-               max_depth: int=20, max_nodes: int=2000, time_budget_s: float=300.0) -> VerifResult: ...
+def verify_bab(net, solver: Solver,
+               max_depth: int=20, max_nodes: int=2000, time_budget_s: float=300.0) -> VerifyResult: ...
 ```
 
 ### How it works

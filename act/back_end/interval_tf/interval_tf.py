@@ -18,7 +18,6 @@ from typing import Dict, List
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.transfer_functions import TransferFunction
 from act.back_end.layer_schema import LayerKind
-from act.back_end.utils import BackendMode, _backend_mode
 from act.back_end.interval_tf.tf_mlp import *
 from act.back_end.interval_tf.tf_cnn import *
 from act.back_end.interval_tf.tf_rnn import *
@@ -28,13 +27,6 @@ from act.back_end.interval_tf.tf_transformer import *
 class IntervalTF(TransferFunction):
     """Interval-based transfer functions for standard bounds propagation."""
     
-    def __init__(self, solving_mode: BackendMode = BackendMode.V):
-        """Initialize IntervalTF with solving mode.
-        
-        Args:
-            solving_mode: Backend solving mode (V=verification, T=training)
-        """
-        self.solving_mode = solving_mode
     
     # Layer kind to function mapping
     _LAYER_REGISTRY = {
@@ -128,10 +120,9 @@ class IntervalTF(TransferFunction):
         """Check if this transfer function supports the given layer kind."""
         return layer_kind.upper() in self._LAYER_REGISTRY
         
-    @_backend_mode
+    @torch.no_grad()
     def apply(self, L: Layer, input_bounds: Bounds, net: Net,
               before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
-        """Apply interval transfer function to layer L."""
         k = L.kind.upper()
         if k not in self._LAYER_REGISTRY:
             raise NotImplementedError(f"IntervalTF: Unsupported layer kind '{k}'")

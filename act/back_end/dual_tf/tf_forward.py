@@ -26,10 +26,14 @@ from act.back_end.layer_schema import LayerKind
 # Main Entry Point
 # ============================================================================
 
-def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
-                           post_activation: bool = False) -> Dict[int, Bounds]:
+def _compute_forward_bounds_impl(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
+                                  post_activation: bool = False) -> Dict[int, Bounds]:
     """
-    Compute forward bounds using linear coefficient tracking.
+    Core implementation of forward bounds - NO torch.no_grad().
+    
+    Used by:
+    - compute_forward_bounds(): Verification (wraps with no_grad)
+    - ProvableLoss: Training (calls directly for gradient flow)
     
     Args:
         net: ACT network
@@ -166,6 +170,25 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
     
     return bounds_dict
+
+
+def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
+                           post_activation: bool = False) -> Dict[int, Bounds]:
+    """
+    Compute forward bounds using linear coefficient tracking.
+    
+    This is the verification API - runs with torch.no_grad() for efficiency.
+    For training with gradients, use _compute_forward_bounds_impl() directly.
+    
+    Args:
+        net: ACT network
+        input_lb, input_ub: Input bounds
+        post_activation: If True, return POST-activation bounds (for validation).
+                        If False, return PRE-activation bounds (for dual backward).
+    """
+    with torch.no_grad():
+        return _compute_forward_bounds_impl(net, input_lb, input_ub, post_activation)
+
 
 # ============================================================================
 # Layer Handlers

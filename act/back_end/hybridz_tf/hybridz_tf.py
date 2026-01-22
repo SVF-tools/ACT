@@ -20,7 +20,6 @@ import torch
 from typing import Dict, List
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.transfer_functions import TransferFunction
-from act.back_end.utils import BackendMode, _backend_mode
 from act.back_end.hybridz_tf.tf_mlp import *
 from act.back_end.hybridz_tf.tf_cnn import *
 from act.back_end.hybridz_tf.tf_rnn import *
@@ -30,13 +29,6 @@ from act.back_end.hybridz_tf.tf_transformer import *
 class HybridzTF(TransferFunction):
     """HybridZ-based transfer functions with zonotope operations."""
     
-    def __init__(self, solving_mode: BackendMode = BackendMode.V):
-        """Initialize HybridzTF with solving mode.
-        
-        Args:
-            solving_mode: Backend solving mode (V=verification, T=training)
-        """
-        self.solving_mode = solving_mode
     
     # Layer kind to function mapping for HybridZ operations
     _LAYER_REGISTRY = {
@@ -91,10 +83,9 @@ class HybridzTF(TransferFunction):
         """Check if HybridZ supports this layer kind."""
         return layer_kind.upper() in self._LAYER_REGISTRY
         
-    @_backend_mode
+    @torch.no_grad()
     def apply(self, L: Layer, input_bounds: Bounds, net: Net,
               before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
-        """Apply HybridZ transfer function to layer L."""
         k = L.kind.upper()
         if k not in self._LAYER_REGISTRY:
             raise NotImplementedError(f"HybridzTF: Unsupported layer kind '{k}'")

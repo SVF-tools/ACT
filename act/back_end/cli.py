@@ -33,6 +33,7 @@ def run_verification(args):
     from act.back_end.bab import verify_bab
     from act.back_end.solver.solver_gurobi import GurobiSolver
     from act.back_end.solver.solver_torch import TorchLPSolver
+    from act.util.stats import VerifyStatus
     
     # Load network
     print(f"Loading network from: {args.network}")
@@ -85,8 +86,8 @@ def run_verification(args):
     print(f"VERIFICATION RESULT: {result.status}")
     print(f"{'='*80}")
     
-    if 'time' in result.stats:
-        print(f"Time: {result.stats['time']:.3f}s")
+    if 'time' in result.metadata:
+        print(f"Time: {result.metadata['time']:.3f}s")
     
     if result.counterexample is not None:
         print(f"Counterexample found:")
@@ -94,14 +95,14 @@ def run_verification(args):
         if args.verbose:
             print(f"  Values: {result.counterexample}")
     
-    if args.verbose and result.stats:
-        print(f"\nVerification stats:")
-        for key, value in result.stats.items():
+    if args.verbose and result.metadata:
+        print(f"\nVerification metadata:")
+        for key, value in result.metadata.items():
             print(f"  {key}: {value}")
     
     print(f"\n{'='*80}\n")
     
-    return 0 if result.status == "CERTIFIED" else 1
+    return 0 if result.status == VerifyStatus.CERTIFIED else 1
 
 
 def run_network_factory(args):

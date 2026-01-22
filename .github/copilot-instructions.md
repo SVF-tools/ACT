@@ -35,7 +35,7 @@ ACT is a unified neural network verification framework with a modern three-tier 
 - **Configuration** (`config.py`) - YAML-based test scenario management
 
 ### Key Data Structures
-- **Verification Results**: `VerifyResult.{SAT, UNSAT, UNKNOWN, TIMEOUT}`
+- **Verification Results**: `VerifyStatus.{CERTIFIED, FALSIFIED, UNKNOWN, TIMEOUT, VERIFIER_ERROR, MODEL_INFER_FAILURE}`
 - **Specifications**: `InKind.{BOX, L_INF, LIN_POLY}`, `OutKind.{SAFETY, ASSERT}`
 - **Core ACT Types**: `Layer` (id, kind, params, meta, vars), `Net` (layers, graph)
 - **Bounds**: Box constraints with `lb`/`ub` tensors for variable ranges

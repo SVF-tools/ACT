@@ -242,29 +242,34 @@ The pipeline provides comprehensive testing infrastructure:
 
 
 
-# VerifyResult: Verification outcome enum### Performance Profiling (`utils.py`)
+# VerifyStatus: Verification outcome enum
 
-print(VerifyResult.UNSAT)  # Property verified safe```python
+```python
+print(VerifyStatus.CERTIFIED)  # Property verified safe
+print(VerifyStatus.FALSIFIED)  # Counterexample found
+```
 
-print(VerifyResult.SAT)    # Counterexample found# Comprehensive performance monitoring
+**VerifyStatus Values**:
+- `CERTIFIED` - Property holds (verified safe)
+- `FALSIFIED` - Property violated (counterexample found)
+- `UNKNOWN` - Could not determine
+- `TIMEOUT` - Verification timed out
+- `VERIFIER_ERROR` - Verification failed due to verifier error
+- `MODEL_INFER_FAILURE` - Model inference failed on clean input
 
-```profiler = PerformanceProfiler()
+### Performance Profiling (`utils.py`)
 
+```python
+# Comprehensive performance monitoring
+profiler = PerformanceProfiler()
 profiler.start()
+# ... run verification ...
+metrics = profiler.stop()  # execution_time, peak_memory_mb, cpu_usage_percent
+```
 
-**VerifyResult Values**:# ... run verification ...
-
-- `SAT` - Property violated (counterexample found)metrics = profiler.stop()  # execution_time, peak_memory_mb, cpu_usage_percent
-
-- `UNSAT` - Property holds (verified safe)```
-
-- `CLEAN_FAILURE` - Failed with clean error
-
-- `UNKNOWN` - Could not determine**Monitoring:**
-
-- `TIMEOUT` - Verification timed out- **Execution Time**: Precise timing of verification operations
-
-- `ERROR` - Unexpected error- **Memory Usage**: Peak memory consumption tracking
+**Monitoring:**
+- **Execution Time**: Precise timing of verification operations
+- **Memory Usage**: Peak memory consumption tracking
 
 - **CPU/GPU Usage**: Resource utilization monitoring
 
@@ -879,7 +884,7 @@ act_net = converter.convert(pytorch_model, input_shape=(1, 784))
 
 # Verify
 result = verify_once(act_net, bounds, output_cons)
-print(f"Result: {result}")  # VerifyResult.SAT or VerifyResult.UNSAT
+print(f"Result: {result.status}")  # VerifyStatus.CERTIFIED or VerifyStatus.FALSIFIED
 ```
 
 ## Design Principles
