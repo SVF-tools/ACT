@@ -21,7 +21,7 @@
 #===---------------------------------------------------------------------===#
 
 # Public API:
-#   - verify_once(net, solver, timelimit=None) -> VerifResult
+#   - verify_once(net, solver, timelimit=None) -> VerifyResult
 #
 # Notes:
 #   * Spec-free verification: all constraints extracted from ACT Net layers.
@@ -48,22 +48,8 @@ from act.back_end.utils import validate_constraints
 # Front-end enums (kinds)
 from act.front_end.specs import InKind, OutKind
 
-# -----------------------------------------------------------------------------
-# Verification Status and Results
-# -----------------------------------------------------------------------------
-
-class VerifStatus:
-    """Verification result status codes."""
-    CERTIFIED = "CERTIFIED"      # Property proven safe
-    FALSIFIED = "FALSIFIED"      # Property violated (counterexample found)
-    UNKNOWN = "UNKNOWN"          # Inconclusive result
-
-@dataclass
-class VerifResult:
-    """Verification result with optional counterexample input."""
-    status: str                                    # CERTIFIED | FALSIFIED | UNKNOWN
-    counterexample: Optional[torch.Tensor] = None  # Input tensor (only if FALSIFIED)
-    stats: Dict[str, Any] = field(default_factory=dict)  # Solver metadata
+# Verification types (canonical location: act/util/stats.py)
+from act.util.stats import VerifyStatus, VerifyResult
 
 # -----------------------------------------------------------------------------
 # ACT Net extraction helpers
@@ -306,7 +292,7 @@ def setup_and_solve(
 # -----------------------------------------------------------------------------
 
 @torch.no_grad()
-def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> VerifResult:
+def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> VerifyResult:
     """
     Single-shot verification without refinement.
     Returns CERTIFIED/FALSIFIED/UNKNOWN with optional counterexample input.
@@ -320,10 +306,10 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     # Interpret result
     if status == SolveStatus.SAT and ce_input is not None:
         ce_x = torch.from_numpy(ce_input)
-        return VerifResult(VerifStatus.FALSIFIED, counterexample=ce_x, stats=stats)
+        return VerifyResult(VerifyStatus.FALSIFIED, counterexample=ce_x, metadata=stats)
     
     if status == SolveStatus.UNSAT:
-        return VerifResult(VerifStatus.CERTIFIED, stats=stats)
+        return VerifyResult(VerifyStatus.CERTIFIED, metadata=stats)
     
-    return VerifResult(VerifStatus.UNKNOWN, stats=stats)
+    return VerifyResult(VerifyStatus.UNKNOWN, metadata=stats)
 

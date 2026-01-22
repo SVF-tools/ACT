@@ -22,7 +22,8 @@ import configparser
 from act.util.path_config import get_config_root
 
 # Import ACT modules
-from act.wrapper_exts.ext_config import Model, Dataset, Spec, InputSpec, OutputSpec, VerifyResult
+from act.wrapper_exts.ext_config import Model, Dataset, Spec, InputSpec, OutputSpec
+from act.util.stats import VerifyStatus, VerifyResult
 from act.wrapper_exts.eran.eran_verifier import ERANVerifier
 from act.wrapper_exts.abcrown.abcrown_verifier import abCrownVerifier
 

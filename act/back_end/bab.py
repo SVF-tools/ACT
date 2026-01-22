@@ -27,14 +27,15 @@ from act.back_end.solver.solver_base import Solver, SolveStatus
 
 # Import from verifier for shared functionality
 from act.back_end.verifier import (
-    VerifStatus,
-    VerifResult,
     find_entry_layer_id,
     gather_input_spec_layers,
     get_assert_layer,
     seed_from_input_specs,
     setup_and_solve,
 )
+
+# Verification types (canonical location: act/util/stats.py)
+from act.util.stats import VerifyStatus, VerifyResult
 
 # Front-end enums
 from act.front_end.specs import OutKind
@@ -96,7 +97,7 @@ def solve_BaB_node(net, node: BabNode, solver: Solver, assert_layer) -> str:
 def verify_bab(net, solver: Solver,
                max_depth: int = 20,
                max_nodes: int = 2000,
-               time_budget_s: float = 300.0) -> VerifResult:
+               time_budget_s: float = 300.0) -> VerifyResult:
     """
     Branch-and-bound verification with iterative refinement.
     Returns CERTIFIED/FALSIFIED/UNKNOWN with optional counterexample input.
@@ -105,11 +106,11 @@ def verify_bab(net, solver: Solver,
     Status Mapping:
         Solver Result (negated property) → BaB Node Result  → Final Verification
         ─────────────────────────────────────────────────────────────────────────
-        SolveStatus.SAT (solution found) → SolveStatus.SAT  → VerifStatus.FALSIFIED
+        SolveStatus.SAT (solution found) → SolveStatus.SAT  → VerifyStatus.FALSIFIED
         SolveStatus.UNSAT (no solution)  → SolveStatus.UNSAT → Continue (node safe)
         SolveStatus.UNKNOWN (spurious)   → SolveStatus.UNKNOWN → Continue branching
         
-        All nodes UNSAT/exhausted → VerifStatus.CERTIFIED
+        All nodes UNSAT/exhausted → VerifyStatus.CERTIFIED
     """
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
@@ -129,10 +130,10 @@ def verify_bab(net, solver: Solver,
         if status == SolveStatus.SAT:
             # Found validated counterexample
             ce_x = torch.from_numpy(node.candidate_ce)
-            return VerifResult(
-                VerifStatus.FALSIFIED,
+            return VerifyResult(
+                VerifyStatus.FALSIFIED,
                 counterexample=ce_x,
-                stats={"nodes": processed}
+                metadata={"nodes": processed}
             )
         
         if status == SolveStatus.UNSAT:
@@ -148,7 +149,7 @@ def verify_bab(net, solver: Solver,
         heapq.heappush(pq, BabNode(Lbox, node.depth + 1, width_sum(Lbox)))
         heapq.heappush(pq, BabNode(Rbox, node.depth + 1, width_sum(Rbox)))
 
-    return VerifResult(VerifStatus.CERTIFIED, stats={"nodes": processed})
+    return VerifyResult(VerifyStatus.CERTIFIED, metadata={"nodes": processed})
 
 # -----------------------------------------------------------------------------
 # Counterexample validation (lightweight, used internally by BaB)

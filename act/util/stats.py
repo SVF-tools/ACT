@@ -25,8 +25,64 @@
 
 import os
 import torch
-from typing import Dict, Any, List, Tuple
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Tuple, Optional
 
+
+# =============================================================================
+# Verification Status and Result Types
+# =============================================================================
+
+class VerifyStatus(Enum):
+    """Verification result status codes.
+    
+    Terminology Note:
+        These differ from solver-level SAT/UNSAT terminology:
+        - SolveStatus.SAT (constraint satisfied) -> VerifyStatus.FALSIFIED (counterexample found)
+        - SolveStatus.UNSAT (constraint unsatisfied) -> VerifyStatus.CERTIFIED (property holds)
+    
+    Attributes:
+        CERTIFIED: Property proven safe - no counterexample exists
+        FALSIFIED: Property violated - valid counterexample found  
+        UNKNOWN: Inconclusive result (e.g., approximation too coarse)
+        TIMEOUT: Time limit exceeded before conclusion
+        VERIFIER_ERROR: Verification failed due to an error in the verifier
+        MODEL_INFER_FAILURE: Model inference failed on clean input (pre-verification check)
+    """
+    CERTIFIED = "certified"
+    FALSIFIED = "falsified"
+    UNKNOWN = "unknown"
+    TIMEOUT = "timeout"
+    VERIFIER_ERROR = "verifier_error"
+    MODEL_INFER_FAILURE = "model_infer_failure"
+
+
+@dataclass
+class VerifyResult:
+    """Verification result with optional counterexample.
+    
+    Attributes:
+        status: The verification outcome (VerifyStatus enum)
+        counterexample: Input tensor that violates the property (only if FALSIFIED)
+        metadata: Solver/verification metadata (timing, nodes explored, etc.)
+    """
+    status: VerifyStatus
+    counterexample: Optional[torch.Tensor] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def is_conclusive(self) -> bool:
+        """Return True if verification reached a definite conclusion."""
+        return self.status in (VerifyStatus.CERTIFIED, VerifyStatus.FALSIFIED)
+    
+    def is_safe(self) -> bool:
+        """Return True if property was proven safe."""
+        return self.status == VerifyStatus.CERTIFIED
+
+
+# =============================================================================
+# Statistics and Logging Utilities
+# =============================================================================
 
 class ACTStats:
     """
@@ -169,7 +225,7 @@ class ACTStats:
         print("\n📊 Verification Results Summary:")
         
         # Display known statistics
-        known_keys = ['total', 'safe', 'unsafe', 'timeout', 'clean_failure']
+        known_keys = ['total', 'safe', 'unsafe', 'timeout', 'model_infer_failure']
         for key in known_keys:
             if key in prediction_stats:
                 print(f"  {key}: {prediction_stats[key]}")
@@ -183,7 +239,7 @@ class ACTStats:
         
         # Display verification result statistics if available
         if verification_result_stat_dict:
-            print("\n🔍 Verification VerifyResult Distribution:")
+            print("\n🔍 Verification VerifyStatus Distribution:")
             for status, count in verification_result_stat_dict.items():
                 print(f"  {status}: {count}")
         
@@ -195,13 +251,12 @@ class ACTStats:
         Print final verification results summary and return the overall verdict.
         
         Args:
-            results: List of VerifyResult for all verified samples
+            results: List of VerifyStatus for all verified samples
             
         Returns:
-            Overall VerifyResult (SAT if all safe, UNSAT if any unsafe, UNKNOWN otherwise)
+            Overall VerifyStatus (CERTIFIED if all safe, FALSIFIED if any unsafe, UNKNOWN otherwise)
         """
-        # Import VerifyResult locally to avoid circular imports
-        from act.wrapper_exts.ext_config import VerifyResult
+        # VerifyStatus is now defined at module level in this file
         
         print("\n" + "🏆" + "="*70 + "🏆")
         print("📊 Final verification results summary")
@@ -212,48 +267,48 @@ class ACTStats:
 
         print("-" * 60)
 
-        sat_count = sum(1 for r in results if r == VerifyResult.SAT)
-        unsat_count = sum(1 for r in results if r == VerifyResult.UNSAT)
-        clean_failure_count = sum(1 for r in results if r == VerifyResult.CLEAN_FAILURE)
-        unknown_count = sum(1 for r in results if r == VerifyResult.UNKNOWN)
+        certified_count = sum(1 for r in results if r == VerifyStatus.CERTIFIED)
+        falsified_count = sum(1 for r in results if r == VerifyStatus.FALSIFIED)
+        model_infer_failure_count = sum(1 for r in results if r == VerifyStatus.MODEL_INFER_FAILURE)
+        unknown_count = sum(1 for r in results if r == VerifyStatus.UNKNOWN)
         total_count = len(results)
 
-        valid_count = total_count - clean_failure_count
+        valid_count = total_count - model_infer_failure_count
 
         print("Verification statistics:")
         print(f"Total samples: {total_count}")
-        print(f"✅ SAT (safe): {sat_count} ")
-        print(f"❌ UNSAT (unsafe): {unsat_count} ")
-        print(f"⚠️  CLEAN_FAILURE (clean prediction failed): {clean_failure_count} ")
+        print(f"✅ CERTIFIED (safe): {certified_count} ")
+        print(f"❌ FALSIFIED (unsafe): {falsified_count} ")
+        print(f"⚠️  MODEL_INFER_FAILURE (model inference failed): {model_infer_failure_count} ")
         print(f"❓ UNKNOWN: {unknown_count} ")
         print(f"🔍 Valid verification samples: {valid_count} ")
 
         if valid_count > 0:
-            sat_percentage = (sat_count / valid_count) * 100
-            unsat_percentage = (unsat_count / valid_count) * 100
-            print(f"📊 SAT over valid samples: {sat_percentage:.2f}% ({sat_count}/{valid_count})")
-            print(f"📊 UNSAT over valid samples: {unsat_percentage:.2f}% ({unsat_count}/{valid_count})")
+            certified_percentage = (certified_count / valid_count) * 100
+            falsified_percentage = (falsified_count / valid_count) * 100
+            print(f"📊 CERTIFIED over valid samples: {certified_percentage:.2f}% ({certified_count}/{valid_count})")
+            print(f"📊 FALSIFIED over valid samples: {falsified_percentage:.2f}% ({falsified_count}/{valid_count})")
         else:
             print("  ⚠️  No valid verification samples")
 
         if total_count > 0:
-            sat_total_percentage = (sat_count / total_count) * 100
-            unsat_total_percentage = (unsat_count / total_count) * 100
-            clean_failure_percentage = (clean_failure_count / total_count) * 100
-            print(f"📊 SAT over total: {sat_total_percentage:.2f}% ({sat_count}/{total_count})")
-            print(f"📊 UNSAT over total: {unsat_total_percentage:.2f}% ({unsat_count}/{total_count})")
-            print(f"📊 CLEAN_FAILURE over total: {clean_failure_percentage:.2f}% ({clean_failure_count}/{total_count})")
+            certified_total_percentage = (certified_count / total_count) * 100
+            falsified_total_percentage = (falsified_count / total_count) * 100
+            model_infer_failure_percentage = (model_infer_failure_count / total_count) * 100
+            print(f"📊 CERTIFIED over total: {certified_total_percentage:.2f}% ({certified_count}/{total_count})")
+            print(f"📊 FALSIFIED over total: {falsified_total_percentage:.2f}% ({falsified_count}/{total_count})")
+            print(f"📊 MODEL_INFER_FAILURE over total: {model_infer_failure_percentage:.2f}% ({model_infer_failure_count}/{total_count})")
 
         print("-" * 60)
 
-        if all(r == VerifyResult.SAT for r in results):
-            final_result = VerifyResult.SAT
-            print("✅ Final Result: SAT - all samples verified safe")
-        elif any(r == VerifyResult.UNSAT for r in results):
-            final_result = VerifyResult.UNSAT
-            print("❌ Final Result: UNSAT - at least one sample violates the property")
+        if all(r == VerifyStatus.CERTIFIED for r in results):
+            final_result = VerifyStatus.CERTIFIED
+            print("✅ Final Result: CERTIFIED - all samples verified safe")
+        elif any(r == VerifyStatus.FALSIFIED for r in results):
+            final_result = VerifyStatus.FALSIFIED
+            print("❌ Final Result: FALSIFIED - at least one sample violates the property")
         else:
-            final_result = VerifyResult.UNKNOWN
+            final_result = VerifyStatus.UNKNOWN
             print("❓ Final Result: UNKNOWN - inconclusive")
 
         print("🏆" + "="*70 + "🏆")

@@ -810,9 +810,9 @@ for model_id, wrapped_model in wrapped_models.items():
     )
     
     print(f"{model_id}: {result.status}")
-    if result.status == VerifyResult.UNSAT:
+    if result.status == VerifyStatus.CERTIFIED:
         print(f"  ✓ Property verified!")
-    elif result.status == VerifyResult.SAT:
+    elif result.status == VerifyStatus.FALSIFIED:
         print(f"  ✗ Counterexample found: {result.counterexample}")
 ```
 
@@ -873,8 +873,9 @@ for model_id, wrapped_model in wrapped_models.items():
 #### Step 4: Verification
 
 ```python
-from act.back_end.verifier import verify_once, verify_bab
-from act.back_end.core import VerifyResult
+from act.back_end.verifier import verify_once
+from act.back_end.bab import verify_bab
+from act.back_end import VerifyStatus, VerifyResult
 
 # Single-shot verification
 result = verify_once(
@@ -882,11 +883,11 @@ result = verify_once(
     solver='gurobi'  # or 'torch_lp'
 )
 
-if result.status == VerifyResult.UNSAT:
+if result.status == VerifyStatus.CERTIFIED:
     print("✓ Property verified (no counterexamples exist)")
-elif result.status == VerifyResult.SAT:
+elif result.status == VerifyStatus.FALSIFIED:
     print(f"✗ Counterexample found: {result.counterexample}")
-elif result.status == VerifyResult.UNKNOWN:
+elif result.status == VerifyStatus.UNKNOWN:
     # Refine with branch-and-bound
     result = verify_bab(
         net=act_net,
@@ -903,7 +904,7 @@ from act.front_end.vnnlib_loader import VNNLibSpecCreator
 from act.front_end.model_synthesis import model_synthesis
 from act.pipeline.verification.torch2act import torch_to_act_net
 from act.back_end.verifier import verify_once
-from act.back_end.core import VerifyResult
+from act.back_end import VerifyStatus
 
 # Process multiple categories
 categories = ["acasxu_2023", "test", "sat_relu"]
@@ -923,7 +924,7 @@ for category in categories:
     # Synthesize and verify
     wrapped_models, input_data = model_synthesis(spec_results=results)
     
-    verified = 0
+    certified = 0
     falsified = 0
     unknown = 0
     
@@ -932,9 +933,9 @@ for category in categories:
             act_net = torch_to_act_net(wrapped_model, input_data[model_id][0])
             result = verify_once(act_net, solver='gurobi', timeout=60)
             
-            if result.status == VerifyResult.UNSAT:
-                verified += 1
-            elif result.status == VerifyResult.SAT:
+            if result.status == VerifyStatus.CERTIFIED:
+                certified += 1
+            elif result.status == VerifyStatus.FALSIFIED:
                 falsified += 1
             else:
                 unknown += 1
@@ -943,7 +944,7 @@ for category in categories:
             unknown += 1
     
     print(f"\nResults for {category}:")
-    print(f"  Verified: {verified}")
+    print(f"  Certified: {certified}")
     print(f"  Falsified: {falsified}")
     print(f"  Unknown: {unknown}")
 ```
