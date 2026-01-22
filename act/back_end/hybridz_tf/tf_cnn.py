@@ -97,12 +97,19 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta.get("kernel_size", 2)
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
-    
+
     # Reshape input if flattened
-    in_shape = L.meta.get("input_shape")  # (channels, height, width)
+    in_shape = L.meta.get("input_shape")  # May be (N,C,H,W) or (C,H,W)
     if len(Bin.lb.shape) == 1 and in_shape:
-        Bin_lb = Bin.lb.view(1, *in_shape)
-        Bin_ub = Bin.ub.view(1, *in_shape)
+        # input_shape may be (N,C,H,W) or (C,H,W)
+        if len(in_shape) == 4:
+            _, C, H, W = in_shape
+        elif len(in_shape) == 3:
+            C, H, W = in_shape
+        else:
+            raise ValueError(f"Unexpected input_shape={in_shape}")
+        Bin_lb = Bin.lb.view(1, C, H, W)
+        Bin_ub = Bin.ub.view(1, C, H, W)
     else:
         Bin_lb = Bin.lb.unsqueeze(0) if len(Bin.lb.shape) == 3 else Bin.lb
         Bin_ub = Bin.ub.unsqueeze(0) if len(Bin.ub.shape) == 3 else Bin.ub
@@ -133,12 +140,19 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta.get("kernel_size", 2)
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
-    
+
     # Reshape input if needed
-    in_shape = L.meta.get("input_shape")
+    in_shape = L.meta.get("input_shape")  # May be (N,C,H,W) or (C,H,W)
     if len(Bin.lb.shape) == 1 and in_shape:
-        Bin_lb = Bin.lb.view(1, *in_shape)
-        Bin_ub = Bin.ub.view(1, *in_shape)
+        # input_shape may be (N,C,H,W) or (C,H,W)
+        if len(in_shape) == 4:
+            _, C, H, W = in_shape
+        elif len(in_shape) == 3:
+            C, H, W = in_shape
+        else:
+            raise ValueError(f"Unexpected input_shape={in_shape}")
+        Bin_lb = Bin.lb.view(1, C, H, W)
+        Bin_ub = Bin.ub.view(1, C, H, W)
     else:
         Bin_lb = Bin.lb.unsqueeze(0) if len(Bin.lb.shape) == 3 else Bin.lb
         Bin_ub = Bin.ub.unsqueeze(0) if len(Bin.ub.shape) == 3 else Bin.ub

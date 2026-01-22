@@ -189,17 +189,44 @@ def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
     idx_pos = torch.where(Bin.lb >= 0)[0]  # Always positive
     idx_neg = torch.where(Bin.ub <= 0)[0]  # Always negative
     idx_amb = torch.where((Bin.lb < 0) & (Bin.ub > 0))[0]  # Crosses zero
-    
+
     # Output bounds
-    lb = torch.where(idx_amb[:, None] == torch.arange(len(Bin.lb))[None, :], 
-                     torch.zeros_like(Bin.lb), 
+    lb = torch.where(idx_amb[:, None] == torch.arange(len(Bin.lb))[None, :],
+                     torch.zeros_like(Bin.lb),
                      torch.where(Bin.lb >= 0, Bin.lb, -Bin.ub))
     ub = torch.maximum(torch.abs(Bin.lb), torch.abs(Bin.ub))
     Bout = Bounds(lb=lb, ub=ub)
-    
+
     cons = ConSet()
     cons.add_op(f"abs:{L.id}", list(L.out_vars + L.in_vars), idx_pos=idx_pos, idx_neg=idx_neg, idx_amb=idx_amb)
-    
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_silu(L: Layer, Bin: Bounds) -> Fact:
+    """HybridZ transfer function for SILU (Swish) activation: x * sigmoid(x)."""
+    # SILU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    # Compute sigmoid bounds
+    s_lb = 1 / (1 + torch.exp(-Bin.lb))
+    s_ub = 1 / (1 + torch.exp(-Bin.ub))
+
+    # SILU is x * sigmoid(x), use interval multiplication
+    # Consider all combinations of x and sigmoid(x) bounds
+    cand = torch.stack([
+        Bin.lb * s_lb,
+        Bin.lb * s_ub,
+        Bin.ub * s_lb,
+        Bin.ub * s_ub
+    ], dim=0)
+
+    lb = torch.min(cand, dim=0).values
+    ub = torch.max(cand, dim=0).values
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"silu:{L.id}", list(L.out_vars + L.in_vars), s_lb=s_lb, s_ub=s_ub)
+
     return Fact(bounds=Bout, cons=cons)
 
 
