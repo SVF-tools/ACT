@@ -26,11 +26,12 @@ except ImportError:
 
 from act.back_end.core import Layer, Net
 from act.back_end.serialization import (
-    save_net_to_file, load_net_from_file, 
+    save_net_to_file, load_net_from_file,
     save_net_to_string, load_net_from_string,
     validate_json_schema,
     TensorEncoder, NetSerializer
 )
+from act.util.path_config import get_examples_nets_dir
 
 # Import for loading networks from examples
 # (No longer using old factory - loading directly from JSON files)
@@ -38,7 +39,7 @@ from act.back_end.serialization import (
 
 def create_test_networks():
     """Load all ACT networks from the examples folder using proper deserialization."""
-    examples_dir = Path("act/back_end/examples/nets")
+    examples_dir = Path(get_examples_nets_dir())
     test_nets = {}
 
     # Gather JSON files

@@ -84,7 +84,7 @@ families:
         count: { range: [2, 4] }
         value: { choice: [32, 64, 128] }  # Width of each hidden layer
     activation:
-      choice: [relu, tanh, sigmoid]  # Activation functions
+      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus]  # Activation functions
     variant:
       weighted:
         plain: 0.4              # Plain feedforward MLP
@@ -104,6 +104,13 @@ families:
       const: true               # Enable bias terms in linear layers
     num_classes:
       choice: [10]              # Number of output classes
+    # Activation parameters
+    lrelu_alpha:
+      choice: [0.01, 0.1, 0.2]  # LeakyReLU negative slope
+    hardtanh_min:
+      choice: [-1.0, -2.0]      # HardTanh min value
+    hardtanh_max:
+      choice: [1.0, 2.0]        # HardTanh max value
 
   # --------------------------------------------------------------------------
   # 4.2 CNN2D (2D Convolutional Network) Family
@@ -127,12 +134,14 @@ families:
       choice: [1]               # Convolution strides
     paddings:
       choice: [1]               # Convolution padding
-    use_maxpool:
-      probability: 0.3          # Add max pooling layers
-    maxpool_kernel:
-      const: 2                  # Max pool kernel size
-    maxpool_stride:
-      const: 2                  # Max pool stride
+    use_pooling:
+      probability: 0.5          # Add pooling layers
+    pool_kind:
+      choice: [maxpool, avgpool, none]  # Pooling type
+    pool_kernel:
+      const: 2                  # Pool kernel size
+    pool_stride:
+      const: 2                  # Pool stride
     fc_hidden:
       choice: [32, 64, 128]     # Hidden units in FC head (plain variant)
     stages:
@@ -150,8 +159,15 @@ families:
     head_pool_to_1x1:
       const: true               # Global pooling before FC head
     activation:
-      choice: [relu, tanh, sigmoid]  # Activation functions
+      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu]  # Activation functions
     use_bias:
       const: true               # Enable bias in conv/linear layers
+    # Activation parameters for CNN
+    lrelu_alpha:
+      choice: [0.01, 0.1, 0.2]  # LeakyReLU negative slope
+    hardtanh_min:
+      choice: [-1.0, -2.0]      # HardTanh min value
+    hardtanh_max:
+      choice: [1.0, 2.0]        # HardTanh max value
     num_classes:
       choice: [10]              # Number of output classes

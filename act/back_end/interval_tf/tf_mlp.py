@@ -57,9 +57,11 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
-    a=float(L.meta["alpha"]); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
-    lb=torch.minimum(a*torch.minimum(l,0.0), torch.maximum(l,0.0))
-    ub=torch.maximum(a*torch.maximum(u,0.0), torch.maximum(u,0.0))
+    # Support both 'alpha' (legacy) and 'negative_slope' (schema standard)
+    a=float(L.meta.get("negative_slope", L.meta.get("alpha", 0.01))); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
+    zero = torch.tensor(0.0, dtype=l.dtype, device=l.device)
+    lb=torch.minimum(a*torch.minimum(l,zero), torch.maximum(l,zero))
+    ub=torch.maximum(a*torch.maximum(u,zero), torch.maximum(u,zero))
     if torch.any(amb):
         s=(u[amb]-a*l[amb])/torch.clamp(u[amb]-l[amb],min=1e-12); t=a*l[amb]-s*l[amb]
     else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
@@ -83,7 +85,10 @@ def tf_abs(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_clip(L: Layer, Bin: Bounds) -> Fact:
-    a,b=L.params["a"],L.params["b"]; B=Bounds(torch.clamp(Bin.lb,a,b), torch.clamp(Bin.ub,a,b))
+    # Support both 'a/b' (legacy) and 'min/max' (schema standard)
+    a=L.params.get("a", L.meta.get("min", float("-inf")))
+    b=L.params.get("b", L.meta.get("max", float("inf")))
+    B=Bounds(torch.clamp(Bin.lb,a,b), torch.clamp(Bin.ub,a,b))
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"clip:{L.id}","a":a,"b":b}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
@@ -235,10 +240,29 @@ def tf_square(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_power(L: Layer, Bin: Bounds) -> Fact:
-    p=float(L.meta["p"]); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
+    # Support both 'p' (legacy) and 'exponent' (schema standard)
+    p=float(L.meta.get("exponent", L.meta.get("p", 2.0))); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
     B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(Bin.lb,Bin.ub,2)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+
+def tf_pow(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
+    """Element-wise power: x^y. Conservative interval arithmetic for x^y."""
+    # For interval [lx,ux]^[ly,uy], consider all combinations
+    cand = torch.stack([
+        torch.pow(torch.clamp(Bx.lb, min=1e-8), By.lb),
+        torch.pow(torch.clamp(Bx.lb, min=1e-8), By.ub),
+        torch.pow(torch.clamp(Bx.ub, min=1e-8), By.lb),
+        torch.pow(torch.clamp(Bx.ub, min=1e-8), By.ub),
+    ], dim=0)
+    lb = torch.min(cand, dim=0).values
+    ub = torch.max(cand, dim=0).values
+    B = Bounds(lb, ub)
+    assert B.lb.numel() == len(L.out_vars), f"pow out_vars length {len(L.out_vars)} != output elements {B.lb.numel()}"
+    C = ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]), {"tag": f"pow:{L.id}"}))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
 
 # -------- Additional Activations --------
 def tf_relu6(L: Layer, Bin: Bounds) -> Fact:

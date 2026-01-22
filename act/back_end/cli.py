@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from act.util.cli_utils import add_device_args, initialize_from_args
+from act.util.path_config import get_examples_nets_dir, get_examples_gen_config_path
 
 
 def run_verification(args):
@@ -111,8 +112,8 @@ def run_network_factory(args):
     print(f"{'='*80}\n")
     
     from act.back_end.net_factory import NetFactory
-    
-    config_file = args.config if args.config else "act/back_end/examples/config_gen_act_net.yaml"
+
+    config_file = args.config if args.config else get_examples_gen_config_path()
     
     print(f"Configuration: {config_file}")
     if args.output:
@@ -239,7 +240,7 @@ def list_examples(args):
 
     from act.pipeline.verification.model_factory import ModelFactory
 
-    nets_dir = Path("act/back_end/examples/nets")
+    nets_dir = Path(get_examples_nets_dir())
 
     if not nets_dir.exists():
         print(f"❌ Nets directory not found: {nets_dir}")
@@ -312,8 +313,8 @@ Examples:
   # VERIFICATION - Run verification on networks
   # ============================================================================
   
-  # Single-shot verification
-  python -m act.back_end --verify --network act/back_end/examples/nets/mnist_robust_easy.json
+  # Single-shot verification (use full path or relative to examples/nets)
+  python -m act.back_end --verify --network mnist_robust_easy.json
   
   # Branch-and-bound verification
   python -m act.back_end --verify --network mnist_robust_hard.json --bab
@@ -391,7 +392,7 @@ Examples:
     factory_group.add_argument(
         "--config", "-c",
         type=str,
-        help="Path to generator YAML configuration file (default: act/back_end/examples/config_gen_act_net.yaml)"
+        help="Path to generator YAML configuration file (default: <project_root>/act/back_end/examples/config_gen_act_net.yaml)"
     )
     factory_group.add_argument(
         "--output", "-o",

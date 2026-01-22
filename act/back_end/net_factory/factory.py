@@ -119,6 +119,17 @@ class NetFactory:
             in_features = meta.get("in_features", 1)
             out_features = meta.get("out_features", 1)
             return torch.randn(out_features, in_features) * 0.1
+
+        if kind == "CONV1D":
+            in_channels = meta.get("in_channels", 1)
+            out_channels = meta.get("out_channels", 1)
+            kernel_size = meta.get("kernel_size", 3)
+            if isinstance(kernel_size, int):
+                weight_shape = (out_channels, in_channels, kernel_size)
+            else:
+                weight_shape = (out_channels, in_channels, kernel_size[0])
+            return torch.randn(*weight_shape) * 0.1
+
         if kind == "CONV2D":
             in_channels = meta.get("in_channels", 1)
             out_channels = meta.get("out_channels", 1)
@@ -128,6 +139,28 @@ class NetFactory:
             else:
                 weight_shape = (out_channels, in_channels, kernel_size[0], kernel_size[1])
             return torch.randn(*weight_shape) * 0.1
+
+        if kind == "CONV3D":
+            in_channels = meta.get("in_channels", 1)
+            out_channels = meta.get("out_channels", 1)
+            kernel_size = meta.get("kernel_size", 3)
+            if isinstance(kernel_size, int):
+                weight_shape = (out_channels, in_channels, kernel_size, kernel_size, kernel_size)
+            else:
+                weight_shape = (out_channels, in_channels, kernel_size[0], kernel_size[1], kernel_size[2])
+            return torch.randn(*weight_shape) * 0.1
+
+        if kind == "CONVTRANSPOSE2D":
+            # Note: ConvTranspose2D weight shape is [in_channels, out_channels, k, k]
+            in_channels = meta.get("in_channels", 1)
+            out_channels = meta.get("out_channels", 1)
+            kernel_size = meta.get("kernel_size", 3)
+            if isinstance(kernel_size, int):
+                weight_shape = (in_channels, out_channels, kernel_size, kernel_size)
+            else:
+                weight_shape = (in_channels, out_channels, kernel_size[0], kernel_size[1])
+            return torch.randn(*weight_shape) * 0.1
+
         return None
 
     def _input_spec_params(
@@ -175,12 +208,25 @@ class NetFactory:
             out_vars = list(range(var_counter, var_counter + out_features))
             return in_vars, out_vars, var_counter + out_features
 
-        if kind in ["RELU", "SIGMOID", "TANH"]:
+        # All activation functions (element-wise operations)
+        activation_kinds = [
+            "RELU", "SIGMOID", "TANH", "LRELU", "RELU6", "HARDTANH", "HARDSIGMOID",
+            "HARDSWISH", "SILU", "SOFTPLUS", "MISH", "SOFTSIGN", "GELU", "ABS",
+            "CLIP", "SQUARE", "POWER"
+        ]
+        if kind in activation_kinds:
             in_vars = layers[layer_index - 1].out_vars
             out_vars = list(range(var_counter, var_counter + len(in_vars)))
             return in_vars, out_vars, var_counter + len(in_vars)
 
-        if kind in ["CONV2D", "MAXPOOL2D", "AVGPOOL2D"]:
+        # All CNN spatial layers (conv, pool, upsample, pad)
+        cnn_spatial_kinds = [
+            "CONV1D", "CONV2D", "CONV3D", "CONVTRANSPOSE2D",
+            "MAXPOOL1D", "MAXPOOL2D", "MAXPOOL3D",
+            "AVGPOOL1D", "AVGPOOL2D", "AVGPOOL3D",
+            "UPSAMPLE", "PAD"
+        ]
+        if kind in cnn_spatial_kinds:
             in_vars = layers[layer_index - 1].out_vars
             out_num_vars = torch.Size(meta["output_shape"]).numel()
             out_vars = list(range(var_counter, var_counter + out_num_vars))
@@ -191,12 +237,33 @@ class NetFactory:
             out_vars = list(range(var_counter, var_counter + len(in_vars)))
             return in_vars, out_vars, var_counter + len(in_vars)
 
-        if kind == "ADD":
+        # Multi-input operations (ADD, SUB, MUL, DIV, POW)
+        if kind in ["ADD", "SUB", "MUL", "DIV", "POW"]:
             x_vars = meta["x_vars"]
             y_vars = meta["y_vars"]
             in_vars = list(x_vars) + list(y_vars)
             out_vars = list(range(var_counter, var_counter + len(x_vars)))
             return in_vars, out_vars, var_counter + len(x_vars)
+
+        if kind == "MATMUL":
+            x_vars = meta["x_vars"]
+            y_vars = meta["y_vars"]
+            in_vars = list(x_vars) + list(y_vars)
+            output_shape = meta["output_shape"]
+            out_num_vars = output_shape[0] * output_shape[1]
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            return in_vars, out_vars, var_counter + out_num_vars
+
+        # Tensor slice/gather operations
+        if kind in ["SLICE", "GATHER", "INDEX_SELECT"]:
+            in_vars = layers[layer_index - 1].out_vars
+            if "output_shape" in meta:
+                out_num_vars = torch.Size(meta["output_shape"]).numel()
+            else:
+                # Conservative: assume same size as input
+                out_num_vars = len(in_vars)
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            return in_vars, out_vars, var_counter + out_num_vars
 
         if kind in ["INPUT_SPEC", "ASSERT"]:
             prev_vars = layers[layer_index - 1].out_vars
@@ -302,8 +369,8 @@ class NetFactory:
             meta = layer_spec.get("meta", {}).copy()
             kind = layer_spec["kind"]
 
-            # Handle ADD layer inputs
-            if kind == "ADD":
+            # Handle multi-input layer inputs (ADD, SUB, DIV, MUL, POW, MATMUL)
+            if kind in ["ADD", "SUB", "DIV", "MUL", "POW", "MATMUL"]:
                 inputs = layer_spec.get("inputs") or {}
                 x_src = inputs.get("x")
                 y_src = inputs.get("y")
@@ -331,7 +398,7 @@ class NetFactory:
                 if meta.get("bias_enabled", False):
                     out_features = meta.get("out_features", 10)
                     params["b"] = torch.zeros(out_features, dtype=dtype)
-            elif kind == "CONV2D" and "weight" not in params:
+            elif kind in ["CONV1D", "CONV2D", "CONV3D", "CONVTRANSPOSE2D"] and "weight" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
                     params["weight"] = weight

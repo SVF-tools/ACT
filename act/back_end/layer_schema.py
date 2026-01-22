@@ -110,6 +110,8 @@ class LayerKind(str, enum.Enum):
     SOFTSIGN = "SOFTSIGN"
     ABS = "ABS"
     CLIP = "CLIP"
+    SQUARE = "SQUARE"
+    POWER = "POWER"
     ADD = "ADD"
     SUB = "SUB"
     MUL = "MUL"
@@ -117,6 +119,7 @@ class LayerKind(str, enum.Enum):
     POW = "POW"
     MIN = "MIN"
     MAX = "MAX"
+    MATMUL = "MATMUL"
 
     # Tensor plumbing
     CONCAT = "CONCAT"
@@ -129,6 +132,10 @@ class LayerKind(str, enum.Enum):
     TILE = "TILE"
     EXPAND = "EXPAND"
     UPSAMPLE = "UPSAMPLE"
+    PAD = "PAD"
+    SLICE = "SLICE"
+    GATHER = "GATHER"
+    INDEX_SELECT = "INDEX_SELECT"
 
     # Sequences & attention
     EMBEDDING = "EMBEDDING"
@@ -174,23 +181,23 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
 
     # Dense/CNN
     LayerKind.DENSE.value:       {"params_required": ["W"], "params_optional": ["b","W_pos","W_neg"], "meta_required": [], "meta_optional": ["activation","input_shape","output_shape","bias_enabled","in_features","out_features"]},
-    LayerKind.CONV1D.value:      {"params_required": ["weight"], "params_optional": ["bias","weight_pos","weight_neg"], "meta_required": ["stride","padding","dilation","groups"], "meta_optional": ["transposed","output_padding","padding_mode","input_shape","output_shape","data_format"]},
+    LayerKind.CONV1D.value:      {"params_required": ["weight"], "params_optional": ["bias","weight_pos","weight_neg"], "meta_required": ["input_shape","output_shape"], "meta_optional": ["stride","padding","dilation","groups","transposed","output_padding","padding_mode","data_format"]},
     LayerKind.CONV2D.value:      {"params_required": ["weight"], "params_optional": ["bias"], "meta_required": ["input_shape","output_shape"], "meta_optional": ["stride","padding","dilation","groups","kernel_size","in_channels","out_channels","transposed","output_padding","padding_mode","data_format"]},
-    LayerKind.CONV3D.value:      {"params_required": ["weight"], "params_optional": ["bias","weight_pos","weight_neg"], "meta_required": ["stride","padding","dilation","groups"], "meta_optional": ["transposed","output_padding","padding_mode","input_shape","output_shape","data_format"]},
-    LayerKind.CONVTRANSPOSE2D.value: {"params_required": ["weight"], "params_optional": ["bias"], "meta_required": ["stride","padding","dilation","groups"], "meta_optional": ["transposed","output_padding","padding_mode","input_shape","output_shape","data_format"]},
+    LayerKind.CONV3D.value:      {"params_required": ["weight"], "params_optional": ["bias","weight_pos","weight_neg"], "meta_required": ["input_shape","output_shape"], "meta_optional": ["stride","padding","dilation","groups","transposed","output_padding","padding_mode","data_format"]},
+    LayerKind.CONVTRANSPOSE2D.value: {"params_required": ["weight"], "params_optional": ["bias"], "meta_required": ["input_shape","output_shape"], "meta_optional": ["stride","padding","dilation","groups","transposed","output_padding","padding_mode","data_format"]},
 
     # Pooling
-    LayerKind.MAXPOOL1D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"]},
+    LayerKind.MAXPOOL1D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
     LayerKind.MAXPOOL2D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
-    LayerKind.MAXPOOL3D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"]},
-    LayerKind.AVGPOOL1D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"]},
+    LayerKind.MAXPOOL3D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
+    LayerKind.AVGPOOL1D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
     LayerKind.AVGPOOL2D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
-    LayerKind.AVGPOOL3D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"]},
+    LayerKind.AVGPOOL3D.value:   {"params_required": [], "params_optional": [], "meta_required": ["kernel_size"], "meta_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"]},
     LayerKind.ADAPTIVEAVGPOOL2D.value: {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["output_size"]},
 
     # Activations / elementwise
     LayerKind.RELU.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["input_shape","output_shape"]},
-    LayerKind.LRELU.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["negative_slope"]},
+    LayerKind.LRELU.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["negative_slope","alpha"]},
     LayerKind.PRELU.value:       {"params_required": ["weight"], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.SIGMOID.value:     {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.TANH.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
@@ -203,14 +210,17 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
     LayerKind.HARDSWISH.value:   {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.SOFTSIGN.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
     LayerKind.ABS.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
-    LayerKind.CLIP.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["min","max"]},
+    LayerKind.CLIP.value:        {"params_required": [], "params_optional": ["a","b"], "meta_required": [], "meta_optional": ["min","max"]},
+    LayerKind.SQUARE.value:      {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": []},
+    LayerKind.POWER.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["p","exponent"]},
     LayerKind.ADD.value:         {"params_required": [], "params_optional": ["bias"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape","x_vars","y_vars"]},
-    LayerKind.SUB.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
-    LayerKind.MUL.value:         {"params_required": [], "params_optional": ["scale"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape"]},
-    LayerKind.DIV.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
-    LayerKind.POW.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
-    LayerKind.MIN.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
-    LayerKind.MAX.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis"]},
+    LayerKind.SUB.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis","x_vars","y_vars"]},
+    LayerKind.MUL.value:         {"params_required": [], "params_optional": ["scale"], "meta_required": [], "meta_optional": ["broadcast","axis","input_shape","output_shape","original_shape","x_vars","y_vars"]},
+    LayerKind.DIV.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis","x_vars","y_vars"]},
+    LayerKind.POW.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis","exponent"]},
+    LayerKind.MIN.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis","y_vars_list"]},
+    LayerKind.MAX.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["broadcast","axis","y_vars_list"]},
+    LayerKind.MATMUL.value:      {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["x_shape","y_shape","output_shape","x_vars","y_vars"]},
 
     # Tensor plumbing
     LayerKind.CONCAT.value:      {"params_required": [], "params_optional": [], "meta_required": ["concat_dim"], "meta_optional": []},
@@ -220,9 +230,13 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
     LayerKind.TRANSPOSE.value:   {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["perm"]},
     LayerKind.SQUEEZE.value:     {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["dims"]},
     LayerKind.UNSQUEEZE.value:   {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["dims"]},
-    LayerKind.TILE.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["repeats"]},
+    LayerKind.TILE.value:        {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["repeats","input_shape"]},
     LayerKind.EXPAND.value:      {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["shape"]},
-    LayerKind.UPSAMPLE.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["mode","align_corners","scale_factor","size"]},
+    LayerKind.UPSAMPLE.value:    {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["mode","align_corners","scale_factor","size","input_shape","output_shape"]},
+    LayerKind.PAD.value:         {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["pad","pads","mode","value","input_shape","output_shape"]},
+    LayerKind.SLICE.value:       {"params_required": [], "params_optional": [], "meta_required": [], "meta_optional": ["starts","ends","axes","steps","input_shape","output_shape"]},
+    LayerKind.GATHER.value:      {"params_required": [], "params_optional": [], "meta_required": ["indices"], "meta_optional": ["axis","input_shape","output_shape"]},
+    LayerKind.INDEX_SELECT.value:{"params_required": [], "params_optional": [], "meta_required": ["indices","dim"], "meta_optional": ["input_shape","output_shape"]},
 
     # Sequences / attention
     LayerKind.EMBEDDING.value:   {"params_required": ["weight"], "params_optional": [], "meta_required": ["num_embeddings","embedding_dim"], "meta_optional": ["padding_idx","max_norm","norm_type","scale_grad_by_freq","sparse"]},
@@ -262,6 +276,14 @@ SUPPORTED_EXPORT_OPS = {
     "posenc",
     "layernorm",
     "gelu",
+    "silu",
+    "relu6",
+    "hardtanh",
+    "hardsigmoid",
+    "hardswish",
+    "softplus",
+    "mish",
+    "softsign",
     "att_scores",
     "att_mix",
     "mask",

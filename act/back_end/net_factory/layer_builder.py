@@ -47,7 +47,21 @@ def _ensure_batch1(shape: Tuple[int, ...]) -> Tuple[int, ...]:
 def _activation_kind(name: str) -> str:
     """Map activation name to layer kind."""
     name = (name or "relu").lower()
-    mapping = {"relu": "RELU", "tanh": "TANH", "sigmoid": "SIGMOID"}
+    mapping = {
+        "relu": "RELU",
+        "tanh": "TANH",
+        "sigmoid": "SIGMOID",
+        "lrelu": "LRELU",
+        "relu6": "RELU6",
+        "hardtanh": "HARDTANH",
+        "hardsigmoid": "HARDSIGMOID",
+        "hardswish": "HARDSWISH",
+        "silu": "SILU",
+        "softplus": "SOFTPLUS",
+        "mish": "MISH",
+        "softsign": "SOFTSIGN",
+        "gelu": "GELU",
+    }
     if name not in mapping:
         raise ValueError(f"Unsupported activation '{name}'")
     return mapping[name]
@@ -180,9 +194,24 @@ def append_dense(
     })
 
 
-def append_act(layers: List[Dict[str, Any]], act_kind: str) -> None:
-    """Append activation layer."""
-    layers.append({"kind": act_kind, "params": {}, "meta": {}})
+def append_act(layers: List[Dict[str, Any]], act_kind: str, *, act_params: Dict[str, Any] = None) -> None:
+    """Append activation layer with optional parameters."""
+    meta = {}
+    if act_params:
+        # Map activation parameters to meta fields
+        if act_kind == "LRELU" and "lrelu_alpha" in act_params:
+            meta["negative_slope"] = float(act_params["lrelu_alpha"])
+        elif act_kind == "HARDTANH":
+            if "hardtanh_min" in act_params:
+                meta["min_val"] = float(act_params["hardtanh_min"])
+            if "hardtanh_max" in act_params:
+                meta["max_val"] = float(act_params["hardtanh_max"])
+        elif act_kind == "HARDSIGMOID":
+            if "hardsigmoid_alpha" in act_params:
+                meta["alpha"] = float(act_params["hardsigmoid_alpha"])
+            if "hardsigmoid_beta" in act_params:
+                meta["beta"] = float(act_params["hardsigmoid_beta"])
+    layers.append({"kind": act_kind, "params": {}, "meta": meta})
 
 
 def append_add(layers: List[Dict[str, Any]], *, skip_idx: int, main_idx: int) -> None:
@@ -211,35 +240,35 @@ def build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> No
     if variant == "plain":
         for h in cfg["hidden_sizes"]:
             append_dense(layers, in_features=in_features, out_features=int(h), use_bias=use_bias)
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
             in_features = int(h)
     elif variant == "block":
         width = int(cfg["block_width"])
         append_dense(layers, in_features=in_features, out_features=width, use_bias=use_bias)
-        append_act(layers, act_kind)
+        append_act(layers, act_kind, act_params=cfg)
         in_features = int(width)
 
         for _ in range(int(cfg["num_blocks"])):
             append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
             append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
             if cfg["post_block_activation"]:
-                append_act(layers, act_kind)
+                append_act(layers, act_kind, act_params=cfg)
     elif variant == "residual":
         width = int(cfg["residual_width"])
         if in_features != width:
             append_dense(layers, in_features=in_features, out_features=width, use_bias=use_bias)
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
             in_features = int(width)
 
         for _ in range(int(cfg["num_residual_blocks"])):
             skip_idx = len(layers) - 1
             append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
             append_dense(layers, in_features=in_features, out_features=in_features, use_bias=use_bias)
             main_idx = len(layers) - 1
             append_add(layers, skip_idx=skip_idx, main_idx=main_idx)
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
     else:
         raise ValueError(f"Unsupported MLP variant '{variant}'")
 
@@ -271,54 +300,67 @@ def build_cnn_layers(
                 layers, in_ch=in_ch, out_ch=int(out_ch), H=H, W=W,
                 kernel=int(k), stride=int(s), padding=int(p),
             )
-            append_act(layers, act_kind)
+            append_act(layers, act_kind, act_params=cfg)
             in_ch = int(out_ch)
 
-            if cfg["use_maxpool"]:
-                H, W = append_pool2d(
-                    layers, kind="MAXPOOL2D", in_ch=in_ch, H=H, W=W,
-                    kernel=int(cfg["maxpool_kernel"]),
-                    stride=int(cfg["maxpool_stride"]),
-                    padding=0,
-                )
+            # Support for different pooling types
+            use_pooling = cfg.get("use_pooling", cfg.get("use_maxpool", False))
+            if use_pooling:
+                pool_kind = cfg.get("pool_kind", "maxpool")
+                if pool_kind == "maxpool":
+                    pool_type = "MAXPOOL2D"
+                elif pool_kind == "avgpool":
+                    pool_type = "AVGPOOL2D"
+                else:
+                    pool_type = None
+
+                if pool_type:
+                    pool_kernel = int(cfg.get("pool_kernel", cfg.get("maxpool_kernel", 2)))
+                    pool_stride = int(cfg.get("pool_stride", cfg.get("maxpool_stride", 2)))
+                    H, W = append_pool2d(
+                        layers, kind=pool_type, in_ch=in_ch, H=H, W=W,
+                        kernel=pool_kernel,
+                        stride=pool_stride,
+                        padding=0,
+                    )
 
         layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
         feat = int(in_ch * H * W)
         append_dense(layers, in_features=int(feat), out_features=int(cfg["fc_hidden"]), use_bias=True)
-        append_act(layers, act_kind)
+        append_act(layers, act_kind, act_params=cfg)
         append_dense(layers, in_features=int(cfg["fc_hidden"]), out_features=int(cfg["num_classes"]), use_bias=True)
         return
 
     # Stage variant
     ch = int(cfg["base_channels"])
     H, W = append_conv2d(layers, in_ch=in_ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
-    append_act(layers, act_kind)
+    append_act(layers, act_kind, act_params=cfg)
 
     for stage in range(int(cfg["stages"])):
         if stage > 0:
             next_ch = min(64, ch * int(cfg["channel_mult"]))
             if cfg["downsample"] == "stride2_conv":
                 H, W = append_conv2d(layers, in_ch=ch, out_ch=next_ch, H=H, W=W, kernel=3, stride=2, padding=1)
-                append_act(layers, act_kind)
+                append_act(layers, act_kind, act_params=cfg)
                 ch = next_ch
             else:
                 pool_kind = "MAXPOOL2D" if cfg["downsample"] == "maxpool" else "AVGPOOL2D"
                 H, W = append_pool2d(layers, kind=pool_kind, in_ch=ch, H=H, W=W, kernel=2, stride=2, padding=0)
                 if next_ch != ch:
                     H, W = append_conv2d(layers, in_ch=ch, out_ch=next_ch, H=H, W=W, kernel=1, stride=1, padding=0)
-                    append_act(layers, act_kind)
+                    append_act(layers, act_kind, act_params=cfg)
                     ch = next_ch
 
         for _ in range(int(cfg["blocks_per_stage"])):
             make_double_conv = (rng.random() < float(cfg["double_conv_p"]))
             if make_double_conv:
                 H, W = append_conv2d(layers, in_ch=ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
-                append_act(layers, act_kind)
+                append_act(layers, act_kind, act_params=cfg)
                 H, W = append_conv2d(layers, in_ch=ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
-                append_act(layers, act_kind)
+                append_act(layers, act_kind, act_params=cfg)
             else:
                 H, W = append_conv2d(layers, in_ch=ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
-                append_act(layers, act_kind)
+                append_act(layers, act_kind, act_params=cfg)
 
     while cfg["head_pool_to_1x1"] and (H > 1 or W > 1):
         H, W = append_pool2d(layers, kind="AVGPOOL2D", in_ch=ch, H=H, W=W, kernel=2, stride=2, padding=0)
