@@ -9,7 +9,7 @@
 # Purpose:
 #   Layer construction helpers for NetFactory.
 #   - Build layer specs in-place (list of dicts).
-#   - Expects already-sampled configs from sampler.py.
+#   - Expects already-sampled configs from ConfigSampler (in factory.py).
 #   - No randomness except the caller-provided rng for CNN variants.
 #   - Does not create Net/Layer objects or serialize output.
 #   - All utility functions are now internal to this module.

@@ -37,7 +37,6 @@ from act.util.device_manager import get_default_dtype
 from act.util.path_config import get_examples_gen_config_path
 
 from .layer_builder import build_cnn_layers, build_mlp_layers
-from .sampler import ConfigSampler
 
 
 # ============================================================================
@@ -63,6 +62,204 @@ def _choose(rng: random.Random, items: List[Any], *, name: str) -> Any:
     if not items:
         raise ValueError(f"Config.{name} must be non-empty")
     return rng.choice(list(items))
+
+
+# ============================================================================
+# ConfigSampler - Generic YAML-based Sampling
+# ============================================================================
+
+
+class ConfigSampler:
+    """Generic sampler that uses YAML-defined sampling rules."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+    def _sample_value(self, rng: random.Random, rule: Any) -> Any:
+        """
+        Sample a value based on a rule definition.
+
+        Rules:
+        - {choice: [v1, v2, ...]} -> random choice
+        - {range: [lo, hi]} -> random int in [lo, hi]
+        - {weighted: {k1: w1, k2: w2, ...}} -> weighted choice
+        - {repeat: {count: rule, value: rule}} -> list of sampled values
+        - {probability: p} -> boolean (True with probability p)
+        - {const: v} -> constant value v
+        - plain value -> return as-is
+        """
+        if not isinstance(rule, dict):
+            return rule
+
+        if "const" in rule:
+            return rule["const"]
+
+        if "choice" in rule:
+            items = rule["choice"]
+            if not items:
+                raise ValueError("choice rule must have non-empty list")
+            return rng.choice(items)
+
+        if "range" in rule:
+            lo, hi = rule["range"]
+            lo, hi = int(lo), int(hi)
+            if hi < lo:
+                lo, hi = hi, lo
+            return rng.randint(lo, hi)
+
+        if "weighted" in rule:
+            weights = rule["weighted"]
+            if not weights:
+                raise ValueError("weighted rule must have non-empty dict")
+            items = list(weights.keys())
+            probs = list(weights.values())
+            total = sum(probs)
+            if total <= 0:
+                raise ValueError("weighted rule must have positive total weight")
+            normalized = [p / total for p in probs]
+            return rng.choices(items, weights=normalized)[0]
+
+        if "repeat" in rule:
+            repeat_rule = rule["repeat"]
+            count = self._sample_value(rng, repeat_rule["count"])
+            value_rule = repeat_rule["value"]
+            return [self._sample_value(rng, value_rule) for _ in range(int(count))]
+
+        if "probability" in rule:
+            p = float(rule["probability"])
+            return rng.random() < p
+
+        raise ValueError(f"Unknown sampling rule: {rule}")
+
+    def _sample_dict(self, rng: random.Random, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively sample all values in a dict spec."""
+        result = {}
+        for key, value in spec.items():
+            if isinstance(value, dict):
+                # Check if it's a sampling rule or nested dict
+                is_rule = any(k in value for k in ["choice", "range", "weighted", "repeat", "probability", "const"])
+                if is_rule:
+                    result[key] = self._sample_value(rng, value)
+                else:
+                    result[key] = self._sample_dict(rng, value)
+            else:
+                result[key] = value
+        return result
+
+    def sample_family(self, rng: random.Random) -> Tuple[str, Dict[str, Any]]:
+        """
+        Sample a family and its parameters.
+        Returns: (family_name, sampled_params)
+        """
+        # Sample family from selection strategy
+        family_selection = self.config["family_selection"]
+        if "weighted" in family_selection:
+            weights = family_selection["weighted"]
+            family_names = list(weights.keys())
+            weight_values = list(weights.values())
+            total = sum(weight_values)
+            normalized = [w / total for w in weight_values]
+            family = rng.choices(family_names, weights=normalized)[0]
+        else:
+            raise ValueError("family_selection must have 'weighted' strategy")
+
+        # Sample family parameters
+        families = self.config["families"]
+        params_spec = families[family]
+        params = self._sample_dict(rng, params_spec)
+
+        # Convert types for compatibility with layer_builder
+        if "input_shape" in params:
+            params["input_shape"] = tuple(int(x) for x in params["input_shape"])
+        if "hidden_sizes" in params:
+            params["hidden_sizes"] = tuple(int(x) for x in params["hidden_sizes"])
+        if "conv_channels" in params:
+            params["conv_channels"] = tuple(int(x) for x in params["conv_channels"])
+
+        return family, params
+
+    def sample_input_spec(self, rng: random.Random) -> Dict[str, Any]:
+        """Sample input specification."""
+        spec_config = self.config["input_spec"]
+        kind = self._sample_value(rng, spec_config["kind"])
+        value_range = self._sample_value(rng, spec_config["value_range"])
+        lo, hi = float(value_range[0]), float(value_range[1])
+        if hi < lo:
+            lo, hi = hi, lo
+
+        if kind == "BOX":
+            shrink_range = spec_config.get("box_shrink_range", [0.0, 0.2])
+            span = hi - lo
+            shrink_a = rng.random() * shrink_range[1]
+            shrink_b = rng.random() * shrink_range[1]
+            lb_val = lo + span * shrink_a
+            ub_val = hi - span * shrink_b
+            if ub_val < lb_val:
+                lb_val, ub_val = lo, hi
+            return {
+                "kind": "BOX",
+                "value_range": (lo, hi),
+                "lb_val": float(lb_val),
+                "ub_val": float(ub_val),
+            }
+
+        if kind == "LINF_BALL":
+            center_val = lo + (hi - lo) * rng.random()
+            eps = self._sample_value(rng, spec_config["eps"])
+            eps = min(float(eps), 0.5 * (hi - lo)) if (hi > lo) else 0.0
+            return {
+                "kind": "LINF_BALL",
+                "value_range": (lo, hi),
+                "center_val": float(center_val),
+                "eps": float(eps),
+            }
+
+        raise ValueError(f"Unsupported input_spec kind '{kind}'")
+
+    def sample_output_spec(self, rng: random.Random, *, num_classes: int) -> Dict[str, Any]:
+        """Sample output specification."""
+        spec_config = self.config["output_spec"]
+        kind = self._sample_value(rng, spec_config["kind"])
+        y_true = int(rng.randrange(int(num_classes)))
+
+        if kind == "TOP1_ROBUST":
+            return {"kind": "TOP1_ROBUST", "y_true": y_true}
+
+        if kind == "MARGIN_ROBUST":
+            margin = self._sample_value(rng, spec_config["margin"])
+            return {"kind": "MARGIN_ROBUST", "y_true": y_true, "margin": float(margin)}
+
+        if kind == "LINEAR_LE":
+            c_range = spec_config["linear_le_c_range"]
+            d_range = spec_config["linear_le_d_range"]
+            c_lo, c_hi = c_range[0], c_range[1]
+            d_lo, d_hi = d_range[0], d_range[1]
+            c_vals = [c_lo + (c_hi - c_lo) * rng.random() for _ in range(int(num_classes))]
+            d_val = d_lo + (d_hi - d_lo) * rng.random()
+            return {"kind": "LINEAR_LE", "c": [float(x) for x in c_vals], "d": float(d_val)}
+
+        if kind == "RANGE":
+            bounds = self._sample_value(rng, spec_config["range_bounds"])
+            lo, hi = bounds[0], bounds[1]
+            lb_vals = []
+            ub_vals = []
+            for _ in range(int(num_classes)):
+                a = lo + (hi - lo) * rng.random()
+                b = lo + (hi - lo) * rng.random()
+                lb_vals.append(min(a, b))
+                ub_vals.append(max(a, b))
+            return {
+                "kind": "RANGE",
+                "lb": [float(x) for x in lb_vals],
+                "ub": [float(x) for x in ub_vals],
+            }
+
+        raise ValueError(f"Unsupported output_spec kind '{kind}'")
+
+
+# ============================================================================
+# NetFactory - Main Orchestration
+# ============================================================================
 
 
 class NetFactory:
@@ -271,16 +468,111 @@ class NetFactory:
 
         raise NotImplementedError(f"Unsupported layer kind '{kind}'")
 
+    def _get_family_tag(self, family: str, cfg: Dict[str, Any]) -> str:
+        """
+        Generate family tag.
+
+        Rules:
+            MLP: mlp_{variant}  (plain/block/residual)
+            CNN2D: cnn2d_plain or resnet (if variant=stage)
+        """
+        if family == "mlp":
+            variant = cfg.get("variant", "plain")
+            return f"mlp_{variant}"
+
+        elif family == "cnn2d":
+            variant = cfg.get("variant", "plain")
+            if variant == "stage":
+                return "resnet"
+            return "cnn2d_plain"
+
+        else:
+            return family
+
+    def _format_input_shape(self, input_shape: tuple) -> str:
+        """
+        Format input shape (remove batch dimension).
+
+        Examples:
+            (1, 6) -> "6"
+            (1, 3, 8) -> "3x8"
+            (1, 3, 16, 16) -> "3x16x16"
+        """
+        dims = input_shape[1:] if input_shape[0] == 1 else input_shape
+        return "x".join(str(d) for d in dims)
+
+    def _format_structure(self, family: str, cfg: Dict[str, Any]) -> str:
+        """
+        Format structure summary.
+
+        Rules:
+            mlp_plain: 32x64x64 (hidden_sizes)
+            mlp_block: 64x4 (block_width x num_blocks)
+            mlp_residual: 128x2 (residual_width x num_residual_blocks)
+            cnn2d_plain: 8x16x32 (conv_channels)
+            resnet: 16x3x2 (base_channels x stages x blocks_per_stage)
+        """
+        if family == "mlp":
+            variant = cfg.get("variant", "plain")
+
+            if variant == "plain":
+                hidden = cfg.get("hidden_sizes", ())
+                return "x".join(str(h) for h in hidden)
+
+            elif variant == "block":
+                width = cfg.get("block_width", 64)
+                num_blocks = cfg.get("num_blocks", 3)
+                return f"{width}x{num_blocks}"
+
+            elif variant == "residual":
+                width = cfg.get("residual_width", 128)
+                num_blocks = cfg.get("num_residual_blocks", 2)
+                return f"{width}x{num_blocks}"
+
+        elif family == "cnn2d":
+            variant = cfg.get("variant", "plain")
+
+            if variant == "plain":
+                channels = cfg.get("conv_channels", ())
+                return "x".join(str(c) for c in channels)
+
+            elif variant == "stage":
+                base = cfg.get("base_channels", 16)
+                stages = cfg.get("num_stages", 3)
+                blocks = cfg.get("blocks_per_stage", 2)
+                return f"{base}x{stages}x{blocks}"
+
+        return "default"
+
+    def _generate_semantic_name(
+        self, family: str, model_cfg: Dict[str, Any], seed: int
+    ) -> str:
+        """
+        Generate semantic filename: {family_tag}_{input}_{structure}_{seed}
+
+        Examples:
+            mlp_plain_6_32x64x64_12345
+            resnet_3x16x16_16x3x2_98765
+        """
+        family_tag = self._get_family_tag(family, model_cfg)
+        input_str = self._format_input_shape(model_cfg["input_shape"])
+        structure_str = self._format_structure(family, model_cfg)
+        return f"{family_tag}_{input_str}_{structure_str}_{seed}"
+
     def _sample_instance(self, idx: int) -> Dict[str, Any]:
         """Sample a single network instance configuration."""
-        instance_id = f"{self.name_prefix}{int(self.base_seed)}_idx{int(idx):05d}"
-        seed = int(_derive_seed(int(self.base_seed), int(idx), instance_id))
+        temp_id = f"{self.name_prefix}{int(self.base_seed)}_idx{int(idx):05d}"
+        seed = int(_derive_seed(int(self.base_seed), int(idx), temp_id))
         rng = random.Random(seed)
 
-        # Sampler returns (family, model_cfg) directly
+        # Sample family and configuration
         family, model_cfg = self.sampler.sample_family(rng)
         num_classes = int(model_cfg["num_classes"])
 
+        # Generate semantic instance name
+        instance_id = self._generate_semantic_name(family, model_cfg, seed)
+
+        # Sample input and output specifications
         input_spec = self.sampler.sample_input_spec(rng)
         output_spec = self.sampler.sample_output_spec(rng, num_classes=num_classes)
 

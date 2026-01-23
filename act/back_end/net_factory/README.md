@@ -9,20 +9,25 @@ The NetFactory package modules:
 ```
 net_factory/
 ├── __init__.py          # Package exports
-├── factory.py           # Main NetFactory class (with internal utilities)
-├── sampler.py           # Configuration sampling logic (with internal utilities)
+├── factory.py           # NetFactory + ConfigSampler (with internal utilities)
 └── layer_builder.py     # Layer construction functions (with internal utilities)
 ```
 
 ## Module Responsibilities
 
-### `factory.py` - NetFactory Class
+### `factory.py` - NetFactory + ConfigSampler
 
-Core responsibilities:
-- Load YAML configuration
+**ConfigSampler** - Generic YAML-based sampling:
+- `sample_family()`: Sample architecture family and parameters using YAML rules
+- `sample_input_spec()`: Sample input specifications (BOX, LINF_BALL)
+- `sample_output_spec()`: Sample output specifications (TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, RANGE)
+- `_sample_value()`: Rule-based value sampling (choice, range, weighted, repeat, probability, const)
+- `_sample_dict()`: Recursive dict sampling
+
+**NetFactory** - Main orchestration:
+- Load YAML configuration and manage output paths
 - Orchestrate sampling, building, and serialization
-- Generate weight tensors
-- Handle layer variables
+- Generate weight tensors and handle layer variables
 - Create and save Net objects
 
 Key methods:
@@ -30,17 +35,6 @@ Key methods:
 - `generate()`: Main entry point for network generation
 - `create_network()`: Create Net from specification
 - `save_network()`: Serialize Net to JSON
-
-### `sampler.py` - ConfigSampler Class
-
-Handles all configuration sampling logic:
-- `sample_family()`: Choose MLP or CNN architecture
-- `sample_mlp()`: Sample MLP configuration
-- `sample_cnn2d()`: Sample CNN configuration
-- `sample_input_spec()`: Sample input specifications (BOX, LINF_BALL)
-- `sample_output_spec()`: Sample output specifications (TOP1_ROBUST, MARGIN_ROBUST, etc.)
-
-All sampling uses the YAML config from `config_gen_act_net.yaml`.
 
 ### `layer_builder.py` - Layer Construction
 
@@ -58,12 +52,9 @@ Layer-by-layer construction functions:
 Each module contains its own internal utility functions (prefixed with `_`):
 
 **factory.py**:
+- `_stable_u32_from_bytes()`: Extract stable u32 from bytes
 - `_derive_seed()`: Deterministic seed generation
 - `_choose()`: Random choice with error handling
-
-**sampler.py**:
-- `_choose()`: Random choice with error handling
-- `_randint_inclusive()`: Sample from range
 
 **layer_builder.py**:
 - `_activation_kind()`: Map activation names to layer kinds
@@ -73,7 +64,7 @@ Each module contains its own internal utility functions (prefixed with `_`):
 - `_prod()`: Product of shape dimensions
 - `_as_block_param()`: Extract per-block parameters
 
-This design follows the principle: "If a utility is used only once, keep it with its usage site."
+This design follows the principle: "Keep utilities with their usage site for better locality."
 
 ## Benefits
 
@@ -126,6 +117,6 @@ Recommended checks:
 
 The modular structure makes it easy to add:
 - New layer types (add to `layer_builder.py`)
-- New sampling strategies (extend `ConfigSampler`)
-- New model families (add methods to `sampler.py` and `layer_builder.py`)
-- Additional utility functions (add to `utils.py`)
+- New sampling rules (extend `ConfigSampler._sample_value()` in `factory.py`)
+- New model families (add to YAML config and `layer_builder.py`)
+- Additional utility functions (add to relevant module with `_` prefix)
