@@ -111,7 +111,7 @@ class ACTToTorch:
     def __init__(self, act_net: Net, use_graph_model: bool = False, strict: bool = False):
         """
         Initialize converter with ACT Net.
-
+        
         Args:
             act_net: ACT Net object (contains architecture + weights)
             use_graph_model: Use DAG-capable VerifiableGraphModel (default: False)
@@ -132,7 +132,7 @@ class ACTToTorch:
 
         Iterates through ACT layers, creates corresponding PyTorch layers,
         transfers weights, and assembles into VerifiableModel or VerifiableGraphModel.
-
+        
         Returns:
             VerifiableModel (Sequential) or VerifiableGraphModel (DAG) with embedded constraint checking
 
@@ -158,7 +158,7 @@ class ACTToTorch:
         # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
         target_device = get_default_device()
-
+        
         for i, act_layer in enumerate(self.act_net.layers):
             kind = act_layer.kind
             meta = act_layer.meta
@@ -520,7 +520,7 @@ class ACTToTorch:
                 raise ValueError("CONV3D layer requires 'out_channels' in meta")
             
             layer = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-    
+
             # Transfer weights and bias from ACT layer
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
