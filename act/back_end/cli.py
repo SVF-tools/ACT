@@ -310,7 +310,7 @@ Examples:
   # VERIFICATION - Run verification on networks
   # ============================================================================
   
-  # Single-shot verification (use full path or relative to examples/nets)
+  # Single-shot verification
   python -m act.back_end --verify --network mnist_robust_easy.json
   
   # Branch-and-bound verification

@@ -204,7 +204,7 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
-
+    
     input_shape = L.meta["input_shape"]
     output_shape = L.meta["output_shape"]
 
