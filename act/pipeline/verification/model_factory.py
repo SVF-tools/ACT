@@ -118,7 +118,7 @@ class ModelFactory:
     ):
         """
         Initialize factory with nets directory and optional manifest.
-
+        
         Args:
             nets_dir: Directory containing pre-generated ACT Net JSON files
             manifest_path: Optional path to manifest.json listing network names
@@ -151,7 +151,7 @@ class ModelFactory:
             if not net_path.exists():
                 logger.warning(f"ACT Net file not found: {net_path}. Skipping '{name}'.")
                 continue
-
+            
             try:
                 with open(net_path, 'r') as f:
                     net_dict = json.load(f)
@@ -161,7 +161,7 @@ class ModelFactory:
             except Exception as e:
                 logger.error(f"Failed to load ACT Net '{name}' from {net_path}: {e}")
                 continue
-
+        
         logger.info(f"Pre-loaded {len(self.nets)} ACT Nets from {self.nets_dir}")
 
     def get_act_net(self, name: str) -> Net:
