@@ -154,7 +154,7 @@ class ACTToTorch:
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
-
+        
         # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
         target_device = get_default_device()
@@ -169,33 +169,9 @@ class ACTToTorch:
             
             if kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import InputSpecLayer
-                from act.front_end.specs import InputSpec, InKind
-
-                # Build InputSpec from ACT layer
-                kind_str = meta['kind']
-                spec_kind = getattr(InKind, kind_str)  # Convert string to enum
-                spec_dict = {'kind': spec_kind}
-                if 'eps' in meta:
-                    spec_dict['eps'] = meta['eps']
-
-                # Convert parameter tensors to device_manager dtype for consistency
-                for param_key in ['lb', 'ub', 'center', 'A', 'b']:
-                    if param_key in act_layer.params:
-                        tensor = act_layer.params[param_key]
-                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
-                spec = InputSpec(**spec_dict)
-                # InputSpecLayer now always returns tuples
-                torch_layers.append(InputSpecLayer(spec))
-                has_input_spec = True
-                continue
-            
-            elif kind == 'ASSERT':
-                # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
-
+                
                 # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
@@ -206,7 +182,7 @@ class ACTToTorch:
                     spec_dict['margin'] = meta['margin']
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
-
+                
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
@@ -221,23 +197,23 @@ class ACTToTorch:
             
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
-
+            
             if torch_layer is not None:
                 torch_layers.append(torch_layer)
-
+        
         if not torch_layers:
             raise ValueError("No valid PyTorch layers found in ACT Net")
-
+        
         # Return VerifiableModel for automatic constraint checking
         from act.front_end.verifiable_model import VerifiableModel
         model = VerifiableModel(*torch_layers)
         model.eval()  # Set to evaluation mode by default
-
+        
         logger.info(f"Created VerifiableModel with {len(torch_layers)} layers "
                    f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
-
+        
         return model
-
+    
     def _run_graph_model(self) -> nn.Module:
         """
         DAG-capable VerifiableGraphModel conversion.
