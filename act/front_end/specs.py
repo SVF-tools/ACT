@@ -70,15 +70,6 @@ class InputSpec:
     A: Optional[torch.Tensor] = None
     b: Optional[torch.Tensor] = None
     
-    def __post_init__(self):
-        """Validate required fields based on kind."""
-        if self.kind == InKind.BOX:
-            assert self.lb is not None and self.ub is not None, "BOX requires lb, ub"
-        elif self.kind == InKind.LINF_BALL:
-            assert self.center is not None and self.eps is not None, "LINF_BALL requires center, eps"
-        elif self.kind == InKind.LIN_POLY:
-            assert self.A is not None and self.b is not None, "LIN_POLY requires A, b"
-    
     def _get_tensor(self) -> torch.Tensor:
         """Get the primary tensor for this spec kind."""
         if self.kind == InKind.BOX:
@@ -208,15 +199,6 @@ class OutputSpec:
     lb: Optional[torch.Tensor] = None
     ub: Optional[torch.Tensor] = None
     meta: Dict[str, Any] = field(default_factory=dict)
-    
-    def __post_init__(self):
-        """Validate required fields based on kind."""
-        if self.kind in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):
-            assert self.y_true is not None, f"{self.kind} requires y_true"
-        elif self.kind == OutKind.LINEAR_LE:
-            assert self.c is not None and self.d is not None, "LINEAR_LE requires c, d"
-        elif self.kind == OutKind.RANGE:
-            assert self.lb is not None or self.ub is not None, "RANGE requires lb or ub"
     
     def _get_tensor(self) -> torch.Tensor:
         """Get the primary tensor for this spec kind."""

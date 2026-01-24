@@ -33,12 +33,18 @@ Usage:
 # Core specification system
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
 
+# Unified spec loader
+from act.front_end.spec_loader import SpecLoader
+
 # Device management - import only when needed to avoid triggering argparse at import time
 # from act.util.device_manager import get_default_device, get_default_dtype, get_current_settings
 
 __all__ = [
     # Specifications
     'InputSpec', 'OutputSpec', 'InKind', 'OutKind',
+    
+    # Unified loader
+    'SpecLoader',
     
     # Device management (available via act.util.device_manager)
     # 'get_default_device', 'get_default_dtype', 'get_current_settings',
