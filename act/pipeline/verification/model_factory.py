@@ -163,37 +163,37 @@ class ModelFactory:
                 continue
         
         logger.info(f"Pre-loaded {len(self.nets)} ACT Nets from {self.nets_dir}")
-
+    
     def get_act_net(self, name: str) -> Net:
         """
         Get pre-loaded ACT Net by name.
-
+        
         Args:
             name: Network name from examples_config.yaml
-
+        
         Returns:
             Pre-loaded ACT Net
-
+        
         Raises:
             KeyError: If network name not found or failed to load
         """
         if name not in self.nets:
             available = ", ".join(self.nets.keys())
             raise KeyError(f"ACT Net '{name}' not available. Available: {available}")
-
+        
         return self.nets[name]
-
+    
     def create_model(self, name: str, load_weights: bool = True) -> nn.Module:
         """
         Create PyTorch model from configuration.
-
+        
         Args:
             name: Network name from examples_config.yaml
             load_weights: If True, load weights from corresponding ACT Net JSON file
-
+        
         Returns:
             PyTorch nn.Module ready for inference or training
-
+        
         Raises:
             KeyError: If network name not found in config
             ValueError: If network architecture is invalid
@@ -201,21 +201,21 @@ class ModelFactory:
         if name not in self.nets:
             available = ", ".join(self.nets.keys())
             raise KeyError(f"Network '{name}' not found. Available: {available}")
-
+        
         if not load_weights:
             raise ValueError("ModelFactory requires load_weights=True (ACT Net JSONs are the source of truth).")
-
+        
         act_net = self.get_act_net(name)
-
+        
         # Auto-detect if network requires DAG mode (has multi-input layers)
         use_graph_model = self._requires_dag_mode(act_net)
-
+        
         # Enable strict mode for verification: fail explicitly on unsupported layers
         converter = ACTToTorch(act_net, use_graph_model=use_graph_model, strict=True)
         model = converter.run()
-
+        
         logger.info(f"Created PyTorch model '{name}' with {sum(p.numel() for p in model.parameters())} parameters")
-
+        
         return model
 
     def _requires_dag_mode(self, net: Net) -> bool:
