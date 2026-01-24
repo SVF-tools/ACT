@@ -779,7 +779,40 @@ def build_cnn_layers(
         append_dense(layers, in_features=int(cfg["fc_hidden"]), out_features=int(cfg["num_classes"]), use_bias=True)
         return
 
-    # Stage variant
+    elif cfg["variant"] == "residual":
+        # Residual variant: Conv blocks with skip connections (ResNet-style)
+        ch = int(cfg["residual_channels"])
+
+        # Initial conv to match residual_channels
+        H, W = append_conv2d(layers, in_ch=in_ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
+        append_act(layers, act_kind, act_params=cfg)
+
+        # Residual blocks
+        for _ in range(int(cfg["num_residual_blocks"])):
+            skip_idx = len(layers) - 1
+
+            # Conv -> Act -> Conv
+            H, W = append_conv2d(layers, in_ch=ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
+            append_act(layers, act_kind, act_params=cfg)
+            H, W = append_conv2d(layers, in_ch=ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
+            main_idx = len(layers) - 1
+
+            # Skip connection (ADD)
+            append_add(layers, skip_idx=skip_idx, main_idx=main_idx)
+            append_act(layers, act_kind, act_params=cfg)
+
+        # Head: global pooling -> flatten -> FC
+        while H > 1 or W > 1:
+            H, W = append_pool2d(layers, kind="AVGPOOL2D", in_ch=ch, H=H, W=W, kernel=2, stride=2, padding=0)
+            if H <= 0 or W <= 0:
+                raise ValueError("Invalid spatial dims after head pooling")
+
+        layers.append({"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}})
+        feat = int(ch * H * W)
+        append_dense(layers, in_features=int(feat), out_features=int(cfg["num_classes"]), use_bias=True)
+        return
+
+    # Stage variant (default for cnn2d)
     ch = int(cfg["base_channels"])
     H, W = append_conv2d(layers, in_ch=in_ch, out_ch=ch, H=H, W=W, kernel=3, stride=1, padding=1)
     append_act(layers, act_kind, act_params=cfg)

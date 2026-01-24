@@ -158,8 +158,9 @@ families:
     # --- Architecture Variant ---
     variant:
       weighted:
-        plain: 0.5                            # Simple sequential Conv layers
-        stage: 0.5                            # Staged architecture (like ResNet)
+        plain: 0.4                            # Simple sequential Conv layers
+        residual: 0.3                         # Conv blocks with skip connections
+        stage: 0.3                            # Staged architecture (like ResNet)
 
     # --- Plain Variant Parameters ---
     num_blocks:
@@ -170,6 +171,12 @@ families:
         value: { choice: [8, 16, 32] }        # Output channels per conv layer
     fc_hidden:
       choice: [32, 64, 128]                   # Hidden units in final FC layer
+
+    # --- Residual Variant Parameters ---
+    num_residual_blocks:
+      range: [2, 4]                           # Number of residual blocks (with skip connections)
+    residual_channels:
+      choice: [16, 32, 64]                    # Channel width for residual blocks
 
     # --- Stage Variant Parameters ---
     stages:

@@ -615,7 +615,7 @@ class NetFactory:
 
         Rules:
             MLP: mlp_{variant}  (plain/block/residual)
-            CNN2D: cnn2d_plain or resnet (if variant=stage)
+            CNN2D: cnn2d_plain, cnn2d_residual, or resnet (if variant=stage)
         """
         if family == "mlp":
             variant = cfg.get("variant", "plain")
@@ -625,6 +625,8 @@ class NetFactory:
             variant = cfg.get("variant", "plain")
             if variant == "stage":
                 return "resnet"
+            elif variant == "residual":
+                return "cnn2d_residual"
             return "cnn2d_plain"
 
         else:
@@ -651,6 +653,7 @@ class NetFactory:
             mlp_block: 64x4 (block_width x num_blocks)
             mlp_residual: 128x2 (residual_width x num_residual_blocks)
             cnn2d_plain: 8x16x32 (conv_channels)
+            cnn2d_residual: 32x3 (residual_channels x num_residual_blocks)
             resnet: 16x3x2 (base_channels x stages x blocks_per_stage)
         """
         if family == "mlp":
@@ -676,6 +679,11 @@ class NetFactory:
             if variant == "plain":
                 channels = cfg.get("conv_channels", ())
                 return "x".join(str(c) for c in channels)
+
+            elif variant == "residual":
+                channels = cfg.get("residual_channels", 32)
+                num_blocks = cfg.get("num_residual_blocks", 3)
+                return f"{channels}x{num_blocks}"
 
             elif variant == "stage":
                 base = cfg.get("base_channels", 16)

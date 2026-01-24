@@ -40,7 +40,7 @@ Key methods:
 
 Layer-by-layer construction functions:
 - `build_mlp_layers()`: Build MLP layer sequences (plain, block, residual variants)
-- `build_cnn_layers()`: Build CNN layer sequences (plain, stage variants)
+- `build_cnn_layers()`: Build CNN layer sequences (plain, residual, stage variants)
 - `append_conv2d()`: Add CONV2D layer
 - `append_pool2d()`: Add pooling layer
 - `append_dense()`: Add DENSE layer
