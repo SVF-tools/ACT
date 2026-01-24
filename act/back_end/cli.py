@@ -125,8 +125,6 @@ def run_network_factory(args):
         print(f"Base seed override: {args.base_seed}")
     if args.name_prefix is not None:
         print(f"Name prefix override: {args.name_prefix}")
-    if args.no_manifest:
-        print("Manifest writing disabled via CLI override")
     print()
     
     try:
@@ -136,8 +134,6 @@ def run_network_factory(args):
             base_seed=args.base_seed,
             num_instances=args.num,
             name_prefix=args.name_prefix,
-            write_manifest=False if args.no_manifest else None,
-            manifest_path=args.manifest_path,
         )
         factory.generate()
         
@@ -416,18 +412,6 @@ Examples:
         type=str,
         dest="name_prefix",
         help="Override generator name prefix (default: from config)"
-    )
-    factory_group.add_argument(
-        "--manifest-path",
-        type=str,
-        dest="manifest_path",
-        help="Override manifest path (default: from config)"
-    )
-    factory_group.add_argument(
-        "--no-manifest",
-        action="store_true",
-        dest="no_manifest",
-        help="Disable manifest writing (default: from config)"
     )
     
     # Verification options
