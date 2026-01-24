@@ -35,10 +35,10 @@ class IntervalTF(TransferFunction):
         LayerKind.ASSERT.value: lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
         
         # MLP operations
-        "DENSE": lambda L, bounds, tf: tf_dense(L, bounds),
+        LayerKind.DENSE.value: lambda L, bounds, tf: tf_dense(L, bounds),
         "BIAS": lambda L, bounds, tf: tf_bias(L, bounds),
         "SCALE": lambda L, bounds, tf: tf_scale(L, bounds),
-        "RELU": lambda L, bounds, tf: tf_relu(L, bounds),
+        LayerKind.RELU.value: lambda L, bounds, tf: tf_relu(L, bounds),
         "LRELU": lambda L, bounds, tf: tf_lrelu(L, bounds),
         "ABS": lambda L, bounds, tf: tf_abs(L, bounds),
         "CLIP": lambda L, bounds, tf: tf_clip(L, bounds),
