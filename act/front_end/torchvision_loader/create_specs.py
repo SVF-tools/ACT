@@ -156,7 +156,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                 dataloader = pair_data['dataloader']
                 
                 # Generate specs for this pair
-                result = self._create_specs_for_single_pair(
+                result = self._create_specs_for_single_instance(
                     data_source=dataset_name,
                     model_name=model_name,
                     pytorch_model=pytorch_model,
@@ -183,7 +183,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         logger.info(f"Successfully created specs for {len(results)} pairs")
         return results
     
-    def _create_specs_for_single_pair(
+    def _create_specs_for_single_instance(
         self,
         data_source: str,
         model_name: str,
