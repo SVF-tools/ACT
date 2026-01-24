@@ -116,7 +116,7 @@ class ACTToTorch:
             act_net: ACT Net object (contains architecture + weights)
             use_graph_model: Use DAG-capable VerifiableGraphModel (default: False)
             strict: Raise on unsupported layers instead of skipping (default: False)
-
+        
         Raises:
             TypeError: If act_net is not a Net instance
         """
@@ -162,7 +162,7 @@ class ACTToTorch:
         for i, act_layer in enumerate(self.act_net.layers):
             kind = act_layer.kind
             meta = act_layer.meta
-
+            
             # Handle wrapper layers specially
             if kind == 'INPUT':
                 continue  # Skip INPUT layer (no-op)
@@ -190,7 +190,7 @@ class ACTToTorch:
                 torch_layers.append(InputSpecLayer(spec))
                 has_input_spec = True
                 continue
-
+            
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
@@ -212,7 +212,7 @@ class ACTToTorch:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
+                
                 spec = OutputSpec(**spec_dict)
                 # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
@@ -287,7 +287,7 @@ class ACTToTorch:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
+                
                 spec = InputSpec(**spec_dict)
                 layer_modules[layer_id] = (InputSpecLayer(spec), True, kind)
                 input_spec_layer_id = layer_id
@@ -314,7 +314,7 @@ class ACTToTorch:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
+                
                 spec = OutputSpec(**spec_dict)
                 layer_modules[layer_id] = (OutputSpecLayer(spec), True, kind)
                 output_spec_layer_id = layer_id
@@ -322,7 +322,7 @@ class ACTToTorch:
             
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
-
+            
             if torch_layer is None:
                 if self.strict:
                     raise ValueError(
@@ -385,7 +385,7 @@ class ACTToTorch:
             kind: Layer kind string (DENSE, CONV2D, RELU, etc.)
             meta: Layer metadata dictionary
             act_layer: Optional ACT Layer to load weights from
-            
+        
         Returns:
             PyTorch nn.Module or None if layer should be skipped
         
@@ -455,7 +455,7 @@ class ACTToTorch:
                 def forward(self, x):
                     return self.A * x + self.c
             return BNAffineModule(A, c)
-
+        
         # Convolutional layers
         elif kind == "CONV2D":
             in_channels = meta.get("in_channels")
@@ -520,7 +520,7 @@ class ACTToTorch:
                 raise ValueError("CONV3D layer requires 'out_channels' in meta")
             
             layer = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-
+    
             # Transfer weights and bias from ACT layer
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
