@@ -53,17 +53,10 @@ def _activation_kind(name: str) -> str:
         "sigmoid": "SIGMOID",
         "lrelu": "LRELU",
         "relu6": "RELU6",
-        "hardtanh": "HARDTANH",
-        "hardsigmoid": "HARDSIGMOID",
-        "hardswish": "HARDSWISH",
         "silu": "SILU",
-        "softplus": "SOFTPLUS",
-        "mish": "MISH",
-        "softsign": "SOFTSIGN",
         "gelu": "GELU",
         # A-group: unary operations
         "abs": "ABS",
-        "clip": "CLIP",
         "square": "SQUARE",
         "power": "POWER",
     }
@@ -471,21 +464,6 @@ def append_act(layers: List[Dict[str, Any]], act_kind: str, *, act_params: Dict[
         # Map activation parameters to meta fields
         if act_kind == "LRELU" and "lrelu_alpha" in act_params:
             meta["negative_slope"] = float(act_params["lrelu_alpha"])
-        elif act_kind == "HARDTANH":
-            if "hardtanh_min" in act_params:
-                meta["min_val"] = float(act_params["hardtanh_min"])
-            if "hardtanh_max" in act_params:
-                meta["max_val"] = float(act_params["hardtanh_max"])
-        elif act_kind == "HARDSIGMOID":
-            if "hardsigmoid_alpha" in act_params:
-                meta["alpha"] = float(act_params["hardsigmoid_alpha"])
-            if "hardsigmoid_beta" in act_params:
-                meta["beta"] = float(act_params["hardsigmoid_beta"])
-        elif act_kind == "CLIP":
-            if "clip_min" in act_params:
-                meta["min"] = float(act_params["clip_min"])
-            if "clip_max" in act_params:
-                meta["max"] = float(act_params["clip_max"])
         elif act_kind == "POWER":
             if "power_exponent" in act_params:
                 meta["exponent"] = float(act_params["power_exponent"])

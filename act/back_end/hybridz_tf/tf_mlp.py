@@ -244,28 +244,279 @@ def hybridz_tf_add(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()  
+@torch.no_grad()
 def hybridz_tf_mul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     """HybridZ transfer function for element-wise multiplication with McCormick relaxation."""
     # McCormick envelope for bilinear terms
     # z = x * y, with x ∈ [lx, ux], y ∈ [ly, uy]
     lx, ux = Bin1.lb, Bin1.ub
     ly, uy = Bin2.lb, Bin2.ub
-    
+
     # Four corner points
     corners = torch.stack([
         lx * ly,  # lower-left
-        lx * uy,  # lower-right  
+        lx * uy,  # lower-right
         ux * ly,  # upper-left
         ux * uy   # upper-right
     ])
-    
+
     lb = torch.min(corners, dim=0)[0]
     ub = torch.max(corners, dim=0)[0]
     Bout = Bounds(lb=lb, ub=ub)
-    
+
     # McCormick constraints
     cons = ConSet()
     cons.add_op(f"mcc:{L.id}", list(L.out_vars + L.in_vars), lx=lx, ux=ux, ly=ly, uy=uy)
-    
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_bn(L: Layer, Bin: Bounds) -> Fact:
+    """HybridZ transfer function for batch normalization."""
+    A = L.params["A"]  # Combined scale factor
+    c = L.params["c"]  # Combined bias
+
+    # BN is affine: y = A * x + c
+    lb = torch.where(A >= 0, A * Bin.lb + c, A * Bin.ub + c)
+    ub = torch.where(A >= 0, A * Bin.ub + c, A * Bin.lb + c)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"bn:{L.id}", list(L.out_vars + L.in_vars), A=A, c=c)
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_relu6(L: Layer, Bin: Bounds) -> Fact:
+    """HybridZ transfer function for ReLU6: clamp(x, 0, 6)."""
+    lb = torch.clamp(Bin.lb, min=0.0, max=6.0)
+    ub = torch.clamp(Bin.ub, min=0.0, max=6.0)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"relu6:{L.id}", list(L.out_vars + L.in_vars))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_sub(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
+    """HybridZ transfer function for element-wise subtraction."""
+    # [a,b] - [c,d] = [a-d, b-c]
+    lb = Bin1.lb - Bin2.ub
+    ub = Bin1.ub - Bin2.lb
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"sub:{L.id}", list(L.out_vars + L.in_vars))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_square(L: Layer, Bin: Bounds) -> Fact:
+    """HybridZ transfer function for square: x^2."""
+    # Clamp inputs to prevent numerical overflow when squaring large values
+    # sqrt(1e150) ~ 1e75, so we clamp to 1e150 to keep squared values < 1e300 (within float64 range)
+    MAX_VAL = 1e150
+    l = torch.clamp(Bin.lb, min=-MAX_VAL, max=MAX_VAL)
+    u = torch.clamp(Bin.ub, min=-MAX_VAL, max=MAX_VAL)
+
+    # If interval crosses zero, lb = 0
+    # Otherwise lb = min(l^2, u^2)
+    crosses_zero = (l <= 0) & (u >= 0)
+    lb = torch.where(crosses_zero, torch.zeros_like(l), torch.minimum(l * l, u * u))
+    ub = torch.maximum(l * l, u * u)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"square:{L.id}", list(L.out_vars + L.in_vars))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_power(L: Layer, Bin: Bounds) -> Fact:
+    """HybridZ transfer function for power: x^p."""
+    p = float(L.meta.get("exponent", L.meta.get("p", 2.0)))
+
+    # Clamp inputs to prevent numerical overflow when raising to power
+    MAX_VAL = 1e150 ** (1.0/max(p, 1.0))  # Ensure result stays < 1e150
+    l = torch.clamp(Bin.lb, min=0.0, max=MAX_VAL)
+    u = torch.clamp(Bin.ub, min=0.0, max=MAX_VAL)
+
+    # For positive base values
+    f = lambda x: torch.pow(x, p)
+    lb = f(l)
+    ub = f(u)
+
+    # Ensure lb <= ub
+    lb2 = torch.minimum(lb, ub)
+    ub2 = torch.maximum(lb, ub)
+    Bout = Bounds(lb=lb2, ub=ub2)
+
+    cons = ConSet()
+    cons.add_op(f"power:{L.id}", list(L.out_vars + L.in_vars), p=p)
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_div(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
+    """HybridZ transfer function for element-wise division."""
+    ly, uy = Bin2.lb, Bin2.ub
+
+    # Check if denominator crosses zero
+    crosses_zero = (ly <= 0) & (uy >= 0)
+
+    # Compute corners for division
+    cand = torch.stack([
+        Bin1.lb / ly,
+        Bin1.lb / uy,
+        Bin1.ub / ly,
+        Bin1.ub / uy,
+    ], dim=0)
+
+    lb = torch.min(cand, dim=0).values
+    ub = torch.max(cand, dim=0).values
+
+    # Conservative bounds when denominator crosses zero
+    big = 1e6
+    lb = torch.where(crosses_zero, torch.full_like(lb, -big), lb)
+    ub = torch.where(crosses_zero, torch.full_like(ub, +big), ub)
+
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"div:{L.id}", list(L.out_vars + L.in_vars), safe=not torch.any(crosses_zero).item())
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_matmul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
+    """HybridZ transfer function for matrix multiplication."""
+    x_shape = L.meta["x_shape"]      # (m, k)
+    y_shape = L.meta["y_shape"]      # (k, n)
+
+    m, k = x_shape
+    k2, n = y_shape
+    assert k == k2, "matmul: inner dim mismatch"
+
+    # Reshape back to matrix form
+    X_lb = Bin1.lb.view(m, k)
+    X_ub = Bin1.ub.view(m, k)
+    Y_lb = Bin2.lb.view(k, n)
+    Y_ub = Bin2.ub.view(k, n)
+
+    out_lb = []
+    out_ub = []
+    for i in range(m):
+        for j in range(n):
+            xs_lb = X_lb[i, :]
+            xs_ub = X_ub[i, :]
+            ys_lb = Y_lb[:, j]
+            ys_ub = Y_ub[:, j]
+
+            # Four corners for each element
+            p1 = xs_lb * ys_lb
+            p2 = xs_lb * ys_ub
+            p3 = xs_ub * ys_lb
+            p4 = xs_ub * ys_ub
+
+            lo_ij = torch.min(torch.min(p1, p2), torch.min(p3, p4)).sum()
+            hi_ij = torch.max(torch.max(p1, p2), torch.max(p3, p4)).sum()
+
+            out_lb.append(lo_ij)
+            out_ub.append(hi_ij)
+
+    lb = torch.stack(out_lb, dim=0)
+    ub = torch.stack(out_ub, dim=0)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"matmul:{L.id}", list(L.out_vars + L.in_vars), x_shape=x_shape, y_shape=y_shape)
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_max(L: Layer, By_list: list) -> Fact:
+    """HybridZ transfer function for element-wise maximum."""
+    lb = By_list[0].lb.clone()
+    ub = By_list[0].ub.clone()
+
+    for b in By_list[1:]:
+        lb = torch.maximum(lb, b.lb)
+        ub = torch.maximum(ub, b.ub)
+
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"max:{L.id}", list(L.out_vars + L.in_vars), k=len(By_list))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_min(L: Layer, By_list: list) -> Fact:
+    """HybridZ transfer function for element-wise minimum."""
+    lb = By_list[0].lb.clone()
+    ub = By_list[0].ub.clone()
+
+    for b in By_list[1:]:
+        lb = torch.minimum(lb, b.lb)
+        ub = torch.minimum(ub, b.ub)
+
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"min:{L.id}", list(L.out_vars + L.in_vars), k=len(By_list))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_pow(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
+    """HybridZ transfer function for element-wise power: x^y."""
+    # Clamp base to prevent overflow: limit base to reasonable range
+    MAX_BASE = 1e50  # Prevents overflow with typical exponents
+    x_lb = torch.clamp(Bin1.lb, min=1e-8, max=MAX_BASE)
+    x_ub = torch.clamp(Bin1.ub, min=1e-8, max=MAX_BASE)
+
+    # Conservative interval arithmetic for x^y
+    cand = torch.stack([
+        torch.pow(x_lb, Bin2.lb),
+        torch.pow(x_lb, Bin2.ub),
+        torch.pow(x_ub, Bin2.lb),
+        torch.pow(x_ub, Bin2.ub),
+    ], dim=0)
+
+    lb = torch.min(cand, dim=0).values
+    ub = torch.max(cand, dim=0).values
+
+    # Clamp result to finite values
+    MAX_VAL = 1e150
+    lb = torch.clamp(lb, min=-MAX_VAL, max=MAX_VAL)
+    ub = torch.clamp(ub, min=-MAX_VAL, max=MAX_VAL)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"pow:{L.id}", list(L.out_vars + L.in_vars))
+
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_concat(L: Layer, Bs: list) -> Fact:
+    """HybridZ transfer function for concatenation."""
+    lb = torch.cat([b.lb for b in Bs], dim=0)
+    ub = torch.cat([b.ub for b in Bs], dim=0)
+    Bout = Bounds(lb=lb, ub=ub)
+
+    cons = ConSet()
+    cons.add_op(f"concat:{L.id}", list(L.out_vars + L.in_vars))
+
     return Fact(bounds=Bout, cons=cons)

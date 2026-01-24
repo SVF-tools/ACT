@@ -308,7 +308,8 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             meta=con.meta; alpha=float(meta["alpha"]); n=len(con.var_ids)//2
             z=list(con.var_ids[:n]); y=list(con.var_ids[n:])
             for i in to_numpy(meta["idx_on"]).astype(int):  solver.add_lin_eq([z[i],y[i]],[1.0,-1.0],0.0)
-            for i in to_numpy(meta["idx_off"]).astype(int): solver.add_lin_eq([z[i],y[i]],[1.0, alpha],0.0)
+            # LRELU: z = alpha * y when y < 0, so constraint is z - alpha*y = 0
+            for i in to_numpy(meta["idx_off"]).astype(int): solver.add_lin_eq([z[i],y[i]],[1.0, -alpha],0.0)
             for i in to_numpy(meta["idx_amb"]).astype(int):
                 solver.add_lin_le([y[i],z[i]],[ 1.0,-1.0],0.0)
                 solver.add_lin_le([y[i],z[i]],[ alpha,-1.0],0.0)

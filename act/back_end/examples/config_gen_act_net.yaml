@@ -112,33 +112,14 @@ families:
         - sigmoid                             # Sigmoid: 1 / (1 + e^-x)
         - lrelu                               # Leaky ReLU: max(alpha*x, x)
         - relu6                               # ReLU6: min(max(0, x), 6)
-        - hardtanh                            # HardTanh: clamp(x, min, max)
         - silu                                # SiLU/Swish: x * sigmoid(x)
-        - softplus                            # Softplus: log(1 + e^x)
-        - hardsigmoid                         # Hard Sigmoid: clamp(alpha*x + beta, 0, 1)
-        - hardswish                           # Hard Swish: x * hardsigmoid(x)
-        - mish                                # Mish: x * tanh(softplus(x))
-        - softsign                            # Softsign: x / (1 + |x|)
         - abs                                 # Absolute value: |x|
-        - clip                                # Clip: clamp(x, min, max)
         - square                              # Square: x^2
         - power                               # Power: x^p
 
     # --- Activation-Specific Parameters ---
     lrelu_alpha:
       choice: [0.01, 0.1, 0.2]                # LeakyReLU negative slope
-    hardtanh_min:
-      choice: [-1.0, -2.0]                    # HardTanh minimum bound
-    hardtanh_max:
-      choice: [1.0, 2.0]                      # HardTanh maximum bound
-    hardsigmoid_alpha:
-      choice: [0.166667, 0.2]                 # HardSigmoid slope (default 1/6)
-    hardsigmoid_beta:
-      choice: [0.5]                           # HardSigmoid offset
-    clip_min:
-      choice: [-1.0, 0.0, -2.0]               # Clip lower bound
-    clip_max:
-      choice: [1.0, 2.0, 6.0]                 # Clip upper bound
     power_exponent:
       choice: [2.0, 3.0, 0.5]                 # Power exponent (square, cube, sqrt)
 
@@ -222,31 +203,13 @@ families:
         - sigmoid                             # Sigmoid
         - lrelu                               # Leaky ReLU
         - relu6                               # ReLU6
-        - hardtanh                            # HardTanh
         - silu                                # SiLU/Swish
-        - hardsigmoid                         # Hard Sigmoid
-        - hardswish                           # Hard Swish
-        - mish                                # Mish
-        - softsign                            # Softsign
         - abs                                 # Absolute value
-        - clip                                # Clip
         - square                              # Square
 
     # --- Activation-Specific Parameters ---
     lrelu_alpha:
       choice: [0.01, 0.1, 0.2]                # LeakyReLU negative slope
-    hardtanh_min:
-      choice: [-1.0, -2.0]                    # HardTanh minimum bound
-    hardtanh_max:
-      choice: [1.0, 2.0]                      # HardTanh maximum bound
-    hardsigmoid_alpha:
-      choice: [0.166667, 0.2]                 # HardSigmoid slope
-    hardsigmoid_beta:
-      choice: [0.5]                           # HardSigmoid offset
-    clip_min:
-      choice: [0.0, -1.0]                     # Clip lower bound
-    clip_max:
-      choice: [1.0, 6.0]                      # Clip upper bound
 
 
 # ============================================================================

@@ -93,53 +93,63 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     """
     Create seed Bounds from INPUT_SPEC layers.
     Prefers BOX, then LINF_BALL, raises if only LIN_POLY exists.
-    
+
     Note: This extracts only box bounds for seeding abstract interpretation.
     All constraints (including LIN_POLY) are added via add_all_input_specs().
+    Returns flat 1D bounds (no batch dimension).
     """
     # BOX first
     for L in spec_layers:
         if L.meta.get("kind") == InKind.BOX and "lb" in L.params and "ub" in L.params:
-            return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
-    
+            lb = L.params["lb"].clone().reshape(-1)  # Flatten to 1D
+            ub = L.params["ub"].clone().reshape(-1)  # Flatten to 1D
+            return Bounds(lb, ub)
+
     # LINF_BALL next
     for L in spec_layers:
         if L.meta.get("kind") == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
-                return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
+                lb = L.params["lb"].clone().reshape(-1)  # Flatten to 1D
+                ub = L.params["ub"].clone().reshape(-1)  # Flatten to 1D
+                return Bounds(lb, ub)
             center = L.params.get("center")
             eps = L.meta.get("eps")
             if center is not None and eps is not None:
+                center_flat = center.reshape(-1)  # Flatten to 1D
                 e = torch.tensor(eps, dtype=center.dtype, device=center.device)
-                return Bounds(center - e, center + e)
-    
+                return Bounds(center_flat - e, center_flat + e)
+
     # LIN_POLY only -> error
     if any(L.meta.get("kind") == InKind.LIN_POLY for L in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
-    
+
     raise ValueError("No valid input specification found for seeding.")
 
 def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> None:
     """
     Add all INPUT_SPEC constraints to constraint set.
-    
+
     This function adds:
     - BOX constraints (box bounds)
     - LINF_BALL constraints (converted to box)
     - LIN_POLY constraints (linear polytope A·x ≤ b)
-    
+
     The LIN_POLY constraints are tagged with "in:linpoly" and will be
     exported to the solver via export_to_solver() in cons_exportor.py.
     """
     for L in spec_layers:
         k = L.meta.get("kind")
         if k == InKind.BOX:
-            globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
+            lb = L.params["lb"].reshape(-1)  # Flatten to 1D
+            ub = L.params["ub"].reshape(-1)  # Flatten to 1D
+            globalC.add_box(-1, input_ids, Bounds(lb, ub))
         elif k == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
-                globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
+                lb = L.params["lb"].reshape(-1)  # Flatten to 1D
+                ub = L.params["ub"].reshape(-1)  # Flatten to 1D
+                globalC.add_box(-1, input_ids, Bounds(lb, ub))
             else:
-                center = L.params["center"]
+                center = L.params["center"].reshape(-1)  # Flatten to 1D
                 eps = L.meta["eps"]
                 e = torch.tensor(eps, dtype=center.dtype, device=center.device)
                 globalC.add_box(-1, input_ids, Bounds(center - e, center + e))

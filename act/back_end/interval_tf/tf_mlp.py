@@ -59,9 +59,11 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
 def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     # Support both 'alpha' (legacy) and 'negative_slope' (schema standard)
     a=float(L.meta.get("negative_slope", L.meta.get("alpha", 0.01))); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
-    zero = torch.tensor(0.0, dtype=l.dtype, device=l.device)
-    lb=torch.minimum(a*torch.minimum(l,zero), torch.maximum(l,zero))
-    ub=torch.maximum(a*torch.maximum(u,zero), torch.maximum(u,zero))
+    # LRELU: y = x if x >= 0, else y = a*x
+    # For lb: if l >= 0 then lb = l (identity), else lb = a*l (scaled negative)
+    # For ub: if u <= 0 then ub = a*u (scaled negative), else ub = u (identity)
+    lb=torch.where(l >= 0, l, a*l)
+    ub=torch.where(u <= 0, a*u, u)
     if torch.any(amb):
         s=(u[amb]-a*l[amb])/torch.clamp(u[amb]-l[amb],min=1e-12); t=a*l[amb]-s*l[amb]
     else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
@@ -235,29 +237,46 @@ def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_square(L: Layer, Bin: Bounds) -> Fact:
-    l,u=Bin.lb,Bin.ub
+    # Clamp inputs to prevent numerical overflow when squaring large values
+    # sqrt(1e150) ~ 1e75, so we clamp to 1e150 to keep squared values < 1e300 (within float64 range)
+    MAX_VAL = 1e150
+    l = torch.clamp(Bin.lb, min=-MAX_VAL, max=MAX_VAL)
+    u = torch.clamp(Bin.ub, min=-MAX_VAL, max=MAX_VAL)
     lb=torch.where((l<=0)&(u>=0), 0.0, torch.minimum(l*l, u*u)); ub=torch.maximum(l*l, u*u)
     B=Bounds(lb,ub); C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"square:{L.id}","segs":pwl_meta(l,u,2)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_power(L: Layer, Bin: Bounds) -> Fact:
     # Support both 'p' (legacy) and 'exponent' (schema standard)
-    p=float(L.meta.get("exponent", L.meta.get("p", 2.0))); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
-    B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(Bin.lb,Bin.ub,2)}))
+    p=float(L.meta.get("exponent", L.meta.get("p", 2.0)))
+    # Clamp inputs to prevent numerical overflow when raising to power
+    MAX_VAL = 1e150 ** (1.0/max(p, 1.0))  # Ensure result stays < 1e150
+    l = torch.clamp(Bin.lb, min=0.0, max=MAX_VAL)
+    u = torch.clamp(Bin.ub, min=0.0, max=MAX_VAL)
+    f=lambda x: torch.pow(x, p)
+    B=Bounds(f(l), f(u)); C=ConSet()
+    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(l,u,2)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_pow(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     """Element-wise power: x^y. Conservative interval arithmetic for x^y."""
+    # Clamp base to prevent overflow: limit base to reasonable range
+    MAX_BASE = 1e50  # Prevents overflow with typical exponents
+    x_lb = torch.clamp(Bx.lb, min=1e-8, max=MAX_BASE)
+    x_ub = torch.clamp(Bx.ub, min=1e-8, max=MAX_BASE)
     # For interval [lx,ux]^[ly,uy], consider all combinations
     cand = torch.stack([
-        torch.pow(torch.clamp(Bx.lb, min=1e-8), By.lb),
-        torch.pow(torch.clamp(Bx.lb, min=1e-8), By.ub),
-        torch.pow(torch.clamp(Bx.ub, min=1e-8), By.lb),
-        torch.pow(torch.clamp(Bx.ub, min=1e-8), By.ub),
+        torch.pow(x_lb, By.lb),
+        torch.pow(x_lb, By.ub),
+        torch.pow(x_ub, By.lb),
+        torch.pow(x_ub, By.ub),
     ], dim=0)
     lb = torch.min(cand, dim=0).values
     ub = torch.max(cand, dim=0).values
+    # Clamp result to finite values
+    MAX_VAL = 1e150
+    lb = torch.clamp(lb, min=-MAX_VAL, max=MAX_VAL)
+    ub = torch.clamp(ub, min=-MAX_VAL, max=MAX_VAL)
     B = Bounds(lb, ub)
     assert B.lb.numel() == len(L.out_vars), f"pow out_vars length {len(L.out_vars)} != output elements {B.lb.numel()}"
     C = ConSet()

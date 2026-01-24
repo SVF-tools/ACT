@@ -478,7 +478,7 @@ class NetFactory:
         cnn_spatial_kinds = [
             "CONV1D", "CONV2D", "CONV3D", "CONVTRANSPOSE2D",
             "MAXPOOL1D", "MAXPOOL2D", "MAXPOOL3D",
-            "AVGPOOL1D", "AVGPOOL2D", "AVGPOOL3D",
+            "AVGPOOL1D", "AVGPOOL2D",
             "UPSAMPLE", "PAD"
         ]
         if kind in cnn_spatial_kinds:

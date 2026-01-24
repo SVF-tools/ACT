@@ -25,7 +25,27 @@ def box_join(a: Bounds, b: Bounds) -> Bounds:
 def changed_or_maskdiff(L, B: Bounds, masks: Optional[Dict[str, torch.Tensor]], eps=1e-9) -> bool:
     plb = L.cache.get("prev_lb"); pub = L.cache.get("prev_ub")
     if plb is None or pub is None: return True
-    if torch.any(torch.abs(plb - B.lb) > eps) or torch.any(torch.abs(pub - B.ub) > eps): return True
+
+    # Handle nan/inf: finiteness change is always a change
+    # (nan - finite = nan, nan > eps = False, so we need explicit check)
+    plb_finite = torch.isfinite(plb)
+    pub_finite = torch.isfinite(pub)
+    lb_finite = torch.isfinite(B.lb)
+    ub_finite = torch.isfinite(B.ub)
+    if torch.any(plb_finite != lb_finite) or torch.any(pub_finite != ub_finite):
+        return True
+
+    # For finite values, check if changed significantly
+    # Use masked comparison to avoid nan issues
+    if torch.any(lb_finite):
+        lb_diff = torch.where(lb_finite, torch.abs(plb - B.lb), torch.zeros_like(plb))
+        if torch.any(lb_diff > eps):
+            return True
+    if torch.any(ub_finite):
+        ub_diff = torch.where(ub_finite, torch.abs(pub - B.ub), torch.zeros_like(pub))
+        if torch.any(ub_diff > eps):
+            return True
+
     prev = L.cache.get("masks")
     if (masks is None) ^ (prev is None): return True
     if masks is None: return False
