@@ -142,7 +142,7 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.meta.get("padding", 0)
     
     # Reshape input if needed
-    in_shape = L.meta.get("input_shape")  # May be (N,C,H,W) or (C,H,W)
+    in_shape = L.meta.get("input_shape")  # (N,C,H,W) or (C,H,W)
     if len(Bin.lb.shape) == 1 and in_shape:
         # input_shape may be (N,C,H,W) or (C,H,W)
         if len(in_shape) == 4:

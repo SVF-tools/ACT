@@ -191,12 +191,12 @@ def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
     idx_amb = torch.where((Bin.lb < 0) & (Bin.ub > 0))[0]  # Crosses zero
 
     # Output bounds
-    lb = torch.where(idx_amb[:, None] == torch.arange(len(Bin.lb))[None, :],
-                     torch.zeros_like(Bin.lb),
+    lb = torch.where(idx_amb[:, None] == torch.arange(len(Bin.lb))[None, :], 
+                     torch.zeros_like(Bin.lb), 
                      torch.where(Bin.lb >= 0, Bin.lb, -Bin.ub))
     ub = torch.maximum(torch.abs(Bin.lb), torch.abs(Bin.ub))
     Bout = Bounds(lb=lb, ub=ub)
-
+    
     cons = ConSet()
     cons.add_op(f"abs:{L.id}", list(L.out_vars + L.in_vars), idx_pos=idx_pos, idx_neg=idx_neg, idx_amb=idx_amb)
 
