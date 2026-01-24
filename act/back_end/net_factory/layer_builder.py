@@ -61,6 +61,11 @@ def _activation_kind(name: str) -> str:
         "mish": "MISH",
         "softsign": "SOFTSIGN",
         "gelu": "GELU",
+        # A-group: unary operations
+        "abs": "ABS",
+        "clip": "CLIP",
+        "square": "SQUARE",
+        "power": "POWER",
     }
     if name not in mapping:
         raise ValueError(f"Unsupported activation '{name}'")
@@ -92,6 +97,52 @@ def _infer_pool2d_output_hw(
     def out_dim(x: int) -> int:
         return int((x + 2 * padding - (kernel - 1) - 1) // stride + 1)
     return out_dim(H), out_dim(W)
+
+
+def _infer_conv1d_output_w(
+    W: int,
+    kernel: int,
+    stride: int,
+    padding: int,
+    dilation: int = 1,
+) -> int:
+    """Compute Conv1D output width."""
+    return int((W + 2 * padding - dilation * (kernel - 1) - 1) // stride + 1)
+
+
+def _infer_conv3d_output_dhw(
+    D: int, H: int, W: int,
+    kernel: int,
+    stride: int,
+    padding: int,
+    dilation: int = 1,
+) -> Tuple[int, int, int]:
+    """Compute Conv3D output spatial dimensions."""
+    def out_dim(x: int) -> int:
+        return int((x + 2 * padding - dilation * (kernel - 1) - 1) // stride + 1)
+    return out_dim(D), out_dim(H), out_dim(W)
+
+
+def _infer_pool1d_output_w(
+    W: int,
+    kernel: int,
+    stride: int,
+    padding: int = 0,
+) -> int:
+    """Compute Pool1D output width."""
+    return int((W + 2 * padding - (kernel - 1) - 1) // stride + 1)
+
+
+def _infer_pool3d_output_dhw(
+    D: int, H: int, W: int,
+    kernel: int,
+    stride: int,
+    padding: int = 0,
+) -> Tuple[int, int, int]:
+    """Compute Pool3D output spatial dimensions."""
+    def out_dim(x: int) -> int:
+        return int((x + 2 * padding - (kernel - 1) - 1) // stride + 1)
+    return out_dim(D), out_dim(H), out_dim(W)
 
 
 def _as_block_param(v: Any, i: int, n_blocks: int, name: str) -> int:
@@ -175,6 +226,189 @@ def append_pool2d(
     return out_H, out_W
 
 
+def append_conv1d(
+    layers: List[Dict[str, Any]],
+    *,
+    in_ch: int,
+    out_ch: int,
+    W: int,
+    kernel: int,
+    stride: int,
+    padding: int,
+) -> int:
+    """Append CONV1D layer and return output W."""
+    input_shape = [1, int(in_ch), int(W)]
+    out_W = _infer_conv1d_output_w(W, kernel=kernel, stride=stride, padding=padding)
+    if out_W <= 0:
+        raise ValueError(f"Invalid CONV1D output width: {out_W}")
+    output_shape = [1, int(out_ch), int(out_W)]
+    layers.append({
+        "kind": "CONV1D",
+        "params": {},
+        "meta": {
+            "in_channels": int(in_ch),
+            "out_channels": int(out_ch),
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_W
+
+
+def append_conv3d(
+    layers: List[Dict[str, Any]],
+    *,
+    in_ch: int,
+    out_ch: int,
+    D: int, H: int, W: int,
+    kernel: int,
+    stride: int,
+    padding: int,
+) -> Tuple[int, int, int]:
+    """Append CONV3D layer and return output D, H, W."""
+    input_shape = [1, int(in_ch), int(D), int(H), int(W)]
+    out_D, out_H, out_W = _infer_conv3d_output_dhw(D, H, W, kernel=kernel, stride=stride, padding=padding)
+    if out_D <= 0 or out_H <= 0 or out_W <= 0:
+        raise ValueError(f"Invalid CONV3D output shape: D={out_D}, H={out_H}, W={out_W}")
+    output_shape = [1, int(out_ch), int(out_D), int(out_H), int(out_W)]
+    layers.append({
+        "kind": "CONV3D",
+        "params": {},
+        "meta": {
+            "in_channels": int(in_ch),
+            "out_channels": int(out_ch),
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_D, out_H, out_W
+
+
+def append_pool1d(
+    layers: List[Dict[str, Any]],
+    *,
+    kind: str,
+    in_ch: int,
+    W: int,
+    kernel: int,
+    stride: int,
+    padding: int = 0,
+) -> int:
+    """Append 1D pooling layer and return output W."""
+    input_shape = [1, int(in_ch), int(W)]
+    out_W = _infer_pool1d_output_w(W, kernel=kernel, stride=stride, padding=padding)
+    if out_W <= 0:
+        raise ValueError(f"Invalid {kind} output width: {out_W}")
+    output_shape = [1, int(in_ch), int(out_W)]
+    layers.append({
+        "kind": kind,
+        "params": {},
+        "meta": {
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_W
+
+
+def append_pool3d(
+    layers: List[Dict[str, Any]],
+    *,
+    kind: str,
+    in_ch: int,
+    D: int, H: int, W: int,
+    kernel: int,
+    stride: int,
+    padding: int = 0,
+) -> Tuple[int, int, int]:
+    """Append 3D pooling layer and return output D, H, W."""
+    input_shape = [1, int(in_ch), int(D), int(H), int(W)]
+    out_D, out_H, out_W = _infer_pool3d_output_dhw(D, H, W, kernel=kernel, stride=stride, padding=padding)
+    if out_D <= 0 or out_H <= 0 or out_W <= 0:
+        raise ValueError(f"Invalid {kind} output shape: D={out_D}, H={out_H}, W={out_W}")
+    output_shape = [1, int(in_ch), int(out_D), int(out_H), int(out_W)]
+    layers.append({
+        "kind": kind,
+        "params": {},
+        "meta": {
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_D, out_H, out_W
+
+
+def append_pad(
+    layers: List[Dict[str, Any]],
+    *,
+    in_ch: int,
+    H: int, W: int,
+    padding: Tuple[int, int, int, int],
+    mode: str = "constant",
+    value: float = 0.0,
+) -> Tuple[int, int]:
+    """Append PAD layer and return output H, W.
+
+    Args:
+        padding: (left, right, top, bottom)
+    """
+    left, right, top, bottom = padding
+    input_shape = [1, int(in_ch), int(H), int(W)]
+    out_H = H + top + bottom
+    out_W = W + left + right
+    output_shape = [1, int(in_ch), int(out_H), int(out_W)]
+    layers.append({
+        "kind": "PAD",
+        "params": {},
+        "meta": {
+            "pad": list(padding),
+            "mode": mode,
+            "value": float(value),
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_H, out_W
+
+
+def append_upsample(
+    layers: List[Dict[str, Any]],
+    *,
+    in_ch: int,
+    H: int, W: int,
+    scale_factor: float,
+    mode: str = "nearest",
+) -> Tuple[int, int]:
+    """Append UPSAMPLE layer and return output H, W."""
+    input_shape = [1, int(in_ch), int(H), int(W)]
+    out_H = int(H * scale_factor)
+    out_W = int(W * scale_factor)
+    output_shape = [1, int(in_ch), int(out_H), int(out_W)]
+    layers.append({
+        "kind": "UPSAMPLE",
+        "params": {},
+        "meta": {
+            "scale_factor": float(scale_factor),
+            "mode": mode,
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+    return out_H, out_W
+
+
 def append_dense(
     layers: List[Dict[str, Any]],
     *,
@@ -191,6 +425,42 @@ def append_dense(
             "out_features": int(out_features),
             "bias_enabled": bool(use_bias),
         },
+    })
+
+
+def append_bias(layers: List[Dict[str, Any]]) -> None:
+    """Append BIAS layer (element-wise bias addition).
+
+    Params will be auto-filled by factory.create_network based on previous layer output size.
+    """
+    layers.append({
+        "kind": "BIAS",
+        "params": {},  # Will be filled with {"c": tensor} by factory
+        "meta": {},
+    })
+
+
+def append_scale(layers: List[Dict[str, Any]]) -> None:
+    """Append SCALE layer (element-wise scaling).
+
+    Params will be auto-filled by factory.create_network based on previous layer output size.
+    """
+    layers.append({
+        "kind": "SCALE",
+        "params": {},  # Will be filled with {"a": tensor} by factory
+        "meta": {},
+    })
+
+
+def append_bn(layers: List[Dict[str, Any]]) -> None:
+    """Append BN (Batch Normalization) layer.
+
+    Params will be auto-filled by factory.create_network based on previous layer output size.
+    """
+    layers.append({
+        "kind": "BN",
+        "params": {},  # Will be filled with {"A": tensor, "c": tensor} by factory
+        "meta": {},
     })
 
 
@@ -211,6 +481,14 @@ def append_act(layers: List[Dict[str, Any]], act_kind: str, *, act_params: Dict[
                 meta["alpha"] = float(act_params["hardsigmoid_alpha"])
             if "hardsigmoid_beta" in act_params:
                 meta["beta"] = float(act_params["hardsigmoid_beta"])
+        elif act_kind == "CLIP":
+            if "clip_min" in act_params:
+                meta["min"] = float(act_params["clip_min"])
+            if "clip_max" in act_params:
+                meta["max"] = float(act_params["clip_max"])
+        elif act_kind == "POWER":
+            if "power_exponent" in act_params:
+                meta["exponent"] = float(act_params["power_exponent"])
     layers.append({"kind": act_kind, "params": {}, "meta": meta})
 
 
@@ -222,6 +500,176 @@ def append_add(layers: List[Dict[str, Any]], *, skip_idx: int, main_idx: int) ->
         "meta": {},
         "inputs": {"x": skip_idx, "y": main_idx},
         "preds": [skip_idx, main_idx],
+    })
+
+
+def append_binary_op(
+    layers: List[Dict[str, Any]],
+    *,
+    op_kind: str,
+    x_idx: int,
+    y_idx: int,
+) -> None:
+    """Append binary operation layer (SUB/MUL/DIV/POW/MAX/MIN).
+
+    Args:
+        layers: Layer specification list
+        op_kind: Operation type (SUB, MUL, DIV, POW, MAX, MIN)
+        x_idx: Index of first input layer
+        y_idx: Index of second input layer
+
+    Note: Both inputs must have the same shape for element-wise operations.
+    The x_vars and y_vars will be populated by factory during variable generation.
+    """
+    layers.append({
+        "kind": op_kind,
+        "params": {},
+        "meta": {},  # x_vars and y_vars will be set by factory._generate_layer_variables
+        "inputs": {"x": x_idx, "y": y_idx},
+        "preds": [x_idx, y_idx],
+    })
+
+
+def append_reshape(
+    layers: List[Dict[str, Any]],
+    *,
+    target_shape: Tuple[int, ...],
+) -> None:
+    """Append RESHAPE layer.
+
+    Note: Caller must ensure target_shape has same number of elements as input.
+    """
+    layers.append({
+        "kind": "RESHAPE",
+        "params": {},
+        "meta": {"target_shape": list(target_shape)},
+    })
+
+
+def append_transpose(
+    layers: List[Dict[str, Any]],
+    *,
+    perm: Tuple[int, ...],
+) -> None:
+    """Append TRANSPOSE layer."""
+    layers.append({
+        "kind": "TRANSPOSE",
+        "params": {},
+        "meta": {"perm": list(perm)},
+    })
+
+
+def append_squeeze(
+    layers: List[Dict[str, Any]],
+    *,
+    dims: Tuple[int, ...],
+) -> None:
+    """Append SQUEEZE layer."""
+    layers.append({
+        "kind": "SQUEEZE",
+        "params": {},
+        "meta": {"dims": list(dims)},
+    })
+
+
+def append_unsqueeze(
+    layers: List[Dict[str, Any]],
+    *,
+    dims: Tuple[int, ...],
+) -> None:
+    """Append UNSQUEEZE layer."""
+    layers.append({
+        "kind": "UNSQUEEZE",
+        "params": {},
+        "meta": {"dims": list(dims)},
+    })
+
+
+def append_slice(
+    layers: List[Dict[str, Any]],
+    *,
+    starts: List[int],
+    ends: List[int],
+    axes: List[int],
+    input_shape: List[int],
+    output_shape: List[int],
+) -> None:
+    """Append SLICE layer."""
+    layers.append({
+        "kind": "SLICE",
+        "params": {},
+        "meta": {
+            "starts": starts,
+            "ends": ends,
+            "axes": axes,
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+
+
+def append_gather(
+    layers: List[Dict[str, Any]],
+    *,
+    indices: List[int],
+    axis: int,
+    input_shape: List[int],
+    output_shape: List[int],
+) -> None:
+    """Append GATHER layer."""
+    layers.append({
+        "kind": "GATHER",
+        "params": {},
+        "meta": {
+            "indices": indices,
+            "axis": axis,
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+    })
+
+
+def append_concat(
+    layers: List[Dict[str, Any]],
+    *,
+    input_indices: List[int],
+    concat_dim: int = 0,
+) -> None:
+    """Append CONCAT layer.
+
+    Args:
+        input_indices: List of layer indices to concatenate
+        concat_dim: Dimension along which to concatenate
+    """
+    layers.append({
+        "kind": "CONCAT",
+        "params": {},
+        "meta": {"concat_dim": concat_dim},
+        "preds": input_indices,
+    })
+
+
+def append_matmul(
+    layers: List[Dict[str, Any]],
+    *,
+    x_idx: int,
+    y_idx: int,
+) -> None:
+    """Append MATMUL layer for matrix multiplication.
+
+    Args:
+        x_idx: Index of first input layer (matrix A)
+        y_idx: Index of second input layer (matrix B)
+
+    Note: Caller must ensure shapes are compatible for matrix multiplication.
+    The x_vars and y_vars will be populated by factory during variable generation.
+    """
+    layers.append({
+        "kind": "MATMUL",
+        "params": {},
+        "meta": {},  # x_vars and y_vars will be set by factory._generate_layer_variables
+        "inputs": {"x": x_idx, "y": y_idx},
+        "preds": [x_idx, y_idx],
     })
 
 

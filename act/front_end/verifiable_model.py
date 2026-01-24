@@ -727,3 +727,211 @@ class OutputSpecLayer(nn.Module):
         
         else:
             return (y, True, f"⚠️ OUTPUT: Unknown kind {self.kind}")
+
+
+# ============================================================================
+# DAG-Capable Verifiable Model (Phase 0+1: Minimal DAG Support)
+# ============================================================================
+
+class VerifiableGraphModel(nn.Module):
+    """
+    DAG-capable verifiable model for networks with multi-input layers.
+
+    Unlike VerifiableModel (nn.Sequential for linear chains), this class
+    supports arbitrary DAG structures by executing layers in topological order
+    and caching intermediate outputs.
+
+    Key Features:
+        - Multi-input layer support via explicit preds field
+        - Topological execution order (follows ACT Net layer sequence)
+        - Output caching (outputs[layer_id] stores intermediate results)
+        - Spec layer integration (InputSpecLayer, OutputSpecLayer)
+        - Strict mode support (inherited from ACTToTorch converter)
+
+    Architecture:
+        1. INPUT layer: Stores input tensor
+        2. INPUT_SPEC layer: Constraint checking, returns (x, satisfied, explanation)
+        3. Computational layers: Execute with inputs from preds
+        4. ASSERT layer: Output constraint checking
+
+    Args:
+        net: ACT Net object (contains layer graph structure)
+        layer_modules: Dict mapping layer_id -> (nn.Module or callable, is_spec_layer, kind)
+        input_spec_layer_id: Layer ID of INPUT_SPEC (None if not present)
+        output_spec_layer_id: Layer ID of ASSERT (None if not present)
+
+    Returns:
+        Dict with keys:
+        - 'output': Model output tensor
+        - 'input_satisfied': True if input constraints satisfied
+        - 'input_explanation': Human-readable input constraint result
+        - 'output_satisfied': True if output constraints satisfied
+        - 'output_explanation': Human-readable output constraint result
+
+    Example:
+        # Create DAG model via ACTToTorch
+        converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
+        model = converter.run()  # Returns VerifiableGraphModel
+
+        # Forward pass
+        result = model(input_tensor)
+        print(f"Output: {result['output']}")
+        print(f"Input OK: {result['input_satisfied']}")
+    """
+
+    def __init__(
+        self,
+        net,  # ACT Net
+        layer_modules: Dict[int, Tuple],  # layer_id -> (module, is_spec_layer, kind)
+        input_spec_layer_id: Optional[int] = None,
+        output_spec_layer_id: Optional[int] = None
+    ):
+        super().__init__()
+
+        self.net = net
+        self.input_spec_layer_id = input_spec_layer_id
+        self.output_spec_layer_id = output_spec_layer_id
+
+        # Register layer modules
+        # Store as nn.ModuleDict for proper .to(device) handling
+        self.layer_modules = nn.ModuleDict()
+        self.layer_callables = {}  # For non-Module callables (e.g., lambda for ADD)
+        self.layer_is_spec = {}  # Track which layers are spec layers
+        self.layer_kinds = {}  # Track layer kinds for debugging
+
+        for layer_id, (module, is_spec_layer, kind) in layer_modules.items():
+            str_id = str(layer_id)
+            self.layer_kinds[layer_id] = kind
+            self.layer_is_spec[layer_id] = is_spec_layer
+
+            if module is None:
+                # INPUT layer (no-op)
+                continue
+            elif isinstance(module, nn.Module):
+                # Register as nn.Module for device handling
+                self.layer_modules[str_id] = module
+            else:
+                # Callable (e.g., lambda for ADD)
+                self.layer_callables[layer_id] = module
+
+    def forward(self, x: torch.Tensor):
+        """
+        Forward pass with DAG execution and constraint checking.
+
+        Execution:
+            1. Iterate through layers in topological order (layer.id sequence)
+            2. For each layer, fetch inputs from outputs[pred_id] based on preds
+            3. Execute layer and store result in outputs[layer_id]
+            4. Collect constraint checking results from spec layers
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            Dict with output, input_satisfied, input_explanation,
+            output_satisfied, output_explanation
+        """
+        outputs = {}  # layer_id -> tensor
+        input_satisfied = True
+        input_explanation = "No INPUT_SPEC layer"
+        output_satisfied = True
+        output_explanation = "No OUTPUT_SPEC layer"
+
+        # Execute layers in topological order
+        for layer in self.net.layers:
+            layer_id = layer.id
+            kind = layer.kind
+
+            # INPUT layer: Store input tensor
+            if kind == "INPUT":
+                outputs[layer_id] = x
+                continue
+
+            # Get layer module/callable
+            str_id = str(layer_id)
+            if str_id in self.layer_modules:
+                module = self.layer_modules[str_id]
+            elif layer_id in self.layer_callables:
+                module = self.layer_callables[layer_id]
+            else:
+                # Layer was skipped (non-strict mode)
+                # Pass through predecessor's output as identity
+                preds = self.net.preds.get(layer_id, [])
+                if preds:
+                    # Use first predecessor's output
+                    outputs[layer_id] = outputs[preds[0]]
+                else:
+                    # Fallback: use previous layer's output
+                    pred_ids = [lid for lid in outputs.keys() if lid < layer_id]
+                    if pred_ids:
+                        outputs[layer_id] = outputs[max(pred_ids)]
+                continue
+
+            # Get inputs based on preds from Net.preds dictionary
+            preds = self.net.preds.get(layer_id, [])
+            if preds:
+                # Multi-input layer: gather inputs from predecessors
+                if len(preds) == 1:
+                    # Single predecessor
+                    layer_input = outputs[preds[0]]
+                elif len(preds) == 2 and kind in ["SUB", "MUL", "DIV", "POW", "MATMUL"]:
+                    # Binary operations (exactly 2 inputs): pass as (x, y) for lambda compatibility
+                    # NOTE: ADD removed from this list as it supports 2+ inputs via reduce
+                    input_x = outputs[preds[0]]
+                    input_y = outputs[preds[1]]
+                    layer_input = (input_x, input_y)
+                else:
+                    # General multi-input (ADD, MAX, MIN, CONCAT with 2+ inputs)
+                    layer_input = tuple(outputs[pred_id] for pred_id in preds)
+            else:
+                # Single-input layer: use previous layer's output
+                # Find the immediate predecessor (layer with max id < current id)
+                pred_ids = [lid for lid in outputs.keys() if lid < layer_id]
+                if not pred_ids:
+                    raise ValueError(f"Layer {layer_id} has no predecessors")
+                pred_id = max(pred_ids)
+                layer_input = outputs[pred_id]
+
+            # Execute layer
+            if callable(module) and not isinstance(module, nn.Module):
+                # Callable (e.g., lambda for ADD)
+                if isinstance(layer_input, tuple):
+                    result = module(*layer_input)
+                else:
+                    result = module(layer_input)
+            else:
+                # nn.Module
+                result = module(layer_input)
+
+            # Handle spec layer results (tuple returns)
+            if self.layer_is_spec.get(layer_id, False):
+                if isinstance(result, tuple) and len(result) == 3:
+                    tensor, satisfied, explanation = result
+
+                    # Determine if this is input or output spec
+                    if layer_id == self.input_spec_layer_id:
+                        input_satisfied = satisfied
+                        input_explanation = explanation
+                    elif layer_id == self.output_spec_layer_id:
+                        output_satisfied = satisfied
+                        output_explanation = explanation
+
+                    outputs[layer_id] = tensor
+                else:
+                    # Spec layer should return tuple
+                    outputs[layer_id] = result
+            else:
+                # Regular layer
+                outputs[layer_id] = result
+
+        # Get final output (last layer's output)
+        final_layer_id = max(outputs.keys())
+        final_output = outputs[final_layer_id]
+
+        return {
+            'output': final_output,
+            'input_satisfied': input_satisfied,
+            'input_explanation': input_explanation,
+            'output_satisfied': output_satisfied,
+            'output_explanation': output_explanation
+        }

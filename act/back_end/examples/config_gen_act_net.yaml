@@ -12,13 +12,18 @@
 # These settings apply to all network types and control the generation process.
 
 common:
-  num_instances: 5              # Number of networks to generate per run
+  num_instances: 15              # Number of networks to generate per run
   base_seed: null               # Seed for reproducibility (null = random)
   name_prefix: cfg_seed         # Prefix for generated network names
   output_dir: act/back_end/examples/nets  # Output directory for JSON files
   write_manifest: true          # Whether to write manifest.json
-  manifest_path: null           # Custom manifest path (null = auto)
+  manifest_path: act/back_end/examples/nets/_meta/manifest.json  # Custom manifest path
   dtype: torch.float64          # Data type for weights and computations
+
+  # Coverage-driven generation settings
+  coverage_mode: basic          # basic = normal, full = ensure all layer types covered
+  coverage_max_attempts: 1000   # Max networks to generate in full mode (safety limit)
+  coverage_report: true         # Print coverage statistics at end
 
 
 # ============================================================================
@@ -84,12 +89,12 @@ families:
         count: { range: [2, 4] }
         value: { choice: [32, 64, 128] }  # Width of each hidden layer
     activation:
-      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus]  # Activation functions
+      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus, hardsigmoid, hardswish, mish, softsign, abs, clip, square, power]  # Activation functions (tf_mlp only)
     variant:
       weighted:
         plain: 0.4              # Plain feedforward MLP
-        block: 0.6              # Block-structured MLP
-        residual: 0.0           # Residual MLP (disabled)
+        block: 0.3              # Block-structured MLP
+        residual: 0.3           # Residual MLP (disabled)
     num_blocks:
       range: [2, 6]             # Number of blocks (block variant)
     block_width:
@@ -111,6 +116,16 @@ families:
       choice: [-1.0, -2.0]      # HardTanh min value
     hardtanh_max:
       choice: [1.0, 2.0]        # HardTanh max value
+    hardsigmoid_alpha:
+      choice: [0.166667, 0.2]   # HardSigmoid slope (1/6, 1/5)
+    hardsigmoid_beta:
+      choice: [0.5]             # HardSigmoid offset
+    clip_min:
+      choice: [-1.0, 0.0, -2.0] # CLIP min value
+    clip_max:
+      choice: [1.0, 2.0, 6.0]   # CLIP max value
+    power_exponent:
+      choice: [2.0, 3.0, 0.5]   # POWER exponent (square, cube, sqrt)
 
   # --------------------------------------------------------------------------
   # 4.2 CNN2D (2D Convolutional Network) Family
@@ -159,7 +174,7 @@ families:
     head_pool_to_1x1:
       const: true               # Global pooling before FC head
     activation:
-      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu]  # Activation functions
+      choice: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, hardsigmoid, hardswish, mish, softsign, abs, clip, square]  # Activation functions (tf_cnn only)
     use_bias:
       const: true               # Enable bias in conv/linear layers
     # Activation parameters for CNN
@@ -169,5 +184,196 @@ families:
       choice: [-1.0, -2.0]      # HardTanh min value
     hardtanh_max:
       choice: [1.0, 2.0]        # HardTanh max value
+    hardsigmoid_alpha:
+      choice: [0.166667, 0.2]   # HardSigmoid slope
+    hardsigmoid_beta:
+      choice: [0.5]             # HardSigmoid offset
+    clip_min:
+      choice: [0.0, -1.0]       # CLIP min value
+    clip_max:
+      choice: [1.0, 6.0]        # CLIP max value
     num_classes:
       choice: [10]              # Number of output classes
+
+
+# ============================================================================
+# 5. SCHEMA CONTRACT (Verification & Classification)
+# ============================================================================
+# This section defines the contract for network validation and classification.
+# Purpose: Enable "search + check" - locate network class and verify structure.
+
+schema:
+  # --------------------------------------------------------------------------
+  # 5.1 Common Fields (Required for ALL networks)
+  # --------------------------------------------------------------------------
+  common_fields:
+    - family              # Network family: mlp, cnn2d
+    - variant             # Variant within family: plain, block, residual, stage
+    - input_shape         # Input tensor shape (including batch=1)
+    - num_classes         # Number of output classes
+    - num_layers          # Total number of layers (computed from JSON)
+    - num_params          # Total parameter count (computed from weights)
+
+  # --------------------------------------------------------------------------
+  # 5.2 Size Tiers (Parameter Count Thresholds)
+  # --------------------------------------------------------------------------
+  # Classification based on total trainable parameters
+  size_tiers:
+    tiny:
+      max_params: 50000       # ≤ 50k parameters
+      description: "Tiny networks for quick verification"
+    small:
+      max_params: 200000      # ≤ 200k parameters
+      description: "Small networks for moderate verification"
+    medium:
+      max_params: 1000000     # ≤ 1M parameters
+      description: "Medium networks for comprehensive verification"
+
+  # --------------------------------------------------------------------------
+  # 5.3 Network Classes (Type-Specific Constraints)
+  # --------------------------------------------------------------------------
+  # Each class defines required fields and validation rules
+  classes:
+    # ------------------------------------------------------------------------
+    # MLP Plain
+    # ------------------------------------------------------------------------
+    mlp_plain:
+      description: "Plain feedforward MLP"
+      match_condition:
+        family: mlp
+        variant: plain
+      required_fields:
+        - hidden_sizes        # List of hidden layer widths
+        - activation          # Activation function name
+        - use_bias            # Boolean: bias enabled
+      constraints:
+        depth_range: [2, 4]   # Number of hidden layers
+        hidden_min: 32        # Minimum hidden layer width
+        hidden_max: 128       # Maximum hidden layer width
+        valid_activations: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus, hardsigmoid, hardswish, mish, softsign, abs, clip, square, power]
+
+    # ------------------------------------------------------------------------
+    # MLP Block
+    # ------------------------------------------------------------------------
+    mlp_block:
+      description: "Block-structured MLP"
+      match_condition:
+        family: mlp
+        variant: block
+      required_fields:
+        - block_width         # Width of each block
+        - num_blocks          # Number of blocks
+        - activation          # Activation function
+        - post_block_activation  # Boolean: activation after blocks
+      constraints:
+        num_blocks_range: [2, 6]
+        block_width_values: [32, 64, 128]
+        valid_activations: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus, hardsigmoid, hardswish, mish, softsign, abs, clip, square, power]
+
+    # ------------------------------------------------------------------------
+    # MLP Residual
+    # ------------------------------------------------------------------------
+    mlp_residual:
+      description: "Residual MLP with skip connections"
+      match_condition:
+        family: mlp
+        variant: residual
+      required_fields:
+        - residual_width      # Width of residual blocks
+        - num_residual_blocks # Number of residual blocks
+        - activation          # Activation function
+      constraints:
+        num_residual_blocks_range: [1, 3]
+        residual_width_values: [32, 64, 128]
+        valid_activations: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, softplus, hardsigmoid, hardswish, mish, softsign, abs, clip, square, power]
+
+    # ------------------------------------------------------------------------
+    # CNN2D Plain
+    # ------------------------------------------------------------------------
+    cnn2d_plain:
+      description: "Plain sequential 2D CNN"
+      match_condition:
+        family: cnn2d
+        variant: plain
+      required_fields:
+        - conv_channels       # List of conv channel counts
+        - activation          # Activation function
+      constraints:
+        # Number of conv blocks (length of conv_channels)
+        conv_channels_length_range: [1, 3]
+        # Each channel value should be in this set
+        conv_channel_valid_values: [8, 16, 32]
+        # Kernel size must be 3
+        kernel_sizes_value: 3
+        valid_activations: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, hardsigmoid, hardswish, mish, softsign, abs, clip, square]
+
+    # ------------------------------------------------------------------------
+    # ResNet (CNN2D Stage Variant)
+    # ------------------------------------------------------------------------
+    resnet:
+      description: "ResNet-like staged CNN with residual connections"
+      match_condition:
+        family: cnn2d
+        variant: stage
+      required_fields:
+        - base_channels       # Base channel count
+        - num_stages          # Number of stages
+        - blocks_per_stage    # Blocks per stage
+        - activation          # Activation function
+      constraints:
+        num_stages_range: [1, 3]
+        blocks_per_stage_range: [1, 2]
+        base_channels_values: [8, 16, 32]
+        valid_activations: [relu, tanh, sigmoid, lrelu, relu6, hardtanh, silu, hardsigmoid, hardswish, mish, softsign, abs, clip, square]
+
+  # --------------------------------------------------------------------------
+  # 5.4 Field Extraction Rules (How to extract fields from Net JSON)
+  # --------------------------------------------------------------------------
+  extraction_rules:
+    description: |
+      Defines how to extract schema fields from generated Net JSON files.
+      Fields are extracted with priority: metadata > layer inference.
+
+      Extraction Reliability:
+      - RELIABLE (no metadata needed): Can be accurately inferred from layers
+      - METADATA-DEPENDENT: Requires metadata from generation (model_cfg)
+
+    rules:
+      # ========== Common Fields (RELIABLE) ==========
+      family: "METADATA-DEPENDENT: Extract from metadata or infer from filename"
+      variant: "METADATA-DEPENDENT: Extract from metadata or infer from filename"
+      input_shape: "RELIABLE: Extract from first INPUT layer's meta.shape"
+      num_classes: "RELIABLE: Extract from INPUT layer meta or ASSERT layer meta"
+      num_layers: "RELIABLE: Count total number of layers in Net.layers"
+      num_params: |
+        RELIABLE: Compute from weight tensors:
+        - DENSE: W.numel() + (b.numel() if bias exists)
+        - CONV*: weight.numel() + (bias.numel() if exists)
+        Sum across all layers
+      activation: "RELIABLE: Extract from first activation layer kind (e.g., RELU -> 'relu')"
+      use_bias: "RELIABLE: Check if 'b' parameter exists in DENSE/CONV layers"
+
+      # ========== MLP Plain (RELIABLE) ==========
+      hidden_sizes: "RELIABLE: Extract from DENSE layer meta.out_features sequence (excluding output layer)"
+
+      # ========== MLP Block (MIXED) ==========
+      block_width: "RELIABLE: Extract from first DENSE layer width"
+      num_blocks: "METADATA-DEPENDENT: Cannot reliably infer (each block may have multiple DENSE layers)"
+      post_block_activation: "METADATA-DEPENDENT: Cannot infer from layer structure"
+
+      # ========== MLP Residual (MIXED) ==========
+      residual_width: "RELIABLE: Extract from first DENSE layer width"
+      num_residual_blocks: "METADATA-DEPENDENT: Cannot reliably infer (similar to num_blocks issue)"
+
+      # ========== CNN2D Plain (RELIABLE) ==========
+      conv_channels: "RELIABLE: Extract from CONV2D layer meta.out_channels sequence"
+      kernel_sizes: "RELIABLE: Extract from CONV2D layer meta.kernel_size"
+
+      # ========== ResNet/CNN2D Stage (MIXED) ==========
+      base_channels: "RELIABLE: Extract from first CONV2D layer out_channels"
+      num_stages: "METADATA-DEPENDENT: Cannot reliably infer (double_conv, 1x1 projections confuse detection)"
+      blocks_per_stage: "METADATA-DEPENDENT: Cannot reliably infer (conv layer count ≠ block count)"
+
+    validation_behavior:
+      with_metadata: "All fields validated; errors reported for violations"
+      without_metadata: "METADATA-DEPENDENT fields generate warnings (not errors); validation continues"

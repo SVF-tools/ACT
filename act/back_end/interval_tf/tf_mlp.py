@@ -206,7 +206,8 @@ def tf_sigmoid(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_tanh(L: Layer, Bin: Bounds) -> Fact:
     B=Bounds(torch.tanh(Bin.lb), torch.tanh(Bin.ub))
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"tanh:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,2)}))
+    # Use K=4 segments for tighter PWL approximation (fixes soundness bugs with large input ranges)
+    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"tanh:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,4)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_softplus(L: Layer, Bin: Bounds) -> Fact:

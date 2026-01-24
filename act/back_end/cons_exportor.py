@@ -62,7 +62,116 @@ def _add_tanh_small_band(solver: Solver, yi: int, zi: int, lo: float, hi: float)
     solver.add_lin_le([zi, yi], [1.0, -1.0], float(delta))
     solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
 
+def _add_tanh_pwl_k_segments(solver: Solver, yi: int, zi: int, lo: float, hi: float, K: int) -> None:
+    """
+    Add K-tangent PWL approximation for z = tanh(y) over [lo, hi].
+
+    CORRECT APPROACH (avoiding under-approximation):
+    - Use ONE GLOBAL SECANT for over/under-approximation (valid everywhere in [lo,hi])
+    - Use K TANGENT LINES for tighter bounds at K sampling points (all valid everywhere)
+
+    For convex region (x < 0):
+      - Global secant as UPPER bound: z <= secant(y)
+      - K tangents as LOWER bounds: z >= tangent_i(y) for all i
+
+    For concave region (x > 0):
+      - Global secant as LOWER bound: z >= secant(y)
+      - K tangents as UPPER bounds: z <= tangent_i(y) for all i
+
+    This ensures all constraints are valid over the entire range [lo, hi],
+    avoiding the under-approximation bug from per-segment secants.
+    """
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+
+    # Handle degenerate case
+    if hi - lo <= TANH_EPS:
+        val = _tanh_value(0.5 * (hi + lo))
+        solver.add_lin_ge([zi], [1.0], float(val))
+        solver.add_lin_ge([zi], [-1.0], float(-val))
+        return
+
+    # Handle small range near zero where tanh(x) ≈ x
+    max_abs = max(abs(lo), abs(hi))
+    if max_abs <= TANH_IDENTITY_WINDOW:
+        delta = max(abs(_tanh_value(lo) - lo), abs(_tanh_value(hi) - hi), TANH_IDENTITY_TOL)
+        solver.add_lin_le([zi, yi], [1.0, -1.0], float(delta))
+        solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
+        return
+
+    # Global secant line (valid everywhere in [lo, hi])
+    f_lo = _tanh_value(lo)
+    f_hi = _tanh_value(hi)
+    slope_global_sec = (f_hi - f_lo) / (hi - lo)
+    intercept_global_sec = f_lo - slope_global_sec * lo
+
+    # Handle different regions
+    if hi <= -TANH_EPS:
+        # Entirely in convex region (x < 0)
+        # Secant is UPPER bound, tangents are LOWER bounds
+        solver.add_lin_le([zi, yi], [1.0, -float(slope_global_sec)], float(intercept_global_sec))
+
+        # Add K tangent lines as lower bounds (all valid in convex region)
+        for k in range(K):
+            t = lo + (k + 0.5) * (hi - lo) / K  # Sample point in k-th segment
+            f_t = _tanh_value(t)
+            slope_tan = _tanh_derivative(t)
+            intercept_tan = f_t - slope_tan * t
+            solver.add_lin_ge([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+    elif lo >= TANH_EPS:
+        # Entirely in concave region (x > 0)
+        # Secant is LOWER bound, tangents are UPPER bounds
+        solver.add_lin_ge([zi, yi], [1.0, -float(slope_global_sec)], float(intercept_global_sec))
+
+        # Add K tangent lines as upper bounds (all valid in concave region)
+        for k in range(K):
+            t = lo + (k + 0.5) * (hi - lo) / K  # Sample point in k-th segment
+            f_t = _tanh_value(t)
+            slope_tan = _tanh_derivative(t)
+            intercept_tan = f_t - slope_tan * t
+            solver.add_lin_le([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+    else:
+        # Range crosses zero - DO NOT use per-region secants (they cause under-approximation)
+        # Per-region secants are only valid in their respective regions, not globally
+        # Using them together over-constrains the LP → UNSAT → false CERTIFIED
+
+        # Instead: use global bounds + tangents only
+        # tanh is monotonic, so global bounds are simply [tanh(lo), tanh(hi)]
+        solver.add_lin_ge([zi], [1.0], float(f_lo))  # z >= tanh(lo)
+        solver.add_lin_le([zi], [1.0], float(f_hi))  # z <= tanh(hi)
+
+        # Add tangent constraints in negative part (convex region)
+        # Tangents in convex region are global lower bounds
+        if lo < -TANH_EPS:
+            neg_hi = min(hi, -TANH_EPS)
+            K_neg = max(1, K // 2)
+            for k in range(K_neg):
+                t = lo + (k + 0.5) * (neg_hi - lo) / K_neg
+                f_t = _tanh_value(t)
+                slope_tan = _tanh_derivative(t)
+                intercept_tan = f_t - slope_tan * t
+                solver.add_lin_ge([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+        # Add tangent constraints in positive part (concave region)
+        # Tangents in concave region are global upper bounds
+        if hi > TANH_EPS:
+            pos_lo = max(lo, TANH_EPS)
+            K_pos = max(1, K - (K // 2))
+            for k in range(K_pos):
+                t = pos_lo + (k + 0.5) * (hi - pos_lo) / K_pos
+                f_t = _tanh_value(t)
+                slope_tan = _tanh_derivative(t)
+                intercept_tan = f_t - slope_tan * t
+                solver.add_lin_le([zi, yi], [1.0, -float(slope_tan)], float(intercept_tan))
+
+        # If range is very close to zero, add small band constraint
+        if abs(lo) < TANH_EPS and abs(hi) < TANH_EPS:
+            _add_tanh_small_band(solver, yi, zi, lo, hi)
+
 def _add_tanh_constraints_for_var(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    """Legacy 2-tangent approximation (fallback when K is not specified)."""
     if not np.isfinite(lo) or not np.isfinite(hi):
         return
 
@@ -211,12 +320,22 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             n = len(con.var_ids) // 2
             z_vars = list(con.var_ids[:n])
             y_vars = list(con.var_ids[n:])
+
+            # Extract K from PWL metadata if available
+            segs = con.meta.get("segs", {})
+            K = segs.get("K", None)
+
             for zi, yi in zip(z_vars, y_vars):
                 bounds = boxes.get(yi)
                 if bounds is None:
                     continue
                 lo, hi = bounds
-                _add_tanh_constraints_for_var(solver, yi, zi, float(lo), float(hi))
+
+                # Use K-segment PWL if K is specified, otherwise use legacy 2-tangent
+                if K is not None and K >= 2:
+                    _add_tanh_pwl_k_segments(solver, yi, zi, float(lo), float(hi), int(K))
+                else:
+                    _add_tanh_constraints_for_var(solver, yi, zi, float(lo), float(hi))
 
         elif tag.startswith("top1:"):
             meta = con.meta; y_vars = list(con.var_ids)

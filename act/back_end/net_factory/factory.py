@@ -17,6 +17,13 @@
 #   Flow:
 #   config -> ConfigSampler -> layer_builder -> Net -> JSON
 #
+#   Validation Strategy:
+#   NetFactory relies on ACT's existing validation infrastructure:
+#   - Layer.__post_init__() → validate_layer() (params/meta against REGISTRY)
+#   - Net.__post_init__() → validate_graph() (layer IDs, variable validity)
+#   Invalid networks raise ValueError during construction.
+#   See README.md "Validation Strategy" for three-layer design details.
+#
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
@@ -37,6 +44,32 @@ from act.util.device_manager import get_default_dtype
 from act.util.path_config import get_examples_gen_config_path
 
 from .layer_builder import build_cnn_layers, build_mlp_layers
+
+
+# ============================================================================
+# Coverage Target - interval_tf/tf_mlp.py + tf_cnn.py Supported Layers
+# ============================================================================
+# This list defines all layer types from interval_tf/tf_mlp.py + tf_cnn.py
+# that we want to cover in generated networks (50 layers total)
+
+COVERAGE_TARGET_LAYERS = [
+    # Linear and normalization operations
+    "DENSE", "BIAS", "SCALE", "BN",
+    # Activations (A-group: element-wise, low risk)
+    "RELU", "LRELU", "ABS", "CLIP", "SQUARE", "POWER",
+    "SIGMOID", "TANH", "SOFTPLUS", "SILU", "RELU6",
+    "HARDTANH", "HARDSIGMOID", "HARDSWISH", "MISH", "SOFTSIGN",
+    # Multi-input operations (B-group: fork-merge, medium risk)
+    "ADD", "SUB", "MUL", "DIV", "POW", "MAX", "MIN", "MATMUL", "CONCAT",
+    # CNN operations (D-group: convolution/pooling, medium risk)
+    "CONV1D", "CONV2D", "CONV3D", "CONVTRANSPOSE2D",
+    "MAXPOOL1D", "MAXPOOL2D", "MAXPOOL3D",
+    "AVGPOOL1D", "AVGPOOL2D",
+    "PAD", "UPSAMPLE", "FLATTEN",
+    # Tensor operations (C-group: shape transformation, high risk)
+    "RESHAPE", "TRANSPOSE", "SQUEEZE", "UNSQUEEZE",
+    "TILE", "EXPAND", "SLICE", "GATHER", "INDEX_SELECT",
+]
 
 
 # ============================================================================
@@ -299,6 +332,13 @@ class NetFactory:
             manifest_path = common.get("manifest_path")
         self.manifest_path = Path(manifest_path) if manifest_path else (self.output_dir / "manifest.json")
 
+        # Coverage tracking
+        self.coverage_mode = common.get("coverage_mode", "basic")
+        self.coverage_max_attempts = int(common.get("coverage_max_attempts", 1000))
+        self.coverage_report = bool(common.get("coverage_report", True))
+        self.coverage_stats = {layer: 0 for layer in COVERAGE_TARGET_LAYERS}
+        self.total_networks_generated = 0
+
     @staticmethod
     def _load_config(path: str) -> Dict[str, Any]:
         """Load YAML configuration file."""
@@ -405,14 +445,32 @@ class NetFactory:
             out_vars = list(range(var_counter, var_counter + out_features))
             return in_vars, out_vars, var_counter + out_features
 
+        # Element-wise normalization layers (BIAS, SCALE, BN)
+        if kind in ["BIAS", "SCALE", "BN"]:
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
+            out_vars = list(range(var_counter, var_counter + len(in_vars)))
+            return in_vars, out_vars, var_counter + len(in_vars)
+
         # All activation functions (element-wise operations)
         activation_kinds = [
             "RELU", "SIGMOID", "TANH", "LRELU", "RELU6", "HARDTANH", "HARDSIGMOID",
-            "HARDSWISH", "SILU", "SOFTPLUS", "MISH", "SOFTSIGN", "GELU", "ABS",
+            "HARDSWISH", "SILU", "SOFTPLUS", "MISH", "SOFTSIGN", "ABS",
             "CLIP", "SQUARE", "POWER"
         ]
         if kind in activation_kinds:
-            in_vars = layers[layer_index - 1].out_vars
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
             out_vars = list(range(var_counter, var_counter + len(in_vars)))
             return in_vars, out_vars, var_counter + len(in_vars)
 
@@ -424,36 +482,74 @@ class NetFactory:
             "UPSAMPLE", "PAD"
         ]
         if kind in cnn_spatial_kinds:
-            in_vars = layers[layer_index - 1].out_vars
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
             out_num_vars = torch.Size(meta["output_shape"]).numel()
             out_vars = list(range(var_counter, var_counter + out_num_vars))
             return in_vars, out_vars, var_counter + out_num_vars
 
         if kind == "FLATTEN":
-            in_vars = layers[layer_index - 1].out_vars
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
             out_vars = list(range(var_counter, var_counter + len(in_vars)))
             return in_vars, out_vars, var_counter + len(in_vars)
 
-        # Multi-input operations (ADD, SUB, MUL, DIV, POW)
-        if kind in ["ADD", "SUB", "MUL", "DIV", "POW"]:
-            x_vars = meta["x_vars"]
-            y_vars = meta["y_vars"]
+        # Multi-input operations (ADD, SUB, MUL, DIV, POW, MAX, MIN)
+        if kind in ["ADD", "SUB", "MUL", "DIV", "POW", "MAX", "MIN"]:
+            x_vars = meta.get("x_vars", [])
+            y_vars = meta.get("y_vars", [])
+            if not x_vars or not y_vars:
+                # Fallback: get from predecessor layers
+                if len(layers) >= 2:
+                    x_vars = layers[layer_index - 2].out_vars
+                    y_vars = layers[layer_index - 1].out_vars
+                    # Update meta for later use
+                    meta["x_vars"] = x_vars
+                    meta["y_vars"] = y_vars
             in_vars = list(x_vars) + list(y_vars)
             out_vars = list(range(var_counter, var_counter + len(x_vars)))
             return in_vars, out_vars, var_counter + len(x_vars)
 
+        # MATMUL - matrix multiplication
         if kind == "MATMUL":
-            x_vars = meta["x_vars"]
-            y_vars = meta["y_vars"]
+            x_vars = meta.get("x_vars", [])
+            y_vars = meta.get("y_vars", [])
+            if not x_vars or not y_vars:
+                # Fallback: get from predecessor layers
+                if len(layers) >= 2:
+                    x_vars = layers[layer_index - 2].out_vars
+                    y_vars = layers[layer_index - 1].out_vars
+                    meta["x_vars"] = x_vars
+                    meta["y_vars"] = y_vars
             in_vars = list(x_vars) + list(y_vars)
-            output_shape = meta["output_shape"]
-            out_num_vars = output_shape[0] * output_shape[1]
+            # For MATMUL, output size depends on matrix dimensions
+            # Conservative fallback: use first input size
+            if "output_shape" in meta:
+                out_num_vars = torch.Size(meta["output_shape"]).numel()
+            else:
+                out_num_vars = len(x_vars)
             out_vars = list(range(var_counter, var_counter + out_num_vars))
             return in_vars, out_vars, var_counter + out_num_vars
 
         # Tensor slice/gather operations
         if kind in ["SLICE", "GATHER", "INDEX_SELECT"]:
-            in_vars = layers[layer_index - 1].out_vars
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
             if "output_shape" in meta:
                 out_num_vars = torch.Size(meta["output_shape"]).numel()
             else:
@@ -461,6 +557,51 @@ class NetFactory:
                 out_num_vars = len(in_vars)
             out_vars = list(range(var_counter, var_counter + out_num_vars))
             return in_vars, out_vars, var_counter + out_num_vars
+
+        # Shape transformation operations (element count preserved)
+        if kind in ["RESHAPE", "TRANSPOSE", "SQUEEZE", "UNSQUEEZE"]:
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
+            # These operations preserve number of elements
+            out_vars = list(range(var_counter, var_counter + len(in_vars)))
+            return in_vars, out_vars, var_counter + len(in_vars)
+
+        # Expansion operations (element count increases)
+        if kind in ["TILE", "EXPAND"]:
+            # Check for explicit predecessors (for fork structures)
+            preds_indices = meta.get("preds_indices", None)
+            if preds_indices:
+                pred_idx = preds_indices[0] if isinstance(preds_indices, list) else preds_indices
+                in_vars = layers[pred_idx].out_vars
+            else:
+                in_vars = layers[layer_index - 1].out_vars
+            if "output_shape" in meta:
+                out_num_vars = torch.Size(meta["output_shape"]).numel()
+            else:
+                # Conservative: assume 2x expansion
+                out_num_vars = len(in_vars) * 2
+            out_vars = list(range(var_counter, var_counter + out_num_vars))
+            return in_vars, out_vars, var_counter + out_num_vars
+
+        # CONCAT - multi-input concatenation
+        if kind == "CONCAT":
+            # Get all predecessor variables from meta
+            preds_indices = meta.get("preds_indices", [])
+            if not preds_indices and layer_index >= 2:
+                # Fallback: use last two layers
+                preds_indices = [layer_index - 2, layer_index - 1]
+            in_vars = []
+            for pred_idx in preds_indices:
+                if pred_idx < len(layers):
+                    in_vars.extend(layers[pred_idx].out_vars)
+            # Output has all concatenated variables
+            out_vars = list(range(var_counter, var_counter + len(in_vars)))
+            return in_vars, out_vars, var_counter + len(in_vars)
 
         if kind in ["INPUT_SPEC", "ASSERT"]:
             prev_vars = layers[layer_index - 1].out_vars
@@ -648,7 +789,13 @@ class NetFactory:
         return {"layers": layers}
 
     def create_network(self, name: str, spec: Dict[str, Any]) -> Net:
-        """Create Net object from specification."""
+        """Create Net object from specification.
+
+        Note: Validation is automatic via Layer.__post_init__() and Net.__post_init__():
+        - validate_layer(): Checks params/meta against REGISTRY (layer_util.py)
+        - validate_graph(): Checks layer IDs and variable validity (layer_util.py)
+        Invalid networks will raise ValueError during construction.
+        """
         dtype = get_default_dtype()
         dtype_str = str(dtype)
 
@@ -661,8 +808,8 @@ class NetFactory:
             meta = layer_spec.get("meta", {}).copy()
             kind = layer_spec["kind"]
 
-            # Handle multi-input layer inputs (ADD, SUB, DIV, MUL, POW, MATMUL)
-            if kind in ["ADD", "SUB", "DIV", "MUL", "POW", "MATMUL"]:
+            # Handle multi-input layer inputs (ADD, SUB, DIV, MUL, POW, MAX, MIN, MATMUL)
+            if kind in ["ADD", "SUB", "DIV", "MUL", "POW", "MAX", "MIN", "MATMUL"]:
                 inputs = layer_spec.get("inputs") or {}
                 x_src = inputs.get("x")
                 y_src = inputs.get("y")
@@ -673,8 +820,28 @@ class NetFactory:
                 meta["x_vars"] = list(layers[x_src].out_vars)
                 meta["y_vars"] = list(layers[y_src].out_vars)
 
+            # Handle CONCAT - multi-input concatenation
+            if kind == "CONCAT":
+                preds = layer_spec.get("preds", [])
+                if not preds and len(layers) >= 2:
+                    # Fallback: use last two layers
+                    preds = [len(layers) - 2, len(layers) - 1]
+                # Store preds in meta for variable generation
+                meta["preds_indices"] = preds
+
+            # Store preds_indices for ALL layers that have explicit preds (for fork structures)
+            if "preds" in layer_spec and "preds_indices" not in meta:
+                meta["preds_indices"] = layer_spec["preds"]
+
             # Generate variables
             in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
+
+            # Handle MAX/MIN - add y_vars_list for interval_tf
+            if kind in ["MAX", "MIN"]:
+                preds = layer_spec.get("preds", [])
+                if preds:
+                    # interval_tf expects y_vars_list: list of var lists from each predecessor
+                    meta["y_vars_list"] = [list(layers[p].out_vars) for p in preds if p < len(layers)]
 
             # Fill in parameters based on layer kind
             if kind == "INPUT":
@@ -694,7 +861,21 @@ class NetFactory:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
                     params["weight"] = weight
+            elif kind == "BIAS" and "c" not in params:
+                # Auto-fill bias vector: c = zeros with size matching input
+                num_elements = len(in_vars)
+                params["c"] = torch.zeros(num_elements, dtype=dtype)
+            elif kind == "SCALE" and "a" not in params:
+                # Auto-fill scale vector: a = ones with size matching input
+                num_elements = len(in_vars)
+                params["a"] = torch.ones(num_elements, dtype=dtype)
+            elif kind == "BN" and "A" not in params:
+                # Auto-fill batch norm parameters: A = ones, c = zeros
+                num_elements = len(in_vars)
+                params["A"] = torch.ones(num_elements, dtype=dtype)
+                params["c"] = torch.zeros(num_elements, dtype=dtype)
 
+            # Layer.__post_init__() automatically calls validate_layer() for strict validation
             layer = Layer(id=i, kind=kind, params=params, meta=meta, in_vars=in_vars, out_vars=out_vars)
             layers.append(layer)
 
@@ -712,6 +893,7 @@ class NetFactory:
             for p in p_list:
                 succs[p].append(i)
 
+        # Net.__post_init__() automatically calls validate_graph() for structure validation
         net = Net(layers=layers, preds=preds, succs=succs)
         net.meta = {"name": name}
         return net
@@ -736,25 +918,422 @@ class NetFactory:
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _record_network_layers(self, net: Net) -> None:
+        """Record layer types from a generated network for coverage tracking."""
+        for layer in net.layers:
+            kind = layer.kind.upper()
+            if kind in self.coverage_stats:
+                self.coverage_stats[kind] += 1
+
+    def _get_uncovered_layers(self) -> List[str]:
+        """Get list of layers with zero occurrences."""
+        return [layer for layer, count in self.coverage_stats.items() if count == 0]
+
+    def _get_coverage_rate(self) -> float:
+        """Calculate coverage rate as percentage."""
+        covered = sum(1 for count in self.coverage_stats.values() if count > 0)
+        total = len(self.coverage_stats)
+        return (covered / total * 100.0) if total > 0 else 100.0
+
+    def _generate_minimal_template(self, layer_kind: str) -> Optional[Dict[str, Any]]:
+        """Generate minimal network template for a specific layer type.
+
+        Returns network spec dict or None if layer cannot be generated standalone.
+        """
+        dtype = str(self.config["common"]["dtype"])
+
+        # Simple 1D input shape for minimal templates
+        input_shape = [1, 4]
+
+        # Element-wise operations: INPUT -> INPUT_SPEC -> layer -> ASSERT
+        if layer_kind in ["BIAS", "SCALE", "BN", "RELU", "SIGMOID", "TANH", "LRELU",
+                          "RELU6", "HARDTANH", "HARDSIGMOID", "HARDSWISH", "SILU",
+                          "SOFTPLUS", "MISH", "SOFTSIGN", "ABS", "CLIP", "SQUARE", "POWER"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": input_shape, "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": layer_kind, "params": {}, "meta": {}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # DENSE: INPUT -> INPUT_SPEC -> DENSE -> ASSERT
+        if layer_kind == "DENSE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": input_shape, "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "DENSE", "params": {}, "meta": {"in_features": 4, "out_features": 4, "bias_enabled": True}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # CNN layers: use 2D input
+        if layer_kind in ["CONV2D", "MAXPOOL2D", "AVGPOOL2D", "PAD", "UPSAMPLE"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1, 4, 4], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": layer_kind, "params": {}, "meta": self._get_cnn_layer_meta(layer_kind, [1, 1, 4, 4])},
+                    {"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # 1D/3D CNN layers
+        if layer_kind in ["CONV1D", "MAXPOOL1D", "AVGPOOL1D"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1, 8], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": layer_kind, "params": {}, "meta": self._get_cnn_layer_meta(layer_kind, [1, 1, 8])},
+                    {"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind in ["CONV3D", "MAXPOOL3D"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1, 4, 4, 4], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": layer_kind, "params": {}, "meta": self._get_cnn_layer_meta(layer_kind, [1, 1, 4, 4, 4])},
+                    {"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # Shape operations
+        if layer_kind == "FLATTEN":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 2, 2], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # Multi-input operations: fork two inputs
+        if layer_kind in ["ADD", "SUB", "MUL", "DIV", "POW"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": input_shape, "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "RELU", "params": {}, "meta": {}},  # branch 1
+                    {"kind": "SIGMOID", "params": {}, "meta": {}},  # branch 2
+                    {"kind": layer_kind, "params": {}, "meta": {}, "inputs": {"x": 2, "y": 3}, "preds": [2, 3]},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # MAX/MIN: special handling for y_vars_list
+        if layer_kind in ["MAX", "MIN"]:
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": input_shape, "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "RELU", "params": {}, "meta": {}},  # branch 1
+                    {"kind": "SIGMOID", "params": {}, "meta": {}},  # branch 2
+                    {"kind": layer_kind, "params": {}, "meta": {}, "inputs": {"x": 2, "y": 3}, "preds": [2, 3]},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # MATMUL: needs real fork with parallel branches from INPUT_SPEC
+        if layer_kind == "MATMUL":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 2, 2], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "RELU", "params": {}, "meta": {}},  # branch 1 (from INPUT_SPEC by default)
+                    {"kind": "SIGMOID", "params": {}, "meta": {}, "preds": [1]},  # branch 2 (also from INPUT_SPEC)
+                    {"kind": "RESHAPE", "params": {}, "meta": {"target_shape": [2, 2]}, "preds": [2]},  # reshape branch 1
+                    {"kind": "RESHAPE", "params": {}, "meta": {"target_shape": [2, 2]}, "preds": [3]},  # reshape branch 2
+                    {"kind": "MATMUL", "params": {}, "meta": {"x_shape": [2, 2], "y_shape": [2, 2], "output_shape": [2, 2]}, "inputs": {"x": 4, "y": 5}, "preds": [4, 5]},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # CONCAT: fork two inputs
+        if layer_kind == "CONCAT":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": input_shape, "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "RELU", "params": {}, "meta": {}},  # branch 1
+                    {"kind": "SIGMOID", "params": {}, "meta": {}},  # branch 2
+                    {"kind": "CONCAT", "params": {}, "meta": {"concat_dim": 0}, "preds": [2, 3]},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        # Shape transformations: minimal examples
+        if layer_kind == "RESHAPE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 2, 2], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "RESHAPE", "params": {}, "meta": {"target_shape": [1, 4]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "TRANSPOSE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 2, 3], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "TRANSPOSE", "params": {}, "meta": {"perm": [0, 2, 1]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "SQUEEZE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1, 4], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "SQUEEZE", "params": {}, "meta": {"dims": [1]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "UNSQUEEZE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 4], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "UNSQUEEZE", "params": {}, "meta": {"dims": [1]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "TILE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 2], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "TILE", "params": {}, "meta": {"repeats": [1, 2], "input_shape": [1, 2], "output_shape": [1, 4]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "EXPAND":
+            # tf_expand returns bounds with same length as input (no expansion), so use non-expanding shape
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "EXPAND", "params": {}, "meta": {"shape": [1, 1], "input_shape": [1, 1], "output_shape": [1, 1]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "SLICE":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 8], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "SLICE", "params": {}, "meta": {"starts": [0], "ends": [4], "axes": [1], "input_shape": [1, 8], "output_shape": [1, 4]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "GATHER":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 8], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "GATHER", "params": {}, "meta": {"indices": [0, 2, 4], "axis": 1, "input_shape": [1, 8], "output_shape": [1, 3]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "INDEX_SELECT":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 8], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "INDEX_SELECT", "params": {}, "meta": {"indices": [0, 2, 4], "dim": 1, "input_shape": [1, 8], "output_shape": [1, 3]}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        if layer_kind == "CONVTRANSPOSE2D":
+            return {
+                "layers": [
+                    {"kind": "INPUT", "params": {}, "meta": {"shape": [1, 1, 2, 2], "dtype": dtype}},
+                    {"kind": "INPUT_SPEC", "params": {}, "meta": {"kind": "BOX"}},
+                    {"kind": "CONVTRANSPOSE2D", "params": {}, "meta": {
+                        "in_channels": 1, "out_channels": 1, "kernel_size": 3,
+                        "stride": 2, "padding": 1, "output_padding": 1,
+                        "input_shape": [1, 1, 2, 2], "output_shape": [1, 1, 4, 4]
+                    }},
+                    {"kind": "FLATTEN", "params": {}, "meta": {"start_dim": 1}},
+                    {"kind": "ASSERT", "params": {}, "meta": {"kind": "TOP1_ROBUST", "target": 0}},
+                ],
+            }
+
+        return None
+
+    def _get_cnn_layer_meta(self, layer_kind: str, input_shape: List[int]) -> Dict[str, Any]:
+        """Get minimal meta for CNN layers."""
+        if layer_kind == "CONV2D":
+            return {
+                "in_channels": 1, "out_channels": 1, "kernel_size": 3,
+                "stride": 1, "padding": 1,
+                "input_shape": input_shape, "output_shape": [1, 1, 4, 4]
+            }
+        elif layer_kind == "CONV1D":
+            return {
+                "in_channels": 1, "out_channels": 1, "kernel_size": 3,
+                "stride": 1, "padding": 1,
+                "input_shape": input_shape, "output_shape": [1, 1, 8]
+            }
+        elif layer_kind == "CONV3D":
+            return {
+                "in_channels": 1, "out_channels": 1, "kernel_size": 3,
+                "stride": 1, "padding": 1,
+                "input_shape": input_shape, "output_shape": [1, 1, 4, 4, 4]
+            }
+        elif layer_kind in ["MAXPOOL2D", "AVGPOOL2D"]:
+            return {
+                "kernel_size": 2, "stride": 2, "padding": 0,
+                "input_shape": input_shape, "output_shape": [1, 1, 2, 2]
+            }
+        elif layer_kind in ["MAXPOOL1D", "AVGPOOL1D"]:
+            return {
+                "kernel_size": 2, "stride": 2, "padding": 0,
+                "input_shape": input_shape, "output_shape": [1, 1, 4]
+            }
+        elif layer_kind == "MAXPOOL3D":
+            return {
+                "kernel_size": 2, "stride": 2, "padding": 0,
+                "input_shape": input_shape, "output_shape": [1, 1, 2, 2, 2]
+            }
+        elif layer_kind == "PAD":
+            return {
+                "pad": [1, 1, 1, 1], "mode": "constant", "value": 0.0,
+                "input_shape": input_shape, "output_shape": [1, 1, 6, 6]
+            }
+        elif layer_kind == "UPSAMPLE":
+            return {
+                "scale_factor": 2.0, "mode": "nearest",
+                "input_shape": input_shape, "output_shape": [1, 1, 8, 8]
+            }
+        return {}
+
+    def _print_coverage_report(self) -> None:
+        """Print coverage statistics."""
+        if not self.coverage_report:
+            return
+
+        covered = sum(1 for count in self.coverage_stats.values() if count > 0)
+        total = len(self.coverage_stats)
+        rate = self._get_coverage_rate()
+
+        print(f"\n{'='*60}")
+        print(f"Layer Coverage Report")
+        print(f"{'='*60}")
+        print(f"Coverage Rate: {covered}/{total} ({rate:.1f}%)")
+        print(f"Total Networks Generated: {self.total_networks_generated}")
+
+        uncovered = self._get_uncovered_layers()
+        if uncovered:
+            print(f"\nUncovered Layers ({len(uncovered)}):")
+            for layer in sorted(uncovered):
+                print(f"  - {layer}")
+        else:
+            print(f"\n✓ All target layers covered!")
+
+        print(f"\nCovered Layers (count > 0):")
+        for layer in sorted(self.coverage_stats.keys()):
+            count = self.coverage_stats[layer]
+            if count > 0:
+                print(f"  {layer}: {count}")
+        print(f"{'='*60}\n")
+
     def generate(self) -> List[str]:
         """Generate all network instances."""
-        print(f"Generating {self.num_instances} networks...")
         common = self.config["common"]
         dtype = str(common["dtype"])
-
         names: List[str] = []
-        for idx in range(self.num_instances):
-            instance = self._sample_instance(idx)
-            name = instance["instance_id"]
-            spec = self._build_network_spec(instance, dtype=dtype)
-            net = self.create_network(name, spec)
-            self.save_network(net, name)
-            names.append(name)
+
+        if self.coverage_mode == "full":
+            print(f"Generating networks in FULL coverage mode...")
+            print(f"Target: {len(COVERAGE_TARGET_LAYERS)} layer types")
+            print(f"Max attempts: {self.coverage_max_attempts}")
+
+            # Generate networks until all layers covered or max attempts reached
+            for idx in range(self.coverage_max_attempts):
+                instance = self._sample_instance(idx)
+                name = instance["instance_id"]
+                spec = self._build_network_spec(instance, dtype=dtype)
+                net = self.create_network(name, spec)
+                self.save_network(net, name)
+                names.append(name)
+                self.total_networks_generated += 1
+
+                # Update coverage
+                self._record_network_layers(net)
+                uncovered = self._get_uncovered_layers()
+
+                # Progress report every 50 networks
+                if (idx + 1) % 50 == 0:
+                    rate = self._get_coverage_rate()
+                    print(f"  Generated {idx + 1} networks, coverage: {rate:.1f}%, uncovered: {len(uncovered)}")
+
+                # Stop if all covered
+                if len(uncovered) == 0:
+                    print(f"\n✓ All layers covered after {idx + 1} networks!")
+                    break
+            else:
+                print(f"\n⚠ Reached max attempts ({self.coverage_max_attempts}), some layers may be uncovered")
+
+            # Generate minimal templates for remaining uncovered layers
+            uncovered = self._get_uncovered_layers()
+            if uncovered:
+                print(f"\nGenerating minimal templates for {len(uncovered)} uncovered layers...")
+                for layer_kind in sorted(uncovered):
+                    template_spec = self._generate_minimal_template(layer_kind)
+                    if template_spec:
+                        try:
+                            name = f"template_{layer_kind.lower()}_minimal"
+                            net = self.create_network(name, template_spec)
+                            self.save_network(net, name)
+                            names.append(name)
+                            self.total_networks_generated += 1
+                            self._record_network_layers(net)
+                            print(f"  ✓ Generated template for {layer_kind}")
+                        except Exception as e:
+                            print(f"  ✗ Failed to generate template for {layer_kind}: {e}")
+                    else:
+                        print(f"  - Skipped {layer_kind} (complex, requires manual implementation)")
+
+        else:  # basic mode
+            print(f"Generating {self.num_instances} networks in BASIC mode...")
+            for idx in range(self.num_instances):
+                instance = self._sample_instance(idx)
+                name = instance["instance_id"]
+                spec = self._build_network_spec(instance, dtype=dtype)
+                net = self.create_network(name, spec)
+                self.save_network(net, name)
+                names.append(name)
+                self.total_networks_generated += 1
+
+                # Track coverage even in basic mode
+                self._record_network_layers(net)
 
         if self.write_manifest:
             self._write_manifest(names)
 
-        print(f"All networks generated in {self.output_dir}")
+        print(f"\nAll networks generated in {self.output_dir}")
+
+        # Print coverage report
+        self._print_coverage_report()
+
         return names
 
 

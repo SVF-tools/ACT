@@ -76,8 +76,33 @@ def affine_bounds(W_pos, W_neg, b, Bin: Bounds) -> Bounds:
         )
     
     # Compute bounds using interval arithmetic
-    lb = W_pos @ lb_vec + W_neg @ ub_vec + b
-    ub = W_pos @ ub_vec + W_neg @ lb_vec + b
+    # Handle infinite bounds specially to avoid NaN from 0*inf
+    has_inf = torch.isinf(lb_vec).any() or torch.isinf(ub_vec).any()
+
+    if has_inf:
+        # Slow path: avoid NaN from 0*inf by replacing inf with large finite values
+        # This preserves soundness while avoiding NaN propagation
+        LARGE_VAL = 1e30
+        lb_vec_safe = torch.where(torch.isinf(lb_vec),
+                                   torch.sign(lb_vec) * LARGE_VAL,
+                                   lb_vec)
+        ub_vec_safe = torch.where(torch.isinf(ub_vec),
+                                   torch.sign(ub_vec) * LARGE_VAL,
+                                   ub_vec)
+
+        lb = W_pos @ lb_vec_safe + W_neg @ ub_vec_safe + b
+        ub = W_pos @ ub_vec_safe + W_neg @ lb_vec_safe + b
+
+        # Restore infinity if result is beyond threshold
+        lb = torch.where(lb < -LARGE_VAL/2, torch.tensor(-float('inf')), lb)
+        lb = torch.where(lb > LARGE_VAL/2, torch.tensor(float('inf')), lb)
+        ub = torch.where(ub < -LARGE_VAL/2, torch.tensor(-float('inf')), ub)
+        ub = torch.where(ub > LARGE_VAL/2, torch.tensor(float('inf')), ub)
+    else:
+        # Fast path: no infinity, use direct computation
+        lb = W_pos @ lb_vec + W_neg @ ub_vec + b
+        ub = W_pos @ ub_vec + W_neg @ lb_vec + b
+
     return Bounds(lb, ub)
 
 def pwl_meta(l: torch.Tensor, u: torch.Tensor, K: int) -> Dict[str, Any]:

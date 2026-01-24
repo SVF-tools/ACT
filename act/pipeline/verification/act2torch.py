@@ -17,7 +17,8 @@
 #   - Weight preservation: Transfers all ACT parameters to PyTorch layers
 #   - VerifiableModel: Returns wrapped model with automatic constraint checking
 #   - Spec reconstruction: Rebuilds InputSpecLayer/OutputSpecLayer from ACT
-#   - Comprehensive coverage: Supports 40+ layer types (MLP, CNN, RNN, etc.)
+#   - Comprehensive coverage: Supports 50+ layer types (MLP, CNN, RNN, etc.)
+#   - DAG Support: VerifiableGraphModel for multi-input layers (ADD, CONCAT, etc.)
 #
 # Architecture:
 #   INPUT      → (skipped)           (no-op, shape already defined)
@@ -25,10 +26,11 @@
 #   DENSE      → nn.Linear           (fully connected layers)
 #   CONV2D     → nn.Conv2d           (convolutional layers)
 #   RELU       → nn.ReLU             (activation functions)
+#   ADD        → torch.add           (multi-input binary operation)
 #   ASSERT     → OutputSpecLayer     (output constraint checking)
 #
-# VerifiableModel:
-#   Wraps nn.Module to provide automatic constraint verification.
+# VerifiableModel (Sequential):
+#   Wraps nn.Module to provide automatic constraint verification for linear chains.
 #   Returns dict with:
 #   - 'output': Model predictions
 #   - 'input_satisfied': Input constraint satisfaction status
@@ -36,13 +38,18 @@
 #   - 'output_satisfied': Output constraint satisfaction status
 #   - 'output_explanation': Human-readable output constraint result
 #
+# VerifiableGraphModel (DAG):
+#   NEW: Supports DAG structures with multi-input layers via explicit preds.
+#   Executes layers in topological order, caching intermediate outputs.
+#   Strict mode: Raises on unsupported layers (no silent skipping).
+#
 # Usage:
 #   from act.pipeline.act2torch import ACTToTorch
-#   
+#
 #   # Convert ACT Net to verifiable PyTorch model
-#   converter = ACTToTorch(act_net)
+#   converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
 #   model = converter.run()
-#   
+#
 #   # Run inference with automatic constraint checking
 #   results = model(input_tensor)
 #   print(f"Output: {results['output']}")
@@ -54,6 +61,486 @@
 #   - Weight transfer: Copies all parameters from ACT Layer.params to PyTorch
 #   - Spec preservation: Reconstructs InputSpec/OutputSpec from ACT metadata
 #   - Layer factory: Creates appropriate PyTorch layers from ACT layer kinds
+#
+#===---------------------------------------------------------------------===#
+#
+# OPERATOR MAPPING TABLE (Phase 0: Minimal DAG Support)
+# ======================================================
+# This table documents the meta/params contract for each supported layer type.
+# Used by _create_torch_layer() to build PyTorch layers from ACT layers.
+#
+# Format:
+#   {
+#     "ACT_KIND": {
+#       "torch_class": nn.Module class or callable,
+#       "meta_required": ["field1", "field2"],      # Required in meta
+#       "meta_optional": ["field3"],                # Optional in meta
+#       "params_required": ["W", "b"],              # Required in params
+#       "params_optional": [],                      # Optional in params
+#       "multi_input": False,                       # Whether requires preds
+#       "notes": "Additional implementation notes"
+#     }
+#   }
+#
+# COMPREHENSIVE OPERATOR SET (Phase 0-3 Complete):
+# ----------------------------------------------------
+# Supports 46+ operators across all categories:
+#   - Core: INPUT, INPUT_SPEC, DENSE, BIAS, SCALE, BN
+#   - Activations: RELU, SIGMOID, TANH, LRELU, RELU6, HARDTANH, HARDSIGMOID,
+#                  HARDSWISH, SILU, SOFTPLUS, MISH, SOFTSIGN
+#   - Unary ops: ABS, CLIP, SQUARE, POWER
+#   - CNN: CONV1D/2D/3D, CONVTRANSPOSE2D, MAXPOOL1D/2D/3D, AVGPOOL1D/2D/3D,
+#          FLATTEN, PAD, UPSAMPLE
+#   - Multi-input (DAG): ADD, SUB, MUL, DIV, POW, MATMUL, CONCAT, MAX, MIN
+#   - Shape ops: RESHAPE, TRANSPOSE, SQUEEZE, UNSQUEEZE, TILE, EXPAND, SLICE,
+#                GATHER, INDEX_SELECT
+#   - Output: ASSERT
+#
+OPERATOR_MAPPING = {
+    # INPUT/SPEC layers (wrapper layers, special handling)
+    "INPUT": {
+        "torch_class": None,  # Skipped (no-op)
+        "meta_required": ["shape", "dtype"],
+        "meta_optional": ["desc", "layout", "dataset_name", "num_classes"],
+        "params_required": [],
+        "params_optional": ["labeled_input"],
+        "multi_input": False,
+        "notes": "Declares symbolic input, skipped in PyTorch conversion"
+    },
+    "INPUT_SPEC": {
+        "torch_class": "InputSpecLayer",  # Special: from act.front_end.verifiable_model
+        "meta_required": ["kind"],
+        "meta_optional": ["eps"],
+        "params_required": [],
+        "params_optional": ["lb", "ub", "center", "A", "b"],
+        "multi_input": False,
+        "notes": "Input constraint checking, returns (x, satisfied, explanation)"
+    },
+
+    # Dense/Linear layers
+    "DENSE": {
+        "torch_class": "nn.Linear",
+        "meta_required": ["in_features", "out_features"],
+        "meta_optional": ["bias_enabled"],
+        "params_required": ["W"],
+        "params_optional": ["b"],
+        "multi_input": False,
+        "notes": "Fully connected layer, weight key='W', bias key='b'"
+    },
+    "BIAS": {
+        "torch_class": "custom",
+        "meta_required": [],
+        "meta_optional": ["input_shape", "output_shape"],
+        "params_required": ["c"],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Bias addition: y = x + c"
+    },
+    "SCALE": {
+        "torch_class": "custom",
+        "meta_required": [],
+        "meta_optional": ["input_shape", "output_shape"],
+        "params_required": ["a"],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise scaling: y = x * a"
+    },
+    "BN": {
+        "torch_class": "custom",
+        "meta_required": [],
+        "meta_optional": ["eps", "momentum", "input_shape", "output_shape"],
+        "params_required": ["A", "c"],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Batch normalization affine transform: y = A*x + c (frozen)"
+    },
+
+    # Activation functions (Phase 2: Extended activations)
+    "RELU": {
+        "torch_class": "nn.ReLU",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise ReLU activation"
+    },
+    "SIGMOID": {
+        "torch_class": "nn.Sigmoid",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise sigmoid activation"
+    },
+    "TANH": {
+        "torch_class": "nn.Tanh",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise tanh activation"
+    },
+    "LRELU": {
+        "torch_class": "nn.LeakyReLU",
+        "meta_required": [],
+        "meta_optional": ["negative_slope"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Leaky ReLU with negative_slope from meta (default: 0.01)"
+    },
+    "RELU6": {
+        "torch_class": "nn.ReLU6",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "ReLU clamped to [0, 6]"
+    },
+    "HARDTANH": {
+        "torch_class": "nn.Hardtanh",
+        "meta_required": [],
+        "meta_optional": ["min_val", "max_val"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Hardtanh with min_val/max_val from meta (default: -1, 1)"
+    },
+    "SOFTPLUS": {
+        "torch_class": "nn.Softplus",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Softplus activation"
+    },
+    "SILU": {
+        "torch_class": "nn.SiLU",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "SiLU/Swish activation"
+    },
+    "HARDSIGMOID": {
+        "torch_class": "nn.Hardsigmoid",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Hard sigmoid activation"
+    },
+    "HARDSWISH": {
+        "torch_class": "nn.Hardswish",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Hard swish activation"
+    },
+    "MISH": {
+        "torch_class": "nn.Mish",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Mish activation"
+    },
+    "SOFTSIGN": {
+        "torch_class": "nn.Softsign",
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Softsign activation"
+    },
+
+    # Simple unary operators (Phase 2: Element-wise operations)
+    "ABS": {
+        "torch_class": "torch.abs",  # Functional
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise absolute value"
+    },
+    "CLIP": {
+        "torch_class": "torch.clamp",  # Functional
+        "meta_required": [],
+        "meta_optional": ["min", "max"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Clamp values to [min, max] from meta"
+    },
+    "SQUARE": {
+        "torch_class": "torch.square",  # Functional
+        "meta_required": [],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise square"
+    },
+    "POWER": {
+        "torch_class": "torch.pow",  # Functional
+        "meta_required": [],
+        "meta_optional": ["exponent"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Element-wise power with exponent from meta"
+    },
+
+    # Multi-input operations (DAG support - Phase 3)
+    "ADD": {
+        "torch_class": "torch.add",  # Functional, not nn.Module
+        "meta_required": [],
+        "meta_optional": ["x_vars", "y_vars", "preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,  # Requires 2 predecessors via preds
+        "notes": "Element-wise addition, requires preds field in ACT layer"
+    },
+    "SUB": {
+        "torch_class": "torch.sub",
+        "meta_required": [],
+        "meta_optional": ["x_vars", "y_vars", "preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise subtraction, x - y"
+    },
+    "MUL": {
+        "torch_class": "torch.mul",
+        "meta_required": [],
+        "meta_optional": ["x_vars", "y_vars", "preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise multiplication"
+    },
+    "DIV": {
+        "torch_class": "torch.div",
+        "meta_required": [],
+        "meta_optional": ["x_vars", "y_vars", "preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise division, x / y"
+    },
+    "POW": {
+        "torch_class": "torch.pow",
+        "meta_required": [],
+        "meta_optional": ["x_vars", "y_vars", "preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise power, x ** y (binary version)"
+    },
+    "MAX": {
+        "torch_class": "torch.maximum",
+        "meta_required": [],
+        "meta_optional": ["preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise maximum (supports 2+ inputs via reduce)"
+    },
+    "MIN": {
+        "torch_class": "torch.minimum",
+        "meta_required": [],
+        "meta_optional": ["preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Element-wise minimum (supports 2+ inputs via reduce)"
+    },
+    "MATMUL": {
+        "torch_class": "torch.matmul",
+        "meta_required": [],
+        "meta_optional": ["preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Matrix multiplication, A @ B"
+    },
+    "CONCAT": {
+        "torch_class": "torch.cat",
+        "meta_required": ["concat_dim"],
+        "meta_optional": ["preds_indices"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": True,
+        "notes": "Concatenate tensors along concat_dim (supports 2+ inputs)"
+    },
+
+    # Shape transformation operations (Phase 3)
+    "RESHAPE": {
+        "torch_class": "torch.reshape",
+        "meta_required": ["target_shape"],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Reshape tensor to target_shape"
+    },
+    "TRANSPOSE": {
+        "torch_class": "torch.permute",
+        "meta_required": ["perm"],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Transpose tensor with permutation perm"
+    },
+    "SQUEEZE": {
+        "torch_class": "torch.squeeze",
+        "meta_required": [],
+        "meta_optional": ["dim", "dims"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Remove singleton dimensions (optionally at specific dim or dims list)"
+    },
+    "UNSQUEEZE": {
+        "torch_class": "torch.unsqueeze",
+        "meta_required": [],
+        "meta_optional": ["dims"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Add singleton dimensions at positions dims"
+    },
+    "TILE": {
+        "torch_class": "torch.tile",
+        "meta_required": [],
+        "meta_optional": ["repeats"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Tile tensor with repetitions repeats"
+    },
+    "EXPAND": {
+        "torch_class": "torch.expand",
+        "meta_required": ["shape"],
+        "meta_optional": [],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Expand tensor to target shape (broadcast)"
+    },
+    "SLICE": {
+        "torch_class": "torch.slice",
+        "meta_required": ["starts", "ends"],
+        "meta_optional": ["axes", "steps"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Slice tensor along specified axes"
+    },
+    "GATHER": {
+        "torch_class": "torch.index_select",
+        "meta_required": [],
+        "meta_optional": ["axis", "dim"],
+        "params_required": [],
+        "params_optional": ["index", "indices"],
+        "multi_input": False,
+        "notes": "Gather values along axis/dim using index/indices tensor"
+    },
+    "INDEX_SELECT": {
+        "torch_class": "torch.index_select",
+        "meta_required": [],
+        "meta_optional": ["dim"],
+        "params_required": [],
+        "params_optional": ["index", "indices"],
+        "multi_input": False,
+        "notes": "Select indices along dim using index/indices tensor"
+    },
+
+    # CNN extensions (Phase 3)
+    "CONVTRANSPOSE2D": {
+        "torch_class": "nn.ConvTranspose2d",
+        "meta_required": ["in_channels", "out_channels"],
+        "meta_optional": ["kernel_size", "stride", "padding", "output_padding", "groups", "dilation", "input_shape", "output_shape"],
+        "params_required": ["weight"],
+        "params_optional": ["bias"],
+        "multi_input": False,
+        "notes": "Transposed 2D convolution (deconvolution)"
+    },
+    "AVGPOOL1D": {
+        "torch_class": "nn.AvgPool1d",
+        "meta_required": ["kernel_size"],
+        "meta_optional": ["stride", "padding"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "1D average pooling"
+    },
+    "AVGPOOL3D": {
+        "torch_class": "nn.AvgPool3d",
+        "meta_required": ["kernel_size"],
+        "meta_optional": ["stride", "padding"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "3D average pooling"
+    },
+    "PAD": {
+        "torch_class": "nn.functional.pad",
+        "meta_required": [],
+        "meta_optional": ["pad", "pads", "padding", "mode", "value"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Pad tensor with pad/pads/padding (left, right, top, bottom, ...)"
+    },
+    "UPSAMPLE": {
+        "torch_class": "nn.Upsample",
+        "meta_required": [],
+        "meta_optional": ["scale_factor", "size", "mode"],
+        "params_required": [],
+        "params_optional": [],
+        "multi_input": False,
+        "notes": "Upsample tensor with scale_factor or size"
+    },
+
+    # Output specification
+    "ASSERT": {
+        "torch_class": "OutputSpecLayer",  # Special: from act.front_end.verifiable_model
+        "meta_required": ["kind"],
+        "meta_optional": ["y_true", "margin", "d"],
+        "params_required": [],
+        "params_optional": ["c", "lb", "ub"],
+        "multi_input": False,
+        "notes": "Output constraint checking, returns (y, satisfied, explanation)"
+    },
+}
+#
+# IMPLEMENTATION STATUS:
+# ----------------------
+# Phase 0-1 (Core + Basic CNN): INPUT, INPUT_SPEC, DENSE, CONV2D, MAXPOOL2D,
+#                                AVGPOOL2D, FLATTEN, RELU, ASSERT
+# Phase 2 (Activations + Unary): Added 15 operators (11 activations + 4 unary ops)
+# Phase 3 (DAG + Extensions): Added 21 operators (multi-input, shape, CNN extensions)
+#
+# Total coverage: 46+ operators supporting both Sequential and DAG execution modes.
+#
+# Metadata compatibility notes:
+#   - PAD: Accepts pad/pads/padding field names
+#   - SQUEEZE/UNSQUEEZE: Accepts both dim (int) and dims (list)
+#   - GATHER/INDEX_SELECT: Accepts axis/dim and indices/index field names
 #
 #===---------------------------------------------------------------------===#
 
@@ -71,94 +558,118 @@ logger = logging.getLogger(__name__)
 class ACTToTorch:
     """
     Convert ACT Net to PyTorch nn.Module.
-    
+
     This class provides the inverse transformation of TorchToACT, enabling
     bidirectional conversion between verification representations (ACT) and
     executable models (PyTorch).
-    
-    Usage:
+
+    Usage (Sequential mode - backward compatible):
         converter = ACTToTorch(act_net)
-        model = converter.run()  # Returns nn.Module
-    
+        model = converter.run()  # Returns VerifiableModel (nn.Sequential)
+
+    Usage (DAG mode - supports multi-input layers):
+        converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
+        model = converter.run()  # Returns VerifiableGraphModel (DAG)
+
     Args:
         act_net: ACT Net object containing layers with architecture and weights
-    
+        use_graph_model: If True, return VerifiableGraphModel (DAG support).
+                         If False, return VerifiableModel (Sequential, legacy).
+        strict: If True, raise ValueError on unsupported layers.
+                If False, log warning and skip (legacy behavior).
+
     Returns:
         PyTorch nn.Module model ready for inference
     """
-    
-    def __init__(self, act_net: Net):
+
+    def __init__(self, act_net: Net, use_graph_model: bool = False, strict: bool = False):
         """
         Initialize converter with ACT Net.
-        
+
         Args:
             act_net: ACT Net object (contains architecture + weights)
-        
+            use_graph_model: Use DAG-capable VerifiableGraphModel (default: False)
+            strict: Raise on unsupported layers instead of skipping (default: False)
+
         Raises:
             TypeError: If act_net is not a Net instance
         """
         if not isinstance(act_net, Net):
             raise TypeError(f"ACTToTorch expects a Net object, got {type(act_net)}")
         self.act_net = act_net
+        self.use_graph_model = use_graph_model
+        self.strict = strict
     
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-        
+
         Iterates through ACT layers, creates corresponding PyTorch layers,
-        transfers weights, and assembles into VerifiableModel model.
-        
+        transfers weights, and assembles into VerifiableModel or VerifiableGraphModel.
+
         Returns:
-            VerifiableModel model with embedded constraint checking
-        
+            VerifiableModel (Sequential) or VerifiableGraphModel (DAG) with embedded constraint checking
+
         Raises:
-            ValueError: If no valid PyTorch layers can be created
+            ValueError: If no valid PyTorch layers can be created, or if strict mode
+                       encounters unsupported layers
+        """
+        if self.use_graph_model:
+            return self._run_graph_model()
+        else:
+            return self._run_sequential_model()
+
+    def _run_sequential_model(self) -> nn.Module:
+        """
+        Legacy Sequential model conversion (backward compatible).
+
+        Returns VerifiableModel (nn.Sequential subclass).
         """
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
-        
+
         # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
         target_device = get_default_device()
-        
+
         for i, act_layer in enumerate(self.act_net.layers):
             kind = act_layer.kind
             meta = act_layer.meta
-            
+
             # Handle wrapper layers specially
             if kind == 'INPUT':
                 continue  # Skip INPUT layer (no-op)
-            
+
             if kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
-                
+
                 # Build InputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
                 if 'eps' in meta:
                     spec_dict['eps'] = meta['eps']
-                
+
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['lb', 'ub', 'center', 'A', 'b']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = InputSpec(**spec_dict)
                 # InputSpecLayer now always returns tuples
                 torch_layers.append(InputSpecLayer(spec))
                 has_input_spec = True
                 continue
-            
+
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
-                
+
                 # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
@@ -169,36 +680,151 @@ class ACTToTorch:
                     spec_dict['margin'] = meta['margin']
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
-                
+
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = OutputSpec(**spec_dict)
                 # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
                 has_output_spec = True
                 continue
-            
+
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
-            
+
             if torch_layer is not None:
                 torch_layers.append(torch_layer)
-        
+
         if not torch_layers:
             raise ValueError("No valid PyTorch layers found in ACT Net")
-        
+
         # Return VerifiableModel for automatic constraint checking
         from act.front_end.verifiable_model import VerifiableModel
         model = VerifiableModel(*torch_layers)
         model.eval()  # Set to evaluation mode by default
-        
+
         logger.info(f"Created VerifiableModel with {len(torch_layers)} layers "
                    f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
-        
+
+        return model
+
+    def _run_graph_model(self) -> nn.Module:
+        """
+        DAG-capable VerifiableGraphModel conversion.
+
+        Supports multi-input layers (ADD, CONCAT, etc.) via explicit preds.
+        Strict mode: Raises ValueError on unsupported layers.
+
+        Returns:
+            VerifiableGraphModel instance
+        """
+        from act.front_end.verifiable_model import VerifiableGraphModel
+
+        # Build layer modules dictionary
+        layer_modules = {}  # layer_id -> (nn.Module or callable, is_spec_layer, kind)
+        input_spec_layer_id = None
+        output_spec_layer_id = None
+
+        # Get target dtype/device once for all tensor conversions
+        target_dtype = get_default_dtype()
+        target_device = get_default_device()
+
+        for act_layer in self.act_net.layers:
+            kind = act_layer.kind
+            meta = act_layer.meta
+            layer_id = act_layer.id
+
+            # Handle wrapper layers specially
+            if kind == 'INPUT':
+                # Store INPUT layer info but don't create PyTorch layer
+                layer_modules[layer_id] = (None, False, kind)
+                continue
+
+            if kind == 'INPUT_SPEC':
+                # Create InputSpecLayer for constraint checking
+                from act.front_end.verifiable_model import InputSpecLayer
+                from act.front_end.specs import InputSpec, InKind
+
+                # Build InputSpec from ACT layer
+                kind_str = meta['kind']
+                spec_kind = getattr(InKind, kind_str)
+                spec_dict = {'kind': spec_kind}
+                if 'eps' in meta:
+                    spec_dict['eps'] = meta['eps']
+
+                # Convert parameter tensors to device_manager dtype for consistency
+                for param_key in ['lb', 'ub', 'center', 'A', 'b']:
+                    if param_key in act_layer.params:
+                        tensor = act_layer.params[param_key]
+                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
+
+                spec = InputSpec(**spec_dict)
+                layer_modules[layer_id] = (InputSpecLayer(spec), True, kind)
+                input_spec_layer_id = layer_id
+                continue
+
+            elif kind == 'ASSERT':
+                # Create OutputSpecLayer for constraint checking
+                from act.front_end.verifiable_model import OutputSpecLayer
+                from act.front_end.specs import OutputSpec, OutKind
+
+                # Build OutputSpec from ACT layer
+                kind_str = meta['kind']
+                spec_kind = getattr(OutKind, kind_str)
+                spec_dict = {'kind': spec_kind}
+                if 'y_true' in meta:
+                    spec_dict['y_true'] = meta['y_true']
+                if 'margin' in meta:
+                    spec_dict['margin'] = meta['margin']
+                if 'd' in meta:
+                    spec_dict['d'] = meta['d']
+
+                # Convert parameter tensors to device_manager dtype for consistency
+                for param_key in ['c', 'lb', 'ub']:
+                    if param_key in act_layer.params:
+                        tensor = act_layer.params[param_key]
+                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
+
+                spec = OutputSpec(**spec_dict)
+                layer_modules[layer_id] = (OutputSpecLayer(spec), True, kind)
+                output_spec_layer_id = layer_id
+                continue
+
+            # Build PyTorch layer from ACT layer (includes weight transfer)
+            torch_layer = self._create_torch_layer(kind, meta, act_layer)
+
+            if torch_layer is None:
+                if self.strict:
+                    raise ValueError(
+                        f"Strict mode: Layer kind '{kind}' not implemented in _create_torch_layer() at layer {layer_id}. "
+                        f"Add implementation for this layer type or disable strict mode."
+                    )
+                else:
+                    logger.warning(f"Unsupported layer kind '{kind}' at layer {layer_id} - skipping")
+                    continue
+
+            layer_modules[layer_id] = (torch_layer, False, kind)
+
+        if not layer_modules:
+            raise ValueError("No valid PyTorch layers found in ACT Net")
+
+        # Create VerifiableGraphModel
+        model = VerifiableGraphModel(
+            net=self.act_net,
+            layer_modules=layer_modules,
+            input_spec_layer_id=input_spec_layer_id,
+            output_spec_layer_id=output_spec_layer_id
+        )
+        model.eval()  # Set to evaluation mode by default
+
+        logger.info(f"Created VerifiableGraphModel with {len(layer_modules)} layers "
+                   f"(INPUT_SPEC={input_spec_layer_id is not None}, "
+                   f"OUTPUT_SPEC={output_spec_layer_id is not None})")
+
         return model
     
     def _transfer_weights(self, torch_layer: nn.Module, act_layer: Layer, 
@@ -258,7 +884,52 @@ class ACTToTorch:
                 self._transfer_weights(layer, act_layer, weight_key="W", bias_key="b")
             
             return layer
-        
+
+        # Affine transformations (BIAS, SCALE, BN)
+        elif kind == "BIAS":
+            # Bias addition: y = x + c
+            if act_layer is None or "c" not in act_layer.params:
+                raise ValueError("BIAS layer requires 'c' in params")
+            c = act_layer.params["c"]
+
+            class BiasModule(nn.Module):
+                def __init__(self, bias):
+                    super().__init__()
+                    self.register_buffer('bias', bias)
+                def forward(self, x):
+                    return x + self.bias
+            return BiasModule(c)
+
+        elif kind == "SCALE":
+            # Element-wise scaling: y = x * a
+            if act_layer is None or "a" not in act_layer.params:
+                raise ValueError("SCALE layer requires 'a' in params")
+            a = act_layer.params["a"]
+
+            class ScaleModule(nn.Module):
+                def __init__(self, scale):
+                    super().__init__()
+                    self.register_buffer('scale', scale)
+                def forward(self, x):
+                    return x * self.scale
+            return ScaleModule(a)
+
+        elif kind == "BN":
+            # Batch normalization affine transform: y = A*x + c (frozen)
+            if act_layer is None or "A" not in act_layer.params or "c" not in act_layer.params:
+                raise ValueError("BN layer requires 'A' and 'c' in params")
+            A = act_layer.params["A"]
+            c = act_layer.params["c"]
+
+            class BNAffineModule(nn.Module):
+                def __init__(self, A, c):
+                    super().__init__()
+                    self.register_buffer('A', A)
+                    self.register_buffer('c', c)
+                def forward(self, x):
+                    return self.A * x + self.c
+            return BNAffineModule(A, c)
+
         # Convolutional layers
         elif kind == "CONV2D":
             in_channels = meta.get("in_channels")
@@ -323,13 +994,45 @@ class ACTToTorch:
                 raise ValueError("CONV3D layer requires 'out_channels' in meta")
             
             layer = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-            
+
             # Transfer weights and bias from ACT layer
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
-            
+
             return layer
-        
+
+        elif kind == "CONVTRANSPOSE2D":
+            in_channels = meta.get("in_channels")
+            out_channels = meta.get("out_channels")
+            kernel_size = meta.get("kernel_size", 3)
+            stride = meta.get("stride", 1)
+            padding = meta.get("padding", 0)
+            output_padding = meta.get("output_padding", 0)
+            groups = meta.get("groups", 1)
+            dilation = meta.get("dilation", 1)
+
+            if in_channels is None:
+                raise ValueError("CONVTRANSPOSE2D layer requires 'in_channels' in meta")
+            if out_channels is None:
+                raise ValueError("CONVTRANSPOSE2D layer requires 'out_channels' in meta")
+
+            layer = nn.ConvTranspose2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                output_padding=output_padding,
+                groups=groups,
+                dilation=dilation
+            )
+
+            # Transfer weights and bias from ACT layer
+            if act_layer is not None:
+                self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
+
+            return layer
+
         # Pooling layers
         elif kind == "MAXPOOL2D":
             kernel_size = meta.get("kernel_size")
@@ -361,16 +1064,36 @@ class ACTToTorch:
             
             return nn.MaxPool3d(kernel_size, stride=stride, padding=padding)
         
+        elif kind == "AVGPOOL1D":
+            kernel_size = meta.get("kernel_size")
+            stride = meta.get("stride")
+            padding = meta.get("padding", 0)
+
+            if kernel_size is None:
+                raise ValueError("AVGPOOL1D layer requires 'kernel_size' in meta")
+
+            return nn.AvgPool1d(kernel_size, stride=stride, padding=padding)
+
         elif kind == "AVGPOOL2D":
             kernel_size = meta.get("kernel_size")
             stride = meta.get("stride")
             padding = meta.get("padding", 0)
-            
+
             if kernel_size is None:
                 raise ValueError("AVGPOOL2D layer requires 'kernel_size' in meta")
-            
+
             return nn.AvgPool2d(kernel_size, stride=stride, padding=padding)
-        
+
+        elif kind == "AVGPOOL3D":
+            kernel_size = meta.get("kernel_size")
+            stride = meta.get("stride")
+            padding = meta.get("padding", 0)
+
+            if kernel_size is None:
+                raise ValueError("AVGPOOL3D layer requires 'kernel_size' in meta")
+
+            return nn.AvgPool3d(kernel_size, stride=stride, padding=padding)
+
         elif kind == "ADAPTIVEAVGPOOL2D":
             output_size = meta.get("output_size", 1)
             return nn.AdaptiveAvgPool2d(output_size)
@@ -427,7 +1150,41 @@ class ACTToTorch:
             start_dim = meta.get("start_dim", 1)
             end_dim = meta.get("end_dim", -1)
             return nn.Flatten(start_dim, end_dim)
-        
+
+        elif kind == "PAD":
+            # Padding operation using functional API
+            # Compatible with pad/pads/padding field names
+            padding = meta.get("pad")
+            if padding is None:
+                padding = meta.get("pads")
+            if padding is None:
+                padding = meta.get("padding")
+            if padding is None:
+                raise ValueError("PAD requires 'pad', 'pads', or 'padding' in meta")
+            mode = meta.get("mode", "constant")
+            value = meta.get("value", 0.0)
+            # padding format: (left, right, top, bottom, front, back, ...)
+            class PadModule(nn.Module):
+                def __init__(self, padding, mode, value):
+                    super().__init__()
+                    self.padding = padding
+                    self.mode = mode
+                    self.value = value
+                def forward(self, x):
+                    return torch.nn.functional.pad(x, self.padding, mode=self.mode, value=self.value)
+            return PadModule(padding, mode, value)
+
+        elif kind == "UPSAMPLE":
+            # Upsampling operation
+            scale_factor = meta.get("scale_factor")
+            size = meta.get("size")
+            mode = meta.get("mode", "nearest")
+
+            if scale_factor is None and size is None:
+                raise ValueError("UPSAMPLE requires either 'scale_factor' or 'size' in meta")
+
+            return nn.Upsample(scale_factor=scale_factor, size=size, mode=mode)
+
         elif kind == "DROPOUT":
             p = meta.get("p", 0.5)
             return nn.Dropout(p)
@@ -510,8 +1267,615 @@ class ACTToTorch:
         elif kind == "SOFTMAX":
             axis = meta.get("axis", -1)
             return nn.Softmax(dim=axis)
-        
+
+        # Extended activation functions (Phase 2)
+        elif kind == "SIGMOID":
+            return nn.Sigmoid()
+
+        elif kind == "TANH":
+            return nn.Tanh()
+
+        elif kind == "LRELU":
+            negative_slope = meta.get("negative_slope", 0.01)
+            return nn.LeakyReLU(negative_slope)
+
+        elif kind == "RELU6":
+            return nn.ReLU6()
+
+        elif kind == "HARDTANH":
+            min_val = meta.get("min_val", -1.0)
+            max_val = meta.get("max_val", 1.0)
+            return nn.Hardtanh(min_val, max_val)
+
+        elif kind == "SOFTPLUS":
+            return nn.Softplus()
+
+        elif kind == "SILU":
+            return nn.SiLU()
+
+        elif kind == "HARDSIGMOID":
+            return nn.Hardsigmoid()
+
+        elif kind == "HARDSWISH":
+            return nn.Hardswish()
+
+        elif kind == "MISH":
+            return nn.Mish()
+
+        elif kind == "SOFTSIGN":
+            return nn.Softsign()
+
+        # Simple unary operators (Phase 2)
+        # NOTE: Wrapped in nn.Module for Sequential compatibility
+        elif kind == "ABS":
+            class AbsModule(nn.Module):
+                def forward(self, x):
+                    return torch.abs(x)
+            return AbsModule()
+
+        elif kind == "CLIP":
+            # Get min/max from meta
+            min_val = meta.get("min", -1.0)
+            max_val = meta.get("max", 1.0)
+            class ClipModule(nn.Module):
+                def __init__(self, min_val, max_val):
+                    super().__init__()
+                    self.min_val = min_val
+                    self.max_val = max_val
+                def forward(self, x):
+                    return torch.clamp(x, min=self.min_val, max=self.max_val)
+            return ClipModule(min_val, max_val)
+
+        elif kind == "SQUARE":
+            class SquareModule(nn.Module):
+                def forward(self, x):
+                    return torch.square(x)
+            return SquareModule()
+
+        elif kind == "POWER":
+            exponent = meta.get("exponent", 2.0)
+            class PowerModule(nn.Module):
+                def __init__(self, exponent):
+                    super().__init__()
+                    self.exponent = exponent
+                def forward(self, x):
+                    return torch.pow(x, self.exponent)
+            return PowerModule(exponent)
+
+        # Multi-input operations (DAG support - Phase 3)
+        elif kind == "ADD":
+            # ADD is a functional operation (torch.add), not an nn.Module
+            # For VerifiableGraphModel, we return a function that performs addition
+            # NOTE: Inputs are provided by VerifiableGraphModel.forward() via preds
+            # Supports 2+ inputs via reduce
+            def add_op(*inputs):
+                if len(inputs) == 2:
+                    return torch.add(inputs[0], inputs[1])
+                else:
+                    # Reduce: sum all inputs
+                    result = inputs[0]
+                    for inp in inputs[1:]:
+                        result = torch.add(result, inp)
+                    return result
+            return add_op
+
+        elif kind == "SUB":
+            return lambda x, y: torch.sub(x, y)
+
+        elif kind == "MUL":
+            return lambda x, y: torch.mul(x, y)
+
+        elif kind == "DIV":
+            return lambda x, y: torch.div(x, y)
+
+        elif kind == "POW":
+            # Binary power: x ** y (different from unary POWER with fixed exponent)
+            return lambda x, y: torch.pow(x, y)
+
+        elif kind == "MAX":
+            # Element-wise maximum (supports 2+ inputs via reduce)
+            # VerifiableGraphModel will provide inputs as tuple if >2 preds
+            def max_op(*inputs):
+                result = inputs[0]
+                for inp in inputs[1:]:
+                    result = torch.maximum(result, inp)
+                return result
+            return max_op
+
+        elif kind == "MIN":
+            # Element-wise minimum (supports 2+ inputs via reduce)
+            def min_op(*inputs):
+                result = inputs[0]
+                for inp in inputs[1:]:
+                    result = torch.minimum(result, inp)
+                return result
+            return min_op
+
+        elif kind == "MATMUL":
+            # Matrix multiplication: A @ B
+            def matmul_op(x, y):
+                # Minimal shape validation: inner dimensions must match
+                if x.shape[-1] != y.shape[-2]:
+                    raise ValueError(
+                        f"MATMUL shape mismatch: x.shape={x.shape}, y.shape={y.shape}. "
+                        f"Inner dimensions must match (x.shape[-1]={x.shape[-1]} != y.shape[-2]={y.shape[-2]})"
+                    )
+                return torch.matmul(x, y)
+            return matmul_op
+
+        elif kind == "CONCAT":
+            # Concatenate tensors along specified dimension
+            concat_dim = meta.get("concat_dim", 0)
+            if concat_dim is None:
+                raise ValueError("CONCAT requires 'concat_dim' in meta")
+            # VerifiableGraphModel will provide inputs as tuple from preds
+            def concat_op(*inputs):
+                # Minimal shape validation: all inputs must have same rank
+                if len(inputs) < 2:
+                    raise ValueError(f"CONCAT requires at least 2 inputs, got {len(inputs)}")
+                ranks = [len(inp.shape) for inp in inputs]
+                if len(set(ranks)) > 1:
+                    shapes = [tuple(inp.shape) for inp in inputs]
+                    raise ValueError(
+                        f"CONCAT shape mismatch: all inputs must have same rank. Got shapes: {shapes}"
+                    )
+                return torch.cat(inputs, dim=concat_dim)
+            return concat_op
+
+        # Shape transformation operations (Phase 3)
+        elif kind == "RESHAPE":
+            target_shape = meta.get("target_shape")
+            if target_shape is None:
+                raise ValueError("RESHAPE requires 'target_shape' in meta")
+            class ReshapeModule(nn.Module):
+                def __init__(self, target_shape):
+                    super().__init__()
+                    self.target_shape = tuple(target_shape)
+                def forward(self, x):
+                    return torch.reshape(x, self.target_shape)
+            return ReshapeModule(target_shape)
+
+        elif kind == "TRANSPOSE":
+            perm = meta.get("perm")
+            if perm is None:
+                raise ValueError("TRANSPOSE requires 'perm' in meta")
+            class TransposeModule(nn.Module):
+                def __init__(self, perm):
+                    super().__init__()
+                    self.perm = tuple(perm)
+                def forward(self, x):
+                    return torch.permute(x, self.perm)
+            return TransposeModule(perm)
+
+        elif kind == "SQUEEZE":
+            # Compatible with both dim (single int) and dims (list)
+            dims = meta.get("dims")
+            if dims is None:
+                dims = meta.get("dim")
+
+            class SqueezeModule(nn.Module):
+                def __init__(self, dims):
+                    super().__init__()
+                    self.dims = dims
+                def forward(self, x):
+                    if self.dims is None:
+                        # Squeeze all singleton dimensions
+                        return torch.squeeze(x)
+                    elif isinstance(self.dims, int):
+                        # Single dimension
+                        return torch.squeeze(x, dim=self.dims)
+                    else:
+                        # Multiple dimensions: squeeze in descending order to avoid index shifting
+                        result = x
+                        for dim in sorted(self.dims, reverse=True):
+                            result = torch.squeeze(result, dim=dim)
+                        return result
+            return SqueezeModule(dims)
+
+        elif kind == "UNSQUEEZE":
+            # Compatible with both dim (single int) and dims (list)
+            dims = meta.get("dims")
+            if dims is None:
+                dims = meta.get("dim")
+            if dims is None:
+                raise ValueError("UNSQUEEZE requires 'dims' or 'dim' in meta")
+
+            class UnsqueezeModule(nn.Module):
+                def __init__(self, dims):
+                    super().__init__()
+                    self.dims = dims
+                def forward(self, x):
+                    if isinstance(self.dims, int):
+                        return torch.unsqueeze(x, dim=self.dims)
+                    else:
+                        # Multiple dimensions: apply unsqueeze iteratively
+                        result = x
+                        for dim in sorted(self.dims):
+                            result = torch.unsqueeze(result, dim=dim)
+                        return result
+            return UnsqueezeModule(dims)
+
+        elif kind == "TILE":
+            repeats = meta.get("repeats")
+            if repeats is None:
+                raise ValueError("TILE requires 'repeats' in meta")
+            class TileModule(nn.Module):
+                def __init__(self, repeats):
+                    super().__init__()
+                    self.repeats = tuple(repeats)
+                def forward(self, x):
+                    return torch.tile(x, self.repeats)
+            return TileModule(repeats)
+
+        elif kind == "EXPAND":
+            shape = meta.get("shape")
+            if shape is None:
+                raise ValueError("EXPAND requires 'shape' in meta")
+            # Note: expand returns a view, not a copy
+            class ExpandModule(nn.Module):
+                def __init__(self, shape):
+                    super().__init__()
+                    self.shape = shape
+                def forward(self, x):
+                    return x.expand(*self.shape)
+            return ExpandModule(shape)
+
+        elif kind == "SLICE":
+            starts = meta.get("starts")
+            ends = meta.get("ends")
+            axes = meta.get("axes")
+            steps = meta.get("steps")
+
+            if starts is None or ends is None:
+                raise ValueError("SLICE requires 'starts' and 'ends' in meta")
+
+            class SliceModule(nn.Module):
+                def __init__(self, starts, ends, axes, steps):
+                    super().__init__()
+                    self.starts = starts
+                    self.ends = ends
+                    self.axes = axes
+                    self.steps = steps
+                def forward(self, x):
+                    # Default: slice all dimensions if axes not specified
+                    if self.axes is None:
+                        # Apply slices to first len(starts) dimensions
+                        slices = [slice(s, e, step if self.steps else None)
+                                 for s, e, step in zip(self.starts, self.ends, self.steps or [None]*len(self.starts))]
+                    else:
+                        # Apply slices only to specified axes
+                        slices = [slice(None)] * x.ndim
+                        for axis, start, end in zip(self.axes, self.starts, self.ends):
+                            step = self.steps[self.axes.index(axis)] if self.steps else None
+                            slices[axis] = slice(start, end, step)
+                    return x[tuple(slices)]
+            return SliceModule(starts, ends, axes, steps)
+
+        elif kind == "GATHER":
+            # GATHER semantics: Uses torch.index_select (not torch.gather)
+            # Rationale: interval_tf/tf_mlp.py:tf_gather uses torch.index_select with 1D indices,
+            # which matches numpy.take and TensorFlow's gather with axis parameter.
+            # This is simpler than torch.gather which requires indices with same rank as input.
+            # Compatible with axis/dim field names
+            axis = meta.get("axis", meta.get("dim", 0))
+            # Compatible with indices/index field names
+            indices = None
+            if act_layer is not None:
+                indices = meta.get("indices")
+                if indices is None:
+                    indices = act_layer.params.get("indices")
+                if indices is None:
+                    indices = act_layer.params.get("index")
+            else:
+                indices = meta.get("indices")
+
+            if indices is None:
+                raise ValueError("GATHER requires 'indices' or 'index' in params or meta")
+
+            class GatherModule(nn.Module):
+                def __init__(self, axis, indices):
+                    super().__init__()
+                    self.axis = axis
+                    # Store indices as buffer if it's already a tensor
+                    if isinstance(indices, torch.Tensor):
+                        self.register_buffer('indices', indices)
+                    else:
+                        self.indices = indices
+                def forward(self, x):
+                    idx = self.indices
+                    if not isinstance(idx, torch.Tensor):
+                        idx = torch.tensor(idx, dtype=torch.long, device=x.device)
+                    elif idx.device != x.device:
+                        idx = idx.to(device=x.device)
+                    return torch.index_select(x, dim=self.axis, index=idx)
+            return GatherModule(axis, indices)
+
+        elif kind == "INDEX_SELECT":
+            # Compatible with dim field name
+            dim = meta.get("dim")
+            if dim is None:
+                raise ValueError("INDEX_SELECT requires 'dim' in meta")
+
+            # Compatible with indices/index field names
+            indices = None
+            if act_layer is not None:
+                indices = meta.get("indices")
+                if indices is None:
+                    indices = act_layer.params.get("indices")
+                if indices is None:
+                    indices = act_layer.params.get("index")
+            else:
+                indices = meta.get("indices")
+
+            if indices is None:
+                raise ValueError("INDEX_SELECT requires 'indices' or 'index' in params or meta")
+
+            class IndexSelectModule(nn.Module):
+                def __init__(self, dim, indices):
+                    super().__init__()
+                    self.dim = dim
+                    # Store indices as buffer if it's already a tensor
+                    if isinstance(indices, torch.Tensor):
+                        self.register_buffer('indices', indices)
+                    else:
+                        self.indices = indices
+                def forward(self, x):
+                    idx = self.indices
+                    if not isinstance(idx, torch.Tensor):
+                        idx = torch.tensor(idx, dtype=torch.long, device=x.device)
+                    elif idx.device != x.device:
+                        idx = idx.to(device=x.device)
+                    return torch.index_select(x, dim=self.dim, index=idx)
+            return IndexSelectModule(dim, indices)
+
         # Skip or warn about unsupported layers
         else:
+            if self.strict:
+                # In strict mode, don't return None - raise immediately
+                # Note: act_layer may be None, so we can't always access layer_id here
+                layer_info = f" at layer {act_layer.id}" if act_layer is not None else ""
+                raise ValueError(
+                    f"Strict mode: Layer kind '{kind}' not implemented in _create_torch_layer(){layer_info}. "
+                    f"Add implementation for this layer type or disable strict mode."
+                )
             logger.warning(f"Unsupported layer kind '{kind}' - skipping")
             return None
+
+
+# ============================================================================
+# SELF-TEST: Minimal Residual Network (Phase 0+1 Validation)
+# ============================================================================
+
+def _self_test_minimal_residual():
+    """
+    Minimal residual network test for DAG conversion validation.
+
+    Network structure:
+        INPUT → INPUT_SPEC → DENSE (branch1)
+                            ↘
+                              ADD → ASSERT
+                            ↗
+                           DENSE (branch2)
+
+    Tests:
+        1. DAG conversion with preds-based multi-input
+        2. Strict mode enforcement
+        3. Spec layer constraint checking
+        4. Forward pass execution
+    """
+    import torch
+    from act.back_end.core import Net
+    from act.back_end.layer_util import create_layer
+    from act.front_end.specs import InKind, OutKind
+
+    print("\n" + "="*80)
+    print("SELF-TEST: Minimal Residual Network (DAG Conversion)")
+    print("="*80)
+
+    # Create minimal residual network
+    layers = []
+
+    # Layer 0: INPUT
+    layers.append(create_layer(
+        id=0,
+        kind="INPUT",
+        params={},
+        meta={"shape": [1, 4], "dtype": "torch.float64"},
+        in_vars=[],
+        out_vars=[0, 1, 2, 3]
+    ))
+
+    # Layer 1: INPUT_SPEC
+    layers.append(create_layer(
+        id=1,
+        kind="INPUT_SPEC",
+        params={"center": torch.zeros(4, dtype=torch.float64)},
+        meta={"kind": "LINF_BALL", "eps": 0.1},
+        in_vars=[0, 1, 2, 3],
+        out_vars=[0, 1, 2, 3]
+    ))
+
+    # Layer 2: DENSE (branch 1 - direct path)
+    W1 = torch.eye(4, dtype=torch.float64)
+    b1 = torch.zeros(4, dtype=torch.float64)
+    layers.append(create_layer(
+        id=2,
+        kind="DENSE",
+        params={"W": W1, "b": b1},
+        meta={"in_features": 4, "out_features": 4, "bias_enabled": True},
+        in_vars=[0, 1, 2, 3],
+        out_vars=[4, 5, 6, 7]
+    ))
+
+    # Layer 3: RELU (activation on branch 1)
+    layers.append(create_layer(
+        id=3,
+        kind="RELU",
+        params={},
+        meta={},
+        in_vars=[4, 5, 6, 7],
+        out_vars=[8, 9, 10, 11]
+    ))
+
+    # Layer 4: DENSE (branch 2 - residual path from INPUT_SPEC)
+    W2 = 0.5 * torch.eye(4, dtype=torch.float64)
+    b2 = torch.zeros(4, dtype=torch.float64)
+    layers.append(create_layer(
+        id=4,
+        kind="DENSE",
+        params={"W": W2, "b": b2},
+        meta={"in_features": 4, "out_features": 4, "bias_enabled": True, "preds_indices": [1]},
+        in_vars=[0, 1, 2, 3],  # From INPUT_SPEC
+        out_vars=[12, 13, 14, 15]
+    ))
+
+    # Layer 5: ADD (merge two branches)
+    layers.append(create_layer(
+        id=5,
+        kind="ADD",
+        params={},
+        meta={"x_vars": [8, 9, 10, 11], "y_vars": [12, 13, 14, 15], "preds_indices": [3, 4]},
+        in_vars=[8, 9, 10, 11, 12, 13, 14, 15],
+        out_vars=[16, 17, 18, 19]
+    ))
+
+    # Layer 6: ASSERT
+    layers.append(create_layer(
+        id=6,
+        kind="ASSERT",
+        params={},
+        meta={"kind": "TOP1_ROBUST", "y_true": 0},
+        in_vars=[16, 17, 18, 19],
+        out_vars=[16, 17, 18, 19]
+    ))
+
+    # Build preds and succs dictionaries for DAG structure
+    preds = {
+        0: [],          # INPUT: no predecessors
+        1: [0],         # INPUT_SPEC: from INPUT
+        2: [1],         # DENSE (branch1): from INPUT_SPEC
+        3: [2],         # RELU: from DENSE
+        4: [1],         # DENSE (branch2): from INPUT_SPEC (fork point!)
+        5: [3, 4],      # ADD: from RELU and DENSE (branch2)
+        6: [5]          # ASSERT: from ADD
+    }
+
+    succs = {
+        0: [1],         # INPUT → INPUT_SPEC
+        1: [2, 4],      # INPUT_SPEC → DENSE (branch1) and DENSE (branch2)
+        2: [3],         # DENSE → RELU
+        3: [5],         # RELU → ADD
+        4: [5],         # DENSE (branch2) → ADD
+        5: [6],         # ADD → ASSERT
+        6: []           # ASSERT: no successors
+    }
+
+    # Create Net
+    net = Net(layers=layers, preds=preds, succs=succs)
+    print(f"✅ Created ACT Net with {len(layers)} layers")
+    print(f"   Structure: INPUT → INPUT_SPEC → DENSE → RELU (branch1)")
+    print(f"                                    ↘               ↗")
+    print(f"                                      ADD (merge)")
+    print(f"                                    ↗               ↘")
+    print(f"                              DENSE (branch2)     ASSERT")
+
+    # Test 1: Sequential model (should fail on ADD)
+    print("\n--- Test 1: Sequential Model (should skip ADD) ---")
+    try:
+        converter_seq = ACTToTorch(net, use_graph_model=False, strict=False)
+        model_seq = converter_seq.run()
+        print(f"✅ Sequential model created (ADD skipped as expected)")
+    except Exception as e:
+        print(f"❌ Sequential model failed: {e}")
+
+    # Test 2: DAG model (should succeed)
+    print("\n--- Test 2: DAG Model (should support ADD) ---")
+    try:
+        converter_dag = ACTToTorch(net, use_graph_model=True, strict=True)
+        model_dag = converter_dag.run()
+        print(f"✅ DAG model created successfully")
+
+        # Test forward pass
+        input_tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float64)
+        print(f"\n   Input: {input_tensor.tolist()}")
+
+        result = model_dag(input_tensor)
+        print(f"   Output: {result['output'].tolist()}")
+        print(f"   Input satisfied: {result['input_satisfied']} - {result['input_explanation']}")
+        print(f"   Output satisfied: {result['output_satisfied']} - {result['output_explanation']}")
+
+        # Verify computation
+        # branch1: DENSE(input) -> RELU -> (1,2,3,4) after ReLU
+        # branch2: DENSE(input) with W=0.5*I -> (0.5, 1, 1.5, 2)
+        # ADD: (1,2,3,4) + (0.5,1,1.5,2) = (1.5, 3, 4.5, 6)
+        expected = torch.tensor([[1.5, 3.0, 4.5, 6.0]], dtype=torch.float64)
+        actual = result['output']
+        if torch.allclose(actual, expected, atol=1e-6):
+            print(f"   ✅ Output matches expected: {expected.tolist()}")
+        else:
+            print(f"   ❌ Output mismatch! Expected: {expected.tolist()}, Got: {actual.tolist()}")
+
+    except Exception as e:
+        print(f"❌ DAG model failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Test 3: Strict mode with unsupported layer (should fail)
+    print("\n--- Test 3: Strict Mode with Unsupported Layer ---")
+    try:
+        # Create an unsupported layer manually (bypass create_layer schema validation)
+        # Insert ABS between ADD and ASSERT (middle of network)
+        # ABS is in layer schema but NOT in OPERATOR_MAPPING (minimal set)
+        from act.back_end.core import Layer
+        unsupported_layer = Layer(
+            id=7,
+            kind="ABS",  # Not in OPERATOR_MAPPING (minimal set), but in layer schema
+            params={},
+            meta={},
+            in_vars=[16, 17, 18, 19],
+            out_vars=[20, 21, 22, 23]
+        )
+
+        # Rebuild layers with SOFTMAX inserted between ADD and ASSERT
+        layers_with_unsupported = layers[:6].copy()  # INPUT, INPUT_SPEC, DENSE, RELU, DENSE, ADD
+        layers_with_unsupported.append(unsupported_layer)  # SOFTMAX
+
+        # Re-create ASSERT to follow SOFTMAX
+        layers_with_unsupported.append(create_layer(
+            id=8,
+            kind="ASSERT",
+            params={},
+            meta={"kind": "TOP1_ROBUST", "y_true": 0},
+            in_vars=[20, 21, 22, 23],
+            out_vars=[20, 21, 22, 23]
+        ))
+
+        # Rebuild preds/succs
+        preds_unsupported = {0: [], 1: [0], 2: [1], 3: [2], 4: [1], 5: [3, 4], 7: [5], 8: [7]}
+        succs_unsupported = {0: [1], 1: [2, 4], 2: [3], 3: [5], 4: [5], 5: [7], 7: [8], 8: []}
+
+        net_unsupported = Net(layers=layers_with_unsupported, preds=preds_unsupported, succs=succs_unsupported)
+
+        converter_strict = ACTToTorch(net_unsupported, use_graph_model=True, strict=True)
+        model_strict = converter_strict.run()
+        print(f"❌ Strict mode should have raised ValueError for SOFTMAX (not in minimal OPERATOR_MAPPING)")
+    except ValueError as e:
+        if "Strict mode" in str(e):
+            print(f"✅ Strict mode correctly raised: {e}")
+        else:
+            print(f"❌ Unexpected ValueError: {e}")
+    except Exception as e:
+        print(f"❌ Unexpected exception: {e}")
+
+    print("\n" + "="*80)
+    print("SELF-TEST COMPLETE")
+    print("="*80 + "\n")
+
+
+# ============================================================================
+# Main Entry Point (Self-Test)
+# ============================================================================
+
+if __name__ == "__main__":
+    """Run minimal residual network self-test when executed directly."""
+    _self_test_minimal_residual()

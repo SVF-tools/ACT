@@ -63,6 +63,14 @@ class GurobiSolver(Solver):
         # device hint ignored (CPU solver)
         self.m = gp.Model(name)
         self.m.Params.OutputFlag = 0
+
+        # Set tighter numerical tolerances for verification soundness
+        # Default FeasibilityTol=1e-6 is too loose for small margin violations,
+        # especially when combined with TANH PWL approximation errors.
+        # This prevents false negatives (CERTIFIED when actually FALSIFIED).
+        self.m.Params.FeasibilityTol = 1e-9  # Constraint violation tolerance
+        self.m.Params.OptimalityTol = 1e-9   # Optimality condition tolerance
+
         self._x = []
 
     def add_vars(self, n: int) -> None:

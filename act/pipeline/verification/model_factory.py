@@ -112,7 +112,12 @@ class ModelFactory:
             raise ValueError("ModelFactory requires load_weights=True (ACT Net JSONs are the source of truth).")
 
         act_net = self.get_act_net(name)
-        converter = ACTToTorch(act_net)
+
+        # Auto-detect if network requires DAG mode (has multi-input layers)
+        use_graph_model = self._requires_dag_mode(act_net)
+
+        # Enable strict mode for verification: fail explicitly on unsupported layers
+        converter = ACTToTorch(act_net, use_graph_model=use_graph_model, strict=True)
         model = converter.run()
 
         logger.info(
@@ -121,6 +126,22 @@ class ModelFactory:
             sum(p.numel() for p in model.parameters()),
         )
         return model
+
+    def _requires_dag_mode(self, net: Net) -> bool:
+        """
+        Check if network requires DAG mode (has multi-input layers).
+
+        Returns:
+            True if any layer has more than one predecessor
+        """
+        if not hasattr(net, 'preds'):
+            return False
+
+        for layer_id, pred_list in net.preds.items():
+            if len(pred_list) > 1:
+                return True
+
+        return False
 
     def _find_layer(self, net: Net, kind: str) -> Optional[Any]:
         for layer in getattr(net, "layers", []):
