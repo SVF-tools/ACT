@@ -44,7 +44,7 @@
 # Usage:
 #   factory = ModelFactory()
 #   model = factory.create_model("mnist_robust_easy", load_weights=True)
-#
+#   
 #   # Model is VerifiableModel with constraint checking
 #   results = model(input_tensor)
 #   print(f"Output: {results['output']}")
@@ -125,16 +125,16 @@ class ModelFactory:
         """
         self.nets_dir = Path(nets_dir)
         self.manifest_path = Path(manifest_path) if manifest_path else None
-
+        
         # Pre-load all ACT Nets for fast access (avoids repeated file I/O)
         self.net_names = _discover_net_names(self.nets_dir, self.manifest_path)
         self.nets: Dict[str, Net] = {}
         self._load_all_nets()
-
+    
     def _load_all_nets(self) -> None:
         """
         Pre-load all ACT Nets from JSON files at initialization.
-
+        
         This eager loading strategy:
         - Avoids repeated file I/O during model creation
         - Validates all nets exist and are valid at init time
@@ -144,10 +144,10 @@ class ModelFactory:
         if not self.nets_dir.exists():
             logger.warning(f"Nets dir not found: {self.nets_dir}")
             return
-
+        
         for name in self.net_names:
             net_path = self.nets_dir / f"{name}.json"
-
+            
             if not net_path.exists():
                 logger.warning(f"ACT Net file not found: {net_path}. Skipping '{name}'.")
                 continue
