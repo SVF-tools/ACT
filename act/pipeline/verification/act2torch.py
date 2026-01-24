@@ -129,13 +129,13 @@ class ACTToTorch:
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-
+        
         Iterates through ACT layers, creates corresponding PyTorch layers,
         transfers weights, and assembles into VerifiableModel or VerifiableGraphModel.
         
         Returns:
             VerifiableModel (Sequential) or VerifiableGraphModel (DAG) with embedded constraint checking
-
+        
         Raises:
             ValueError: If no valid PyTorch layers can be created, or if strict mode
                        encounters unsupported layers
