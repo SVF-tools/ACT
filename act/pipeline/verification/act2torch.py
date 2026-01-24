@@ -169,9 +169,32 @@ class ACTToTorch:
             
             if kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
+                from act.front_end.verifiable_model import InputSpecLayer
+                from act.front_end.specs import InputSpec, InKind
+
+                # Build InputSpec from ACT layer
+                kind_str = meta['kind']
+                spec_kind = getattr(InKind, kind_str)  # Convert string to enum
+                spec_dict = {'kind': spec_kind}
+                if 'eps' in meta:
+                    spec_dict['eps'] = meta['eps']
+
+                # Convert parameter tensors to device_manager dtype for consistency
+                for param_key in ['lb', 'ub', 'center', 'A', 'b']:
+                    if param_key in act_layer.params:
+                        tensor = act_layer.params[param_key]
+                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
+
+                spec = InputSpec(**spec_dict)
+                torch_layers.append(InputSpecLayer(spec))
+                has_input_spec = True
+                continue
+
+            if kind == 'ASSERT':
+                # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
-                
+
                 # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
@@ -182,19 +205,18 @@ class ACTToTorch:
                     spec_dict['margin'] = meta['margin']
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
-                
+
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = OutputSpec(**spec_dict)
-                # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
                 has_output_spec = True
                 continue
-            
+
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
             
