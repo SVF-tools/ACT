@@ -17,6 +17,7 @@ import torch
 from typing import Dict, List
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.transfer_functions import TransferFunction
+from act.back_end.layer_schema import LayerKind
 from act.back_end.interval_tf.tf_mlp import *
 from act.back_end.interval_tf.tf_cnn import *
 from act.back_end.interval_tf.tf_rnn import *
@@ -29,9 +30,9 @@ class IntervalTF(TransferFunction):
     # Layer kind to function mapping
     _LAYER_REGISTRY = {
         # Identity/constraint layers
-        "INPUT": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
-        "INPUT_SPEC": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
-        "ASSERT": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
+        LayerKind.INPUT.value: lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
+        LayerKind.INPUT_SPEC.value: lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
+        LayerKind.ASSERT.value: lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
         
         # MLP operations
         "DENSE": lambda L, bounds, tf: tf_dense(L, bounds),
