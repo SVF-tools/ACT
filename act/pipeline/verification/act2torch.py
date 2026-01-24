@@ -84,30 +84,30 @@ logger = logging.getLogger(__name__)
 class ACTToTorch:
     """
     Convert ACT Net to PyTorch nn.Module.
-
+    
     This class provides the inverse transformation of TorchToACT, enabling
     bidirectional conversion between verification representations (ACT) and
     executable models (PyTorch).
-
+    
     Usage (Sequential mode - backward compatible):
         converter = ACTToTorch(act_net)
         model = converter.run()  # Returns VerifiableModel (nn.Sequential)
-
+    
     Usage (DAG mode - supports multi-input layers):
         converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
         model = converter.run()  # Returns VerifiableGraphModel (DAG)
-
+    
     Args:
         act_net: ACT Net object containing layers with architecture and weights
         use_graph_model: If True, return VerifiableGraphModel (DAG support).
                          If False, return VerifiableModel (Sequential, legacy).
         strict: If True, raise ValueError on unsupported layers.
                 If False, log warning and skip (legacy behavior).
-
+    
     Returns:
         PyTorch nn.Module model ready for inference
     """
-
+    
     def __init__(self, act_net: Net, use_graph_model: bool = False, strict: bool = False):
         """
         Initialize converter with ACT Net.
@@ -213,7 +213,7 @@ class ACTToTorch:
                    f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
         
         return model
-    
+
     def _run_graph_model(self) -> nn.Module:
         """
         DAG-capable VerifiableGraphModel conversion.
