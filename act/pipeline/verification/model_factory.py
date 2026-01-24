@@ -170,10 +170,10 @@ class ModelFactory:
         
         Args:
             name: Network name from examples_config.yaml
-        
+            
         Returns:
             Pre-loaded ACT Net
-        
+            
         Raises:
             KeyError: If network name not found or failed to load
         """
@@ -190,10 +190,10 @@ class ModelFactory:
         Args:
             name: Network name from examples_config.yaml
             load_weights: If True, load weights from corresponding ACT Net JSON file
-        
+            
         Returns:
             PyTorch nn.Module ready for inference or training
-        
+            
         Raises:
             KeyError: If network name not found in config
             ValueError: If network architecture is invalid
@@ -254,14 +254,14 @@ class ModelFactory:
     def generate_test_input(self, name: str, test_case: str = "center") -> torch.Tensor:
         """
         Generate strategic test input considering both INPUT metadata and INPUT_SPEC constraints.
-
+        
         Args:
             name: Network name from examples_config.yaml
             test_case: One of "center" (safe), "boundary" (risky), "random" (uncertain)
-
+            
         Returns:
             Input tensor strategically placed for verification testing
-
+            
         Test Case Strategy:
         - center: Input at center of constraint region (expected PASS)
         - boundary: Input near boundary of constraints (expected UNCERTAIN/FAIL)
@@ -276,23 +276,23 @@ class ModelFactory:
 
         if input_layer is None:
             raise ValueError(f"No INPUT layer found in network '{name}'")
-
+        
         # Get INPUT metadata
         input_meta = input_layer.meta or {}
         shape = input_meta.get('shape')
         if shape is None:
             raise ValueError(f"INPUT layer missing 'shape' in network '{name}'")
-
+        
         # Use device_manager's dtype/device for test inputs
         # This ensures test inputs match the model's configuration
         dtype = get_default_dtype()
         device = get_default_device()
-
+        
         # Get INPUT_SPEC constraints if present
         if input_spec_layer is not None:
             spec_meta = input_spec_layer.meta or {}
             spec_kind = str(spec_meta.get('kind'))
-
+            
             if spec_kind == 'BOX':
                 lb_val = spec_meta.get('lb_val')
                 ub_val = spec_meta.get('ub_val')
@@ -316,7 +316,7 @@ class ModelFactory:
                     tensor = torch.rand(*shape, dtype=dtype, device=device) * (ub_val - lb_val) + lb_val
                 else:
                     raise ValueError(f"Unknown test_case '{test_case}'")
-
+            
             elif spec_kind == 'LINF_BALL':
                 center_val = spec_meta.get('center_val', 0.5)
                 eps = spec_meta.get('eps', 0.1)
@@ -334,23 +334,23 @@ class ModelFactory:
                     tensor = torch.full(shape, center_val, dtype=dtype, device=device) + perturbation
                 else:
                     raise ValueError(f"Unknown test_case '{test_case}'")
-
+            
             else:
                 # LIN_POLY or unknown: fallback to uniform random in value_range
                 value_range = input_meta.get('value_range', [0.0, 1.0])
                 tensor = torch.rand(*shape, dtype=dtype, device=device) * (value_range[1] - value_range[0]) + value_range[0]
-
+        
         else:
             # No INPUT_SPEC: use uniform random in value_range
             value_range = input_meta.get('value_range', [0.0, 1.0])
             tensor = torch.rand(*shape, dtype=dtype, device=device) * (value_range[1] - value_range[0]) + value_range[0]
-
+        
         return tensor
-
+    
     def list_networks(self) -> List[str]:
         """List all available network names."""
         return list(self.nets.keys())
-
+    
     def get_network_info(self, name: str) -> Dict[str, Any]:
         """Get metadata about a network without creating it."""
         if name not in self.nets:
@@ -378,49 +378,49 @@ class ModelFactory:
 def main():
     """Test model factory with all example networks and verify spec-free verification."""
     logging.basicConfig(level=logging.INFO)
-
+    
     factory = ModelFactory()
-
+    
     print("=" * 80)
     print("PyTorch Model Factory - Spec-Free Verification Testing")
     print("=" * 80)
-
+    
     all_passed = True
     total_tests = 0
     passed_tests = 0
-
+    
     for name in factory.list_networks():
         print(f"\n{'=' * 80}")
         print(f"Network: {name}")
         print("=" * 80)
-
+        
         # Get network info
         info = factory.get_network_info(name)
         print(f"Description: {info['description']}")
         print(f"Architecture: {info['architecture_type']}")
         print(f"Input shape: {info['input_shape']}")
-
+        
         # Create model with VerifiableModel wrapper
         try:
             model = factory.create_model(name, load_weights=True)
             print(f"\n✅ Created VerifiableModel model")
-
+            
             # Test with 3 strategic test cases
             test_cases = ['center', 'boundary', 'random']
-
+            
             for test_case in test_cases:
                 print(f"\n📊 Test Case: {test_case}")
                 print("-" * 80)
-
+                
                 try:
                     # Generate strategic input
                     input_tensor = factory.generate_test_input(name, test_case)
                     print(f"  Input shape: {list(input_tensor.shape)}")
                     print(f"  Input range: [{input_tensor.min():.4f}, {input_tensor.max():.4f}]")
-
+                    
                     # Run model with automatic constraint checking
                     results = model(input_tensor)
-
+                    
                     # Check if results is a dict (VerifiableModel) or tensor (legacy)
                     if isinstance(results, dict):
                         # VerifiableModel returns dict with verification info
@@ -429,12 +429,12 @@ def main():
                         input_explanation = results['input_explanation']
                         output_satisfied = results['output_satisfied']
                         output_explanation = results['output_explanation']
-
+                        
                         print(f"\n  📥 {input_explanation}")
                         print(f"  📤 {output_explanation}")
                         print(f"  Output shape: {list(output.shape)}")
                         print(f"  Output range: [{output.min():.4f}, {output.max():.4f}]")
-
+                        
                         # Track test success
                         total_tests += 1
                         if input_satisfied and output_satisfied:
@@ -444,7 +444,7 @@ def main():
                             print(f"  ⚠️  Test UNCERTAIN (input constraint violated)")
                         else:
                             print(f"  ❌ Test FAILED (output constraint violated)")
-
+                    
                     else:
                         # Legacy nn.Module (no verification)
                         output = results
@@ -452,19 +452,19 @@ def main():
                         print(f"  Output shape: {list(output.shape)}")
                         print(f"  Output range: [{output.min():.4f}, {output.max():.4f}]")
                         total_tests += 1
-
+                
                 except Exception as e:
                     print(f"  ❌ Test case '{test_case}' failed: {e}")
                     import traceback
                     traceback.print_exc()
                     all_passed = False
-
+            
         except Exception as e:
             print(f"\n❌ Failed to create/test model '{name}': {e}")
             import traceback
             traceback.print_exc()
             all_passed = False
-
+    
     # Print summary
     print("\n" + "=" * 80)
     print(f"📊 Verification Test Summary:")
@@ -475,7 +475,7 @@ def main():
         success_rate = (passed_tests / total_tests) * 100
         print(f"   Success rate: {success_rate:.1f}%")
     print("=" * 80)
-
+    
     if all_passed:
         print("✅ All models created and tested successfully")
     else:
