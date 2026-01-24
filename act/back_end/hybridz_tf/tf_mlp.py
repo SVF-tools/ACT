@@ -189,7 +189,7 @@ def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
     idx_pos = torch.where(Bin.lb >= 0)[0]  # Always positive
     idx_neg = torch.where(Bin.ub <= 0)[0]  # Always negative
     idx_amb = torch.where((Bin.lb < 0) & (Bin.ub > 0))[0]  # Crosses zero
-
+    
     # Output bounds
     lb = torch.where(idx_amb[:, None] == torch.arange(len(Bin.lb))[None, :], 
                      torch.zeros_like(Bin.lb), 

@@ -45,11 +45,11 @@
 #
 # Usage:
 #   from act.pipeline.act2torch import ACTToTorch
-#
+#   
 #   # Convert ACT Net to verifiable PyTorch model
 #   converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
 #   model = converter.run()
-#
+#   
 #   # Run inference with automatic constraint checking
 #   results = model(input_tensor)
 #   print(f"Output: {results['output']}")
@@ -166,7 +166,7 @@ class ACTToTorch:
             # Handle wrapper layers specially
             if kind == 'INPUT':
                 continue  # Skip INPUT layer (no-op)
-
+            
             if kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
@@ -218,7 +218,7 @@ class ACTToTorch:
                 torch_layers.append(OutputSpecLayer(spec))
                 has_output_spec = True
                 continue
-
+            
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
 
@@ -269,7 +269,7 @@ class ACTToTorch:
                 # Store INPUT layer info but don't create PyTorch layer
                 layer_modules[layer_id] = (None, False, kind)
                 continue
-
+            
             if kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
@@ -292,7 +292,7 @@ class ACTToTorch:
                 layer_modules[layer_id] = (InputSpecLayer(spec), True, kind)
                 input_spec_layer_id = layer_id
                 continue
-
+            
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
@@ -319,7 +319,7 @@ class ACTToTorch:
                 layer_modules[layer_id] = (OutputSpecLayer(spec), True, kind)
                 output_spec_layer_id = layer_id
                 continue
-
+            
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
 
@@ -332,7 +332,7 @@ class ACTToTorch:
                 else:
                     logger.warning(f"Unsupported layer kind '{kind}' at layer {layer_id} - skipping")
                     continue
-
+            
             layer_modules[layer_id] = (torch_layer, False, kind)
 
         if not layer_modules:

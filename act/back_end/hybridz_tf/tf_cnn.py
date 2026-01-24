@@ -97,7 +97,7 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.meta.get("kernel_size", 2)
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
-
+    
     # Reshape input if flattened
     in_shape = L.meta.get("input_shape")  # May be (N,C,H,W) or (C,H,W)
     if len(Bin.lb.shape) == 1 and in_shape:

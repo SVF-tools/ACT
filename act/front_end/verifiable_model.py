@@ -730,7 +730,7 @@ class OutputSpecLayer(nn.Module):
 
 
 # ============================================================================
-# DAG-Capable Verifiable Model (Phase 0+1: Minimal DAG Support)
+# DAG-Capable Verifiable Model (DAG Support)
 # ============================================================================
 
 class VerifiableGraphModel(nn.Module):
