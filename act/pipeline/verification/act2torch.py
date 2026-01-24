@@ -17,8 +17,7 @@
 #   - Weight preservation: Transfers all ACT parameters to PyTorch layers
 #   - VerifiableModel: Returns wrapped model with automatic constraint checking
 #   - Spec reconstruction: Rebuilds InputSpecLayer/OutputSpecLayer from ACT
-#   - Comprehensive coverage: Supports 50+ layer types (MLP, CNN, RNN, etc.)
-#   - DAG Support: VerifiableGraphModel for multi-input layers (ADD, CONCAT, etc.)
+#   - Comprehensive coverage: Supports 40+ layer types (MLP, CNN, RNN, etc.)
 #
 # Architecture:
 #   INPUT      → (skipped)           (no-op, shape already defined)
@@ -26,11 +25,10 @@
 #   DENSE      → nn.Linear           (fully connected layers)
 #   CONV2D     → nn.Conv2d           (convolutional layers)
 #   RELU       → nn.ReLU             (activation functions)
-#   ADD        → torch.add           (multi-input binary operation)
 #   ASSERT     → OutputSpecLayer     (output constraint checking)
 #
-# VerifiableModel (Sequential):
-#   Wraps nn.Module to provide automatic constraint verification for linear chains.
+# VerifiableModel:
+#   Wraps nn.Module to provide automatic constraint verification.
 #   Returns dict with:
 #   - 'output': Model predictions
 #   - 'input_satisfied': Input constraint satisfaction status
@@ -38,18 +36,13 @@
 #   - 'output_satisfied': Output constraint satisfaction status
 #   - 'output_explanation': Human-readable output constraint result
 #
-# VerifiableGraphModel (DAG):
-#   NEW: Supports DAG structures with multi-input layers via explicit preds.
-#   Executes layers in topological order, caching intermediate outputs.
-#   Strict mode: Raises on unsupported layers (no silent skipping).
-#
 # Usage:
 #   from act.pipeline.act2torch import ACTToTorch
-#   
+#
 #   # Convert ACT Net to verifiable PyTorch model
-#   converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
+#   converter = ACTToTorch(act_net)
 #   model = converter.run()
-#   
+#
 #   # Run inference with automatic constraint checking
 #   results = model(input_tensor)
 #   print(f"Output: {results['output']}")
@@ -61,12 +54,6 @@
 #   - Weight transfer: Copies all parameters from ACT Layer.params to PyTorch
 #   - Spec preservation: Reconstructs InputSpec/OutputSpec from ACT metadata
 #   - Layer factory: Creates appropriate PyTorch layers from ACT layer kinds
-#
-#===---------------------------------------------------------------------===#
-#
-# Supported layer types are defined in:
-#   - act/back_end/layer_schema.py (REGISTRY) for schema validation
-#   - _create_torch_layer() method below for PyTorch conversion logic
 #
 #===---------------------------------------------------------------------===#
 
@@ -84,73 +71,66 @@ logger = logging.getLogger(__name__)
 class ACTToTorch:
     """
     Convert ACT Net to PyTorch nn.Module.
-    
+
     This class provides the inverse transformation of TorchToACT, enabling
     bidirectional conversion between verification representations (ACT) and
     executable models (PyTorch).
-    
-    Usage (Sequential mode - backward compatible):
+
+    Usage:
         converter = ACTToTorch(act_net)
-        model = converter.run()  # Returns VerifiableModel (nn.Sequential)
-    
-    Usage (DAG mode - supports multi-input layers):
-        converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
-        model = converter.run()  # Returns VerifiableGraphModel (DAG)
-    
+        model = converter.run()  # Returns nn.Module
+
     Args:
         act_net: ACT Net object containing layers with architecture and weights
-        use_graph_model: If True, return VerifiableGraphModel (DAG support).
-                         If False, return VerifiableModel (Sequential, legacy).
-        strict: If True, raise ValueError on unsupported layers.
-                If False, log warning and skip (legacy behavior).
-    
+
     Returns:
         PyTorch nn.Module model ready for inference
     """
-    
-    def __init__(self, act_net: Net, use_graph_model: bool = False, strict: bool = False):
+
+    def __init__(self, act_net: Net):
         """
         Initialize converter with ACT Net.
-        
+
         Args:
             act_net: ACT Net object (contains architecture + weights)
-            use_graph_model: Use DAG-capable VerifiableGraphModel (default: False)
-            strict: Raise on unsupported layers instead of skipping (default: False)
-        
+
         Raises:
             TypeError: If act_net is not a Net instance
         """
         if not isinstance(act_net, Net):
             raise TypeError(f"ACTToTorch expects a Net object, got {type(act_net)}")
         self.act_net = act_net
-        self.use_graph_model = use_graph_model
-        self.strict = strict
-    
+
+    def _requires_dag_mode(self) -> bool:
+        """Check if network requires DAG mode (has multi-input layers)."""
+        if not hasattr(self.act_net, 'preds') or not self.act_net.preds:
+            return False
+        for layer_id, pred_ids in self.act_net.preds.items():
+            if len(pred_ids) > 1:
+                return True
+        return False
+
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-        
+
         Iterates through ACT layers, creates corresponding PyTorch layers,
-        transfers weights, and assembles into VerifiableModel or VerifiableGraphModel.
-        
+        transfers weights, and assembles into VerifiableModel model.
+
         Returns:
-            VerifiableModel (Sequential) or VerifiableGraphModel (DAG) with embedded constraint checking
-        
+            VerifiableModel model with embedded constraint checking
+
         Raises:
-            ValueError: If no valid PyTorch layers can be created, or if strict mode
-                       encounters unsupported layers
+            ValueError: If no valid PyTorch layers can be created
         """
-        if self.use_graph_model:
+        # Auto-detect if DAG mode is needed
+        if self._requires_dag_mode():
             return self._run_graph_model()
         else:
             return self._run_sequential_model()
 
     def _run_sequential_model(self) -> nn.Module:
-        """
-        Legacy Sequential model conversion (backward compatible).
-
-        Returns VerifiableModel (nn.Sequential subclass).
-        """
+        """Sequential model conversion for linear chains."""
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
@@ -167,7 +147,7 @@ class ACTToTorch:
             if kind == 'INPUT':
                 continue  # Skip INPUT layer (no-op)
             
-            if kind == 'INPUT_SPEC':
+            elif kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
@@ -186,11 +166,12 @@ class ACTToTorch:
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
 
                 spec = InputSpec(**spec_dict)
+                # InputSpecLayer now always returns tuples
                 torch_layers.append(InputSpecLayer(spec))
                 has_input_spec = True
                 continue
 
-            if kind == 'ASSERT':
+            elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
@@ -213,10 +194,11 @@ class ACTToTorch:
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
 
                 spec = OutputSpec(**spec_dict)
+                # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
                 has_output_spec = True
                 continue
-
+            
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
             
@@ -237,15 +219,7 @@ class ACTToTorch:
         return model
 
     def _run_graph_model(self) -> nn.Module:
-        """
-        DAG-capable VerifiableGraphModel conversion.
-
-        Supports multi-input layers (ADD, CONCAT, etc.) via explicit preds.
-        Strict mode: Raises ValueError on unsupported layers.
-
-        Returns:
-            VerifiableGraphModel instance
-        """
+        """DAG-capable VerifiableGraphModel conversion for multi-input layers."""
         from act.front_end.verifiable_model import VerifiableGraphModel
 
         # Build layer modules dictionary
@@ -267,8 +241,8 @@ class ACTToTorch:
                 # Store INPUT layer info but don't create PyTorch layer
                 layer_modules[layer_id] = (None, False, kind)
                 continue
-            
-            if kind == 'INPUT_SPEC':
+
+            elif kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
@@ -285,12 +259,12 @@ class ACTToTorch:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = InputSpec(**spec_dict)
                 layer_modules[layer_id] = (InputSpecLayer(spec), True, kind)
                 input_spec_layer_id = layer_id
                 continue
-            
+
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
@@ -312,25 +286,19 @@ class ACTToTorch:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = OutputSpec(**spec_dict)
                 layer_modules[layer_id] = (OutputSpecLayer(spec), True, kind)
                 output_spec_layer_id = layer_id
                 continue
-            
+
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
-            
+
             if torch_layer is None:
-                if self.strict:
-                    raise ValueError(
-                        f"Strict mode: Layer kind '{kind}' not implemented in _create_torch_layer() at layer {layer_id}. "
-                        f"Add implementation for this layer type or disable strict mode."
-                    )
-                else:
-                    logger.warning(f"Unsupported layer kind '{kind}' at layer {layer_id} - skipping")
-                    continue
-            
+                logger.warning(f"Unsupported layer kind '{kind}' at layer {layer_id} - skipping")
+                continue
+
             layer_modules[layer_id] = (torch_layer, False, kind)
 
         if not layer_modules:
@@ -383,7 +351,7 @@ class ACTToTorch:
             kind: Layer kind string (DENSE, CONV2D, RELU, etc.)
             meta: Layer metadata dictionary
             act_layer: Optional ACT Layer to load weights from
-        
+            
         Returns:
             PyTorch nn.Module or None if layer should be skipped
         
@@ -518,11 +486,11 @@ class ACTToTorch:
                 raise ValueError("CONV3D layer requires 'out_channels' in meta")
             
             layer = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-
+            
             # Transfer weights and bias from ACT layer
             if act_layer is not None:
                 self._transfer_weights(layer, act_layer, weight_key="weight", bias_key="bias")
-
+            
             return layer
 
         elif kind == "CONVTRANSPOSE2D":
@@ -602,10 +570,10 @@ class ACTToTorch:
             kernel_size = meta.get("kernel_size")
             stride = meta.get("stride")
             padding = meta.get("padding", 0)
-
+            
             if kernel_size is None:
                 raise ValueError("AVGPOOL2D layer requires 'kernel_size' in meta")
-
+            
             return nn.AvgPool2d(kernel_size, stride=stride, padding=padding)
 
         elif kind == "AVGPOOL3D":
@@ -1154,13 +1122,5 @@ class ACTToTorch:
 
         # Skip or warn about unsupported layers
         else:
-            if self.strict:
-                # In strict mode, don't return None - raise immediately
-                # Note: act_layer may be None, so we can't always access layer_id here
-                layer_info = f" at layer {act_layer.id}" if act_layer is not None else ""
-                raise ValueError(
-                    f"Strict mode: Layer kind '{kind}' not implemented in _create_torch_layer(){layer_info}. "
-                    f"Add implementation for this layer type or disable strict mode."
-                )
             logger.warning(f"Unsupported layer kind '{kind}' - skipping")
             return None

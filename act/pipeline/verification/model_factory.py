@@ -201,38 +201,19 @@ class ModelFactory:
         if name not in self.nets:
             available = ", ".join(self.nets.keys())
             raise KeyError(f"Network '{name}' not found. Available: {available}")
-        
+
         if not load_weights:
             raise ValueError("ModelFactory requires load_weights=True (ACT Net JSONs are the source of truth).")
-        
+
         act_net = self.get_act_net(name)
-        
-        # Auto-detect if network requires DAG mode (has multi-input layers)
-        use_graph_model = self._requires_dag_mode(act_net)
-        
-        # Enable strict mode for verification: fail explicitly on unsupported layers
-        converter = ACTToTorch(act_net, use_graph_model=use_graph_model, strict=True)
+
+        # Convert ACT Net to PyTorch model (auto-detects DAG mode)
+        converter = ACTToTorch(act_net)
         model = converter.run()
-        
+
         logger.info(f"Created PyTorch model '{name}' with {sum(p.numel() for p in model.parameters())} parameters")
-        
+
         return model
-
-    def _requires_dag_mode(self, net: Net) -> bool:
-        """
-        Check if network requires DAG mode (has multi-input layers).
-
-        Returns:
-            True if any layer has more than one predecessor
-        """
-        if not hasattr(net, 'preds'):
-            return False
-
-        for layer_id, pred_list in net.preds.items():
-            if len(pred_list) > 1:
-                return True
-
-        return False
 
     def _find_layer(self, net: Net, kind: str) -> Optional[Any]:
         """Find first layer of given kind in network."""
@@ -320,7 +301,7 @@ class ModelFactory:
             elif spec_kind == 'LINF_BALL':
                 center_val = spec_meta.get('center_val', 0.5)
                 eps = spec_meta.get('eps', 0.1)
-
+                
                 if test_case == 'center':
                     # At center of L∞ ball
                     tensor = torch.full(shape, center_val, dtype=dtype, device=device)
