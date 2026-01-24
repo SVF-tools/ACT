@@ -38,11 +38,11 @@
 #
 # Usage:
 #   from act.pipeline.act2torch import ACTToTorch
-#
+#   
 #   # Convert ACT Net to verifiable PyTorch model
 #   converter = ACTToTorch(act_net)
 #   model = converter.run()
-#
+#   
 #   # Run inference with automatic constraint checking
 #   results = model(input_tensor)
 #   print(f"Output: {results['output']}")
@@ -71,29 +71,29 @@ logger = logging.getLogger(__name__)
 class ACTToTorch:
     """
     Convert ACT Net to PyTorch nn.Module.
-
+    
     This class provides the inverse transformation of TorchToACT, enabling
     bidirectional conversion between verification representations (ACT) and
     executable models (PyTorch).
-
+    
     Usage:
         converter = ACTToTorch(act_net)
         model = converter.run()  # Returns nn.Module
-
+    
     Args:
         act_net: ACT Net object containing layers with architecture and weights
-
+    
     Returns:
         PyTorch nn.Module model ready for inference
     """
-
+    
     def __init__(self, act_net: Net):
         """
         Initialize converter with ACT Net.
-
+        
         Args:
             act_net: ACT Net object (contains architecture + weights)
-
+        
         Raises:
             TypeError: If act_net is not a Net instance
         """
@@ -113,13 +113,13 @@ class ACTToTorch:
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-
+        
         Iterates through ACT layers, creates corresponding PyTorch layers,
         transfers weights, and assembles into VerifiableModel model.
-
+        
         Returns:
             VerifiableModel model with embedded constraint checking
-
+        
         Raises:
             ValueError: If no valid PyTorch layers can be created
         """
@@ -128,7 +128,7 @@ class ACTToTorch:
             return self._run_graph_model()
         else:
             return self._run_sequential_model()
-
+    
     def _run_sequential_model(self) -> nn.Module:
         """Sequential model conversion for linear chains."""
         torch_layers = []
@@ -151,31 +151,31 @@ class ACTToTorch:
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
-
+                
                 # Build InputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
                 if 'eps' in meta:
                     spec_dict['eps'] = meta['eps']
-
+                
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['lb', 'ub', 'center', 'A', 'b']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
+                
                 spec = InputSpec(**spec_dict)
                 # InputSpecLayer now always returns tuples
                 torch_layers.append(InputSpecLayer(spec))
                 has_input_spec = True
                 continue
-
+            
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
-
+                
                 # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
@@ -186,13 +186,13 @@ class ACTToTorch:
                     spec_dict['margin'] = meta['margin']
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
-
+                
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
+                
                 spec = OutputSpec(**spec_dict)
                 # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
