@@ -746,7 +746,14 @@ class VerifiableGraphModel(nn.Module):
         - Topological execution order (follows ACT Net layer sequence)
         - Output caching (outputs[layer_id] stores intermediate results)
         - Spec layer integration (InputSpecLayer, OutputSpecLayer)
-        - Strict mode support (inherited from ACTToTorch converter)
+        - Strict mode support: fail on missing modules instead of silently passing
+
+    Strict Mode:
+        Controlled via VerifiableGraphModel.set_strict_mode(True/False).
+        When enabled:
+        - Raises ValueError on missing layer modules (instead of pass-through)
+        - Raises ValueError on input/output constraint violations
+        Default: False (graceful fallback behavior).
 
     Architecture:
         1. INPUT layer: Stores input tensor
@@ -768,16 +775,23 @@ class VerifiableGraphModel(nn.Module):
         - 'output_satisfied': True if output constraints satisfied
         - 'output_explanation': Human-readable output constraint result
 
+    Raises:
+        ValueError: If strict mode enabled and layer module missing or constraints violated
+
     Example:
-        # Create DAG model via ACTToTorch
-        converter = ACTToTorch(act_net, use_graph_model=True, strict=True)
+        # Create DAG model via ACTToTorch with strict mode
+        VerifiableGraphModel.set_strict_mode(True)
+        converter = ACTToTorch(act_net, use_graph_model=True)
         model = converter.run()  # Returns VerifiableGraphModel
 
-        # Forward pass
+        # Forward pass (fails fast on missing modules)
         result = model(input_tensor)
         print(f"Output: {result['output']}")
         print(f"Input OK: {result['input_satisfied']}")
     """
+
+    # Class-level strict mode setting (shared across all instances)
+    _strict_mode: bool = False
 
     def __init__(
         self,
@@ -813,6 +827,25 @@ class VerifiableGraphModel(nn.Module):
             else:
                 # Callable (e.g., lambda for ADD)
                 self.layer_callables[layer_id] = module
+
+    @classmethod
+    def set_strict_mode(cls, enabled: bool) -> None:
+        """
+        Enable or disable strict mode.
+
+        When enabled:
+        - Raises ValueError on missing layer modules (instead of pass-through)
+        - Raises ValueError on input/output constraint violations
+
+        Args:
+            enabled: True to enable strict mode, False to disable
+        """
+        cls._strict_mode = enabled
+
+    @classmethod
+    def get_strict_mode(cls) -> bool:
+        """Get current strict mode setting."""
+        return cls._strict_mode
 
     def forward(self, x: torch.Tensor):
         """
@@ -854,18 +887,25 @@ class VerifiableGraphModel(nn.Module):
             elif layer_id in self.layer_callables:
                 module = self.layer_callables[layer_id]
             else:
-                # Layer was skipped (non-strict mode)
-                # Pass through predecessor's output as identity
-                preds = self.net.preds.get(layer_id, [])
-                if preds:
-                    # Use first predecessor's output
-                    outputs[layer_id] = outputs[preds[0]]
+                # Layer module not found
+                if self._strict_mode:
+                    # STRICT MODE: Fail on missing modules
+                    raise ValueError(
+                        f"Layer {layer_id} ({kind}): missing module in strict mode. "
+                        f"All layers must have corresponding modules for strict verification."
+                    )
                 else:
-                    # Fallback: use previous layer's output
-                    pred_ids = [lid for lid in outputs.keys() if lid < layer_id]
-                    if pred_ids:
-                        outputs[layer_id] = outputs[max(pred_ids)]
-                continue
+                    # Non-strict mode: Pass through predecessor's output as identity
+                    preds = self.net.preds.get(layer_id, [])
+                    if preds:
+                        # Use first predecessor's output
+                        outputs[layer_id] = outputs[preds[0]]
+                    else:
+                        # Fallback: use previous layer's output
+                        pred_ids = [lid for lid in outputs.keys() if lid < layer_id]
+                        if pred_ids:
+                            outputs[layer_id] = outputs[max(pred_ids)]
+                    continue
 
             # Get inputs based on preds from Net.preds dictionary
             preds = self.net.preds.get(layer_id, [])
@@ -927,6 +967,17 @@ class VerifiableGraphModel(nn.Module):
         # Get final output (last layer's output)
         final_layer_id = max(outputs.keys())
         final_output = outputs[final_layer_id]
+
+        # STRICT MODE: Fail on constraint violations
+        if self._strict_mode:
+            if not input_satisfied:
+                raise ValueError(
+                    f"Input constraint violated in strict mode: {input_explanation}"
+                )
+            if not output_satisfied:
+                raise ValueError(
+                    f"Output constraint violated in strict mode: {output_explanation}"
+                )
 
         return {
             'output': final_output,

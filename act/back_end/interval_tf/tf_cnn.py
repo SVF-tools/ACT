@@ -17,11 +17,55 @@ from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
 from act.back_end.utils import affine_bounds, pwl_meta, bound_var_interval, scale_interval
 
 
-def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
+def _assert_shape_match(L: Layer, Bin: Bounds, expected_ndim: int) -> Tuple:
+    """Assert input bounds match metadata shape and return validated shape tuple.
+
+    Args:
+        L: Layer with input_shape metadata
+        Bin: Input bounds (must be 1D flattened)
+        expected_ndim: Expected dimensionality (3=1D, 4=2D, 5=3D)
+
+    Returns:
+        Validated input_shape as tuple
+
+    Raises:
+        AssertionError: If shape validation fails
     """
-    Transfer function for Conv2d layer.
-    
+    # Bounds must be 1D (flattened)
+    assert Bin.lb.dim() == 1, (
+        f"Layer {L.id} ({L.kind}): bounds must be 1D (flattened), got {Bin.lb.shape}"
+    )
+
+    # input_shape must exist
+    assert "input_shape" in L.meta, (
+        f"Layer {L.id} ({L.kind}): missing 'input_shape' in metadata. "
+        f"CNN layers require input_shape for strict shape validation."
+    )
+
+    input_shape = tuple(L.meta["input_shape"])
+    assert len(input_shape) == expected_ndim, (
+        f"Layer {L.id} ({L.kind}): expected {expected_ndim}D input_shape, "
+        f"got {len(input_shape)}D shape {input_shape}"
+    )
+
+    # Validate bounds numel matches shape
+    expected_numel = 1
+    for d in input_shape:
+        expected_numel *= int(d)
+    actual_numel = Bin.lb.numel()
+    assert actual_numel == expected_numel, (
+        f"Layer {L.id} ({L.kind}): bounds size mismatch. "
+        f"Expected {expected_numel} from input_shape={input_shape}, got {actual_numel}."
+    )
+
+    return input_shape
+
+
+def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for Conv2d layer.
+
     Linearizes the convolution operation using im2col transformation.
+    Requires input_shape metadata in (N, C, H, W) format.
     """
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_h, kernel_w]
@@ -30,7 +74,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
     groups = L.meta.get("groups", 1)
-    
+
     # Normalize stride/padding/dilation to tuples
     if isinstance(stride, int):
         stride = (stride, stride)
@@ -38,49 +82,69 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
         padding = (padding, padding)
     if isinstance(dilation, int):
         dilation = (dilation, dilation)
-    
-    # Get weight dimensions
+
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    assert "input_shape" in L.meta, (
+        f"Layer {L.id} (CONV2D): missing 'input_shape' in metadata. "
+        f"CONV2D requires input_shape=(N,C,H,W) for strict shape validation."
+    )
+    input_shape = tuple(L.meta["input_shape"])
+    assert len(input_shape) == 4, (
+        f"Layer {L.id} (CONV2D): input_shape must be 4D (N,C,H,W), got {input_shape}"
+    )
+
+    # Validate bounds match metadata
+    expected_numel = 1
+    for d in input_shape:
+        expected_numel *= int(d)
+    actual_numel = Bin.lb.numel()
+    assert actual_numel == expected_numel, (
+        f"Layer {L.id} (CONV2D): bounds size mismatch. "
+        f"Expected {expected_numel} from input_shape={input_shape}, got {actual_numel}."
+    )
+
+    # Extract validated dimensions from metadata (no inference)
+    _, in_channels, in_h, in_w = input_shape
+
+    # Get weight dimensions and validate
     out_channels, in_channels_per_group, kernel_h, kernel_w = weight.shape
-    in_channels = in_channels_per_group * groups
-    
-    # Get ACTUAL input size from bounds (not metadata - metadata may be wrong!)
-    actual_input_size = Bin.lb.numel()
-    
-    # Infer spatial dimensions from actual input size
-    spatial_size = actual_input_size // in_channels
-    in_h = in_w = int(spatial_size ** 0.5)  # Assume square initially
-    
-    # Verify and adjust if needed
-    if in_h * in_w * in_channels != actual_input_size:
-        # Try to find correct rectangular dimensions
-        for h in range(int(spatial_size ** 0.5) + 10, 0, -1):
-            if spatial_size % h == 0:
-                in_h = h
-                in_w = spatial_size // h
-                if in_h * in_w * in_channels == actual_input_size:
-                    break
-    
-    input_shape = (1, in_channels, in_h, in_w)
+    expected_in_ch = in_channels_per_group * groups
+    assert in_channels == expected_in_ch, (
+        f"Layer {L.id} (CONV2D): channel mismatch. input_shape has {in_channels} channels, "
+        f"but weight expects {expected_in_ch} (in_ch_per_group={in_channels_per_group} * groups={groups})."
+    )
     
     # Compute output dimensions using standard conv formula
     out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
     output_shape = (1, out_channels, out_h, out_w)
-    
+
+    # Validate output_shape metadata if present
+    if "output_shape" in L.meta:
+        meta_output_shape = tuple(L.meta["output_shape"])
+        assert output_shape == meta_output_shape, (
+            f"Layer {L.id} (CONV2D): output_shape mismatch. "
+            f"Computed {output_shape}, metadata has {meta_output_shape}."
+        )
+
+    # Validate output dimensions are positive
+    assert out_h > 0 and out_w > 0, (
+        f"Layer {L.id} (CONV2D): invalid output dimensions out_h={out_h}, out_w={out_w}. "
+        f"Check kernel/stride/padding/dilation parameters."
+    )
+
     # Create equivalent linear transformation matrix using im2col
-    # This converts the convolution to matrix multiplication
     W_equiv = _conv2d_to_linear_matrix(
         weight, input_shape, output_shape, stride, padding, dilation, groups
     )
-    
+
     # Apply affine transformation
-    # Use actual matrix output size to ensure bias matches (metadata may be inconsistent)
-    actual_output_size = W_equiv.shape[0]
-    spatial_size_per_channel = actual_output_size // out_channels
+    output_flat_size = out_channels * out_h * out_w
+    spatial_size_per_channel = out_h * out_w
     if bias is not None:
         b_equiv = bias.repeat_interleave(spatial_size_per_channel)
     else:
-        b_equiv = torch.zeros(actual_output_size, dtype=weight.dtype, device=weight.device)
+        b_equiv = torch.zeros(output_flat_size, dtype=weight.dtype, device=weight.device)
     
     # Compute bounds using affine transformation
     W_pos = torch.clamp(W_equiv, min=0)
@@ -115,17 +179,24 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for MaxPool1d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
+    b, c, w = input_shape
+
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
 
-    input_shape = L.meta["input_shape"]   # [batch, channels, width]
-    output_shape = L.meta["output_shape"] # [batch, channels, out_w]
-
-    b, c, w = input_shape
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (MAXPOOL1D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     _, _, out_w = output_shape
 
+    # Reshape using validated shape (no guessing)
     lb_in = Bin.lb.view(b, c, w)
     ub_in = Bin.ub.view(b, c, w)
 
@@ -151,28 +222,25 @@ def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for MaxPool2d layer.
-    
-    Uses interval arithmetic to bound the max pooling operation.
-    """
+    """Transfer function for MaxPool2d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
+    batch_size, channels, in_h, in_w = input_shape
+
     # Extract pooling parameters
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
-    
-    # Shape information
-    input_shape = L.meta["input_shape"]  # [batch, channels, height, width]
-    output_shape = L.meta["output_shape"]  # [batch, channels, out_h, out_w]
-    
-    batch_size, channels, in_h, in_w = input_shape
+
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (MAXPOOL2D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     _, _, out_h, out_w = output_shape
-    
-    # For max pooling, we need to consider all possible inputs in each pool window
-    # The output bounds are the max of upper bounds and max of lower bounds in each window
-    
-    # Reshape bounds for pooling operation
+
+    # Reshape using validated shape (no guessing)
     input_lb = Bin.lb.view(batch_size, channels, in_h, in_w)
     input_ub = Bin.ub.view(batch_size, channels, in_h, in_w)
     
@@ -201,14 +269,21 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for AvgPool1d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
+    b, c, w = input_shape
+
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
 
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (AVGPOOL1D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
 
-    b, c, w = input_shape
+    # Reshape using validated shape (no guessing)
     lb_in = Bin.lb.view(b, c, w)
     ub_in = Bin.ub.view(b, c, w)
 
@@ -229,15 +304,22 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for MaxPool3d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=5)
+    b, c, d, h, w = input_shape
+
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
 
-    input_shape = L.meta["input_shape"]   # [b, c, d, h, w]
-    output_shape = L.meta["output_shape"] # [b, c, od, oh, ow]
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (MAXPOOL3D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
 
-    b, c, d, h, w = input_shape
+    # Reshape using validated shape (no guessing)
     lb_in = Bin.lb.view(b, c, d, h, w)
     ub_in = Bin.ub.view(b, c, d, h, w)
 
@@ -262,6 +344,7 @@ def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_pad(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for Pad layer with strict shape validation."""
     pads = L.meta.get("pad", None)
     if pads is None:
         pads = L.meta.get("pads", None)
@@ -272,7 +355,22 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     mode = L.meta.get("mode", "constant")
     value = float(L.meta.get("value", 0.0))
 
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    assert "input_shape" in L.meta, (
+        f"Layer {L.id} (PAD): missing 'input_shape' in metadata."
+    )
     in_shape = tuple(L.meta["input_shape"])
+
+    # Validate bounds match input_shape
+    expected_numel = 1
+    for d in in_shape:
+        expected_numel *= int(d)
+    assert Bin.lb.numel() == expected_numel, (
+        f"Layer {L.id} (PAD): bounds size mismatch. "
+        f"Expected {expected_numel} from input_shape={in_shape}, got {Bin.lb.numel()}."
+    )
+
+    # Reshape using validated shape (no guessing)
     lb_in = Bin.lb.view(*in_shape)
     ub_in = Bin.ub.view(*in_shape)
 
@@ -293,18 +391,37 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for Flatten layer with strict shape validation."""
     lb = Bin.lb
     ub = Bin.ub
 
-    if "input_shape" in L.meta:
-        input_shape = tuple(L.meta["input_shape"])
-    else:
-        input_shape = (int(lb.numel()),)
+    # STRICT MODE: Assert bounds are 1D
+    assert lb.dim() == 1, (
+        f"Layer {L.id} (FLATTEN): bounds must be 1D (flattened), got {lb.shape}"
+    )
 
-    if "output_shape" in L.meta:
-        output_shape = tuple(L.meta["output_shape"])
-    else:
-        output_shape = (int(lb.numel()),)
+    # STRICT MODE: Assert input_shape metadata exists
+    assert "input_shape" in L.meta, (
+        f"Layer {L.id} (FLATTEN): missing 'input_shape' in metadata. "
+        f"FLATTEN requires input_shape for strict shape validation."
+    )
+    input_shape = tuple(L.meta["input_shape"])
+
+    # Validate bounds numel matches input_shape
+    expected_numel = 1
+    for d in input_shape:
+        expected_numel *= int(d)
+    assert lb.numel() == expected_numel, (
+        f"Layer {L.id} (FLATTEN): bounds size mismatch. "
+        f"Expected {expected_numel} from input_shape={input_shape}, got {lb.numel()}."
+    )
+
+    # STRICT MODE: Assert output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (FLATTEN): missing 'output_shape' in metadata. "
+        f"FLATTEN requires output_shape for strict shape validation."
+    )
+    output_shape = tuple(L.meta["output_shape"])
 
     axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
     start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
@@ -396,21 +513,21 @@ def _conv2d_to_linear_matrix(
 
 
 def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for AvgPool2d layer.
-    
-    Uses linear transformation to handle average pooling.
-    """
+    """Transfer function for AvgPool2d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
+    batch_size, channels, in_h, in_w = input_shape
+
     # Extract pooling parameters
     kernel_size = L.meta["kernel_size"]
     stride = L.meta.get("stride", kernel_size)
     padding = L.meta.get("padding", 0)
-    
-    # Input/output shape information
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
-    
-    batch_size, channels, in_h, in_w = input_shape
+
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (AVGPOOL2D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     _, _, out_h, out_w = output_shape
     
     # Create equivalent linear transformation for average pooling
@@ -508,7 +625,10 @@ def _avgpool2d_to_linear_matrix(
 # -------- Additional CNN Layers --------
 
 def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Conv1d layer."""
+    """Transfer function for Conv1d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
+
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_w]
     bias = L.params.get("bias", None)
@@ -516,10 +636,12 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
     groups = L.meta.get("groups", 1)
-    
-    # Input/output shape information
-    input_shape = L.meta["input_shape"]   # [batch, channels, width]
-    output_shape = L.meta["output_shape"] # [batch, out_channels, out_w]
+
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (CONV1D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _conv1d_to_linear_matrix(
@@ -557,7 +679,10 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Conv3d layer."""
+    """Transfer function for Conv3d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=5)
+
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_d, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
@@ -565,10 +690,12 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
     groups = L.meta.get("groups", 1)
-    
-    # Input/output shape information
-    input_shape = L.meta["input_shape"]   # [batch, channels, depth, height, width]
-    output_shape = L.meta["output_shape"] # [batch, out_channels, out_d, out_h, out_w]
+
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (CONV3D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _conv3d_to_linear_matrix(
@@ -606,7 +733,10 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for ConvTranspose2d layer."""
+    """Transfer function for ConvTranspose2d layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
+
     # Extract parameters
     weight = L.params["weight"]  # [in_channels, out_channels, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
@@ -615,10 +745,12 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     output_padding = L.meta.get("output_padding", 0)
     dilation = L.meta.get("dilation", 1)
     groups = L.meta.get("groups", 1)
-    
-    # Input/output shape information
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
+
+    # Validate output_shape metadata exists
+    assert "output_shape" in L.meta, (
+        f"Layer {L.id} (CONVTRANSPOSE2D): missing 'output_shape' in metadata."
+    )
+    output_shape = tuple(L.meta["output_shape"])
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _convtranspose2d_to_linear_matrix(
@@ -656,7 +788,24 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
+    """Transfer function for Upsample layer with strict shape validation."""
+    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Upsample is typically 4D (N,C,H,W) but can also be 3D or 5D
+    assert "input_shape" in L.meta, (
+        f"Layer {L.id} (UPSAMPLE): missing 'input_shape' in metadata."
+    )
     in_shape = tuple(L.meta["input_shape"])
+
+    # Validate bounds match input_shape
+    expected_numel = 1
+    for d in in_shape:
+        expected_numel *= int(d)
+    assert Bin.lb.numel() == expected_numel, (
+        f"Layer {L.id} (UPSAMPLE): bounds size mismatch. "
+        f"Expected {expected_numel} from input_shape={in_shape}, got {Bin.lb.numel()}."
+    )
+
+    # Reshape using validated shape (no guessing)
     x_lb = Bin.lb.view(*in_shape)
     x_ub = Bin.ub.view(*in_shape)
 
