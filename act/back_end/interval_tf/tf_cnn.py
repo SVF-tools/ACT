@@ -391,37 +391,48 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Flatten layer with strict shape validation."""
+    """Transfer function for Flatten layer.
+
+    FLATTEN is a simple reshape operation that preserves element count.
+    Shape metadata is optional for backward compatibility with pre-existing
+    network files. When metadata is present, it is validated.
+    """
     lb = Bin.lb
     ub = Bin.ub
 
-    # STRICT MODE: Assert bounds are 1D
+    # Assert bounds are 1D (flattened representation)
     assert lb.dim() == 1, (
         f"Layer {L.id} (FLATTEN): bounds must be 1D (flattened), got {lb.shape}"
     )
 
-    # STRICT MODE: Assert input_shape metadata exists
-    assert "input_shape" in L.meta, (
-        f"Layer {L.id} (FLATTEN): missing 'input_shape' in metadata. "
-        f"FLATTEN requires input_shape for strict shape validation."
-    )
-    input_shape = tuple(L.meta["input_shape"])
+    # Shape metadata is OPTIONAL for FLATTEN (backward compatibility)
+    # FLATTEN simply reshapes data - the output is the same as input (1D flattened)
+    input_shape = None
+    output_shape = None
 
-    # Validate bounds numel matches input_shape
-    expected_numel = 1
-    for d in input_shape:
-        expected_numel *= int(d)
-    assert lb.numel() == expected_numel, (
-        f"Layer {L.id} (FLATTEN): bounds size mismatch. "
-        f"Expected {expected_numel} from input_shape={input_shape}, got {lb.numel()}."
-    )
+    if "input_shape" in L.meta:
+        input_shape = tuple(L.meta["input_shape"])
+        # Validate bounds numel matches input_shape when metadata is present
+        expected_numel = 1
+        for d in input_shape:
+            expected_numel *= int(d)
+        assert lb.numel() == expected_numel, (
+            f"Layer {L.id} (FLATTEN): bounds size mismatch. "
+            f"Expected {expected_numel} from input_shape={input_shape}, got {lb.numel()}."
+        )
 
-    # STRICT MODE: Assert output_shape metadata exists
-    assert "output_shape" in L.meta, (
-        f"Layer {L.id} (FLATTEN): missing 'output_shape' in metadata. "
-        f"FLATTEN requires output_shape for strict shape validation."
-    )
-    output_shape = tuple(L.meta["output_shape"])
+    if "output_shape" in L.meta:
+        output_shape = tuple(L.meta["output_shape"])
+        expected = int(torch.tensor(output_shape).prod().item())
+        assert lb.numel() == expected, (
+            f"flatten output numel {lb.numel()} != expected {expected} from output_shape={output_shape}"
+        )
+
+    # Default shapes: infer from bounds if metadata not provided
+    if input_shape is None:
+        input_shape = (lb.numel(),)  # 1D representation
+    if output_shape is None:
+        output_shape = (lb.numel(),)  # 1D representation
 
     axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
     start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
@@ -430,9 +441,7 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     lb_flat = lb.view(-1)
     ub_flat = ub.view(-1)
     assert lb_flat.numel() == len(L.out_vars), f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.numel()}"
-    if "output_shape" in L.meta:
-        expected = int(torch.tensor(output_shape).prod().item())
-        assert lb_flat.numel() == expected, f"flatten output numel {lb_flat.numel()} != expected {expected}"
+
     B_out = Bounds(lb_flat, ub_flat)
     # Note: bounds validity is checked in analyze.py with detailed debug info
 
