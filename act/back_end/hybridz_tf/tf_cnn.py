@@ -147,18 +147,17 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     # For HybridZ: track which neurons contribute to maximum
     lb_pool = F.max_pool2d(Bin_lb, kernel_size, stride=stride, padding=padding)
     ub_pool = F.max_pool2d(Bin_ub, kernel_size, stride=stride, padding=padding)
-    
-    # For max pooling, lower bound is more complex - use max of lower bounds in each region
-    # This is conservative but sound
-    lb = lb_pool.squeeze(0).flatten() if len(L.out_vars) != lb_pool.numel() else lb_pool.squeeze(0)
-    ub = ub_pool.squeeze(0).flatten() if len(L.out_vars) != ub_pool.numel() else ub_pool.squeeze(0)
+
+    # Flatten to 1D (bounds must always be 1D)
+    lb = lb_pool.reshape(-1)
+    ub = ub_pool.reshape(-1)
 
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
     # Max pooling generates max constraints
-    cons.add_op( f"maxpool2d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size, 
-        stride=stride, padding=padding, input_shape=in_shape, output_shape=L.meta.get("output_shape"),)
+    cons.add_op( f"maxpool2d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size,
+        stride=stride, padding=padding, input_shape=input_shape, output_shape=L.meta.get("output_shape"),)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -181,16 +180,17 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     # Average pooling is linear - exact bounds
     lb_pool = F.avg_pool2d(Bin_lb, kernel_size, stride=stride, padding=padding)
     ub_pool = F.avg_pool2d(Bin_ub, kernel_size, stride=stride, padding=padding)
-    
-    lb = lb_pool.squeeze(0).flatten() if len(L.out_vars) != lb_pool.numel() else lb_pool.squeeze(0)
-    ub = ub_pool.squeeze(0).flatten() if len(L.out_vars) != ub_pool.numel() else ub_pool.squeeze(0)
-    
+
+    # Flatten to 1D (bounds must always be 1D)
+    lb = lb_pool.reshape(-1)
+    ub = ub_pool.reshape(-1)
+
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
     cons.add_op(
         f"avgpool2d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size, stride=stride,
-        padding=padding, input_shape=in_shape, output_shape=L.meta.get("output_shape"),)
+        padding=padding, input_shape=input_shape, output_shape=L.meta.get("output_shape"),)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -347,7 +347,7 @@ def hybridz_tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     cons.add_op(f"maxpool1d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size,
                 stride=stride, padding=padding, dilation=dilation,
-                input_shape=in_shape, output_shape=L.meta.get("output_shape"))
+                input_shape=input_shape, output_shape=L.meta.get("output_shape"))
 
     return Fact(bounds=Bout, cons=cons)
 
@@ -378,7 +378,7 @@ def hybridz_tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     cons.add_op(f"maxpool3d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size,
                 stride=stride, padding=padding, dilation=dilation,
-                input_shape=in_shape, output_shape=L.meta.get("output_shape"))
+                input_shape=input_shape, output_shape=L.meta.get("output_shape"))
 
     return Fact(bounds=Bout, cons=cons)
 
@@ -408,7 +408,7 @@ def hybridz_tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     cons.add_op(f"avgpool1d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size,
                 stride=stride, padding=padding,
-                input_shape=in_shape, output_shape=L.meta.get("output_shape"))
+                input_shape=input_shape, output_shape=L.meta.get("output_shape"))
 
     return Fact(bounds=Bout, cons=cons)
 
