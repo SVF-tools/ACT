@@ -53,7 +53,7 @@ jobs:
       - name: Generate Networks (float64)
         run: |
           cd ${{ github.workspace }}
-          python -m act.back_end --generate --device cpu --dtype float64
+          python -m act.back_end --generate --device cpu --dtype float64 --tf-targets interval hybridz dual
       
       - name: Run Serialization Tests (float64)
         run: |
@@ -90,7 +90,7 @@ jobs:
       - name: Generate Networks (float32)
         run: |
           cd ${{ github.workspace }}
-          python -m act.back_end --generate --device cpu --dtype float32
+          python -m act.back_end --generate --device cpu --dtype float32 --tf-targets interval hybridz dual
       
       - name: Run Serialization Tests (float32)
         run: |

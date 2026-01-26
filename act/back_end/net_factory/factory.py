@@ -13,9 +13,15 @@
 #   - Orchestrate sampling, building, and serialization
 #   - Generate weight tensors and handle layer variables
 #   - Write optional manifest for downstream tools
+#   - TF-aware network generation (via tf_capabilities)
 #
 #   Flow:
 #   config -> ConfigSampler -> layer_builder -> Net -> JSON
+#
+#   TF-Aware Generation:
+#   NetFactory uses tf_capabilities module to dynamically determine allowed
+#   layers based on target Transfer Functions (IntervalTF, HybridzTF, DualTF).
+#   This enables generating networks that are compatible with specific TFs.
 #
 #   Validation Strategy:
 #   NetFactory relies on ACT's existing validation infrastructure:
@@ -29,30 +35,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import secrets
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import torch
 import yaml
 
 from act.back_end.core import Layer, Net
 from act.back_end.serialization.serialization import NetSerializer
+from .tf_capabilities import get_allowed_layers
 from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
 from act.util.path_config import get_examples_gen_config_path
 
 from .layer_builder import build_cnn_layers, build_mlp_layers
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
-# Coverage Target - interval_tf/tf_mlp.py + tf_cnn.py Supported Layers
+# Coverage Target - Default Layer List (Legacy Fallback)
 # ============================================================================
-# This list defines all layer types from interval_tf/tf_mlp.py + tf_cnn.py
-# that we want to cover in generated networks (50 layers total)
+# This list defines default layer types for coverage tracking.
+# When tf_targets is specified, layers are dynamically determined from
+# tf_capabilities module based on each TF's registered layer support.
+#
+# Note: This constant is kept for backward compatibility. New code should
+# use get_allowed_layers() from tf_capabilities for dynamic layer sets.
 
-COVERAGE_TARGET_LAYERS = [
+_DEFAULT_COVERAGE_LAYERS = [
     # Linear and normalization operations
     "DENSE", "BIAS", "SCALE", "BN",
     # Activations (A-group: element-wise, low risk)
@@ -70,6 +84,9 @@ COVERAGE_TARGET_LAYERS = [
     "RESHAPE", "TRANSPOSE", "SQUEEZE", "UNSQUEEZE",
     "TILE", "EXPAND", "SLICE", "GATHER", "INDEX_SELECT",
 ]
+
+# Legacy alias for backward compatibility
+COVERAGE_TARGET_LAYERS = _DEFAULT_COVERAGE_LAYERS
 
 
 # ============================================================================
@@ -90,23 +107,69 @@ def _derive_seed(base_seed: int, idx: int, instance_id: str) -> int:
     return _stable_u32_from_bytes(digest)
 
 
-def _choose(rng: random.Random, items: List[Any], *, name: str) -> Any:
-    """Randomly choose from items with error handling."""
-    if not items:
-        raise ValueError(f"Config.{name} must be non-empty")
-    return rng.choice(list(items))
-
-
 # ============================================================================
 # ConfigSampler - Generic YAML-based Sampling
 # ============================================================================
 
 
 class ConfigSampler:
-    """Generic sampler that uses YAML-defined sampling rules."""
+    """
+    Generic sampler that uses YAML-defined sampling rules.
 
-    def __init__(self, config: Dict[str, Any]):
+    Args:
+        config: YAML configuration dictionary.
+        allowed_layers: Set of allowed layer kinds for filtering.
+            When specified, families that require unsupported layers
+            are filtered out during sampling.
+    """
+
+    # Layer requirements for each network family
+    # Maps family name to set of layers that MUST be supported
+    _FAMILY_REQUIRED_LAYERS = {
+        "mlp": {"DENSE", "RELU"},  # Basic MLP needs DENSE and activation
+        "cnn2d": {"CONV2D", "DENSE", "RELU"},  # CNN needs CONV2D, DENSE, activation
+    }
+
+    # Activation functions available for sampling
+    _ALL_ACTIVATIONS = frozenset({
+        "RELU", "LRELU", "SIGMOID", "TANH", "RELU6",
+        "HARDTANH", "HARDSIGMOID", "HARDSWISH", "SILU",
+        "SOFTPLUS", "MISH", "SOFTSIGN", "ABS",
+    })
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        allowed_layers: Optional[FrozenSet[str]] = None
+    ):
         self.config = config
+        self.allowed_layers = allowed_layers or frozenset(_DEFAULT_COVERAGE_LAYERS)
+
+        # Compute available activations
+        self.available_activations = self._ALL_ACTIVATIONS & self.allowed_layers
+        if not self.available_activations:
+            # Fallback to RELU if no activations available
+            self.available_activations = frozenset({"RELU"})
+            logger.warning("No activations in allowed_layers, defaulting to RELU")
+
+        # Compute available families
+        self.available_families = self._compute_available_families()
+        logger.debug(f"ConfigSampler: available_families={self.available_families}")
+
+    def _compute_available_families(self) -> List[str]:
+        """Compute families whose required layers are all in allowed_layers."""
+        available = []
+        for family, required in self._FAMILY_REQUIRED_LAYERS.items():
+            # Check if family is in config
+            if family not in self.config.get("families", {}):
+                continue
+            # Check if all required layers are allowed
+            if required <= self.allowed_layers:
+                available.append(family)
+            else:
+                missing = required - self.allowed_layers
+                logger.debug(f"Family '{family}' excluded: missing {missing}")
+        return available
 
     def _sample_value(self, rng: random.Random, rule: Any) -> Any:
         """
@@ -182,14 +245,40 @@ class ConfigSampler:
     def sample_family(self, rng: random.Random) -> Tuple[str, Dict[str, Any]]:
         """
         Sample a family and its parameters.
-        Returns: (family_name, sampled_params)
+
+        Filters families based on allowed_layers from tf_capabilities.
+        Only families whose required layers are all supported will be sampled.
+
+        Returns:
+            (family_name, sampled_params)
+
+        Raises:
+            ValueError: If no families are available for the current allowed_layers.
         """
-        # Sample family from selection strategy
+        # Check available families
+        if not self.available_families:
+            raise ValueError(
+                f"No families available for allowed_layers. "
+                f"Required: {self._FAMILY_REQUIRED_LAYERS}, "
+                f"Allowed: {len(self.allowed_layers)} layers"
+            )
+
+        # Sample family from selection strategy (filtered)
         family_selection = self.config["family_selection"]
         if "weighted" in family_selection:
             weights = family_selection["weighted"]
-            family_names = list(weights.keys())
-            weight_values = list(weights.values())
+            # Filter to only available families
+            filtered_weights = {
+                k: v for k, v in weights.items()
+                if k in self.available_families
+            }
+            if not filtered_weights:
+                raise ValueError(
+                    f"No families in config match available_families: "
+                    f"{self.available_families}"
+                )
+            family_names = list(filtered_weights.keys())
+            weight_values = list(filtered_weights.values())
             total = sum(weight_values)
             normalized = [w / total for w in weight_values]
             family = rng.choices(family_names, weights=normalized)[0]
@@ -209,7 +298,21 @@ class ConfigSampler:
         if "conv_channels" in params:
             params["conv_channels"] = tuple(int(x) for x in params["conv_channels"])
 
+        # Filter activation functions based on allowed_layers
+        params = self._filter_activations(params)
+
         return family, params
+
+    def _filter_activations(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Filter activation functions in params to only use allowed ones."""
+        # Check if 'activation' is in params and filter it
+        if "activation" in params:
+            act = params["activation"]
+            if isinstance(act, str) and act.upper() not in self.allowed_layers:
+                # Replace with a random allowed activation
+                params["activation"] = list(self.available_activations)[0]
+                logger.debug(f"Replaced activation '{act}' with '{params['activation']}'")
+        return params
 
     def sample_input_spec(self, rng: random.Random) -> Dict[str, Any]:
         """Sample input specification."""
@@ -296,7 +399,36 @@ class ConfigSampler:
 
 
 class NetFactory:
-    """Simplified generator-driven factory for ACT Nets."""
+    """
+    Generator-driven factory for ACT Nets with TF-aware layer support.
+
+    Args:
+        gen_config_path: Path to YAML generation config file.
+        output_dir: Output directory for generated networks.
+        base_seed: Base seed for deterministic generation.
+        num_instances: Number of networks to generate.
+        name_prefix: Prefix for generated network names.
+        write_manifest: Whether to write manifest.json.
+        manifest_path: Custom manifest file path.
+        tf_targets: List of target TFs for layer filtering.
+            - None: Use all TFs (intersection by default)
+            - ["interval"]: Only IntervalTF layers
+            - ["interval", "hybridz"]: Intersection/union of both
+            - ["interval", "hybridz", "dual"]: All TFs
+        registry_mode: How to combine multiple TF layer sets.
+            - "intersection": Layers supported by ALL targets (default, safest)
+            - "union": Layers supported by ANY target (broader coverage)
+
+    Example:
+        >>> # Generate networks compatible with all TFs (safest)
+        >>> factory = NetFactory(tf_targets=["interval", "hybridz", "dual"])
+
+        >>> # Generate networks for IntervalTF only (full coverage)
+        >>> factory = NetFactory(tf_targets=["interval"])
+
+        >>> # Generate networks compatible with interval OR hybridz
+        >>> factory = NetFactory(tf_targets=["interval", "hybridz"], registry_mode="union")
+    """
 
     def __init__(
         self,
@@ -308,13 +440,24 @@ class NetFactory:
         name_prefix: Optional[str] = None,
         write_manifest: Optional[bool] = None,
         manifest_path: Optional[str] = None,
+        tf_targets: Optional[List[str]] = None,
+        registry_mode: str = "intersection",
     ):
         self.config_path = str(gen_config_path)
         self.config = self._load_config(self.config_path)
         common = self.config["common"]
 
-        # Initialize sampler
-        self.sampler = ConfigSampler(self.config)
+        # TF-aware layer support
+        self.tf_targets = tf_targets
+        self.registry_mode = registry_mode
+        self.allowed_layers = self._compute_allowed_layers(tf_targets, registry_mode)
+        logger.info(
+            f"NetFactory: tf_targets={tf_targets}, mode={registry_mode}, "
+            f"allowed_layers={len(self.allowed_layers)}"
+        )
+
+        # Initialize sampler with allowed layers for filtering
+        self.sampler = ConfigSampler(self.config, allowed_layers=self.allowed_layers)
 
         # Setup generation parameters
         base_seed = base_seed if base_seed is not None else common.get("base_seed")
@@ -332,12 +475,39 @@ class NetFactory:
             manifest_path = common.get("manifest_path")
         self.manifest_path = Path(manifest_path) if manifest_path else (self.output_dir / "manifest.json")
 
-        # Coverage tracking
+        # Coverage tracking - use allowed_layers instead of static list
         self.coverage_mode = common.get("coverage_mode", "basic")
         self.coverage_max_attempts = int(common.get("coverage_max_attempts", 1000))
         self.coverage_report = bool(common.get("coverage_report", True))
-        self.coverage_stats = {layer: 0 for layer in COVERAGE_TARGET_LAYERS}
+        self._init_coverage_stats()
         self.total_networks_generated = 0
+
+    def _compute_allowed_layers(
+        self,
+        tf_targets: Optional[List[str]],
+        registry_mode: str
+    ) -> FrozenSet[str]:
+        """
+        Compute allowed layers based on TF targets and registry mode.
+
+        Falls back to _DEFAULT_COVERAGE_LAYERS if tf_capabilities fails.
+        """
+        try:
+            return get_allowed_layers(tf_targets, registry_mode)
+        except Exception as e:
+            logger.warning(
+                f"Failed to get TF capabilities: {e}. "
+                f"Using default coverage layers."
+            )
+            return frozenset(_DEFAULT_COVERAGE_LAYERS)
+
+    def _init_coverage_stats(self) -> None:
+        """Initialize coverage stats from allowed_layers."""
+        # Filter to only layers that can be generated (exclude base layers)
+        base_layers = {'INPUT', 'INPUT_SPEC', 'OUTPUT_SPEC', 'ASSERT'}
+        identity_layers = {'DROPOUT', 'IDENTITY'}
+        generatable_layers = self.allowed_layers - base_layers - identity_layers
+        self.coverage_stats = {layer: 0 for layer in sorted(generatable_layers)}
 
     @staticmethod
     def _load_config(path: str) -> Dict[str, Any]:
@@ -922,6 +1092,10 @@ class NetFactory:
             "name_prefix": self.name_prefix,
             "nets": list(names),
             "config_path": self.config_path,
+            # TF-aware generation metadata
+            "tf_targets": self.tf_targets,
+            "registry_mode": self.registry_mode,
+            "allowed_layers_count": len(self.allowed_layers),
         }
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1234,7 +1408,7 @@ class NetFactory:
         return {}
 
     def _print_coverage_report(self) -> None:
-        """Print coverage statistics."""
+        """Print coverage statistics with TF-aware information."""
         if not self.coverage_report:
             return
 
@@ -1245,7 +1419,16 @@ class NetFactory:
         print(f"\n{'='*60}")
         print(f"Layer Coverage Report")
         print(f"{'='*60}")
-        print(f"Coverage Rate: {covered}/{total} ({rate:.1f}%)")
+
+        # TF-aware info
+        if self.tf_targets:
+            print(f"TF Targets: {self.tf_targets} (mode: {self.registry_mode})")
+        else:
+            print(f"TF Targets: all (mode: {self.registry_mode})")
+        print(f"Allowed Layers: {len(self.allowed_layers)}")
+        print(f"Trackable Layers: {total}")
+
+        print(f"\nCoverage Rate: {covered}/{total} ({rate:.1f}%)")
         print(f"Total Networks Generated: {self.total_networks_generated}")
 
         uncovered = self._get_uncovered_layers()
@@ -1254,7 +1437,7 @@ class NetFactory:
             for layer in sorted(uncovered):
                 print(f"  - {layer}")
         else:
-            print(f"\n✓ All target layers covered!")
+            print(f"\nAll target layers covered!")
 
         print(f"\nCovered Layers (count > 0):")
         for layer in sorted(self.coverage_stats.keys()):
@@ -1264,14 +1447,14 @@ class NetFactory:
         print(f"{'='*60}\n")
 
     def generate(self) -> List[str]:
-        """Generate all network instances."""
+        """Generate all network instances with TF-aware layer support."""
         common = self.config["common"]
         dtype = str(common["dtype"])
         names: List[str] = []
 
         if self.coverage_mode == "full":
             print(f"Generating networks in FULL coverage mode...")
-            print(f"Target: {len(COVERAGE_TARGET_LAYERS)} layer types")
+            print(f"Target: {len(self.coverage_stats)} layer types")
             print(f"Max attempts: {self.coverage_max_attempts}")
 
             # Generate networks until all layers covered or max attempts reached
@@ -1301,24 +1484,28 @@ class NetFactory:
                 print(f"\n⚠ Reached max attempts ({self.coverage_max_attempts}), some layers may be uncovered")
 
             # Generate minimal templates for remaining uncovered layers
+            # Only generate templates for layers that are in allowed_layers
             uncovered = self._get_uncovered_layers()
             if uncovered:
-                print(f"\nGenerating minimal templates for {len(uncovered)} uncovered layers...")
-                for layer_kind in sorted(uncovered):
-                    template_spec = self._generate_minimal_template(layer_kind)
-                    if template_spec:
-                        try:
-                            name = f"template_{layer_kind.lower()}_minimal"
-                            net = self.create_network(name, template_spec)
-                            self.save_network(net, name)
-                            names.append(name)
-                            self.total_networks_generated += 1
-                            self._record_network_layers(net)
-                            print(f"  ✓ Generated template for {layer_kind}")
-                        except Exception as e:
-                            print(f"  ✗ Failed to generate template for {layer_kind}: {e}")
-                    else:
-                        print(f"  - Skipped {layer_kind} (complex, requires manual implementation)")
+                # Filter to only layers in allowed_layers
+                generatable = [l for l in uncovered if l in self.allowed_layers]
+                if generatable:
+                    print(f"\nGenerating minimal templates for {len(generatable)} uncovered layers...")
+                    for layer_kind in sorted(generatable):
+                        template_spec = self._generate_minimal_template(layer_kind)
+                        if template_spec:
+                            try:
+                                name = f"template_{layer_kind.lower()}_minimal"
+                                net = self.create_network(name, template_spec)
+                                self.save_network(net, name)
+                                names.append(name)
+                                self.total_networks_generated += 1
+                                self._record_network_layers(net)
+                                print(f"  Generated template for {layer_kind}")
+                            except Exception as e:
+                                print(f"  Failed to generate template for {layer_kind}: {e}")
+                        else:
+                            print(f"  - Skipped {layer_kind} (complex, requires manual implementation)")
 
         else:  # basic mode
             print(f"Generating {self.num_instances} networks in BASIC mode...")

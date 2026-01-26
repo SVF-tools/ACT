@@ -111,11 +111,11 @@ def run_network_factory(args):
     print(f"\n{'='*80}")
     print(f"ACT NETWORK FACTORY")
     print(f"{'='*80}\n")
-    
+
     from act.back_end.net_factory import NetFactory
 
     config_file = args.config if args.config else get_examples_gen_config_path()
-    
+
     print(f"Configuration: {config_file}")
     if args.output:
         print(f"Output directory override: {args.output}")
@@ -125,8 +125,14 @@ def run_network_factory(args):
         print(f"Base seed override: {args.base_seed}")
     if args.name_prefix is not None:
         print(f"Name prefix override: {args.name_prefix}")
+
+    # TF-aware generation info
+    tf_targets = getattr(args, 'tf_targets', None)
+    registry_mode = getattr(args, 'registry_mode', 'intersection')
+    if tf_targets:
+        print(f"TF targets: {tf_targets} (mode: {registry_mode})")
     print()
-    
+
     try:
         factory = NetFactory(
             gen_config_path=config_file,
@@ -134,16 +140,18 @@ def run_network_factory(args):
             base_seed=args.base_seed,
             num_instances=args.num,
             name_prefix=args.name_prefix,
+            tf_targets=tf_targets,
+            registry_mode=registry_mode,
         )
         factory.generate()
-        
+
         print(f"\n{'='*80}")
-        print(f"✓ Network generation complete")
+        print(f"Network generation complete")
         print(f"{'='*80}\n")
-        
+
         return 0
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
@@ -296,13 +304,22 @@ Examples:
   # ============================================================================
   # NETWORK FACTORY - Generate example networks
   # ============================================================================
-  
+
   # Generate all example networks from default config
   python -m act.back_end --generate
-  
+
   # Generate with custom config
   python -m act.back_end --generate --config my_config.yaml --output ./networks
-  
+
+  # Generate networks for specific TF (only layers supported by IntervalTF)
+  python -m act.back_end --generate --tf-targets interval
+
+  # Generate networks compatible with both interval and hybridz TFs (intersection)
+  python -m act.back_end --generate --tf-targets interval hybridz
+
+  # Generate networks using layers from ANY specified TF (union mode)
+  python -m act.back_end --generate --tf-targets interval hybridz --registry-mode union
+
   # List available example networks
   python -m act.back_end --list-examples
   
@@ -412,6 +429,24 @@ Examples:
         type=str,
         dest="name_prefix",
         help="Override generator name prefix (default: from config)"
+    )
+    factory_group.add_argument(
+        "--tf-targets",
+        type=str,
+        nargs="+",
+        dest="tf_targets",
+        choices=["interval", "hybridz", "dual"],
+        help="Target TFs for layer filtering (e.g., --tf-targets interval hybridz). "
+             "Networks will only use layers supported by specified TFs."
+    )
+    factory_group.add_argument(
+        "--registry-mode",
+        type=str,
+        dest="registry_mode",
+        choices=["intersection", "union"],
+        default="intersection",
+        help="How to combine multiple TF layer sets: 'intersection' (default, safest) "
+             "uses layers supported by ALL targets; 'union' uses layers supported by ANY target."
     )
     
     # Verification options
