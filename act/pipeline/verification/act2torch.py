@@ -100,17 +100,17 @@ class ACTToTorch:
         if not isinstance(act_net, Net):
             raise TypeError(f"ACTToTorch expects a Net object, got {type(act_net)}")
         self.act_net = act_net
-
+    
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-
+        
         Iterates through ACT layers, creates corresponding PyTorch layers,
         transfers weights, and assembles into VerifiableModel model.
-
+        
         Returns:
             VerifiableModel model with embedded constraint checking
-
+        
         Raises:
             ValueError: If no valid PyTorch layers can be created
         """
@@ -200,7 +200,7 @@ class ACTToTorch:
                    f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
         
         return model
-
+    
     def _transfer_weights(self, torch_layer: nn.Module, act_layer: Layer, 
                          weight_key: str = "W", bias_key: str = "b") -> None:
         """
