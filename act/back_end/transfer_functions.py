@@ -14,6 +14,29 @@
 #===---------------------------------------------------------------------===#
 
 """
+for different layer types during the analysis phase.
+
+The interface supports multiple implementations:
+- IntervalTF: Interval-based bounds propagation  
+- HybridzTF: HybridZ zonotope-based analysis with enhanced precision
+"""
+
+#===- act/back_end/transfer_functions.py - Transfer Function Interface --===#
+# ACT: Abstract Constraint Transformer
+# Copyright (C) 2025– ACT Team
+#
+# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
+# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
+#===---------------------------------------------------------------------===#
+#
+# Purpose:
+#   Transfer Function Interface. Defines the abstract interface for transfer
+#   function implementations in the ACT verification framework. Transfer
+#   functions compute bounds and constraints.
+#
+#===---------------------------------------------------------------------===#
+
+"""
 Transfer function dispatch interface used by the backend analysis.
 
 This module defines a small abstract interface for transfer function
@@ -222,7 +245,7 @@ def set_transfer_function_mode(mode: str = "interval") -> None:
 @torch.no_grad()
 def dispatch_tf(L: Layer, before: Dict[int, Fact], after: Dict[int, Fact], net: Net) -> Fact:
     """Dispatch to current transfer function implementation.
-
+    
     This is the main entry point called by analyze() for each layer.
     Performs shape validation before and after transfer function execution.
     Optionally logs detailed debug information to file when debug_tf is enabled.

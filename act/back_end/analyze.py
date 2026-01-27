@@ -26,7 +26,8 @@ def initialize_tf_mode(mode: str = "interval"):
 
 @torch.no_grad()
 def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple[Dict[int, Fact], Dict[int, Fact], ConSet]:
-    """Perform abstract interpretation on the network starting from entry_fact.
+    """
+    Perform abstract interpretation on the network starting from entry_fact.
 
     This implements a worklist-based forward abstract interpretation algorithm
     that propagates bounds through the network topology. The algorithm handles
@@ -46,7 +47,7 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     Note: The changed_or_maskdiff function handles nan values that can arise from
     operations like 0 * inf = nan during matmul with infinite bounds. It detects
     finiteness changes explicitly to ensure proper convergence.
-
+    
     Args:
         net: ACT network structure containing layers and topology (preds/succs)
         entry_id: ID of the entry (INPUT) layer
@@ -65,13 +66,12 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
         get_transfer_function()  # Check if already initialized
     except RuntimeError:
         initialize_tf_mode("interval")  # Default to interval mode
-
+        
     before: Dict[int, Fact] = {}
     after:  Dict[int, Fact] = {}
     globalC = ConSet()
 
-    # Initialize all layers with infinite bounds (±inf).
-    # These will be refined as the worklist propagates finite bounds.
+    # init with +/- inf boxes (vector length per layer's out_vars)
     for L in net.layers:
         n = len(L.out_vars)
         hi = torch.full((n,), float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
@@ -86,39 +86,30 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     # Worklist algorithm: process layers in order, re-add successors on change
     WL = deque([entry_id])
     while WL:
-        lid = WL.popleft()
-        L = net.by_id[lid]
+        lid = WL.popleft(); L = net.by_id[lid]
 
         # DAG merge: join bounds from all predecessors using box_join
         # For layers with multiple predecessors (e.g., ADD in residual blocks),
         # we compute the interval hull of all predecessor bounds.
         if net.preds.get(lid):
             preds_list = net.preds[lid]
-            # Initialize from first predecessor
+            # Initialize from first predecessor (not infinite bounds)
             first_bounds = after[preds_list[0]].bounds
             Bjoin = Bounds(lb=first_bounds.lb.clone(), ub=first_bounds.ub.clone())
             Cjoin = ConSet()
-            for con in after[preds_list[0]].cons:
-                Cjoin.replace(con)
+            for con in after[preds_list[0]].cons: Cjoin.replace(con)
             # Join with remaining predecessors (for DAG merge points)
             for pid in preds_list[1:]:
                 Bjoin = box_join(Bjoin, after[pid].bounds)
-                for con in after[pid].cons:
-                    Cjoin.replace(con)
+                for con in after[pid].cons: Cjoin.replace(con)
             before[lid] = Fact(Bjoin, Cjoin)
 
-        # Apply transfer function to compute output bounds
         out_fact = dispatch_tf(L, before, after, net)
 
-        # Check if bounds changed significantly (handles nan from inf arithmetic)
         if changed_or_maskdiff(L, out_fact.bounds, None, eps):
             after[lid] = out_fact
             update_cache(L, out_fact.bounds, None)
-            # Collect constraints globally
-            for con in out_fact.cons:
-                globalC.replace(con)
-            # Add all successors to worklist for re-processing
-            for sid in net.succs.get(lid, []):
-                WL.append(sid)
+            for con in out_fact.cons: globalC.replace(con)
+            for sid in net.succs.get(lid, []): WL.append(sid)
 
     return before, after, globalC

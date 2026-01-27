@@ -93,7 +93,7 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     """
     Create seed Bounds from INPUT_SPEC layers.
     Prefers BOX, then LINF_BALL, raises if only LIN_POLY exists.
-
+    
     Note: This extracts only box bounds for seeding abstract interpretation.
     All constraints (including LIN_POLY) are added via add_all_input_specs().
     Returns flat 1D bounds (no batch dimension).
@@ -118,22 +118,22 @@ def seed_from_input_specs(spec_layers) -> Bounds:
                 center_flat = center.reshape(-1)  # Flatten to 1D
                 e = torch.tensor(eps, dtype=center.dtype, device=center.device)
                 return Bounds(center_flat - e, center_flat + e)
-
+    
     # LIN_POLY only -> error
     if any(L.meta.get("kind") == InKind.LIN_POLY for L in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
-
+    
     raise ValueError("No valid input specification found for seeding.")
 
 def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> None:
     """
     Add all INPUT_SPEC constraints to constraint set.
-
+    
     This function adds:
     - BOX constraints (box bounds)
     - LINF_BALL constraints (converted to box)
     - LIN_POLY constraints (linear polytope A·x ≤ b)
-
+    
     The LIN_POLY constraints are tagged with "in:linpoly" and will be
     exported to the solver via export_to_solver() in cons_exportor.py.
     """

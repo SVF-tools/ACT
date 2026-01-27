@@ -74,7 +74,7 @@ def _assert_shape_match(L: Layer, Bin: Bounds, expected_ndim: int) -> Tuple:
 
 @torch.no_grad()
 def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
-    """HybridZ transfer function for 2D convolution with strict shape validation."""
+    """HybridZ transfer function for 2D convolution with enhanced precision."""
     # STRICT MODE: Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
     N, C, H, W = input_shape
@@ -130,7 +130,7 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
 
 @torch.no_grad()
 def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """HybridZ transfer function for 2D max pooling with strict shape validation."""
+    """HybridZ transfer function for 2D max pooling."""
     # STRICT MODE: Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
     N, C, H, W = input_shape
@@ -217,19 +217,19 @@ def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
 def hybridz_tf_reshape(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for general tensor reshaping."""
     target_shape = L.meta.get("target_shape")
-
+    
     # Reshape bounds preserving values
     lb = Bin.lb.reshape(target_shape) if target_shape else Bin.lb
     ub = Bin.ub.reshape(target_shape) if target_shape else Bin.ub
-
+    
     # Flatten for output variables
     lb = lb.flatten()
     ub = ub.flatten()
     Bout = Bounds(lb=lb, ub=ub)
-
+    
     cons = ConSet()
     cons.add_op(f"reshape:{L.id}", list(L.out_vars + L.in_vars), target_shape=target_shape, input_shape=L.meta.get("input_shape"), output_shape=L.meta.get("output_shape"))
-
+    
     return Fact(bounds=Bout, cons=cons)
 
 

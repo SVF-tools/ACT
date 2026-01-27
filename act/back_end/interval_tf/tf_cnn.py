@@ -74,7 +74,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.meta.get("padding", 0)
     dilation = L.meta.get("dilation", 1)
     groups = L.meta.get("groups", 1)
-
+    
     # Normalize stride/padding/dilation to tuples
     if isinstance(stride, int):
         stride = (stride, stride)
@@ -137,7 +137,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     W_equiv = _conv2d_to_linear_matrix(
         weight, input_shape, output_shape, stride, padding, dilation, groups
     )
-
+    
     # Apply affine transformation
     output_flat_size = out_channels * out_h * out_w
     spatial_size_per_channel = out_h * out_w

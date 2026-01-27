@@ -28,14 +28,14 @@ from act.back_end.hybridz_tf.tf_transformer import *
 
 class HybridzTF(TransferFunction):
     """HybridZ-based transfer functions with zonotope operations."""
-
+    
     # Layer kind to function mapping for HybridZ operations
     _LAYER_REGISTRY = {
         # Identity/constraint layers
         "INPUT": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
         "INPUT_SPEC": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
         "ASSERT": lambda L, bounds, tf: Fact(bounds=bounds, cons=ConSet()),
-
+        
         # MLP operations (with HybridZ precision)
         "DENSE": lambda L, bounds, tf: hybridz_tf_dense(L, bounds),
         "BIAS": lambda L, bounds, tf: hybridz_tf_bias(L, bounds),
@@ -106,7 +106,7 @@ class HybridzTF(TransferFunction):
         "GRU": lambda L, bounds, tf: hybridz_tf_gru(L, bounds),
         "RNN": lambda L, bounds, tf: hybridz_tf_rnn(L, bounds),
         "EMBEDDING": lambda L, bounds, tf: hybridz_tf_embedding(L, bounds),
-
+        
         # Transformer operations
         "LAYERNORM": lambda L, bounds, tf: hybridz_tf_layernorm(L, bounds),
         "GELU": lambda L, bounds, tf: hybridz_tf_gelu(L, bounds),

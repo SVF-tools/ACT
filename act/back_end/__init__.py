@@ -73,7 +73,7 @@ __all__ = [
     'Bounds', 'Con', 'ConSet', 'Fact', 'Layer', 'Net',
     # Device management
     'initialize_device_dtype', 'ensure_initialized', 'summary', 'temp_device_dtype', 'wrap_model_fn',
-    # Utilities
+    # Utilities  
     'box_join', 'changed_or_maskdiff', 'update_cache', 'affine_bounds',
     'pwl_meta', 'bound_var_interval', 'scale_interval',
     # Transfer function interface

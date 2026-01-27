@@ -199,7 +199,7 @@ def hybridz_tf_abs(L: Layer, Bin: Bounds) -> Fact:
                      torch.where(Bin.lb >= 0, Bin.lb, -Bin.ub))
     ub = torch.maximum(torch.abs(Bin.lb), torch.abs(Bin.ub))
     Bout = Bounds(lb=lb, ub=ub)
-
+    
     cons = ConSet()
     cons.add_op(f"abs:{L.id}", list(L.out_vars + L.in_vars), idx_pos=idx_pos, idx_neg=idx_neg, idx_amb=idx_amb)
 
@@ -247,14 +247,14 @@ def hybridz_tf_add(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     return Fact(bounds=Bout, cons=cons)
 
 
-@torch.no_grad()
+@torch.no_grad()  
 def hybridz_tf_mul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     """HybridZ transfer function for element-wise multiplication with McCormick relaxation."""
     # McCormick envelope for bilinear terms
     # z = x * y, with x ∈ [lx, ux], y ∈ [ly, uy]
     lx, ux = Bin1.lb, Bin1.ub
     ly, uy = Bin2.lb, Bin2.ub
-
+    
     # Four corner points
     corners = torch.stack([
         lx * ly,  # lower-left
@@ -262,15 +262,15 @@ def hybridz_tf_mul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
         ux * ly,  # upper-left
         ux * uy   # upper-right
     ])
-
+    
     lb = torch.min(corners, dim=0)[0]
     ub = torch.max(corners, dim=0)[0]
     Bout = Bounds(lb=lb, ub=ub)
-
+    
     # McCormick constraints
     cons = ConSet()
     cons.add_op(f"mcc:{L.id}", list(L.out_vars + L.in_vars), lx=lx, ux=ux, ly=ly, uy=uy)
-
+    
     return Fact(bounds=Bout, cons=cons)
 
 
