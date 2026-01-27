@@ -128,6 +128,11 @@ def get_modules_root() -> str:
     return os.path.join(get_project_root(), 'modules')
 
 
+def get_examples_nets_dir() -> str:
+    """Get the examples nets directory path."""
+    return os.path.join(get_project_root(), 'act', 'back_end', 'examples', 'nets')
+
+
 def get_eran_tf_verify_path() -> str:
     """Get the ERAN tf_verify directory path."""
     return os.path.join(get_modules_root(), 'eran', 'tf_verify')
