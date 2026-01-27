@@ -50,14 +50,6 @@ from .transfer_functions import (
 from .interval_tf import IntervalTF
 from .hybridz_tf import HybridzTF
 
-# TF capabilities registry (moved to net_factory)
-from .net_factory.tf_capabilities import (
-    get_tf_capabilities, get_allowed_layers,
-    get_common_layers, get_all_known_layers,
-    for_interval, for_hybridz, for_dual, for_all_tfs,
-    print_capabilities_report
-)
-
 # Analysis algorithms
 from .analyze import analyze, initialize_tf_mode
 
@@ -88,11 +80,6 @@ __all__ = [
     'TransferFunction', 'IntervalTF', 'HybridzTF',
     'set_transfer_function', 'get_transfer_function', 'set_transfer_function_mode',
     'dispatch_tf',
-    # TF capabilities
-    'get_tf_capabilities', 'get_allowed_layers',
-    'get_common_layers', 'get_all_known_layers',
-    'for_interval', 'for_hybridz', 'for_dual', 'for_all_tfs',
-    'print_capabilities_report',
     # Analysis
     'analyze', 'initialize_tf_mode',
     # Export
