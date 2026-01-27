@@ -69,7 +69,7 @@ jobs:
       - name: Run Verifier Validation (float64, interval)
         run: |
           cd ${{ github.workspace }}
-          python -m act.pipeline --validate-verifier --device cpu --dtype float64
+          python -m act.pipeline --validate-verifier --device cpu --dtype float64 --tf-modes interval
 
       # HybridZ TF mode (float64)
       - name: Run Verifier Validation (float64, hybridz)
@@ -90,7 +90,7 @@ jobs:
       - name: Generate Networks (float32)
         run: |
           cd ${{ github.workspace }}
-          python -m act.back_end --generate --device cpu --dtype float32 --tf-targets interval hybridz dual
+          python -m act.back_end --generate --device cpu --dtype float32
       
       - name: Run Serialization Tests (float32)
         run: |
