@@ -357,21 +357,15 @@ def cmd_fuzz(args):
         print(f"⚠️  Strict mode enabled: Errors will be raised on constraint violations")
     print()
     
-    # Load configuration
-    config = FuzzingConfig(
+    # Load configuration from YAML with CLI overrides
+    config = FuzzingConfig.from_yaml(
         max_iterations=args.iterations,
         timeout_seconds=args.timeout,
         device=args.device,
         save_counterexamples=not args.no_save,
         output_dir=Path(args.output),
         report_interval=args.report_interval,
-        mutation_weights={
-            "gradient": 0.4,
-            "pgd": 0.0,
-            "activation": 0.3,
-            "boundary": 0.2,
-            "random": 0.1
-        },
+        # mutation_weights now loaded from config.yaml
         # Tracing configuration
         trace_level=args.trace_level,
         trace_sample_rate=args.trace_sample,

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 import time
 import json
+import yaml
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -24,7 +25,7 @@ from act.pipeline.fuzzing.mutations import MutationEngine
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import PropertyChecker, Counterexample
-from act.util.path_config import get_pipeline_log_dir
+from act.util.path_config import get_pipeline_log_dir, get_project_root
 
 
 @dataclass
@@ -37,6 +38,8 @@ class FuzzingConfig:
         timeout_seconds: Total time budget
         seed_selection_strategy: "energy" or "random"
         mutation_weights: Dict of strategy weights
+        coverage_strategy: Coverage tracking strategy ("BestInputCov" or "GlobalCov")
+        activation_threshold: Neuron activation threshold for coverage tracking
         perturb_mode: Perturbation size computation mode ("adaptive_scalar", "adaptive_perdim", "fixed")
         perturb_scale: Fraction of range per mutation perturbation (e.g., 0.1 = 10% = ~10 steps to traverse)
         device: Torch device ("cuda" or "cpu")
@@ -68,31 +71,82 @@ class FuzzingConfig:
         - steps_to_traverse = 1 / perturb_scale
         - Example: perturb_scale=0.1 → 10% per perturbation → ~10 steps to traverse from lb to ub
     """
-    max_iterations: int = 10000
-    timeout_seconds: float = 3600.0
-    seed_selection_strategy: str = "energy"
-    mutation_weights: Dict[str, float] = field(default_factory=lambda: {
-        "gradient": 0.2,
-        "pgd": 0.2,
-        "activation": 0.3,
-        "boundary": 0.2,
-        "random": 0.1
-    })
-    coverage_strategy: str = "BestInputCov"  # "BestInputCov"/"GlobalCov"
-    activation_threshold: float = 0.1  # Neuron activation threshold
-    perturb_mode: str = "adaptive_scalar"  # Perturbation size computation mode
-    perturb_scale: float = 0.1  # Fraction of range per perturbation (10% → ~10 steps)
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_counterexamples: bool = True
-    output_dir: Path = field(default_factory=lambda: Path(get_pipeline_log_dir()) / "fuzzing_results")
-    report_interval: int = 100
-    verbose: int = 1  # 0=silent, 1=report in progress only, 2=print each violation immediately
+    # NOTE: All configuration values are loaded from config.yaml via from_yaml() class method.
+    # Direct instantiation without from_yaml() is not supported.
+    max_iterations: int
+    timeout_seconds: float
+    seed_selection_strategy: str
+    mutation_weights: Dict[str, float]
+    coverage_strategy: str
+    activation_threshold: float
+    perturb_mode: str
+    perturb_scale: float
+    device: str
+    save_counterexamples: bool
+    output_dir: Path
+    report_interval: int
+    verbose: int
+    trace_level: int
+    trace_sample_rate: int
+    trace_storage: str
+    trace_output: Optional[Path] = None
     
-    # Tracing configuration
-    trace_level: int = 0  # 0=disabled, 1=default, 2=full, 3=debug
-    trace_sample_rate: int = 1  # Capture every Nth iteration
-    trace_storage: str = "json"  # "json" or "hdf5"
-    trace_output: Optional[Path] = None  # Auto-generated if None
+    def __post_init__(self):
+        """Normalize output_dir to Path object."""
+        if isinstance(self.output_dir, str):
+            self.output_dir = Path(get_pipeline_log_dir()) / self.output_dir
+        elif not isinstance(self.output_dir, Path):
+            self.output_dir = Path(self.output_dir)
+    
+    @classmethod
+    def from_yaml(cls, config_path: Optional[str | Path] = None, **overrides) -> "FuzzingConfig":
+        """
+        Load FuzzingConfig from YAML file with optional overrides.
+        
+        Args:
+            config_path: Path to config YAML file (default: act/pipeline/fuzzing/config.yaml)
+            **overrides: Keyword arguments to override YAML values
+        
+        Returns:
+            FuzzingConfig instance with merged configuration
+        
+        Example:
+            >>> # Load defaults from YAML
+            >>> config = FuzzingConfig.from_yaml()
+            >>> 
+            >>> # Override specific values
+            >>> config = FuzzingConfig.from_yaml(
+            ...     timeout_seconds=60.0,
+            ...     max_iterations=1000
+            ... )
+        """
+        # Default config path
+        if config_path is None:
+            config_path = Path(get_project_root()) / "act/pipeline/fuzzing/config.yaml"
+        else:
+            config_path = Path(config_path)
+        
+        # Verify config file exists
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Configuration file not found: {config_path}\n"
+                f"Expected location: act/pipeline/fuzzing/config.yaml"
+            )
+        
+        # Load YAML
+        with open(config_path) as f:
+            yaml_data = yaml.safe_load(f)
+            yaml_config = yaml_data['fuzzing']
+        
+        # Merge YAML config with overrides (overrides take precedence)
+        merged_config = {**yaml_config, **overrides}
+        
+        # Convert output_dir string to Path if present
+        if 'output_dir' in merged_config and isinstance(merged_config['output_dir'], str):
+            merged_config['output_dir'] = Path(get_pipeline_log_dir()) / merged_config['output_dir']
+        
+        # Create FuzzingConfig instance
+        return cls(**merged_config)
 
 
 @dataclass
@@ -185,7 +239,7 @@ class ACTFuzzer:
             initial_seeds: List of LabeledInputTensor from spec creators
             config: Fuzzing configuration (uses defaults if None)
         """
-        self.config = config or FuzzingConfig()
+        self.config = config or FuzzingConfig.from_yaml()
         self.model = wrapped_model.to(self.config.device)
         self.device = torch.device(self.config.device)
         

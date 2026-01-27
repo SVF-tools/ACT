@@ -67,8 +67,8 @@ initial_seeds = []
 for _, _, _, labeled_tensors, _ in spec_results:
     initial_seeds.extend(labeled_tensors)
 
-# Fuzz
-config = FuzzingConfig(max_iterations=5000, device="cuda")
+# Fuzz (loads config from config.yaml with optional overrides)
+config = FuzzingConfig.from_yaml(max_iterations=5000, device="cuda")
 fuzzer = ACTFuzzer(
     wrapped_model=list(wrapped_models.values())[0],
     initial_seeds=initial_seeds,
@@ -414,8 +414,8 @@ from pathlib import Path
 from act.pipeline.fuzzing import ACTFuzzer, FuzzingConfig
 from act.pipeline.fuzzing.trace_reader import create_reader
 
-# Enable tracing during fuzzing
-config = FuzzingConfig(
+# Enable tracing during fuzzing (loads config.yaml with overrides)
+config = FuzzingConfig.from_yaml(
     max_iterations=5000,
     trace_level=1,              # Enable basic tracing
     trace_sample_rate=5,        # Every 5th iteration

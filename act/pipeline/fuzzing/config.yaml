@@ -47,9 +47,6 @@ fuzzing:
   # Seed selection
   seed_selection_strategy: "energy"  # or "random"
   
-  # Coverage tracking
-  coverage_threshold: 0.1  # Neuron activation threshold
-  
   # Device
   device: "cuda"  # or "cpu"
   
@@ -57,3 +54,10 @@ fuzzing:
   save_counterexamples: true
   output_dir: "fuzzing_results"
   report_interval: 500  # Print progress every N iterations
+  verbose: 1  # 0=silent, 1=report violations in progress only, 2=print each violation immediately
+  
+  # Tracing configuration
+  trace_level: 0  # 0=disabled, 1=default, 2=full, 3=debug
+  trace_sample_rate: 1  # Capture every Nth iteration (1=all iterations)
+  trace_storage: "json"  # "json" or "hdf5"
+  trace_output: null  # Auto-generate path if null
