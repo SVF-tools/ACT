@@ -258,7 +258,7 @@ def hybridz_tf_mul(L: Layer, Bin1: Bounds, Bin2: Bounds) -> Fact:
     # Four corner points
     corners = torch.stack([
         lx * ly,  # lower-left
-        lx * uy,  # lower-right
+        lx * uy,  # lower-right  
         ux * ly,  # upper-left
         ux * uy   # upper-right
     ])

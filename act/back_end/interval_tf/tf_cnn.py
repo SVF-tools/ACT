@@ -83,7 +83,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     if isinstance(dilation, int):
         dilation = (dilation, dilation)
 
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Assert input_shape metadata exists and matches bounds
     assert "input_shape" in L.meta, (
         f"Layer {L.id} (CONV2D): missing 'input_shape' in metadata. "
         f"CONV2D requires input_shape=(N,C,H,W) for strict shape validation."
@@ -180,7 +180,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for MaxPool1d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
     b, c, w = input_shape
 
@@ -222,8 +222,12 @@ def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for MaxPool2d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """
+    Transfer function for MaxPool2d layer.
+    
+    Uses interval arithmetic to bound the max pooling operation.
+    """
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
     batch_size, channels, in_h, in_w = input_shape
 
@@ -270,7 +274,7 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for AvgPool1d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
     b, c, w = input_shape
 
@@ -305,7 +309,7 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for MaxPool3d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=5)
     b, c, d, h, w = input_shape
 
@@ -355,7 +359,7 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     mode = L.meta.get("mode", "constant")
     value = float(L.meta.get("value", 0.0))
 
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    # Assert input_shape metadata exists and matches bounds
     assert "input_shape" in L.meta, (
         f"Layer {L.id} (PAD): missing 'input_shape' in metadata."
     )
@@ -522,8 +526,12 @@ def _conv2d_to_linear_matrix(
 
 
 def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for AvgPool2d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """
+    Transfer function for AvgPool2d layer.
+    
+    Uses linear transformation to handle average pooling.
+    """
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
     batch_size, channels, in_h, in_w = input_shape
 
@@ -634,8 +642,8 @@ def _avgpool2d_to_linear_matrix(
 # -------- Additional CNN Layers --------
 
 def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Conv1d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """Transfer function for Conv1d layer."""
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=3)
 
     # Extract convolution parameters
@@ -688,8 +696,8 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Conv3d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """Transfer function for Conv3d layer."""
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=5)
 
     # Extract convolution parameters
@@ -742,8 +750,8 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
 
 
 def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for ConvTranspose2d layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """Transfer function for ConvTranspose2d layer."""
+    # Assert input_shape metadata exists and matches bounds
     input_shape = _assert_shape_match(L, Bin, expected_ndim=4)
 
     # Extract parameters
@@ -797,8 +805,8 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
-    """Transfer function for Upsample layer with strict shape validation."""
-    # STRICT MODE: Assert input_shape metadata exists and matches bounds
+    """Transfer function for Upsample layer."""
+    # Assert input_shape metadata exists and matches bounds
     # Upsample is typically 4D (N,C,H,W) but can also be 3D or 5D
     assert "input_shape" in L.meta, (
         f"Layer {L.id} (UPSAMPLE): missing 'input_shape' in metadata."

@@ -101,36 +101,19 @@ class ACTToTorch:
             raise TypeError(f"ACTToTorch expects a Net object, got {type(act_net)}")
         self.act_net = act_net
 
-    def _requires_dag_mode(self) -> bool:
-        """Check if network requires DAG mode (has multi-input layers)."""
-        if not hasattr(self.act_net, 'preds') or not self.act_net.preds:
-            return False
-        for layer_id, pred_ids in self.act_net.preds.items():
-            if len(pred_ids) > 1:
-                return True
-        return False
-
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-        
+
         Iterates through ACT layers, creates corresponding PyTorch layers,
         transfers weights, and assembles into VerifiableModel model.
-        
+
         Returns:
             VerifiableModel model with embedded constraint checking
-        
+
         Raises:
             ValueError: If no valid PyTorch layers can be created
         """
-        # Auto-detect if DAG mode is needed
-        if self._requires_dag_mode():
-            return self._run_graph_model()
-        else:
-            return self._run_sequential_model()
-    
-    def _run_sequential_model(self) -> nn.Module:
-        """Sequential model conversion for linear chains."""
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
@@ -218,107 +201,6 @@ class ACTToTorch:
         
         return model
 
-    def _run_graph_model(self) -> nn.Module:
-        """DAG-capable VerifiableGraphModel conversion for multi-input layers."""
-        from act.front_end.verifiable_model import VerifiableGraphModel
-
-        # Build layer modules dictionary
-        layer_modules = {}  # layer_id -> (nn.Module or callable, is_spec_layer, kind)
-        input_spec_layer_id = None
-        output_spec_layer_id = None
-
-        # Get target dtype/device once for all tensor conversions
-        target_dtype = get_default_dtype()
-        target_device = get_default_device()
-
-        for act_layer in self.act_net.layers:
-            kind = act_layer.kind
-            meta = act_layer.meta
-            layer_id = act_layer.id
-
-            # Handle wrapper layers specially
-            if kind == 'INPUT':
-                # Store INPUT layer info but don't create PyTorch layer
-                layer_modules[layer_id] = (None, False, kind)
-                continue
-
-            elif kind == 'INPUT_SPEC':
-                # Create InputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import InputSpecLayer
-                from act.front_end.specs import InputSpec, InKind
-
-                # Build InputSpec from ACT layer
-                kind_str = meta['kind']
-                spec_kind = getattr(InKind, kind_str)
-                spec_dict = {'kind': spec_kind}
-                if 'eps' in meta:
-                    spec_dict['eps'] = meta['eps']
-
-                # Convert parameter tensors to device_manager dtype for consistency
-                for param_key in ['lb', 'ub', 'center', 'A', 'b']:
-                    if param_key in act_layer.params:
-                        tensor = act_layer.params[param_key]
-                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
-                spec = InputSpec(**spec_dict)
-                layer_modules[layer_id] = (InputSpecLayer(spec), True, kind)
-                input_spec_layer_id = layer_id
-                continue
-
-            elif kind == 'ASSERT':
-                # Create OutputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import OutputSpecLayer
-                from act.front_end.specs import OutputSpec, OutKind
-
-                # Build OutputSpec from ACT layer
-                kind_str = meta['kind']
-                spec_kind = getattr(OutKind, kind_str)
-                spec_dict = {'kind': spec_kind}
-                if 'y_true' in meta:
-                    spec_dict['y_true'] = meta['y_true']
-                if 'margin' in meta:
-                    spec_dict['margin'] = meta['margin']
-                if 'd' in meta:
-                    spec_dict['d'] = meta['d']
-
-                # Convert parameter tensors to device_manager dtype for consistency
-                for param_key in ['c', 'lb', 'ub']:
-                    if param_key in act_layer.params:
-                        tensor = act_layer.params[param_key]
-                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-
-                spec = OutputSpec(**spec_dict)
-                layer_modules[layer_id] = (OutputSpecLayer(spec), True, kind)
-                output_spec_layer_id = layer_id
-                continue
-
-            # Build PyTorch layer from ACT layer (includes weight transfer)
-            torch_layer = self._create_torch_layer(kind, meta, act_layer)
-
-            if torch_layer is None:
-                logger.warning(f"Unsupported layer kind '{kind}' at layer {layer_id} - skipping")
-                continue
-
-            layer_modules[layer_id] = (torch_layer, False, kind)
-
-        if not layer_modules:
-            raise ValueError("No valid PyTorch layers found in ACT Net")
-
-        # Create VerifiableGraphModel
-        model = VerifiableGraphModel(
-            net=self.act_net,
-            layer_modules=layer_modules,
-            input_spec_layer_id=input_spec_layer_id,
-            output_spec_layer_id=output_spec_layer_id
-        )
-        model.eval()  # Set to evaluation mode by default
-
-        logger.info(f"Created VerifiableGraphModel with {len(layer_modules)} layers "
-                   f"(INPUT_SPEC={input_spec_layer_id is not None}, "
-                   f"OUTPUT_SPEC={output_spec_layer_id is not None})")
-
-        return model
-    
     def _transfer_weights(self, torch_layer: nn.Module, act_layer: Layer, 
                          weight_key: str = "W", bias_key: str = "b") -> None:
         """
@@ -834,11 +716,9 @@ class ACTToTorch:
                     return torch.pow(x, self.exponent)
             return PowerModule(exponent)
 
-        # Multi-input operations (DAG support - Phase 3)
+        # Multi-input operations (for potential DAG support)
         elif kind == "ADD":
             # ADD is a functional operation (torch.add), not an nn.Module
-            # For VerifiableGraphModel, we return a function that performs addition
-            # NOTE: Inputs are provided by VerifiableGraphModel.forward() via preds
             # Supports 2+ inputs via reduce
             def add_op(*inputs):
                 if len(inputs) == 2:
@@ -866,7 +746,6 @@ class ACTToTorch:
 
         elif kind == "MAX":
             # Element-wise maximum (supports 2+ inputs via reduce)
-            # VerifiableGraphModel will provide inputs as tuple if >2 preds
             def max_op(*inputs):
                 result = inputs[0]
                 for inp in inputs[1:]:
@@ -900,7 +779,6 @@ class ACTToTorch:
             concat_dim = meta.get("concat_dim", 0)
             if concat_dim is None:
                 raise ValueError("CONCAT requires 'concat_dim' in meta")
-            # VerifiableGraphModel will provide inputs as tuple from preds
             def concat_op(*inputs):
                 # Minimal shape validation: all inputs must have same rank
                 if len(inputs) < 2:

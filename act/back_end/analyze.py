@@ -49,13 +49,13 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     finiteness changes explicitly to ensure proper convergence.
     
     Args:
-        net: ACT network structure containing layers and topology (preds/succs)
+        net: ACT network structure
         entry_id: ID of the entry (INPUT) layer
         entry_fact: Initial Fact containing bounds and constraints for the input
         eps: Convergence epsilon for fixpoint iteration
-
+    
     Returns:
-        Tuple of (before, after, globalC):
+        Tuple of (before, after, globalC) containing propagated facts and global constraints
           - before: Dict mapping layer_id -> Fact (pre-transfer bounds)
           - after: Dict mapping layer_id -> Fact (post-transfer bounds)
           - globalC: ConSet containing all collected constraints
@@ -88,9 +88,7 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     while WL:
         lid = WL.popleft(); L = net.by_id[lid]
 
-        # DAG merge: join bounds from all predecessors using box_join
-        # For layers with multiple predecessors (e.g., ADD in residual blocks),
-        # we compute the interval hull of all predecessor bounds.
+        # merge predecessors into before[lid]
         if net.preds.get(lid):
             preds_list = net.preds[lid]
             # Initialize from first predecessor (not infinite bounds)

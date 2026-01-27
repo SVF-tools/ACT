@@ -46,7 +46,7 @@ implementations and a global registry to select between implementations
 
 import torch
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 from act.back_end.core import Bounds, Fact, Layer, Net
 from act.util.options import PerformanceOptions
 
