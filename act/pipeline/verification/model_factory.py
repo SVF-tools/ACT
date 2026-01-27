@@ -55,6 +55,7 @@
 #
 #===---------------------------------------------------------------------===#
 
+import yaml
 import json
 import torch
 import torch.nn as nn
@@ -62,72 +63,32 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import logging
 
-from act.back_end.core import Net
+from act.back_end.core import Net, Layer
 from act.back_end.serialization.serialization import NetSerializer
 from act.pipeline.verification.act2torch import ACTToTorch
 from act.util.device_manager import get_default_dtype, get_default_device
-from act.util.path_config import get_examples_nets_dir
 
 logger = logging.getLogger(__name__)
 
 
-def _load_manifest(manifest_path: Path) -> List[str]:
-    """Load network names from manifest JSON file."""
-    payload = json.loads(manifest_path.read_text(encoding='utf-8'))
-    return list(payload.get('nets', []))
-
-
-def _discover_net_names(nets_dir: Path, manifest_path: Optional[Path]) -> List[str]:
-    """
-    Discover network names from manifest and/or directory scan.
-
-    Priority: manifest first, then directory glob.
-    Duplicates are removed while preserving order.
-    """
-    names: List[str] = []
-    if manifest_path is None:
-        default_manifest = nets_dir / 'manifest.json'
-        if default_manifest.exists():
-            manifest_path = default_manifest
-
-    if manifest_path is not None and manifest_path.exists():
-        try:
-            names.extend(str(n) for n in _load_manifest(manifest_path))
-        except Exception as e:
-            logger.warning(f"Failed to read manifest {manifest_path}: {e}")
-
-    names.extend(p.stem for p in nets_dir.glob('*.json'))
-
-    ordered: List[str] = []
-    seen = set()
-    for name in names:
-        if name in seen:
-            continue
-        seen.add(name)
-        ordered.append(name)
-    return ordered
-
-
 class ModelFactory:
-    """Factory for creating PyTorch models from ACT Net JSONs."""
-
-    def __init__(
-        self,
-        nets_dir: str = get_examples_nets_dir(),
-        manifest_path: Optional[str] = None,
-    ):
+    """Factory for creating PyTorch models from examples_config.yaml."""
+    
+    def __init__(self, 
+                 config_path: str = "act/back_end/examples/examples_config.yaml",
+                 nets_dir: str = "act/back_end/examples/nets"):
         """
-        Initialize factory with nets directory and optional manifest.
+        Initialize factory with configuration file and pre-load all ACT Nets.
         
         Args:
+            config_path: Path to examples_config.yaml
             nets_dir: Directory containing pre-generated ACT Net JSON files
-            manifest_path: Optional path to manifest.json listing network names
         """
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
         self.nets_dir = Path(nets_dir)
-        self.manifest_path = Path(manifest_path) if manifest_path else None
         
         # Pre-load all ACT Nets for fast access (avoids repeated file I/O)
-        self.net_names = _discover_net_names(self.nets_dir, self.manifest_path)
         self.nets: Dict[str, Net] = {}
         self._load_all_nets()
     
@@ -141,11 +102,7 @@ class ModelFactory:
         - Enables O(1) lookup via get_act_net()
         - Costs ~10-20MB memory for typical test suites
         """
-        if not self.nets_dir.exists():
-            logger.warning(f"Nets dir not found: {self.nets_dir}")
-            return
-        
-        for name in self.net_names:
+        for name in self.config['networks'].keys():
             net_path = self.nets_dir / f"{name}.json"
             
             if not net_path.exists():
@@ -198,40 +155,30 @@ class ModelFactory:
             KeyError: If network name not found in config
             ValueError: If network architecture is invalid
         """
-        if name not in self.nets:
-            available = ", ".join(self.nets.keys())
+        if name not in self.config['networks']:
+            available = ", ".join(self.config['networks'].keys())
             raise KeyError(f"Network '{name}' not found. Available: {available}")
-
-        if not load_weights:
-            raise ValueError("ModelFactory requires load_weights=True (ACT Net JSONs are the source of truth).")
-
-        act_net = self.get_act_net(name)
-
-        # Convert ACT Net to PyTorch model (auto-detects DAG mode)
-        converter = ACTToTorch(act_net)
-        model = converter.run()
-
+        
+        spec = self.config['networks'][name]
+        
+        # Get pre-loaded ACT Net if weights should be transferred
+        act_net = None
+        if load_weights:
+            act_net = self.get_act_net(name)  # O(1) lookup, no file I/O
+            logger.debug(f"Using pre-loaded ACT Net '{name}'")
+        
+        # Build PyTorch module using ACTToTorch converter
+        if act_net is not None:
+            converter = ACTToTorch(act_net)
+            model = converter.run()
+        else:
+            # Fallback: build from config with random weights
+            raise ValueError(f"Cannot create model without ACT Net. Set load_weights=True or ensure {name}.json exists.")
+        
         logger.info(f"Created PyTorch model '{name}' with {sum(p.numel() for p in model.parameters())} parameters")
-
+        
         return model
-
-    def _find_layer(self, net: Net, kind: str) -> Optional[Any]:
-        """Find first layer of given kind in network."""
-        for layer in getattr(net, 'layers', []):
-            if getattr(layer, 'kind', None) == kind:
-                return layer
-        return None
-
-    def _infer_box_bounds(self, params: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-        """Infer box bounds from lb/ub parameter tensors."""
-        lb = params.get('lb')
-        ub = params.get('ub')
-        if lb is None or ub is None:
-            return None
-        lb_t = torch.as_tensor(lb)
-        ub_t = torch.as_tensor(ub)
-        return float(lb_t.min().item()), float(ub_t.max().item())
-
+    
     def generate_test_input(self, name: str, test_case: str = "center") -> torch.Tensor:
         """
         Generate strategic test input considering both INPUT metadata and INPUT_SPEC constraints.
@@ -248,18 +195,26 @@ class ModelFactory:
         - boundary: Input near boundary of constraints (expected UNCERTAIN/FAIL)
         - random: Random input in constraint region (expected varied results)
         """
-        if name not in self.nets:
+        if name not in self.config['networks']:
             raise KeyError(f"Network '{name}' not found")
-
-        act_net = self.get_act_net(name)
-        input_layer = self._find_layer(act_net, 'INPUT')
-        input_spec_layer = self._find_layer(act_net, 'INPUT_SPEC')
-
+        
+        spec = self.config['networks'][name]
+        layers_spec = spec['layers']
+        
+        # Find INPUT and INPUT_SPEC layers
+        input_layer = None
+        input_spec_layer = None
+        for layer_spec in layers_spec:
+            if layer_spec['kind'] == 'INPUT':
+                input_layer = layer_spec
+            elif layer_spec['kind'] == 'INPUT_SPEC':
+                input_spec_layer = layer_spec
+        
         if input_layer is None:
             raise ValueError(f"No INPUT layer found in network '{name}'")
         
         # Get INPUT metadata
-        input_meta = input_layer.meta or {}
+        input_meta = input_layer.get('meta', {})
         shape = input_meta.get('shape')
         if shape is None:
             raise ValueError(f"INPUT layer missing 'shape' in network '{name}'")
@@ -271,30 +226,24 @@ class ModelFactory:
         
         # Get INPUT_SPEC constraints if present
         if input_spec_layer is not None:
-            spec_meta = input_spec_layer.meta or {}
-            spec_kind = str(spec_meta.get('kind'))
+            spec_meta = input_spec_layer.get('meta', {})
+            spec_kind = spec_meta.get('kind')
             
             if spec_kind == 'BOX':
-                lb_val = spec_meta.get('lb_val')
-                ub_val = spec_meta.get('ub_val')
-                if lb_val is None or ub_val is None:
-                    bounds = self._infer_box_bounds(input_spec_layer.params or {})
-                    if bounds:
-                        lb_val, ub_val = bounds
-                if lb_val is None or ub_val is None:
-                    lb_val, ub_val = 0.0, 1.0
-
+                lb_val = spec_meta.get('lb_val', 0.0)
+                ub_val = spec_meta.get('ub_val', 1.0)
+                
                 if test_case == 'center':
                     # Center of box: (lb + ub) / 2
                     value = (lb_val + ub_val) / 2.0
-                    tensor = torch.full(shape, value, dtype=dtype, device=device)
+                    tensor = torch.full(shape, value, dtype=dtype)
                 elif test_case == 'boundary':
                     # Near upper boundary: ub - small_epsilon
                     value = ub_val - 0.001
-                    tensor = torch.full(shape, value, dtype=dtype, device=device)
+                    tensor = torch.full(shape, value, dtype=dtype)
                 elif test_case == 'random':
                     # Random within bounds
-                    tensor = torch.rand(*shape, dtype=dtype, device=device) * (ub_val - lb_val) + lb_val
+                    tensor = torch.rand(*shape, dtype=dtype) * (ub_val - lb_val) + lb_val
                 else:
                     raise ValueError(f"Unknown test_case '{test_case}'")
             
@@ -304,55 +253,48 @@ class ModelFactory:
                 
                 if test_case == 'center':
                     # At center of L∞ ball
-                    tensor = torch.full(shape, center_val, dtype=dtype, device=device)
+                    tensor = torch.full(shape, center_val, dtype=dtype)
                 elif test_case == 'boundary':
                     # Near boundary: center + eps - small_delta
                     value = center_val + eps - 0.001
-                    tensor = torch.full(shape, value, dtype=dtype, device=device)
+                    tensor = torch.full(shape, value, dtype=dtype)
                 elif test_case == 'random':
                     # Random within L∞ ball
-                    perturbation = (torch.rand(*shape, dtype=dtype, device=device) - 0.5) * 2.0 * eps
-                    tensor = torch.full(shape, center_val, dtype=dtype, device=device) + perturbation
+                    perturbation = (torch.rand(*shape, dtype=dtype) - 0.5) * 2.0 * eps
+                    tensor = torch.full(shape, center_val, dtype=dtype) + perturbation
                 else:
                     raise ValueError(f"Unknown test_case '{test_case}'")
             
             else:
                 # LIN_POLY or unknown: fallback to uniform random in value_range
                 value_range = input_meta.get('value_range', [0.0, 1.0])
-                tensor = torch.rand(*shape, dtype=dtype, device=device) * (value_range[1] - value_range[0]) + value_range[0]
+                tensor = torch.rand(*shape, dtype=dtype) * (value_range[1] - value_range[0]) + value_range[0]
         
         else:
             # No INPUT_SPEC: use uniform random in value_range
             value_range = input_meta.get('value_range', [0.0, 1.0])
-            tensor = torch.rand(*shape, dtype=dtype, device=device) * (value_range[1] - value_range[0]) + value_range[0]
+            tensor = torch.rand(*shape, dtype=dtype) * (value_range[1] - value_range[0]) + value_range[0]
         
         return tensor
     
     def list_networks(self) -> List[str]:
         """List all available network names."""
-        return list(self.nets.keys())
+        return list(self.config['networks'].keys())
     
     def get_network_info(self, name: str) -> Dict[str, Any]:
         """Get metadata about a network without creating it."""
-        if name not in self.nets:
+        if name not in self.config['networks']:
             raise KeyError(f"Network '{name}' not found")
-
-        net = self.nets[name]
-        meta = getattr(net, 'meta', {}) or {}
-        input_layer = self._find_layer(net, 'INPUT')
-        input_shape = None
-        if input_layer is not None:
-            input_shape = (input_layer.meta or {}).get('shape')
-
-        num_layers = len([l for l in net.layers if l.kind not in ['INPUT', 'INPUT_SPEC', 'ASSERT']])
-
+        
+        spec = self.config['networks'][name]
+        
         return {
             'name': name,
-            'description': meta.get('description', 'No description'),
-            'architecture_type': meta.get('architecture_type', 'unknown'),
-            'input_shape': input_shape or 'unknown',
-            'num_layers': num_layers,
-            'metadata': meta,
+            'description': spec.get('description', 'No description'),
+            'architecture_type': spec.get('architecture_type', 'unknown'),
+            'input_shape': spec.get('input_shape', 'unknown'),
+            'num_layers': len([l for l in spec['layers'] if l['kind'] not in ['INPUT', 'INPUT_SPEC', 'ASSERT']]),
+            'metadata': spec.get('metadata', {})
         }
 
 

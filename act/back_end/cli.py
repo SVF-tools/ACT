@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Optional
 
 from act.util.cli_utils import add_device_args, initialize_from_args
-from act.util.path_config import get_examples_nets_dir, get_examples_gen_config_path
 
 
 def run_verification(args):
@@ -111,47 +110,29 @@ def run_network_factory(args):
     print(f"\n{'='*80}")
     print(f"ACT NETWORK FACTORY")
     print(f"{'='*80}\n")
-
+    
     from act.back_end.net_factory import NetFactory
-
-    config_file = args.config if args.config else get_examples_gen_config_path()
-
+    
+    config_file = args.config if args.config else "act/back_end/examples/examples_config.yaml"
+    
     print(f"Configuration: {config_file}")
+    print(f"Output directory: act/back_end/examples/nets (fixed)\n")
+    
     if args.output:
-        print(f"Output directory override: {args.output}")
-    if args.num is not None:
-        print(f"Instance count override: {args.num}")
-    if args.base_seed is not None:
-        print(f"Base seed override: {args.base_seed}")
-    if args.name_prefix is not None:
-        print(f"Name prefix override: {args.name_prefix}")
-
-    # TF-aware generation info
-    tf_targets = getattr(args, 'tf_targets', None)
-    registry_mode = getattr(args, 'registry_mode', 'intersection')
-    if tf_targets:
-        print(f"TF targets: {tf_targets} (mode: {registry_mode})")
-    print()
-
+        print(f"⚠️  Note: Custom output directory not supported by NetFactory")
+        print(f"   Networks will be saved to: act/back_end/examples/nets\n")
+    
     try:
-        factory = NetFactory(
-            gen_config_path=config_file,
-            output_dir=args.output,
-            base_seed=args.base_seed,
-            num_instances=args.num,
-            name_prefix=args.name_prefix,
-            tf_targets=tf_targets,
-            registry_mode=registry_mode,
-        )
-        factory.generate()
-
+        factory = NetFactory(config_file)
+        factory.generate_all()
+        
         print(f"\n{'='*80}")
-        print(f"Network generation complete")
+        print(f"✓ Network generation complete")
         print(f"{'='*80}\n")
-
+        
         return 0
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\n❌ Error: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
@@ -242,28 +223,27 @@ def list_examples(args):
     print(f"\n{'='*80}")
     print(f"AVAILABLE EXAMPLE NETWORKS")
     print(f"{'='*80}\n")
-
-    from act.pipeline.verification.model_factory import ModelFactory
-
-    nets_dir = Path(get_examples_nets_dir())
-
-    if not nets_dir.exists():
-        print(f"❌ Nets directory not found: {nets_dir}")
+    
+    import yaml
+    from pathlib import Path
+    
+    config_file = "act/back_end/examples/examples_config.yaml"
+    
+    if not Path(config_file).exists():
+        print(f"❌ Configuration file not found: {config_file}")
         return 1
-
-    factory = ModelFactory(nets_dir=str(nets_dir))
-    network_names = factory.list_networks()
-
-    print(f"Total networks: {len(network_names)}\n")
-
+    
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    networks = config.get('networks', {})
+    
+    print(f"Total networks: {len(networks)}\n")
+    
     # Group by category
     categories = {}
-    for net_name in network_names:
-        try:
-            desc = factory.get_network_info(net_name).get("description", "No description")
-        except Exception:
-            desc = "No description"
-
+    for net_name, net_config in networks.items():
+        desc = net_config.get('description', 'No description')
         # Try to infer category from name
         if 'mnist' in net_name.lower():
             cat = 'MNIST Classification'
@@ -304,22 +284,13 @@ Examples:
   # ============================================================================
   # NETWORK FACTORY - Generate example networks
   # ============================================================================
-
+  
   # Generate all example networks from default config
   python -m act.back_end --generate
-
+  
   # Generate with custom config
   python -m act.back_end --generate --config my_config.yaml --output ./networks
-
-  # Generate networks for specific TF (only layers supported by IntervalTF)
-  python -m act.back_end --generate --tf-targets interval
-
-  # Generate networks compatible with both interval and hybridz TFs (intersection)
-  python -m act.back_end --generate --tf-targets interval hybridz
-
-  # Generate networks using layers from ANY specified TF (union mode)
-  python -m act.back_end --generate --tf-targets interval hybridz --registry-mode union
-
+  
   # List available example networks
   python -m act.back_end --list-examples
   
@@ -328,7 +299,7 @@ Examples:
   # ============================================================================
   
   # Single-shot verification
-  python -m act.back_end --verify --network mnist_robust_easy.json
+  python -m act.back_end --verify --network act/back_end/examples/nets/mnist_robust_easy.json
   
   # Branch-and-bound verification
   python -m act.back_end --verify --network mnist_robust_hard.json --bab
@@ -406,47 +377,12 @@ Examples:
     factory_group.add_argument(
         "--config", "-c",
         type=str,
-        help="Path to generator YAML configuration file (default: <project_root>/act/back_end/examples/config_gen_act_net.yaml)"
+        help="Path to YAML configuration file (default: act/back_end/examples/examples_config.yaml)"
     )
     factory_group.add_argument(
         "--output", "-o",
         type=str,
-        help="Output directory override for generated networks (default: from config)"
-    )
-    factory_group.add_argument(
-        "--num",
-        type=int,
-        help="Override number of instances to generate"
-    )
-    factory_group.add_argument(
-        "--base-seed",
-        type=int,
-        dest="base_seed",
-        help="Override generator base seed (default: from config)"
-    )
-    factory_group.add_argument(
-        "--name-prefix",
-        type=str,
-        dest="name_prefix",
-        help="Override generator name prefix (default: from config)"
-    )
-    factory_group.add_argument(
-        "--tf-targets",
-        type=str,
-        nargs="+",
-        dest="tf_targets",
-        choices=["interval", "hybridz", "dual"],
-        help="Target TFs for layer filtering (e.g., --tf-targets interval hybridz). "
-             "Networks will only use layers supported by specified TFs."
-    )
-    factory_group.add_argument(
-        "--registry-mode",
-        type=str,
-        dest="registry_mode",
-        choices=["intersection", "union"],
-        default="intersection",
-        help="How to combine multiple TF layer sets: 'intersection' (default, safest) "
-             "uses layers supported by ALL targets; 'union' uses layers supported by ANY target."
+        help="Output directory for generated networks (default: act/back_end/examples/nets)"
     )
     
     # Verification options
@@ -499,11 +435,8 @@ Examples:
     # Add standard device/dtype arguments (shared across all ACT CLIs)
     add_device_args(parser)
     
-    args, unknown = parser.parse_known_args()
+    args = parser.parse_args()
     
-    if unknown:
-        parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
-
     # Initialize device manager from CLI arguments
     initialize_from_args(args)
     
