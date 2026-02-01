@@ -17,6 +17,7 @@
 #   - Weight preservation: Transfers all ACT parameters to PyTorch layers
 #   - VerifiableModel: Returns wrapped model with automatic constraint checking
 #   - Spec reconstruction: Rebuilds InputSpecLayer/OutputSpecLayer from ACT
+#   - DAG support: Handles ResNet-style skip connections and multi-input layers
 #   - Comprehensive coverage: Supports 40+ layer types (MLP, CNN, RNN, etc.)
 #
 # Architecture:
@@ -25,7 +26,12 @@
 #   DENSE      → nn.Linear           (fully connected layers)
 #   CONV2D     → nn.Conv2d           (convolutional layers)
 #   RELU       → nn.ReLU             (activation functions)
+#   ADD/CONCAT → callable ops        (multi-input for DAG support)
 #   ASSERT     → OutputSpecLayer     (output constraint checking)
+#
+# Execution Modes:
+#   - Sequential: For linear chains, uses VerifiableModel (nn.Sequential-based)
+#   - DAG: For graphs with skip connections, uses _DAGExecutor (topo-order execution)
 #
 # VerifiableModel:
 #   Wraps nn.Module to provide automatic constraint verification.
@@ -54,6 +60,8 @@
 #   - Weight transfer: Copies all parameters from ACT Layer.params to PyTorch
 #   - Spec preservation: Reconstructs InputSpec/OutputSpec from ACT metadata
 #   - Layer factory: Creates appropriate PyTorch layers from ACT layer kinds
+#   - DAG detection: Automatically detects multi-predecessor/successor patterns
+#   - Graph execution: Tracks intermediate outputs for multi-input operations
 #
 #===---------------------------------------------------------------------===#
 
@@ -70,19 +78,32 @@ logger = logging.getLogger(__name__)
 
 class ACTToTorch:
     """
-    Convert ACT Net to PyTorch nn.Module.
-    
+    Convert ACT Net to PyTorch nn.Module with DAG support.
+
     This class provides the inverse transformation of TorchToACT, enabling
     bidirectional conversion between verification representations (ACT) and
-    executable models (PyTorch).
-    
+    executable models (PyTorch). Supports both sequential models and DAG
+    structures (ResNet skip connections, multi-input operations).
+
+    Execution Modes:
+        - Sequential: For linear chains without skip connections
+        - DAG: For graphs with multi-input layers (ADD, CONCAT, etc.)
+
+    The mode is automatically detected based on the ACT Net structure:
+        - If any layer has >1 predecessor or >1 successor → DAG mode
+        - Otherwise → Sequential mode
+
     Usage:
         converter = ACTToTorch(act_net)
         model = converter.run()  # Returns nn.Module
-    
+
+        # For DAG models (ResNet, etc.):
+        results = model(input_tensor)
+        # results is a dict with: output, input_satisfied, output_satisfied, etc.
+
     Args:
         act_net: ACT Net object containing layers with architecture and weights
-    
+
     Returns:
         PyTorch nn.Module model ready for inference
     """
@@ -104,61 +125,85 @@ class ACTToTorch:
     def run(self) -> nn.Module:
         """
         Convert ACT Net to PyTorch nn.Module.
-        
-        Iterates through ACT layers, creates corresponding PyTorch layers,
-        transfers weights, and assembles into VerifiableModel model.
-        
+
+        Automatically detects whether the ACT Net is a DAG (has multi-input layers
+        like ADD, CONCAT) or a sequential chain, and uses the appropriate conversion
+        strategy.
+
         Returns:
             VerifiableModel model with embedded constraint checking
-        
+
         Raises:
             ValueError: If no valid PyTorch layers can be created
+        """
+        # Detect DAG structure: any layer with >1 predecessor or any layer with >1 successor
+        is_dag = (
+            any(len(preds) > 1 for preds in self.act_net.preds.values()) or
+            any(len(succs) > 1 for succs in self.act_net.succs.values())
+        )
+
+        if is_dag:
+            logger.info("Detected DAG structure, using graph-based execution")
+            return self._run_dag_model()
+        else:
+            logger.info("Detected sequential structure, using nn.Sequential")
+            return self._run_sequential_model()
+
+    def _run_sequential_model(self) -> nn.Module:
+        """
+        Sequential model conversion for linear chains.
+
+        This is the original conversion logic for models without skip connections
+        or multi-input operations.
+
+        Returns:
+            VerifiableModel with nn.Sequential-style execution
         """
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
-        
+
         # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
         target_device = get_default_device()
-        
+
         for i, act_layer in enumerate(self.act_net.layers):
             kind = act_layer.kind
             meta = act_layer.meta
-            
+
             # Handle wrapper layers specially
             if kind == 'INPUT':
                 continue  # Skip INPUT layer (no-op)
-            
+
             elif kind == 'INPUT_SPEC':
                 # Create InputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
-                
+
                 # Build InputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
                 if 'eps' in meta:
                     spec_dict['eps'] = meta['eps']
-                
+
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['lb', 'ub', 'center', 'A', 'b']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = InputSpec(**spec_dict)
                 # InputSpecLayer now always returns tuples
                 torch_layers.append(InputSpecLayer(spec))
                 has_input_spec = True
                 continue
-            
+
             elif kind == 'ASSERT':
                 # Create OutputSpecLayer for constraint checking
                 from act.front_end.verifiable_model import OutputSpecLayer
                 from act.front_end.specs import OutputSpec, OutKind
-                
+
                 # Build OutputSpec from ACT layer
                 kind_str = meta['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
@@ -169,37 +214,297 @@ class ACTToTorch:
                     spec_dict['margin'] = meta['margin']
                 if 'd' in meta:
                     spec_dict['d'] = meta['d']
-                
+
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
                     if param_key in act_layer.params:
                         tensor = act_layer.params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
-                
+
                 spec = OutputSpec(**spec_dict)
                 # OutputSpecLayer now always returns tuples
                 torch_layers.append(OutputSpecLayer(spec))
                 has_output_spec = True
                 continue
-            
+
             # Build PyTorch layer from ACT layer (includes weight transfer)
             torch_layer = self._create_torch_layer(kind, meta, act_layer)
-            
+
             if torch_layer is not None:
                 torch_layers.append(torch_layer)
-        
+
         if not torch_layers:
             raise ValueError("No valid PyTorch layers found in ACT Net")
-        
+
         # Return VerifiableModel for automatic constraint checking
         from act.front_end.verifiable_model import VerifiableModel
         model = VerifiableModel(*torch_layers)
         model.eval()  # Set to evaluation mode by default
-        
+
         logger.info(f"Created VerifiableModel with {len(torch_layers)} layers "
                    f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})")
-        
+
         return model
+
+    def _run_dag_model(self) -> nn.Module:
+        """
+        DAG model conversion for graphs with skip connections and multi-input layers.
+
+        This method handles models like ResNet (ADD skip connections) and DenseNet
+        (CONCAT merges) by executing layers in topological order and tracking
+        intermediate outputs.
+
+        Returns:
+            _DAGExecutor module with graph-based execution
+        """
+        from act.front_end.verifiable_model import InputSpecLayer, OutputSpecLayer
+        from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+
+        target_dtype = get_default_dtype()
+        target_device = get_default_device()
+
+        # Step 1: Create all layer operations
+        layer_ops = {}
+        input_id = None
+        input_spec_id = None
+        assert_id = None
+
+        for act_layer in self.act_net.layers:
+            layer_id = act_layer.id
+            kind = act_layer.kind
+            meta = act_layer.meta or {}
+
+            if kind == 'INPUT':
+                input_id = layer_id
+                layer_ops[layer_id] = None  # INPUT is just a placeholder
+
+            elif kind == 'INPUT_SPEC':
+                input_spec_id = layer_id
+                # Build InputSpec
+                kind_str = meta['kind']
+                spec_kind = getattr(InKind, kind_str)
+                spec_dict = {'kind': spec_kind}
+                if 'eps' in meta:
+                    spec_dict['eps'] = meta['eps']
+                for param_key in ['lb', 'ub', 'center', 'A', 'b']:
+                    if param_key in act_layer.params:
+                        tensor = act_layer.params[param_key]
+                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
+                spec = InputSpec(**spec_dict)
+                layer_ops[layer_id] = InputSpecLayer(spec)
+
+            elif kind == 'ASSERT':
+                assert_id = layer_id
+                # Build OutputSpec
+                kind_str = meta['kind']
+                spec_kind = getattr(OutKind, kind_str)
+                spec_dict = {'kind': spec_kind}
+                if 'y_true' in meta:
+                    spec_dict['y_true'] = meta['y_true']
+                if 'margin' in meta:
+                    spec_dict['margin'] = meta['margin']
+                if 'd' in meta:
+                    spec_dict['d'] = meta['d']
+                for param_key in ['c', 'lb', 'ub']:
+                    if param_key in act_layer.params:
+                        tensor = act_layer.params[param_key]
+                        spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
+                spec = OutputSpec(**spec_dict)
+                layer_ops[layer_id] = OutputSpecLayer(spec)
+
+            else:
+                # Regular computation layer
+                layer_ops[layer_id] = self._create_torch_layer(kind, meta, act_layer)
+
+        # Validate: must have INPUT and ASSERT
+        if input_id is None:
+            raise ValueError("ACT Net must have an INPUT layer")
+        if assert_id is None:
+            # Fallback: find layer with no successors
+            for layer in self.act_net.layers:
+                if not self.act_net.succs.get(layer.id, []):
+                    assert_id = layer.id
+                    break
+            if assert_id is None:
+                raise ValueError("ACT Net must have an ASSERT layer or a terminal layer")
+
+        # Step 2: Build reference counts for memory optimization (optional)
+        ref_counts = {}
+        for layer_id, succs in self.act_net.succs.items():
+            ref_counts[layer_id] = len(succs)
+
+        # Step 3: Define the DAG executor as a local class
+        class _DAGExecutor(nn.Module):
+            """
+            Graph-based execution module for DAG models.
+
+            Executes layers in topological order (using Net.layers which is already
+            topo-sorted) and maintains intermediate outputs for multi-input layers.
+            """
+            def __init__(self, layers, layer_ops, preds, input_id, input_spec_id,
+                         assert_id, ref_counts):
+                super().__init__()
+                self.layers = layers
+                self.preds = preds
+                self.input_id = input_id
+                self.input_spec_id = input_spec_id
+                self.assert_id = assert_id
+                self.ref_counts = ref_counts.copy()
+
+                # Register nn.Module operations as submodules for proper parameter handling
+                self.layer_ops = nn.ModuleDict()
+                self.layer_funcs = {}  # For callable (non-Module) operations
+
+                for layer_id, op in layer_ops.items():
+                    str_id = str(layer_id)
+                    if op is None:
+                        self.layer_funcs[layer_id] = None
+                    elif isinstance(op, nn.Module):
+                        self.layer_ops[str_id] = op
+                    else:
+                        # Callable function (ADD, CONCAT, etc.)
+                        self.layer_funcs[layer_id] = op
+
+                # Runtime state (reset on each forward)
+                self._input_satisfied = True
+                self._input_explanation = "✅ No input spec"
+
+            def _get_op(self, layer_id):
+                """Get operation for layer (Module or callable)."""
+                str_id = str(layer_id)
+                if str_id in self.layer_ops:
+                    return self.layer_ops[str_id]
+                return self.layer_funcs.get(layer_id)
+
+            def forward(self, x):
+                outputs = {}  # layer_id → tensor
+                ref_counts = self.ref_counts.copy()  # Local copy for memory management
+
+                # Reset input spec state
+                self._input_satisfied = True
+                self._input_explanation = "✅ No input spec"
+
+                for layer in self.layers:
+                    layer_id = layer.id
+                    kind = layer.kind
+                    op = self._get_op(layer_id)
+                    preds = self.preds.get(layer_id, [])
+
+                    # === Case 1: INPUT layer ===
+                    if kind == "INPUT":
+                        outputs[layer_id] = x
+                        continue
+
+                    # === Case 2: INPUT_SPEC layer (returns tuple) ===
+                    if kind == "INPUT_SPEC":
+                        if not preds:
+                            pred_out = x
+                        else:
+                            pred_out = outputs[preds[0]]
+                        result = op(pred_out)  # Returns (tensor, satisfied, explanation)
+                        outputs[layer_id] = result[0]  # Only pass tensor forward
+                        self._input_satisfied = result[1]
+                        self._input_explanation = result[2]
+                        continue
+
+                    # === Case 3: ASSERT layer (returns tuple) ===
+                    if kind == "ASSERT":
+                        pred_out = outputs[preds[0]]
+                        result = op(pred_out)  # Returns (tensor, satisfied, explanation)
+                        outputs[layer_id] = result  # Keep full tuple for final output
+                        continue
+
+                    # === Case 4: Single-input layer ===
+                    if len(preds) == 1:
+                        pred_out = outputs.get(preds[0])
+                        if pred_out is None:
+                            raise RuntimeError(
+                                f"Layer {layer_id} ({kind}) predecessor {preds[0]} not yet computed. "
+                                f"Net.layers may not be in topological order."
+                            )
+                        if op is not None:
+                            if callable(op):
+                                outputs[layer_id] = op(pred_out)
+                            else:
+                                outputs[layer_id] = pred_out  # Identity
+                        else:
+                            outputs[layer_id] = pred_out
+                        continue
+
+                    # === Case 5: Multi-input layer (ADD/CONCAT/MAX/MIN/etc.) ===
+                    if len(preds) >= 2:
+                        inputs = []
+                        for p in preds:
+                            pred_out = outputs.get(p)
+                            if pred_out is None:
+                                raise RuntimeError(
+                                    f"Layer {layer_id} ({kind}) predecessor {p} not yet computed. "
+                                    f"Net.layers may not be in topological order."
+                                )
+                            inputs.append(pred_out)
+
+                        # Validate binary operations
+                        if kind in ["SUB", "MUL", "DIV", "POW", "MATMUL"]:
+                            if len(inputs) != 2:
+                                raise ValueError(
+                                    f"{kind} requires exactly 2 inputs, got {len(inputs)}"
+                                )
+
+                        if op is not None and callable(op):
+                            outputs[layer_id] = op(*inputs)
+                        else:
+                            # Fallback: use first input (shouldn't happen for valid multi-input ops)
+                            outputs[layer_id] = inputs[0]
+                        continue
+
+                    # === Case 6: No predecessors (shouldn't happen except for INPUT) ===
+                    if not preds:
+                        outputs[layer_id] = x if op is None else op(x)
+                        continue
+
+                # === Build final output ===
+                final_output = outputs.get(self.assert_id)
+
+                if final_output is None:
+                    raise RuntimeError(f"ASSERT layer {self.assert_id} output not computed")
+
+                # final_output is a tuple (tensor, satisfied, explanation) from OutputSpecLayer
+                if isinstance(final_output, tuple) and len(final_output) == 3:
+                    return {
+                        "output": final_output[0],
+                        "input_satisfied": self._input_satisfied,
+                        "output_satisfied": final_output[1],
+                        "input_explanation": self._input_explanation,
+                        "output_explanation": final_output[2],
+                    }
+                else:
+                    # Fallback if ASSERT layer didn't return expected tuple
+                    return {
+                        "output": final_output,
+                        "input_satisfied": self._input_satisfied,
+                        "output_satisfied": True,
+                        "input_explanation": self._input_explanation,
+                        "output_explanation": "⚠️ No output spec",
+                    }
+
+        # Step 4: Create and return the executor
+        executor = _DAGExecutor(
+            layers=self.act_net.layers,
+            layer_ops=layer_ops,
+            preds=self.act_net.preds,
+            input_id=input_id,
+            input_spec_id=input_spec_id,
+            assert_id=assert_id,
+            ref_counts=ref_counts,
+        )
+        executor.eval()
+
+        logger.info(
+            f"Created DAG executor with {len(self.act_net.layers)} layers "
+            f"(INPUT={input_id}, INPUT_SPEC={input_spec_id}, ASSERT={assert_id})"
+        )
+
+        return executor
     
     def _transfer_weights(self, torch_layer: nn.Module, act_layer: Layer, 
                          weight_key: str = "W", bias_key: str = "b") -> None:
