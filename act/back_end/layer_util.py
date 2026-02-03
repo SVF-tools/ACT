@@ -48,6 +48,28 @@ except Exception:  # typing only
     Tensor = "torch.Tensor"  # type: ignore
 
 # ------------------------------
+# Torch Restoration Meta Keys
+# ------------------------------
+# These meta keys are globally allowed for all layer types to support
+# dynamic PyTorch module restoration in act2torch.py
+TORCH_RESTORATION_META = frozenset([
+    # Core restoration metadata
+    "torch_module",      # Full module path, e.g. "torch.nn.Linear"
+    "torch_args",        # Positional args for module constructor
+    "torch_kwargs",      # Keyword args for module constructor
+    # BatchNorm decomposition restoration
+    "is_batchnorm_decomposition",  # True if this layer is part of BatchNorm decomposition
+    "batchnorm_module",            # Original BatchNorm module path
+    "batchnorm_args",              # BatchNorm constructor args
+    "batchnorm_kwargs",            # BatchNorm constructor kwargs
+    "batchnorm_state",             # BatchNorm state_dict for restoration
+    "paired_with_scale",           # True for BIAS layer paired with SCALE
+    # Graph structure metadata (for non-Sequential models)
+    "requires_graph_restoration",  # True if layer needs DAG structure
+    "input_node_ids",              # Input layer IDs for multi-input ops
+])
+
+# ------------------------------
 # Strict validation & helpers
 # ------------------------------
 def _missing(required: List[str], got: Dict[str, Any]) -> List[str]:
@@ -130,7 +152,8 @@ def validate_layer(layer: "Layer") -> None:
     miss_m = _missing(spec['meta_required'], layer.meta)
     
     allowed_p = spec['params_required'] + spec['params_optional']
-    allowed_m = spec['meta_required'] + spec['meta_optional']
+    # Include globally allowed torch restoration meta for all layers
+    allowed_m = spec['meta_required'] + spec['meta_optional'] + list(TORCH_RESTORATION_META)
 
     unk_p = _unknown(allowed_p, layer.params)
     unk_m = _unknown(allowed_m, layer.meta)

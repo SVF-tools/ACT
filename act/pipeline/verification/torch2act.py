@@ -437,13 +437,19 @@ class _LayerGraphBuilder:
     # Layer Conversion - Specific Converters
     # -------------------------------------------------------------------------
     
-    def _create_flatten_layer(self, node_name: Optional[str] = None) -> List[int]:
+    def _create_flatten_layer(self, node_name: Optional[str] = None,
+                               start_dim: int = 1, end_dim: int = -1) -> List[int]:
         """Create FLATTEN layer, optionally register node."""
         out_vars = self._same_size_forward()
         output_shape = (1, _prod(self.shape[1:]))
         layer_id = self._add_layer(
             LayerKind.FLATTEN.value, {},
-            {"input_shape": self.shape, "output_shape": output_shape},
+            {"input_shape": self.shape, "output_shape": output_shape,
+             "start_dim": start_dim, "end_dim": end_dim,
+             # Torch restoration metadata
+             "torch_module": "torch.nn.Flatten",
+             "torch_args": [],
+             "torch_kwargs": {"start_dim": start_dim, "end_dim": end_dim}},
             self.prev_out, out_vars
         )
         self.prev_out = out_vars
@@ -454,21 +460,28 @@ class _LayerGraphBuilder:
     
     def _convert_flatten(self, mod: nn.Flatten) -> None:
         """Convert nn.Flatten."""
-        self._create_flatten_layer()
+        self._create_flatten_layer(start_dim=mod.start_dim, end_dim=mod.end_dim)
     
     def _convert_linear(self, mod: nn.Linear) -> None:
         """Convert nn.Linear to DENSE layer."""
+        in_features = int(mod.in_features)
         out_features = int(mod.out_features)
+        has_bias = mod.bias is not None
+        
         W = mod.weight.detach()
-        b = mod.bias.detach() if mod.bias is not None else torch.zeros(out_features, dtype=W.dtype, device=W.device)
+        b = mod.bias.detach() if has_bias else torch.zeros(out_features, dtype=W.dtype, device=W.device)
         
         out_vars = self._alloc_ids(out_features)
         self._add_layer(
             LayerKind.DENSE.value,
             {"W": W, "b": b},
             {"input_shape": self.shape, "output_shape": (1, out_features),
-             "in_features": int(mod.in_features), "out_features": out_features,
-             "bias_enabled": mod.bias is not None},
+             "in_features": in_features, "out_features": out_features,
+             "bias_enabled": has_bias,
+             # Torch restoration metadata
+             "torch_module": "torch.nn.Linear",
+             "torch_args": [in_features, out_features],
+             "torch_kwargs": {"bias": has_bias}},
             self.prev_out, out_vars
         )
         self.shape = (1, out_features)
@@ -477,7 +490,8 @@ class _LayerGraphBuilder:
     def _convert_conv2d(self, mod: nn.Conv2d) -> None:
         """Convert nn.Conv2d."""
         weight = mod.weight.detach()
-        bias = mod.bias.detach() if mod.bias is not None else None
+        has_bias = mod.bias is not None
+        bias = mod.bias.detach() if has_bias else None
         
         # Infer input shape if flattened
         if len(self.shape) == 2:
@@ -504,7 +518,13 @@ class _LayerGraphBuilder:
             {"input_shape": input_shape, "output_shape": output_shape,
              "kernel_size": mod.kernel_size, "stride": mod.stride,
              "padding": mod.padding, "dilation": mod.dilation,
-             "groups": mod.groups, "in_channels": in_c, "out_channels": out_c},
+             "groups": mod.groups, "in_channels": in_c, "out_channels": out_c,
+             # Torch restoration metadata
+             "torch_module": "torch.nn.Conv2d",
+             "torch_args": [in_c, out_c, mod.kernel_size],
+             "torch_kwargs": {"stride": mod.stride, "padding": mod.padding,
+                              "dilation": mod.dilation, "groups": mod.groups,
+                              "bias": has_bias}},
             self.prev_out, out_vars
         )
         self.shape = output_shape
@@ -527,11 +547,28 @@ class _LayerGraphBuilder:
         out_w = (in_w + 2 * pad[1] - ks[1]) // st[1] + 1
         output_shape = (1, in_c, out_h, out_w)
         
+        # Torch restoration metadata
+        torch_module = "torch.nn.MaxPool2d" if is_max else "torch.nn.AvgPool2d"
+        torch_kwargs: Dict[str, Any] = {
+            "stride": mod.stride or mod.kernel_size,
+            "padding": mod.padding
+        }
+        if is_max:
+            torch_kwargs["dilation"] = mod.dilation
+            torch_kwargs["ceil_mode"] = mod.ceil_mode
+        else:
+            torch_kwargs["ceil_mode"] = mod.ceil_mode
+            torch_kwargs["count_include_pad"] = mod.count_include_pad
+        
         out_vars = self._alloc_ids(in_c * out_h * out_w)
         self._add_layer(
             kind.value, {},
             {"kernel_size": mod.kernel_size, "stride": mod.stride or mod.kernel_size,
-             "padding": mod.padding, "input_shape": self.shape, "output_shape": output_shape},
+             "padding": mod.padding, "input_shape": self.shape, "output_shape": output_shape,
+             # Torch restoration metadata
+             "torch_module": torch_module,
+             "torch_args": [mod.kernel_size],
+             "torch_kwargs": torch_kwargs},
             self.prev_out, out_vars
         )
         self.shape = output_shape
@@ -549,13 +586,17 @@ class _LayerGraphBuilder:
         
         out_vars = self._alloc_ids(in_c * out_h * out_w)
         self._add_layer(LayerKind.ADAPTIVEAVGPOOL2D.value, {},
-                       {"output_size": (out_h, out_w)},
+                       {"output_size": (out_h, out_w),
+                        # Torch restoration metadata
+                        "torch_module": "torch.nn.AdaptiveAvgPool2d",
+                        "torch_args": [(out_h, out_w)],
+                        "torch_kwargs": {}},
                        self.prev_out, out_vars)
         self.shape = output_shape
         self.prev_out = out_vars
     
     def _convert_batchnorm(self, mod: _BatchNorm) -> None:
-        """Convert BatchNorm to SCALE + BIAS layers."""
+        """Convert BatchNorm to SCALE + BIAS layers with restoration metadata."""
         gamma = mod.weight.detach() if mod.weight is not None else torch.ones(
             mod.num_features, dtype=mod.running_mean.dtype, device=mod.running_mean.device)
         beta = mod.bias.detach() if mod.bias is not None else torch.zeros(
@@ -573,20 +614,62 @@ class _LayerGraphBuilder:
         scale_full = scale.repeat_interleave(spatial) if spatial > 1 else scale
         bias_full = bias.repeat_interleave(spatial) if spatial > 1 else bias
         
-        # SCALE layer
+        # Determine BatchNorm type for restoration
+        if isinstance(mod, nn.BatchNorm1d):
+            bn_module = "torch.nn.BatchNorm1d"
+        elif isinstance(mod, nn.BatchNorm2d):
+            bn_module = "torch.nn.BatchNorm2d"
+        elif isinstance(mod, nn.BatchNorm3d):
+            bn_module = "torch.nn.BatchNorm3d"
+        else:
+            bn_module = "torch.nn.BatchNorm2d"  # fallback
+
+        # Store BatchNorm state for restoration
+        batchnorm_state = {
+            "weight": gamma,
+            "bias": beta,
+            "running_mean": mod.running_mean.detach(),
+            "running_var": mod.running_var.detach(),
+            "num_batches_tracked": mod.num_batches_tracked.detach() if mod.num_batches_tracked is not None else torch.tensor(0),
+        }
+
+        # SCALE layer - stores BatchNorm restoration info
         out_scale = self._same_size_forward()
-        self._add_layer("SCALE", {"a": scale_full}, {}, self.prev_out, out_scale)
+        self._add_layer("SCALE", {"a": scale_full},
+                       {"input_shape": self.shape, "output_shape": self.shape,
+                        # BatchNorm restoration metadata
+                        "is_batchnorm_decomposition": True,
+                        "batchnorm_module": bn_module,
+                        "batchnorm_args": [n_channels],
+                        "batchnorm_kwargs": {"eps": mod.eps, "momentum": mod.momentum,
+                                             "affine": mod.affine, "track_running_stats": mod.track_running_stats},
+                        "batchnorm_state": batchnorm_state},
+                       self.prev_out, out_scale)
         self.prev_out = out_scale
         
-        # BIAS layer
+        # BIAS layer - marked as paired with SCALE
         out_bias = self._same_size_forward()
-        self._add_layer("BIAS", {"c": bias_full}, {}, self.prev_out, out_bias)
+        self._add_layer("BIAS", {"c": bias_full},
+                       {"input_shape": self.shape, "output_shape": self.shape,
+                        "is_batchnorm_decomposition": True,
+                        "paired_with_scale": True},
+                       self.prev_out, out_bias)
         self.prev_out = out_bias
     
     def _convert_activation(self, mod: nn.Module, kind: LayerKind, 
                            extra_meta: Optional[Dict[str, Any]] = None) -> None:
         """Convert activation function."""
         out_vars = self._same_size_forward()
+
+        # Map LayerKind to torch module info
+        activation_torch_info: Dict[LayerKind, Tuple[str, List, Dict]] = {
+            LayerKind.RELU: ("torch.nn.ReLU", [], {}),
+            LayerKind.SILU: ("torch.nn.SiLU", [], {}),
+            LayerKind.SIGMOID: ("torch.nn.Sigmoid", [], {}),
+            LayerKind.TANH: ("torch.nn.Tanh", [], {}),
+            LayerKind.LRELU: ("torch.nn.LeakyReLU", [], {"negative_slope": getattr(mod, 'negative_slope', 0.01)}),
+        }
+
         # Only include input_shape/output_shape for layers that support them
         # LRELU only accepts negative_slope, not shape metadata
         if kind == LayerKind.LRELU:
@@ -595,6 +678,14 @@ class _LayerGraphBuilder:
             meta = {"input_shape": self.shape, "output_shape": self.shape}
         if extra_meta:
             meta.update(extra_meta)
+        
+        # Add torch restoration metadata
+        if kind in activation_torch_info:
+            torch_module, torch_args, torch_kwargs = activation_torch_info[kind]
+            meta["torch_module"] = torch_module
+            meta["torch_args"] = torch_args
+            meta["torch_kwargs"] = torch_kwargs
+
         self._add_layer(kind.value, {}, meta, self.prev_out, out_vars)
         self.prev_out = out_vars
     
