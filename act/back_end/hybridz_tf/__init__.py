@@ -20,6 +20,7 @@ precision through zonotope arithmetic and constraint generation.
 """
 
 from .hybridz_tf import HybridzTF
+from act.back_end.solver.hz_bounds import HZono
 from .tf_mlp import *
 from .tf_cnn import *
 from .tf_rnn import *
@@ -27,5 +28,5 @@ from .tf_transformer import *
 
 __all__ = [
     'HybridzTF',
-    # MLP, CNN, RNN, and Transformer functions will be imported via tf_* modules
+    'HZono',
 ]

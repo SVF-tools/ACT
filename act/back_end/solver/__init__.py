@@ -15,8 +15,10 @@
 from .solver_base import Solver, SolverCaps, SolveStatus
 from .solver_torch import TorchLPSolver
 from .solver_gurobi import GurobiSolver
+from .hz_bounds import hz_compute_bounds
 
 __all__ = [
     'Solver', 'SolverCaps', 'SolveStatus',
-    'TorchLPSolver', 'GurobiSolver'
+    'TorchLPSolver', 'GurobiSolver',
+    'hz_compute_bounds',
 ]

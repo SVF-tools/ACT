@@ -15,7 +15,6 @@
 
 import torch
 import math
-from typing import Optional
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
@@ -65,7 +64,7 @@ def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb_out, ub=ub_out)
     
     cons = ConSet()
-    cons.add_layernorm(L.id, L.in_vars, L.out_vars, normalized_shape, eps, weight, bias)
+    cons.add_op(f"layernorm:{L.id}", list(L.out_vars + L.in_vars), normalized_shape=normalized_shape, eps=eps)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -79,9 +78,6 @@ def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
     # Define breakpoints for piecewise linear approximation
     breakpoints = torch.tensor([-3.0, -1.0, 0.0, 1.0, 3.0], device=Bin.lb.device, dtype=Bin.lb.dtype)
     
-    # GELU values at breakpoints (approximately)
-    gelu_values = torch.tensor([-0.0, -0.159, 0.0, 0.841, 3.0], device=Bin.lb.device, dtype=Bin.lb.dtype)
-    
     # Compute piecewise linear bounds
     lb = torch.zeros_like(Bin.lb)
     ub = torch.zeros_like(Bin.ub)
@@ -90,13 +86,8 @@ def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
         x_min, x_max = Bin.lb[i].item(), Bin.ub[i].item()
         
         # Find which segments the interval [x_min, x_max] intersects
-        y_candidates = []
-        
-        # Check GELU values at interval endpoints
-        y_candidates.append(gelu_approx(x_min))
-        y_candidates.append(gelu_approx(x_max))
-        
         # Check GELU values at breakpoints within interval
+        y_candidates = [gelu_approx(x_min), gelu_approx(x_max)]
         for bp in breakpoints:
             if x_min <= bp <= x_max:
                 y_candidates.append(gelu_approx(bp.item()))
@@ -112,7 +103,7 @@ def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_gelu(L.id, L.in_vars, L.out_vars)
+    cons.add_op(f"gelu:{L.id}", list(L.out_vars + L.in_vars))
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -140,8 +131,6 @@ def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     lb = torch.zeros_like(Bin.lb)
     ub = torch.ones_like(Bin.ub)
     
-    # Tighter bounds based on input range
-    input_range = Bin.ub - Bin.lb
     max_input = torch.max(Bin.ub)
     min_input = torch.min(Bin.lb)
     
@@ -164,7 +153,7 @@ def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     # Softmax generates simplex constraints (sum = 1, all ≥ 0)
     cons = ConSet()
     rowsize = len(L.out_vars)
-    cons.add_simplex(L.id, L.out_vars, rowsize)
+    cons.add_op(f"softmax:{L.id}", list(L.out_vars), rowsize=rowsize)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -188,7 +177,7 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_posenc(L.id, L.in_vars, L.out_vars, max_len, d_model)
+    cons.add_op(f"posenc:{L.id}", list(L.out_vars + L.in_vars), max_len=max_len, d_model=d_model)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -230,6 +219,6 @@ def hybridz_tf_attention_scores(L: Layer, Q_bounds: Bounds, K_bounds: Bounds) ->
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_attention_scores(L.id, L.in_vars, L.out_vars, d_k)
+    cons.add_op(f"att_scores:{L.id}", list(L.out_vars + L.in_vars), d_k=d_k)
     
     return Fact(bounds=Bout, cons=cons)

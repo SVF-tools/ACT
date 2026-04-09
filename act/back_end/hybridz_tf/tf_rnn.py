@@ -13,7 +13,6 @@
 #===---------------------------------------------------------------------===#
 
 import torch
-from typing import Tuple
 from act.back_end.core import Bounds, Fact, Layer, ConSet
 
 
@@ -49,7 +48,7 @@ def hybridz_tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_lstm(L.id, L.in_vars, L.out_vars, input_size, hidden_size)
+    cons.add_op(f"lstm:{L.id}", list(L.out_vars + L.in_vars), input_size=input_size, hidden_size=hidden_size)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -76,7 +75,7 @@ def hybridz_tf_gru(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_gru(L.id, L.in_vars, L.out_vars, input_size, hidden_size)
+    cons.add_op(f"gru:{L.id}", list(L.out_vars + L.in_vars), input_size=input_size, hidden_size=hidden_size)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -106,7 +105,7 @@ def hybridz_tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_rnn(L.id, L.in_vars, L.out_vars, input_size, hidden_size, nonlinearity)
+    cons.add_op(f"rnn:{L.id}", list(L.out_vars + L.in_vars), input_size=input_size, hidden_size=hidden_size, nonlinearity=nonlinearity)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -132,6 +131,6 @@ def hybridz_tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_embedding(L.id, L.in_vars, L.out_vars, num_embeddings, embedding_dim, weight)
+    cons.add_op(f"embedding:{L.id}", list(L.out_vars + L.in_vars), num_embeddings=num_embeddings, embedding_dim=embedding_dim, weight=weight)
     
     return Fact(bounds=Bout, cons=cons)
