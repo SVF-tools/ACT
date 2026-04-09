@@ -95,23 +95,7 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
 
     Bout = Bounds(lb=lb_conv.view(-1), ub=ub_conv.view(-1))
 
-    cons = ConSet()
-    cons.add_op(
-        f"conv2d:{L.id}",
-        list(L.out_vars + L.in_vars),
-        weight=weight,
-        bias=bias
-        if bias is not None
-        else torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype),
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        groups=groups,
-        input_shape=L.params.get("input_shape"),
-        output_shape=L.params.get("output_shape"),
-    )
-
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -120,18 +104,23 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     kernel_size = L.params.get("kernel_size", 2)
     stride = L.params.get("stride", kernel_size)
     padding = L.params.get("padding", 0)
-
     input_shape = L.params.get("input_shape")
 
-    if input_shape is None:
-        return Fact(bounds=Bin, cons=ConSet())
+    if input_shape is not None and len(input_shape) == 4:
+        _, C, H, W = input_shape
+    elif input_shape is not None and len(input_shape) == 3:
+        C, H, W = input_shape
+    else:
+        total = Bin.lb.numel()
+        C = 1
+        spatial = total
+        H = W = int(spatial**0.5)
 
-    lb_pool = F.max_pool2d(
-        Bin.lb.view(*input_shape), kernel_size, stride=stride, padding=padding
-    )
-    ub_pool = F.max_pool2d(
-        Bin.ub.view(*input_shape), kernel_size, stride=stride, padding=padding
-    )
+    lb_in = Bin.lb.view(1, C, H, W)
+    ub_in = Bin.ub.view(1, C, H, W)
+
+    lb_pool = F.max_pool2d(lb_in, kernel_size, stride, padding)
+    ub_pool = F.max_pool2d(ub_in, kernel_size, stride, padding)
 
     Bout = Bounds(lb=lb_pool.view(-1), ub=ub_pool.view(-1))
 
@@ -143,42 +132,6 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
         stride=stride,
         padding=padding,
         input_shape=input_shape,
-        output_shape=L.params.get("output_shape"),
-    )
-
-    return Fact(bounds=Bout, cons=cons)
-
-
-@torch.no_grad()
-def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
-    """HybridZ transfer function for 2D average pooling."""
-    kernel_size = L.params.get("kernel_size", 2)
-    stride = L.params.get("stride", kernel_size)
-    padding = L.params.get("padding", 0)
-
-    input_shape = L.params.get("input_shape")
-
-    if input_shape is None:
-        return Fact(bounds=Bin, cons=ConSet())
-
-    lb_pool = F.avg_pool2d(
-        Bin.lb.view(*input_shape), kernel_size, stride=stride, padding=padding
-    )
-    ub_pool = F.avg_pool2d(
-        Bin.ub.view(*input_shape), kernel_size, stride=stride, padding=padding
-    )
-
-    Bout = Bounds(lb=lb_pool.view(-1), ub=ub_pool.view(-1))
-
-    cons = ConSet()
-    cons.add_op(
-        f"avgpool2d:{L.id}",
-        list(L.out_vars + L.in_vars),
-        kernel_size=kernel_size,
-        stride=stride,
-        padding=padding,
-        input_shape=input_shape,
-        output_shape=L.params.get("output_shape"),
     )
 
     return Fact(bounds=Bout, cons=cons)
@@ -228,4 +181,268 @@ def hybridz_tf_reshape(L: Layer, Bin: Bounds) -> Fact:
         output_shape=L.params.get("output_shape"),
     )
 
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
+    kernel_size = L.params.get("kernel_size", 2)
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
+    input_shape = L.params.get("input_shape")
+    output_shape = L.params.get("output_shape")
+
+    if input_shape is not None and len(input_shape) == 4:
+        _, C, H, W = input_shape
+    elif input_shape is not None and len(input_shape) == 3:
+        C, H, W = input_shape
+    else:
+        total = Bin.lb.numel()
+        C = 1
+        H = W = int(total**0.5)
+
+    lb_in = Bin.lb.view(1, C, H, W)
+    ub_in = Bin.ub.view(1, C, H, W)
+
+    lb_pool = F.avg_pool2d(lb_in, kernel_size, stride, padding)
+    ub_pool = F.avg_pool2d(ub_in, kernel_size, stride, padding)
+
+    Bout = Bounds(lb=lb_pool.view(-1), ub=ub_pool.view(-1))
+    cons = ConSet()
+    cons.add_op(
+        f"avgpool2d:{L.id}",
+        list(L.out_vars + L.in_vars),
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        input_shape=input_shape,
+        output_shape=output_shape,
+    )
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
+    weight = L.params["weight"]
+    bias = L.params.get("bias", None)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
+    input_shape = L.params.get("input_shape")
+
+    if input_shape is not None and len(input_shape) == 3:
+        _, C, W = input_shape
+    elif input_shape is not None and len(input_shape) == 2:
+        C, W = input_shape
+    else:
+        out_c, in_c_per_g, kW = weight.shape
+        C = in_c_per_g * groups
+        W = Bin.lb.numel() // C
+
+    lb_in = Bin.lb.view(1, C, W)
+    ub_in = Bin.ub.view(1, C, W)
+
+    weight_pos = torch.clamp(weight, min=0)
+    weight_neg = torch.clamp(weight, max=0)
+
+    lb_conv = F.conv1d(
+        lb_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    lb_conv += F.conv1d(
+        ub_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    ub_conv = F.conv1d(
+        ub_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    ub_conv += F.conv1d(
+        lb_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    if bias is not None:
+        lb_conv += bias.view(1, -1, 1)
+        ub_conv += bias.view(1, -1, 1)
+
+    Bout = Bounds(lb=lb_conv.view(-1), ub=ub_conv.view(-1))
+    cons = ConSet()
+    cons.add_op(f"conv1d:{L.id}", list(L.out_vars + L.in_vars))
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
+    weight = L.params["weight"]
+    bias = L.params.get("bias", None)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
+    input_shape = L.params.get("input_shape")
+
+    if input_shape is not None and len(input_shape) == 5:
+        _, C, D, H, W = input_shape
+    elif input_shape is not None and len(input_shape) == 4:
+        C, D, H, W = input_shape
+    else:
+        out_c, in_c_per_g = weight.shape[:2]
+        C = in_c_per_g * groups
+        spatial = Bin.lb.numel() // C
+        side = int(round(spatial ** (1 / 3)))
+        D = H = W = side
+
+    lb_in = Bin.lb.view(1, C, D, H, W)
+    ub_in = Bin.ub.view(1, C, D, H, W)
+
+    weight_pos = torch.clamp(weight, min=0)
+    weight_neg = torch.clamp(weight, max=0)
+
+    lb_conv = F.conv3d(
+        lb_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    lb_conv += F.conv3d(
+        ub_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    ub_conv = F.conv3d(
+        ub_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    ub_conv += F.conv3d(
+        lb_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    if bias is not None:
+        lb_conv += bias.view(1, -1, 1, 1, 1)
+        ub_conv += bias.view(1, -1, 1, 1, 1)
+
+    Bout = Bounds(lb=lb_conv.view(-1), ub=ub_conv.view(-1))
+    cons = ConSet()
+    cons.add_op(f"conv3d:{L.id}", list(L.out_vars + L.in_vars))
+    return Fact(bounds=Bout, cons=cons)
+
+
+@torch.no_grad()
+def hybridz_tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
+    weight = L.params["weight"]
+    bias = L.params.get("bias", None)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    output_padding = L.params.get("output_padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
+    input_shape = L.params.get("input_shape")
+
+    if input_shape is not None and len(input_shape) == 4:
+        _, C, H, W = input_shape
+    elif input_shape is not None and len(input_shape) == 3:
+        C, H, W = input_shape
+    else:
+        in_c = weight.shape[0]
+        C = in_c
+        spatial = Bin.lb.numel() // C
+        H = W = int(spatial**0.5)
+
+    lb_in = Bin.lb.view(1, C, H, W)
+    ub_in = Bin.ub.view(1, C, H, W)
+
+    weight_pos = torch.clamp(weight, min=0)
+    weight_neg = torch.clamp(weight, max=0)
+
+    lb_conv = F.conv_transpose2d(
+        lb_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    lb_conv += F.conv_transpose2d(
+        ub_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    ub_conv = F.conv_transpose2d(
+        ub_in,
+        weight_pos,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=dilation,
+        groups=groups,
+    )
+    ub_conv += F.conv_transpose2d(
+        lb_in,
+        weight_neg,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    if bias is not None:
+        lb_conv += bias.view(1, -1, 1, 1)
+        ub_conv += bias.view(1, -1, 1, 1)
+
+    Bout = Bounds(lb=lb_conv.view(-1), ub=ub_conv.view(-1))
+    cons = ConSet()
+    cons.add_op(f"convtranspose2d:{L.id}", list(L.out_vars + L.in_vars))
     return Fact(bounds=Bout, cons=cons)

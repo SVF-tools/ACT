@@ -725,4 +725,27 @@ SUPPORTED_EXPORT_OPS = {
     "gru",
     "rnn",
     "embedding",
+    # Activations
+    "clip",
+    "softplus",
+    "silu",
+    "relu6",
+    "hardtanh",
+    "hardsigmoid",
+    "hardswish",
+    "mish",
+    "softsign",
+    # Element-wise / tensor ops
+    "square",
+    "power",
+    "concat",
+    "transpose",
+    "squeeze",
+    "unsqueeze",
+    "tile",
+    "expand",
+    # CNN variants
+    "conv1d",
+    "conv3d",
+    "convtranspose2d",
 }

@@ -63,10 +63,7 @@ def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb_out, ub=ub_out)
     
-    cons = ConSet()
-    cons.add_op(f"layernorm:{L.id}", list(L.out_vars + L.in_vars), normalized_shape=normalized_shape, eps=eps)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -102,10 +99,7 @@ def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_op(f"gelu:{L.id}", list(L.out_vars + L.in_vars))
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 def gelu_approx(x: float) -> float:
@@ -153,7 +147,8 @@ def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     # Softmax generates simplex constraints (sum = 1, all ≥ 0)
     cons = ConSet()
     rowsize = len(L.out_vars)
-    cons.add_op(f"softmax:{L.id}", list(L.out_vars), rowsize=rowsize)
+    mode = L.params.get("mode", "simplex")
+    cons.add_op(f"softmax:{mode}:{L.id}", list(L.out_vars), rowsize=rowsize)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -175,10 +170,7 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     lb = Bin.lb - pe_range
     ub = Bin.ub + pe_range
     Bout = Bounds(lb=lb, ub=ub)
-    
-    cons = ConSet()
-    cons.add_op(f"posenc:{L.id}", list(L.out_vars + L.in_vars), max_len=max_len, d_model=d_model)
-    
+    return Fact(bounds=Bout, cons=ConSet())
     return Fact(bounds=Bout, cons=cons)
 
 
@@ -217,8 +209,5 @@ def hybridz_tf_attention_scores(L: Layer, Q_bounds: Bounds, K_bounds: Bounds) ->
     ub = torch.tensor([p[1] for p in products]) * scale
     
     Bout = Bounds(lb=lb, ub=ub)
-    
-    cons = ConSet()
-    cons.add_op(f"att_scores:{L.id}", list(L.out_vars + L.in_vars), d_k=d_k)
-    
+    return Fact(bounds=Bout, cons=ConSet())
     return Fact(bounds=Bout, cons=cons)
