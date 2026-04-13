@@ -246,7 +246,7 @@ def setup_and_solve(
     Returns:
         Tuple of (status, counterexample_input, stats):
         - status: SolveStatus.SAT/UNSAT/UNKNOWN
-        - counterexample_input: np.ndarray if SAT, else None
+        - counterexample_input: torch.Tensor if SAT, else None
         - stats: Dict with metadata (ncons, status, etc.)
     """
     from act.back_end.analyze import analyze
@@ -305,7 +305,7 @@ def verify_once(net, solver: Solver, timelimit: Optional[float] = None) -> Verif
     
     # Interpret result
     if status == SolveStatus.SAT and ce_input is not None:
-        ce_x = torch.from_numpy(ce_input)
+        ce_x = ce_input if isinstance(ce_input, torch.Tensor) else torch.as_tensor(ce_input)
         return VerifyResult(VerifyStatus.FALSIFIED, counterexample=ce_x, metadata=stats)
     
     if status == SolveStatus.UNSAT:

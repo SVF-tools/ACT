@@ -47,12 +47,7 @@ def tf_maxpool2d(L, bounds, tf):
         shape = L.params.get("input_shape")
         done = False
         if shape is not None:
-            if len(shape) == 4:
-                _, C, H, W = shape
-            elif len(shape) == 3:
-                C, H, W = shape
-            else:
-                hz_in = None
+            _, C, H, W = shape
             if hz_in is not None:
                 _, idx = F.max_pool2d(
                     bds.lb.view(1, C, H, W),
@@ -103,12 +98,7 @@ def hz_conv2d(
     """Apply conv2d to a hybrid zonotope: convolve center and each generator column."""
     dtype, device = hz.c.dtype, hz.c.device
     # Inline shape extraction (no parse_input_shape dependency)
-    if len(input_shape) == 4:
-        _, C, H, W = input_shape
-    elif len(input_shape) == 3:
-        C, H, W = input_shape
-    else:
-        raise ValueError(f"Unexpected input_shape={input_shape}, expected 3D or 4D")
+    _, C, H, W = input_shape
     weight = weight.to(dtype=dtype, device=device)
 
     c_img = hz.c.view(C, H, W).unsqueeze(0)

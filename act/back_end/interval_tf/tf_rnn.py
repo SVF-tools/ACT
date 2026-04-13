@@ -51,12 +51,12 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden and cell states bounds (typically zeros)
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype),
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype)
     )
     c_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype),
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype)
     )
     
     # Process each time step
@@ -149,8 +149,8 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype),
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype)
     )
     
     # Process each time step
@@ -239,8 +239,8 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype),
+        torch.zeros(batch_size, hidden_size, device=Bin.lb.device, dtype=Bin.lb.dtype)
     )
     
     # Process each time step
@@ -465,8 +465,9 @@ def _apply_linear_bounds(input_bounds, weight, bias=None):
     W_pos = torch.clamp(weight, min=0)
     W_neg = torch.clamp(weight, max=0)
     
-    result = affine_bounds(W_pos, W_neg, bias or torch.zeros(weight.shape[0]), input_bounds)
-    return result
+    if bias is None:
+        bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+    return affine_bounds(W_pos, W_neg, bias, input_bounds)
 
 
 def _apply_sigmoid_bounds(bounds):

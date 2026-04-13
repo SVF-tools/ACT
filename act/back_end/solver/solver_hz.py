@@ -59,9 +59,7 @@ def hz_multiply(hz: HZono, R: torch.Tensor) -> HZono:
 
 
 def hz_add_const(hz: HZono, v: torch.Tensor) -> HZono:
-    v = v.to(dtype=hz.c.dtype, device=hz.c.device)
-    if v.ndim == 1:
-        v = v.view(-1, 1)
+    v = v.to(dtype=hz.c.dtype, device=hz.c.device).view(-1, 1)
     return HZono(
         c=hz.c + v,
         Gc=hz.Gc.clone(),

@@ -30,8 +30,8 @@ def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     cx_lb, cx_ub = Bin.lb - mu_ub, Bin.ub - mu_lb
     v_lo, v_hi = bound_var_interval(Bin.lb, Bin.ub)
     eps=float(L.params.get("eps",1e-5))
-    inv_lb = 1.0/torch.sqrt(torch.tensor(v_hi+eps, dtype=Bin.lb.dtype, device=Bin.lb.device))
-    inv_ub = 1.0/torch.sqrt(torch.tensor(max(v_lo,0.0)+eps, dtype=Bin.lb.dtype, device=Bin.lb.device))
+    inv_lb = 1.0/torch.sqrt(v_hi+eps)
+    inv_ub = 1.0/torch.sqrt(torch.clamp(v_lo, min=0.0)+eps)
     sh_lb, sh_ub = scale_interval(cx_lb, cx_ub, inv_lb, inv_ub)
     gamma,beta=L.params["gamma"],L.params["beta"]
     lb=torch.where(gamma>=0, gamma*sh_lb+beta, gamma*sh_ub+beta)

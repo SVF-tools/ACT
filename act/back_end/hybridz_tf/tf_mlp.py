@@ -43,7 +43,7 @@ def tf_dense(L, bounds, tf):
         b = L.params.get("bias")
         if b is not None:
             b_col = b.to(dtype=dtype, device=device)
-            hz = hz_add_const(hz, b_col.view(-1, 1) if b_col.ndim == 1 else b_col)
+            hz = hz_add_const(hz, b_col.view(-1, 1))
         tf._hz_cache[L.id] = hz
     fact = interval.tf_dense(L, bounds)
     if hz_in is not None:
@@ -56,7 +56,7 @@ def tf_bias(L, bounds, tf):
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
         c = L.params["c"].to(dtype=dtype, device=device)
-        tf._hz_cache[L.id] = hz_add_const(hz_in, c.view(-1, 1) if c.ndim == 1 else c)
+        tf._hz_cache[L.id] = hz_add_const(hz_in, c.view(-1, 1))
     fact = interval.tf_bias(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
@@ -145,7 +145,7 @@ def tf_bn(L, bounds, tf):
         A = L.params["A"].to(dtype=dtype, device=device).flatten()
         c = L.params["c"].to(dtype=dtype, device=device)
         hz = hz_multiply(hz_in, torch.diag(A))
-        tf._hz_cache[L.id] = hz_add_const(hz, c.view(-1, 1) if c.ndim == 1 else c)
+        tf._hz_cache[L.id] = hz_add_const(hz, c.view(-1, 1))
     fact = interval.tf_bn(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
@@ -296,14 +296,13 @@ def hz_apply_relu(hz: HZono) -> HZono:
     eq_Ab[r2, col_z] = -1.0
     eq_b[r2, 0] = 1.0
 
-    for j in range(k):
-        idx_i = int(unstable_idx[j].item())
-        eq_Ac[3 * j + 2, col_xi1[j]] = alpha[j] / 2.0
-        eq_Ac[3 * j + 2, col_xi2[j]] = -beta[j] / 2.0
-        eq_Ac[3 * j + 2, :ng] -= hz.Gc[idx_i]
-        eq_Ab[3 * j + 2, :nb] -= hz.Gb[idx_i]
-        eq_Ab[3 * j + 2, col_z[j]] = alpha[j] / 2.0
-        eq_b[3 * j + 2, 0] = hz.c[idx_i, 0] - beta[j] / 2.0
+    r3 = 3 * t + 2
+    eq_Ac[r3, :ng] = -hz.Gc[unstable_idx]
+    eq_Ac[r3, col_xi1] = alpha / 2.0
+    eq_Ac[r3, col_xi2] = -beta / 2.0
+    eq_Ab[r3, :nb] = -hz.Gb[unstable_idx]
+    eq_Ab[r3, col_z] = alpha / 2.0
+    eq_b[r3, 0] = hz.c[unstable_idx, 0] - beta / 2.0
 
     old_Ac_ext = torch.cat(
         [hz.Ac, torch.zeros((nc, 4 * k), dtype=dtype, device=device)], dim=1
@@ -417,14 +416,13 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
     eq_Ab[r3, col_z] = -0.5
     eq_b[r3, 0] = 0.5
 
-    for j in range(k):
-        idx_i = int(unstable_idx[j].item())
-        eq_Ac[5 * j + 4, :ng] = hz.Gc[idx_i]
-        eq_Ac[5 * j + 4, col_g1[j]] = -l[j] / 2.0
-        eq_Ac[5 * j + 4, col_g2[j]] = u[j] / 2.0
-        eq_Ab[5 * j + 4, :nb] = hz.Gb[idx_i]
-        eq_Ab[5 * j + 4, col_z[j]] = -(l[j] - u[j]) / 4.0
-        eq_b[5 * j + 4, 0] = (u[j] + l[j]) / 4.0 - hz.c[idx_i, 0]
+    r4 = 5 * t + 4
+    eq_Ac[r4, :ng] = hz.Gc[unstable_idx]
+    eq_Ac[r4, col_g1] = -l / 2.0
+    eq_Ac[r4, col_g2] = u / 2.0
+    eq_Ab[r4, :nb] = hz.Gb[unstable_idx]
+    eq_Ab[r4, col_z] = -(l - u) / 4.0
+    eq_b[r4, 0] = (u + l) / 4.0 - hz.c[unstable_idx, 0]
 
     old_Ac_ext = torch.cat(
         [hz.Ac, torch.zeros((nc, 6 * k), dtype=dtype, device=device)], dim=1
@@ -458,7 +456,7 @@ def hz_apply_piecewise(hz: HZono, func, dfunc, K: int = 2) -> HZono:
     wide = (ub - lb) > 1e-12
     narrow = ~wide
     wide_idx = torch.where(wide)[0]
-    m = int(wide_idx.sum() if wide_idx.ndim == 0 else wide_idx.shape[0])
+    m = wide_idx.shape[0]
 
     new_c = hz.c.clone()
     new_c[narrow] = func(hz.c[narrow])
@@ -537,9 +535,7 @@ def hz_apply_piecewise(hz: HZono, func, dfunc, K: int = 2) -> HZono:
         g2_x_k.append(g2x)
         g2_y_k.append(g2y)
 
-    cy_sum = torch.zeros(m, dtype=dtype, device=device)
-    for k_idx in range(K):
-        cy_sum = cy_sum + centers_y_k[k_idx]
+    cy_sum = torch.stack(centers_y_k, dim=0).sum(dim=0)
     new_c[wide_idx] = (cy_sum / 2.0).unsqueeze(1)
     new_Gc_base[wide_idx] = 0.0
     new_Gb_base[wide_idx] = 0.0
@@ -549,18 +545,14 @@ def hz_apply_piecewise(hz: HZono, func, dfunc, K: int = 2) -> HZono:
     Gc_new = torch.zeros((n, n_real + n_slack), dtype=dtype, device=device)
     for k_idx in range(K):
         g1_cols = torch.arange(k_idx * m, (k_idx + 1) * m, device=device)
-        g2_cols = torch.arange(
-            K * m + k_idx * m, K * m + (k_idx + 1) * m, device=device
-        )
-        for j in range(m):
-            Gc_new[wide_idx[j], g1_cols[j]] = g1_y_k[k_idx][j]
-            Gc_new[wide_idx[j], g2_cols[j]] = g2_y_k[k_idx][j]
+        g2_cols = torch.arange(K * m + k_idx * m, K * m + (k_idx + 1) * m, device=device)
+        Gc_new[wide_idx, g1_cols] = g1_y_k[k_idx]
+        Gc_new[wide_idx, g2_cols] = g2_y_k[k_idx]
 
     Gb_new = torch.zeros((n, K * m), dtype=dtype, device=device)
     for k_idx in range(K):
         z_cols = torch.arange(k_idx * m, (k_idx + 1) * m, device=device)
-        for j in range(m):
-            Gb_new[wide_idx[j], z_cols[j]] = -centers_y_k[k_idx][j] / 2.0
+        Gb_new[wide_idx, z_cols] = -centers_y_k[k_idx] / 2.0
 
     out_Gc = torch.cat([new_Gc_base, Gc_new], dim=1)
     out_Gb = torch.cat([new_Gb_base, Gb_new], dim=1)
@@ -574,50 +566,40 @@ def hz_apply_piecewise(hz: HZono, func, dfunc, K: int = 2) -> HZono:
     eq_b = torch.zeros((n_eq_total, 1), dtype=dtype, device=device)
 
     for k_idx in range(K):
-        for j in range(m):
-            g1_col = ng + k_idx * m + j
-            g2_col = ng + K * m + k_idx * m + j
-            z_col = nb + k_idx * m + j
-            s_base = ng + n_real + (k_idx * m + j) * 4
-            r = 4 * (k_idx * m + j)
-            eq_Ac[r, g1_col] = 1.0
-            eq_Ac[r, s_base] = 1.0
-            eq_Ab[r, z_col] = -0.5
-            eq_b[r, 0] = 0.5
-            eq_Ac[r + 1, g1_col] = -1.0
-            eq_Ac[r + 1, s_base + 1] = 1.0
-            eq_Ab[r + 1, z_col] = -0.5
-            eq_b[r + 1, 0] = 0.5
-            eq_Ac[r + 2, g2_col] = 1.0
-            eq_Ac[r + 2, s_base + 2] = 1.0
-            eq_Ab[r + 2, z_col] = -0.5
-            eq_b[r + 2, 0] = 0.5
-            eq_Ac[r + 3, g2_col] = -1.0
-            eq_Ac[r + 3, s_base + 3] = 1.0
-            eq_Ab[r + 3, z_col] = -0.5
-            eq_b[r + 3, 0] = 0.5
+        j_idx = torch.arange(m, device=device)
+        g1_col = ng + k_idx * m + j_idx
+        g2_col = ng + K * m + k_idx * m + j_idx
+        z_col = nb + k_idx * m + j_idx
+        s_base = ng + n_real + (k_idx * m + j_idx) * 4
+        r = 4 * (k_idx * m + j_idx)
+        eq_Ac[r, g1_col] = 1.0;     eq_Ac[r, s_base] = 1.0
+        eq_Ab[r, z_col] = -0.5;     eq_b[r, 0] = 0.5
+        eq_Ac[r+1, g1_col] = -1.0;  eq_Ac[r+1, s_base+1] = 1.0
+        eq_Ab[r+1, z_col] = -0.5;   eq_b[r+1, 0] = 0.5
+        eq_Ac[r+2, g2_col] = 1.0;   eq_Ac[r+2, s_base+2] = 1.0
+        eq_Ab[r+2, z_col] = -0.5;   eq_b[r+2, 0] = 0.5
+        eq_Ac[r+3, g2_col] = -1.0;  eq_Ac[r+3, s_base+3] = 1.0
+        eq_Ab[r+3, z_col] = -0.5;   eq_b[r+3, 0] = 0.5
 
-    for j in range(m):
-        idx_i = int(wide_idx[j].item())
-        r = n_box + j
-        rhs_val = 0.0
-        for k_idx in range(K):
-            g1_col = ng + k_idx * m + j
-            g2_col = ng + K * m + k_idx * m + j
-            z_col = nb + k_idx * m + j
-            rhs_val += centers_x_k[k_idx][j].item() / 2.0
-            eq_Ac[r, g1_col] = -g1_x_k[k_idx][j]
-            eq_Ac[r, g2_col] = -g2_x_k[k_idx][j]
-            eq_Ab[r, z_col] = centers_x_k[k_idx][j] / 2.0
-        eq_Ac[r, :ng] = hz.Gc[idx_i]
-        eq_Ab[r, :nb] = hz.Gb[idx_i]
-        eq_b[r, 0] = rhs_val - hz.c[idx_i, 0].item()
+    j_idx = torch.arange(m, device=device)
+    r_link = n_box + j_idx
+    rhs_val = torch.zeros(m, dtype=dtype, device=device)
+    for k_idx in range(K):
+        g1_col = ng + k_idx * m + j_idx
+        g2_col = ng + K * m + k_idx * m + j_idx
+        z_col = nb + k_idx * m + j_idx
+        rhs_val = rhs_val + centers_x_k[k_idx] / 2.0
+        eq_Ac[r_link, g1_col] = -g1_x_k[k_idx]
+        eq_Ac[r_link, g2_col] = -g2_x_k[k_idx]
+        eq_Ab[r_link, z_col] = centers_x_k[k_idx] / 2.0
+    eq_Ac[r_link, :ng] = hz.Gc[wide_idx]
+    eq_Ab[r_link, :nb] = hz.Gb[wide_idx]
+    eq_b[r_link, 0] = rhs_val - hz.c[wide_idx, 0]
 
-    for j in range(m):
-        r = n_box + m + j
-        for k_idx in range(K):
-            eq_Ab[r, nb + k_idx * m + j] = 1.0
-        eq_b[r, 0] = float(K - 2)
+    r_bin = n_box + m + j_idx
+    for k_idx in range(K):
+        eq_Ab[r_bin, nb + k_idx * m + j_idx] = 1.0
+    eq_b[r_bin, 0] = float(K - 2)
 
     old_Ac_ext = torch.cat(
         [hz.Ac, torch.zeros((nc, n_real + n_slack), dtype=dtype, device=device)], dim=1

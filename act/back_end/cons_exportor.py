@@ -146,7 +146,7 @@ def export_to_solver(globalC: ConSet, solver: Solver,
         all_ids.update(con.var_ids)
         tag = con.meta.get("tag","")
         if tag.startswith("box:"):
-            lb = to_numpy(con.meta["lb"]); ub = to_numpy(con.meta["ub"])
+            lb = to_numpy(con.meta["lb"]).reshape(-1); ub = to_numpy(con.meta["ub"]).reshape(-1)
             for i, vid in enumerate(con.var_ids):
                 cur=boxes.get(vid, (-np.inf, +np.inf))
                 boxes[vid]=(max(cur[0], float(lb[i])), min(cur[1], float(ub[i])))

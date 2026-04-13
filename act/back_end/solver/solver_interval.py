@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math, os, time
 from typing import List, Optional, Tuple
-import numpy as np
+
 import torch
 
 from act.back_end.solver.solver_base import Solver, SolveStatus, SolverCaps
@@ -76,14 +76,14 @@ class TorchLPSolver(Solver):
         if self._n == 0:
             self._n = n
             # Create tensors on the correct device and dtype
-            self._lb = torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)
-            self._ub = torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)
+            self._lb = torch.full((n,), float('-inf'), device=self._device, dtype=self._dtype)
+            self._ub = torch.full((n,), float('inf'), device=self._device, dtype=self._dtype)
         else:
             old_n = self._n
             self._n += n
             # Extend tensors on the correct device and dtype
-            self._lb = torch.cat([self._lb, torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)])
-            self._ub = torch.cat([self._ub, torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)])
+            self._lb = torch.cat([self._lb, torch.full((n,), float('-inf'), device=self._device, dtype=self._dtype)])
+            self._ub = torch.cat([self._ub, torch.full((n,), float('inf'), device=self._device, dtype=self._dtype)])
 
     def add_binary_vars(self, n: int) -> List[int]:
         start = self._n
@@ -94,7 +94,7 @@ class TorchLPSolver(Solver):
         self._ub[idxs] = 1.0
         return idxs
 
-    def set_bounds(self, idxs: List[int], lb: np.ndarray, ub: np.ndarray) -> None:
+    def set_bounds(self, idxs: List[int], lb: torch.Tensor, ub: torch.Tensor) -> None:
         # Convert to tensors with correct device and dtype
         lb_t = torch.as_tensor(lb, device=self._device, dtype=self._dtype)
         ub_t = torch.as_tensor(ub, device=self._device, dtype=self._dtype)
@@ -255,11 +255,11 @@ class TorchLPSolver(Solver):
     def has_solution(self) -> bool:
         return bool(self._has_solution)
 
-    def get_values(self, vids: List[int]) -> np.ndarray:
+    def get_values(self, vids: List[int]) -> torch.Tensor:
         assert self._sol is not None, "No solution available"
         with torch.no_grad():
-            return self._sol[vids].detach().cpu().to(self._dtype).numpy()
+            return self._sol[vids].detach().to(self._dtype)
 
-    def get_counterexample(self, input_ids: List[int]) -> np.ndarray:
+    def get_counterexample(self, input_ids: List[int]) -> torch.Tensor:
         # Already projected to box during optimize(); can return directly.
         return self.get_values(input_ids)
