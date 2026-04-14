@@ -1,20 +1,20 @@
-# ===- act/back_end/dual_tf/tf_forward.py - Forward Bounds ----------------====#
+#===- act/back_end/dual_tf/tf_forward.py - Forward Bounds ----------------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
 # Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
-# ===---------------------------------------------------------------------===#
+#===---------------------------------------------------------------------===#
 #
 # Purpose:
 #   Forward bound propagation for DualTF using linear coefficient tracking.
 #   Tracks linear coefficients: output = A @ input + bias
 #   Bounds: lb = A @ x0 + bias - |A| @ eps, ub = A @ x0 + bias + |A| @ eps
-#
+#   
 #   Much tighter than interval propagation for deeper networks.
 #   For activation layers, returns PRE-activation bounds (needed by dual backward).
 #
-# ===---------------------------------------------------------------------===#
+#===---------------------------------------------------------------------===#
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +26,6 @@ from act.back_end.layer_schema import LayerKind
 # Main Entry Point
 # ============================================================================
 
-
 @torch.no_grad()
 def compute_forward_bounds(
     net: Net,
@@ -36,7 +35,7 @@ def compute_forward_bounds(
 ) -> Dict[int, Bounds]:
     """
     Compute forward bounds using linear coefficient tracking.
-
+    
     Args:
         net: ACT network
         input_lb, input_ub: Input bounds
@@ -56,31 +55,26 @@ def compute_forward_bounds(
     B = lb_in.shape[0]
     input_dim = lb_in.shape[1]
     device, dtype = lb_in.device, lb_in.dtype
-
+    
     x0 = (lb_in + ub_in) / 2  # [B, input_dim]
     eps = (ub_in - lb_in) / 2  # [B, input_dim]
     A = torch.eye(input_dim, device=device, dtype=dtype)  # [n, n] shared
     bias = torch.zeros(input_dim, device=device, dtype=dtype)  # [n] shared
     lb, ub = lb_in.clone(), ub_in.clone()  # [B, n]
-
+    
     for layer in net.layers:
         lid, kind = (
             layer.id,
             layer.kind.upper() if isinstance(layer.kind, str) else layer.kind,
         )
-
+        
         # Input layers
-        if kind in [
-            LayerKind.INPUT.value,
-            LayerKind.INPUT_SPEC.value,
-            "INPUT",
-            "INPUT_SPEC",
-        ]:
+        if kind in [LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value]:
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             continue
-
+        
         # Dispatch
-        if kind in [LayerKind.RELU.value, "RELU"]:
+        if kind == LayerKind.RELU.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             if post_activation or B > 1:
@@ -91,55 +85,47 @@ def compute_forward_bounds(
             else:
                 A, bias, lb, ub = _fwd_relu_tracked(A, bias, x0, eps, lb, ub)
 
-        elif kind in [LayerKind.DENSE.value, "DENSE"]:
+        elif kind == LayerKind.DENSE.value:
             A, bias, lb, ub = _fwd_dense(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-
-        elif kind in [LayerKind.CONV2D.value, "CONV2D"]:
+            
+        elif kind == LayerKind.CONV2D.value:
             lb, ub = _fwd_conv2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
-        elif kind == "BIAS":
+            
+        elif kind == LayerKind.BIAS.value:
             A, bias, lb, ub = _fwd_bias(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-
-        elif kind == "SCALE":
+            
+        elif kind == LayerKind.SCALE.value:
             A, bias, lb, ub = _fwd_scale(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-
-        elif kind == "BN":
+            
+        elif kind == LayerKind.BN.value:
             A, bias, lb, ub = _fwd_bn(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-
-        elif kind in ["FLATTEN", "RESHAPE"]:
+            
+        elif kind in [LayerKind.FLATTEN.value, LayerKind.RESHAPE.value]:
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
 
-        elif kind in [LayerKind.SIGMOID.value, "SIGMOID"]:
+        elif kind == LayerKind.SIGMOID.value:
             if not post_activation:
-                bounds_dict[lid] = Bounds(
-                    lb.clone(), ub.clone()
-                )  # PRE-activation (for dual backward)
+                bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             lb, ub = torch.sigmoid(lb), torch.sigmoid(ub)
             if post_activation:
-                bounds_dict[lid] = Bounds(
-                    lb.clone(), ub.clone()
-                )  # POST-activation (for validation)
+                bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
-        elif kind in [LayerKind.TANH.value, "TANH"]:
+            
+        elif kind == LayerKind.TANH.value:
             if not post_activation:
-                bounds_dict[lid] = Bounds(
-                    lb.clone(), ub.clone()
-                )  # PRE-activation (for dual backward)
+                bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             lb, ub = torch.tanh(lb), torch.tanh(ub)
             if post_activation:
-                bounds_dict[lid] = Bounds(
-                    lb.clone(), ub.clone()
-                )  # POST-activation (for validation)
+                bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
-        elif kind in ["LRELU", "LEAKY_RELU"]:
+            
+        elif kind == LayerKind.LRELU.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             alpha = float(layer.params.get("alpha", 0.01))
@@ -151,31 +137,30 @@ def compute_forward_bounds(
             else:
                 A, bias, lb, ub = _fwd_lrelu_tracked(A, bias, x0, eps, lb, ub, alpha)
 
-        elif kind in ["MAXPOOL2D"]:
+        elif kind == LayerKind.MAXPOOL2D.value:
             lb, ub = _fwd_maxpool2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
-        elif kind in ["AVGPOOL2D"]:
+            
+        elif kind == LayerKind.AVGPOOL2D.value:
             lb, ub = _fwd_avgpool2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
+            
         elif kind in [
             LayerKind.ASSERT.value,
-            "ASSERT",
-            "TRANSPOSE",
-            "SQUEEZE",
-            "UNSQUEEZE",
+            LayerKind.TRANSPOSE.value,
+            LayerKind.SQUEEZE.value,
+            LayerKind.UNSQUEEZE.value,
         ]:
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
 
-        elif kind == "ADD":
+        elif kind == LayerKind.ADD.value:
             # ADD layer: z = x + y (+ bias if present)
             # Get bounds from predecessor layers via x_src and y_src
             x_src = layer.params.get("x_src")
             y_src = layer.params.get("y_src")
-
+            
             if (
                 x_src is not None
                 and y_src is not None
@@ -189,10 +174,10 @@ def compute_forward_bounds(
                     min_size = min(lb_x.shape[-1], lb_y.shape[-1])
                     lb_x, ub_x = lb_x[..., :min_size], ub_x[..., :min_size]
                     lb_y, ub_y = lb_y[..., :min_size], ub_y[..., :min_size]
-
+                
                 lb = lb_x + lb_y
                 ub = ub_x + ub_y
-
+                
                 # Add bias if present
                 if "bias" in layer.params and layer.params["bias"] is not None:
                     b = layer.params["bias"].flatten()
@@ -206,18 +191,16 @@ def compute_forward_bounds(
                     lb = lb + b
                     ub = ub + b
             # else: keep current lb, ub as fallback
-
+            
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-
+            
         else:
             import warnings
-
             warnings.warn(f"forward_bounds: Unknown layer '{kind}', passing through")
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-
+    
     return bounds_dict
-
 
 # ============================================================================
 # Layer Handlers
@@ -234,20 +217,16 @@ def _fwd_dense(
     """Dense: new = W @ (A @ x + bias) + b = (W @ A) @ x + (W @ bias + b)"""
     W = layer.params["weight"]
     b = layer.params.get("bias")
-
+    
     n_in = W.shape[1]
     if A.shape[0] != n_in:
         if A.shape[0] < n_in:
             pad = n_in - A.shape[0]
-            A = torch.cat(
-                [A, torch.zeros(pad, A.shape[1], dtype=A.dtype, device=A.device)], dim=0
-            )
-            bias = torch.cat(
-                [bias, torch.zeros(pad, dtype=bias.dtype, device=bias.device)]
-            )
+            A = torch.cat([A, torch.zeros(pad, A.shape[1], dtype=A.dtype, device=A.device)], dim=0)
+            bias = torch.cat([bias, torch.zeros(pad, dtype=bias.dtype, device=bias.device)])
         else:
             A, bias = A[:n_in, :], bias[:n_in]
-
+    
     A_new = W @ A
     bias_new = W @ bias + b if b is not None else W @ bias
     center = x0 @ A_new.T + bias_new
@@ -268,16 +247,16 @@ def _fwd_relu_bounds(
     diag(d) @ A @ x0 = d * (x0 @ A.T) — avoids materializing [B, n, input_dim].
     """
     on, off, amb = lb >= 0, ub <= 0, ~((lb >= 0) | (ub <= 0))
-
+    
     d_ub = torch.where(on, torch.ones_like(lb), torch.zeros_like(lb))
     offset_ub = torch.zeros_like(lb)
-
+    
     if amb.any():
         denom = (ub - lb).clamp(min=1e-12)
         slope = ub / denom
         d_ub = torch.where(amb, slope, d_ub)
         offset_ub = torch.where(amb, -slope * lb, offset_ub)
-
+    
     Ax0 = x0 @ A.T
     Aeps = eps @ A.abs().T
     center_ub = d_ub * (Ax0 + bias) + offset_ub
@@ -384,17 +363,17 @@ def _fwd_lrelu_bounds(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Leaky ReLU forward bounds using diagonal decomposition (batched)."""
     on, off, amb = lb >= 0, ub <= 0, ~((lb >= 0) | (ub <= 0))
-
+    
     d = torch.where(on, torch.ones_like(lb), torch.full_like(lb, alpha))
     offset = torch.zeros_like(lb)
-
+    
     if amb.any():
         denom = (ub - lb).clamp(min=1e-12)
         slope = (ub - alpha * lb) / denom
         off_val = alpha * lb - slope * lb
         d = torch.where(amb, slope, d)
         offset = torch.where(amb, off_val, offset)
-
+    
     Ax0 = x0 @ A.T
     Aeps = eps @ A.abs().T
     center = d * (Ax0 + bias) + offset
@@ -413,25 +392,22 @@ def _fwd_conv2d(
     padding = layer.params.get("padding", 0)
     dilation = layer.params.get("dilation", 1)
     groups = layer.params.get("groups", 1)
-
-    if isinstance(stride, (list, tuple)):
-        stride = stride[0]
-    if isinstance(padding, (list, tuple)):
-        padding = padding[0]
-    if isinstance(dilation, (list, tuple)):
-        dilation = dilation[0]
-
+    
+    if isinstance(stride, (list, tuple)): stride = stride[0]
+    if isinstance(padding, (list, tuple)): padding = padding[0]
+    if isinstance(dilation, (list, tuple)): dilation = dilation[0]
+    
     out_c, in_c_per_g, kH, kW = weight.shape
     in_c = in_c_per_g * groups
     B = lb.shape[0]
     spatial = lb.shape[1] // in_c
     in_h = in_w = int(spatial**0.5)
-
+    
     try:
         lb_4d, ub_4d = lb.view(B, in_c, in_h, in_w), ub.view(B, in_c, in_h, in_w)
     except RuntimeError:
         return lb, ub
-
+    
     W_pos, W_neg = weight.clamp(min=0), weight.clamp(max=0)
     lb_out = F.conv2d(lb_4d, W_pos, None, stride, padding, dilation, groups) + F.conv2d(
         ub_4d, W_neg, None, stride, padding, dilation, groups
@@ -439,7 +415,7 @@ def _fwd_conv2d(
     ub_out = F.conv2d(ub_4d, W_pos, None, stride, padding, dilation, groups) + F.conv2d(
         lb_4d, W_neg, None, stride, padding, dilation, groups
     )
-
+    
     if bias is not None:
         lb_out, ub_out = (
             lb_out + bias.view(1, -1, 1, 1),
@@ -489,17 +465,12 @@ def _fwd_avgpool2d(
 # Helpers
 # ============================================================================
 
-
 def _align(a: torch.Tensor, n: int) -> torch.Tensor:
     """Align tensor to size n."""
     a = a.flatten()
-    if a.numel() == n:
-        return a
-    elif a.numel() > n:
-        return a[:n]
-    else:
-        return a.repeat((n + a.numel() - 1) // a.numel())[:n]
-
+    if a.numel() == n: return a
+    elif a.numel() > n: return a[:n]
+    else: return a.repeat((n + a.numel() - 1) // a.numel())[:n]
 
 def _reset_state(lb: torch.Tensor, ub: torch.Tensor, device, dtype):
     """Reset linear tracking state after non-linear layers."""

@@ -1,21 +1,20 @@
-# ===- act/back_end/dual_tf/tf_cnn.py - CNN Dual Transfer Functions ------====#
+#===- act/back_end/dual_tf/tf_cnn.py - CNN Dual Transfer Functions ------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
 # Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
-# ===---------------------------------------------------------------------===#
+#===---------------------------------------------------------------------===#
 #
 # Purpose:
 #   CNN dual backward functions. Conv2D: v_out=ConvT(v,W), contrib=-b^T@v.
 #   Forward bounds handled by IntervalTF (see tf_forward.py).
 #
-# ===---------------------------------------------------------------------===#
+#===---------------------------------------------------------------------===#
 
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
-
 
 # -------- Conv2D --------
 @torch.no_grad()
@@ -32,18 +31,18 @@ def dual_conv2d_backward(
     assert weight.dim() == 4, (
         f"weight must be 4D [oC,iC,kH,kW], got shape {weight.shape}"
     )
-
+    
     oC, iC, kH, kW = weight.shape
     B = nu.shape[0]
     n = nu.shape[1]
-
+    
     # Determine output spatial dims
     if output_shape is not None:
         _, oC, oH, oW = output_shape
     else:
         spatial = n // oC if oC > 0 else n
-        oH = oW = int(spatial**0.5) if spatial > 0 else 1
-
+        oH = oW = int(spatial ** 0.5) if spatial > 0 else 1
+    
     try:
         expected = oC * oH * oW
         if n == expected:
@@ -60,19 +59,18 @@ def dual_conv2d_backward(
             m = min(oC, n)
             contrib = -(nu[..., :m] * bias[:m]).sum(dim=-1)
         return nu, contrib
-
+    
     v_out = F.conv_transpose2d(
         v_4d, weight, None, stride=stride, padding=padding
     ).flatten(start_dim=1)
-
+    
     if bias is not None:
         v_per_ch = v_4d.sum(dim=(2, 3))  # [B, oC]
         contrib = -(v_per_ch * bias).sum(dim=-1)  # [B]
     else:
         contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
-
+    
     return v_out, contrib
-
 
 # -------- Pooling (placeholders) --------
 @torch.no_grad()
@@ -87,7 +85,6 @@ def dual_maxpool2d_backward(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """MaxPool2d backward: distributes gradient to max locations. (Pending)"""
     raise NotImplementedError("dual_maxpool2d_backward: pending")
-
 
 @torch.no_grad()
 def dual_avgpool2d_backward(

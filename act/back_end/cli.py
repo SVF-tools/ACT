@@ -13,6 +13,7 @@ License: AGPLv3+
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -20,65 +21,64 @@ from typing import Optional
 from act.util.cli_utils import add_device_args, initialize_from_args
 
 
-def run_verification(args):
-    """Run verification on a network."""
+def _make_solver(solver_name: str):
+    """Instantiate a solver backend by name."""
+    from act.back_end.solver.solver_interval import TorchLPSolver
+
+    if solver_name == "gurobi":
+        from act.back_end.solver.solver_gurobi import GurobiSolver
+
+        return GurobiSolver()
+    if solver_name == "torch":
+        return TorchLPSolver()
+    # "auto": try Gurobi, fall back to TorchLP
+    try:
+        from act.back_end.solver.solver_gurobi import GurobiSolver
+
+        return GurobiSolver()
+    except Exception:
+        return TorchLPSolver()
+
+
+def run_verification(args, backend_cfg):
+    """Run verification on a network using *backend_cfg*."""
     print(f"\n{'=' * 80}")
     print(f"ACT BACK-END VERIFICATION")
     print(f"{'=' * 80}\n")
 
-    # Import here to avoid circular dependencies
-    from act.back_end.core import Net
     from act.back_end.serialization.serialization import load_net_from_file
     from act.back_end.verifier import verify_once
     from act.back_end.bab import verify_bab
-    from act.back_end.solver.solver_gurobi import GurobiSolver
-    from act.back_end.solver.solver_interval import TorchLPSolver
     from act.util.stats import VerifyStatus
 
-    # Load network
     print(f"Loading network from: {args.network}")
     net = load_net_from_file(args.network)
     print(f"Loaded network with {len(net.layers)} layers")
 
-    # Select solver
-    if args.solver == "gurobi":
-        print(f"Using solver: Gurobi")
-        solver = GurobiSolver()
-    elif args.solver == "torch":
-        print(f"Using solver: TorchLP")
-        solver = TorchLPSolver()
-    else:  # auto
-        try:
-            from act.back_end.solver.solver_gurobi import GurobiSolver
+    solver = _make_solver(backend_cfg.solver)
+    print(f"Solver: {backend_cfg.solver}")
 
-            print(f"Using solver: Gurobi (auto-detected)")
-            solver = GurobiSolver()
-        except:
-            print(f"Using solver: TorchLP (Gurobi not available)")
-            solver = TorchLPSolver()
-
-    # Run verification
-    if args.bab:
+    if backend_cfg.bab_enabled:
+        bab = backend_cfg.bab
         print(f"\nRunning Branch-and-Bound verification...")
-        print(f"  Max depth: {args.bab_max_depth}")
-        print(f"  Max subproblems: {args.bab_max_subproblems}")
-        print(f"  Timeout: {args.timeout}s\n")
+        print(f"  Max depth: {bab.max_depth}")
+        print(f"  Max subproblems: {bab.max_nodes}")
+        print(f"  Branching: {bab.branching_method}")
+        print(f"  Bounding: {bab.bounding_method}")
+        print(f"  Timeout: {backend_cfg.timeout}s\n")
 
         result = verify_bab(
             net=net,
             solver=solver,
-            timelimit=args.timeout,
-            max_depth=args.bab_max_depth,
-            max_subproblems=args.bab_max_subproblems,
-            verbose=args.verbose,
+            config=bab,
+            time_budget_s=backend_cfg.timeout,
         )
     else:
         print(f"\nRunning single-shot verification...")
-        print(f"  Timeout: {args.timeout}s\n")
+        print(f"  Timeout: {backend_cfg.timeout}s\n")
 
-        result = verify_once(net=net, solver=solver, timelimit=args.timeout)
+        result = verify_once(net=net, solver=solver, timelimit=backend_cfg.timeout)
 
-    # Display results
     print(f"\n{'=' * 80}")
     print(f"VERIFICATION RESULT: {result.status}")
     print(f"{'=' * 80}")
@@ -89,10 +89,10 @@ def run_verification(args):
     if result.counterexample is not None:
         print(f"Counterexample found:")
         print(f"  Shape: {result.counterexample.shape}")
-        if args.verbose:
+        if backend_cfg.verbose:
             print(f"  Values: {result.counterexample}")
 
-    if args.verbose and result.metadata:
+    if backend_cfg.verbose and result.metadata:
         print(f"\nVerification metadata:")
         for key, value in result.metadata.items():
             print(f"  {key}: {value}")
@@ -102,7 +102,7 @@ def run_verification(args):
     return 0 if result.status == VerifyStatus.CERTIFIED else 1
 
 
-def run_network_factory(args):
+def run_network_factory(args, backend_cfg):
     """Generate example networks using TF-aware NetFactory."""
     print(f"\n{'=' * 80}")
     print(f"ACT NETWORK FACTORY")
@@ -110,27 +110,25 @@ def run_network_factory(args):
 
     from act.back_end.net_factory import NetFactory
 
-    config_file = args.config if args.config else None
-    tf_targets = getattr(args, "tf_targets", None)
-    registry_mode = getattr(args, "registry_mode", "intersection")
+    gen = backend_cfg.generation
 
-    if tf_targets:
-        print(f"TF targets: {tf_targets} (mode: {registry_mode})")
-    if config_file:
-        print(f"Config: {config_file}")
-    if args.output:
-        print(f"Output: {args.output}")
+    if gen.tf_targets:
+        print(f"TF targets: {gen.tf_targets} (mode: {gen.registry_mode})")
+    print(f"Config: {gen.gen_config_path}")
+    print(f"Output: {gen.output_dir}")
+    print(f"Instances: {gen.num_instances}, Seed: {gen.base_seed}")
     print()
 
     try:
         factory = NetFactory(
-            gen_config_path=config_file,
-            output_dir=args.output,
-            base_seed=getattr(args, "base_seed", None),
-            num_instances=getattr(args, "num", None),
-            name_prefix=getattr(args, "name_prefix", None),
-            tf_targets=tf_targets,
-            registry_mode=registry_mode,
+            gen_config_path=gen.gen_config_path,
+            output_dir=gen.output_dir,
+            base_seed=gen.base_seed,
+            num_instances=gen.num_instances,
+            name_prefix=gen.name_prefix,
+            tf_targets=gen.tf_targets,
+            registry_mode=gen.registry_mode,
+            write_manifest=gen.write_manifest,
         )
         factory.generate()
         print(f"\n{'=' * 80}")
@@ -140,7 +138,7 @@ def run_network_factory(args):
         return 0
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        if args.verbose:
+        if backend_cfg.verbose:
             import traceback
 
             traceback.print_exc()
@@ -418,34 +416,70 @@ Examples:
         "-s",
         type=str,
         choices=["auto", "gurobi", "torch"],
-        default="auto",
-        help="Solver backend (default: auto - try Gurobi first, fallback to Torch)",
-    )
-    verify_group.add_argument(
-        "--bab",
-        action="store_true",
-        help="Use branch-and-bound refinement (instead of single-shot)",
-    )
-    verify_group.add_argument(
-        "--bab-max-depth",
-        type=int,
-        default=5,
-        dest="bab_max_depth",
-        help="Maximum BaB tree depth (default: 5)",
-    )
-    verify_group.add_argument(
-        "--bab-max-subproblems",
-        type=int,
-        default=100,
-        dest="bab_max_subproblems",
-        help="Maximum number of BaB subproblems (default: 100)",
+        default=None,
+        help="Solver backend (default: from config.yaml / $ACT_SOLVER / 'auto')",
     )
     verify_group.add_argument(
         "--timeout",
         "-t",
         type=float,
-        default=300.0,
-        help="Solver timeout in seconds (default: 300)",
+        default=None,
+        help="Verification timeout in seconds (default: from config.yaml)",
+    )
+
+    # BaB mode: --bab enables, --no-bab disables, absent = from config.yaml
+    bab_toggle = verify_group.add_mutually_exclusive_group()
+    bab_toggle.add_argument(
+        "--bab",
+        action="store_true",
+        default=None,
+        dest="bab",
+        help="Enable branch-and-bound verification",
+    )
+    bab_toggle.add_argument(
+        "--no-bab",
+        action="store_false",
+        dest="bab",
+        help="Disable branch-and-bound (single-shot)",
+    )
+
+    # BaB algorithm parameters
+    verify_group.add_argument(
+        "--bab-max-depth",
+        type=int,
+        default=None,
+        dest="bab_max_depth",
+        help="Maximum BaB tree depth (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-max-subproblems",
+        type=int,
+        default=None,
+        dest="bab_max_subproblems",
+        help="Maximum number of BaB subproblems (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-branching",
+        type=str,
+        default=None,
+        dest="bab_branching",
+        help="Branching strategy (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-bounding",
+        type=str,
+        default=None,
+        dest="bab_bounding",
+        help="Bounding strategy (default: from config.yaml)",
+    )
+
+    # Backend config file
+    verify_group.add_argument(
+        "--backend-config",
+        type=str,
+        default=None,
+        dest="backend_config",
+        help="Path to backend YAML config (default: act/back_end/config.yaml)",
     )
 
     # Common options
@@ -454,22 +488,43 @@ Examples:
     # Add standard device/dtype arguments (shared across all ACT CLIs)
     add_device_args(parser)
 
-    args = parser.parse_args()
+    # Detect user-provided flags BEFORE parsing so env vars / config.yaml
+    # can serve as fallbacks without overriding explicit CLI flags.
+    argv = sys.argv[1:]
+    _user_set = lambda flag: any(  # noqa: E731
+        a == flag or a.startswith(flag + "=") for a in argv
+    )
 
-    # Initialize device manager from CLI arguments
-    initialize_from_args(args)
+    args = parser.parse_args()
 
     # Validate arguments based on command
     if args.verify or args.info:
         if not args.network:
             parser.error("--network is required for --verify and --info")
 
+    # ── Build BackendConfig ──────────────────────────────────────────────
+    # Load YAML as baseline, then overlay env vars and CLI flags on top.
+    # Precedence: CLI flag > env var > config.yaml > dataclass default
+    from act.back_end.config import BackendConfig
+
+    backend_cfg = BackendConfig.from_yaml(
+        config_path=args.backend_config,
+        **_collect_backend_overrides(args, _user_set),
+    )
+
+    # Initialize device manager from the resolved config
+    import argparse as _ap
+
+    initialize_from_args(
+        _ap.Namespace(device=backend_cfg.device, dtype=backend_cfg.dtype)
+    )
+
     # Execute command
     try:
         if args.generate:
-            return run_network_factory(args)
+            return run_network_factory(args, backend_cfg)
         elif args.verify:
-            return run_verification(args)
+            return run_verification(args, backend_cfg)
         elif args.info:
             return run_network_info(args)
         elif args.list_examples:
@@ -489,6 +544,90 @@ Examples:
 
             traceback.print_exc()
         return 1
+
+
+def _collect_backend_overrides(args, _user_set) -> dict:
+    """Build overrides dict from CLI flags + env vars.
+
+    Only includes keys the user explicitly provided (CLI flag) or that are
+    set in the environment.  Everything else falls through to config.yaml.
+
+    Prefix conventions: ``bab_<field>`` → BaBConfig, ``gen_<field>`` → GenerationConfig.
+    """
+    overrides: dict = {}
+
+    # ── Runtime selectors: CLI > env > config.yaml ──
+    if args.solver is not None:
+        overrides["solver"] = args.solver
+    elif os.environ.get("ACT_SOLVER"):
+        overrides["solver"] = os.environ["ACT_SOLVER"]
+
+    if _user_set("--device"):
+        overrides["device"] = args.device
+    elif os.environ.get("ACT_DEVICE"):
+        overrides["device"] = os.environ["ACT_DEVICE"]
+
+    if _user_set("--dtype"):
+        overrides["dtype"] = args.dtype
+    elif os.environ.get("ACT_DTYPE"):
+        overrides["dtype"] = os.environ["ACT_DTYPE"]
+
+    if args.verbose:
+        overrides["verbose"] = True
+
+    # ── Verification ──
+    if args.timeout is not None:
+        overrides["timeout"] = args.timeout
+
+    # bab enabled: --bab / --no-bab (None = defer to config.yaml)
+    if args.bab is not None:
+        overrides["bab_enabled"] = args.bab
+
+    if args.bab_max_depth is not None:
+        overrides["bab_max_depth"] = args.bab_max_depth
+    if args.bab_max_subproblems is not None:
+        overrides["bab_max_nodes"] = args.bab_max_subproblems
+    if args.bab_branching is not None:
+        overrides["bab_branching_method"] = args.bab_branching
+    if args.bab_bounding is not None:
+        overrides["bab_bounding_method"] = args.bab_bounding
+
+    # ── Generation: CLI > env > config.yaml ──
+    config_flag = getattr(args, "config", None)
+    if config_flag is not None:
+        overrides["gen_gen_config_path"] = config_flag
+
+    output_flag = getattr(args, "output", None)
+    if output_flag is not None:
+        overrides["gen_output_dir"] = output_flag
+    elif os.environ.get("ACT_GEN_OUTPUT"):
+        overrides["gen_output_dir"] = os.environ["ACT_GEN_OUTPUT"]
+
+    num_flag = getattr(args, "num", None)
+    if num_flag is not None:
+        overrides["gen_num_instances"] = num_flag
+    elif os.environ.get("ACT_GEN_NUM"):
+        overrides["gen_num_instances"] = int(os.environ["ACT_GEN_NUM"])
+
+    seed_flag = getattr(args, "base_seed", None)
+    if seed_flag is not None:
+        overrides["gen_base_seed"] = seed_flag
+    elif os.environ.get("ACT_GEN_SEED"):
+        overrides["gen_base_seed"] = int(os.environ["ACT_GEN_SEED"])
+
+    prefix_flag = getattr(args, "name_prefix", None)
+    if prefix_flag is not None:
+        overrides["gen_name_prefix"] = prefix_flag
+
+    tf_flag = getattr(args, "tf_targets", None)
+    if tf_flag is not None:
+        overrides["gen_tf_targets"] = tf_flag
+
+    reg_flag = getattr(args, "registry_mode", None)
+    if reg_flag is not None and _user_set("--registry-mode"):
+        overrides["gen_registry_mode"] = reg_flag
+
+    return overrides
 
 
 if __name__ == "__main__":

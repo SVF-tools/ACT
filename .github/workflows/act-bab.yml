@@ -1,0 +1,62 @@
+name: ACT BaB Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  ACT_CI_MODE: "true"
+  ACT_SOLVER: "torch"
+  ACT_DEVICE: "cpu"
+  ACT_DTYPE: "float64"
+
+jobs:
+  bab-tests:
+    name: Branch-and-Bound Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache
+          df -h
+
+      - name: Clean pip cache
+        run: |
+          pip cache purge || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm pytest psutil transformers scikit-learn
+
+      - name: Run BaB module tests
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.back_end.bab.bab
+
+      - name: Generate example networks
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.back_end --generate
+
+      - name: Run BaB verification (float64)
+        run: |
+          cd ${{ github.workspace }}
+          NET=$(ls act/back_end/examples/nets/mlp_block_*.json | head -1)
+          echo "Testing BaB on: $NET"
+          # All settings from act/back_end/config.yaml + ACT_* env vars above.
+          python -m act.back_end --verify --network "$NET"

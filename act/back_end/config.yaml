@@ -1,0 +1,100 @@
+# ACT Back-End Configuration
+#
+# Canonical source for ALL back-end settings (runtime, verification, generation).
+# CI (.github/workflows/act-bab.yml) relies on these defaults.
+#
+# Precedence:  CLI flag  >  environment variable  >  this file  >  code default
+# Env vars:    ACT_SOLVER / ACT_DEVICE / ACT_DTYPE
+
+backend:
+
+  # ── Verification Runtime (global) ────────────────────────────────────────────────────
+
+  # Solver backend for LP/MILP verification.
+  #   "auto"   – try Gurobi first, fall back to TorchLP
+  #   "gurobi" – exact MILP/LP via Gurobi (requires license)
+  #   "torch"  – PyTorch-based LP relaxation (GPU-capable, no license)
+  solver: "torch"
+
+  # Compute device.
+  #   "cpu"  – run on CPU (CI default, always available)
+  #   "cuda" – run on NVIDIA GPU (requires CUDA toolkit)
+  #   "gpu"  – alias for "cuda"
+  device: "cpu"
+
+  # Floating-point precision for all tensors.
+  #   "float64" – double precision (more accurate, slower)
+  #   "float32" – single precision (faster, may cause numerical drift)
+  dtype: "float64"
+
+  # Print extra diagnostic output across all commands.
+  verbose: false
+
+  # ── BaBVerification ────────────────────────────────────────────────────────
+
+  # Wall-clock budget in seconds for both single execution and BaB verification.
+  timeout: 60.0
+
+  bab:
+    # Enable Branch-and-Bound refinement (true) or single execution (false).
+    enabled: true
+
+    # Maximum depth of the BaB search tree.
+    max_depth: 3
+
+    # Maximum number of subproblems (nodes) to explore.
+    max_nodes: 10
+
+    # How to pick the next input dimension to split.
+    #   "random" – uniform random selection (baseline)
+    branching_method: "random"
+
+    # How to order subproblems in the work pool.
+    #   "random" – random ordering (baseline)
+    bounding_method: "random"
+
+  # ── Network Generation (net_factory) ────────────────────────────────────
+  # Controls how many networks to generate, where, and TF filtering.
+  # Architecture sampling DSL (family definitions, input/output specs)
+  # lives in gen_config_path — a separate file with its own schema.
+
+  generation:
+    # Path to the architecture sampling config (families, specs, etc.).
+    gen_config_path: "act/back_end/examples/config_gen_act_net.yaml"
+
+    # Directory where generated .json network files are written.
+    output_dir: "act/back_end/examples/nets"
+
+    # Number of networks to generate per run.
+    num_instances: 15
+
+    # Random seed for reproducible generation.
+    base_seed: 42
+
+    # Prefix prepended to every generated filename.
+    name_prefix: "cfg_seed"
+
+    # Transfer-function targets for layer filtering.
+    #   null            – no filtering, all layer types allowed
+    #   ["interval"]    – only layers supported by interval TF
+    #   ["interval", "hybridz"] – layers supported by both TFs
+    tf_targets: null
+
+    # How to combine layer sets when multiple tf_targets are given.
+    #   "intersection" – keep only layers supported by ALL targets (stricter)
+    #   "union"        – keep layers supported by ANY target (more permissive)
+    registry_mode: "intersection"
+
+    # When to stop generating.
+    #   "basic" – generate exactly num_instances, then stop
+    #   "full"  – keep generating until every target layer type is covered
+    coverage_mode: "basic"
+
+    # Maximum attempts in "full" coverage mode before giving up.
+    coverage_max_attempts: 1000
+
+    # Print a layer-coverage summary after generation finishes.
+    coverage_report: true
+
+    # Write a manifest.json listing all generated network filenames.
+    write_manifest: true
