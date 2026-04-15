@@ -73,7 +73,7 @@ class SubproblemBatch:
         """Wrap a single ``Bounds`` into a batch of size 1."""
         lb = bounds.lb.detach().unsqueeze(0)  # (1, D)
         ub = bounds.ub.detach().unsqueeze(0)  # (1, D)
-        depths = torch.tensor([depth], dtype=torch.long, device=lb.device)
+        depths = torch.tensor([depth], dtype=torch.long)
         return SubproblemBatch(lb=lb, ub=ub, depths=depths)
 
     # -- conversions --------------------------------------------------------

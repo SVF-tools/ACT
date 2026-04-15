@@ -24,7 +24,7 @@ def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     W = L.params["weight"]
     W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
     W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
-    b = L.params.get("bias", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
+    b = L.params.get("bias", torch.zeros(W.shape[0]))
     
     B = affine_bounds(W_pos, W_neg, b, Bin)
     C = ConSet()
@@ -70,7 +70,7 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
             )
             t = torch.where(finite, -s * la, torch.zeros_like(gap))
         else:
-            s = t = torch.empty(0, dtype=l.dtype, device=l.device)
+            s = t = torch.empty(0)
         C.replace(
             Con(
                 "INEQ",
@@ -112,7 +112,7 @@ def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
             )
             t = torch.where(finite, a * la - s * la, torch.zeros_like(gap))
         else:
-            s = t = torch.empty(0, dtype=l.dtype, device=l.device)
+            s = t = torch.empty(0)
         C.replace(
             Con(
                 "INEQ",
@@ -700,9 +700,9 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
-        indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
+        indices = torch.tensor(raw_idx, dtype=torch.long)
     else:
-        indices = raw_idx.to(x_lb.device).long()
+        indices = raw_idx.long()
 
     out_lb = torch.index_select(x_lb, dim=axis, index=indices)
     out_ub = torch.index_select(x_ub, dim=axis, index=indices)
@@ -739,9 +739,9 @@ def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
-        indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
+        indices = torch.tensor(raw_idx, dtype=torch.long)
     else:
-        indices = raw_idx.to(x_lb.device).long()
+        indices = raw_idx.long()
     assert indices.numel() > 0, "index_select received empty indices"
 
     out_lb = torch.index_select(x_lb, dim=dim, index=indices)
@@ -786,7 +786,7 @@ def tf_reorder(L, ctx):
     order = (
         raw_order
         if torch.is_tensor(raw_order)
-        else torch.tensor(raw_order, device=lx.device, dtype=torch.long)
+        else torch.tensor(raw_order, dtype=torch.long)
     )
     dim = L.params.get("dim", 0)
     assert order.numel() == lx.shape[dim], (

@@ -60,19 +60,19 @@ def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
 
     if k == OutKind.TOP1_ROBUST:
         t = int(assert_layer.params["y_true"])
-        mask = torch.ones(y.shape[0], dtype=torch.bool, device=y.device)
+        mask = torch.ones(y.shape[0], dtype=torch.bool)
         mask[t] = False
         return (y[mask] - y[t]).max().item() >= 0.0
 
     if k == OutKind.MARGIN_ROBUST:
         t = int(assert_layer.params["y_true"])
         margin = float(assert_layer.params["margin"])
-        mask = torch.ones(y.shape[0], dtype=torch.bool, device=y.device)
+        mask = torch.ones(y.shape[0], dtype=torch.bool)
         mask[t] = False
         return (y[mask] - y[t]).max().item() >= margin
 
     if k == OutKind.LINEAR_LE:
-        c = torch.as_tensor(assert_layer.params["c"], dtype=y.dtype, device=y.device)
+        c = torch.as_tensor(assert_layer.params["c"], dtype=y.dtype)
         d = float(assert_layer.params["d"])
         return (c @ y).item() >= d + 1e-8
 
@@ -80,11 +80,11 @@ def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
         lb = assert_layer.params.get("lb")
         ub = assert_layer.params.get("ub")
         if lb is not None:
-            lb_t = torch.as_tensor(lb, dtype=y.dtype, device=y.device)
+            lb_t = torch.as_tensor(lb, dtype=y.dtype)
             if (y < lb_t - 1e-8).any():
                 return True
         if ub is not None:
-            ub_t = torch.as_tensor(ub, dtype=y.dtype, device=y.device)
+            ub_t = torch.as_tensor(ub, dtype=y.dtype)
             if (y > ub_t + 1e-8).any():
                 return True
         return False

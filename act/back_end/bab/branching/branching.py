@@ -123,7 +123,7 @@ class RandomBranching(BranchingStrategy):
         N, D = batch.batch_size, batch.input_dim
         device = batch.lb.device
 
-        scores = torch.rand(N, D, device=device)
+        scores = torch.rand(N, D)
 
         if unstable_mask is not None:
             # Neuron-split mode: zero-out stable neurons

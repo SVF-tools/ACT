@@ -379,7 +379,7 @@ class abCrown:
                     'eps_min': properties[0][0].get('eps_min', 0),
                 }
             else:
-                x_range = torch.tensor(properties[0], dtype=torch.get_default_dtype())
+                x_range = torch.tensor(properties[0])
                 data_min = x_range.select(-1, 0).reshape(vnnlib_shape)
                 data_max = x_range.select(-1, 1).reshape(vnnlib_shape)
                 x = x_range.mean(-1).reshape(vnnlib_shape)

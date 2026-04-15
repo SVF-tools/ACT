@@ -78,7 +78,7 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     if bias is not None:
         b_equiv = bias.repeat_interleave(spatial_size_per_channel)
     else:
-        b_equiv = torch.zeros(actual_output_size, dtype=weight.dtype, device=weight.device)
+        b_equiv = torch.zeros(actual_output_size)
     
     # Store conv params for constraint (no Toeplitz materialization)
     C = ConSet()
@@ -354,7 +354,7 @@ def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     )
     
     # No bias for average pooling
-    b_equiv = torch.zeros(output_flat_size, dtype=Bin.lb.dtype, device=Bin.lb.device)
+    b_equiv = torch.zeros(output_flat_size)
     
     # Apply linear transformation
     W_pos = torch.clamp(W_equiv, min=0)
@@ -468,7 +468,7 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
     if bias is not None:
         b_equiv = bias.repeat(output_shape[-1])  # Repeat for spatial dimensions
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0], device=weight.device, dtype=weight.dtype)
+        b_equiv = torch.zeros(W_equiv.shape[0])
     
     # Compute bounds using affine transformation
     W_pos = torch.clamp(W_equiv, min=0)
@@ -527,7 +527,7 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
         out_d, out_h, out_w = output_shape[-3:]
         b_equiv = bias.repeat(out_d * out_h * out_w)
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0], device=weight.device, dtype=weight.dtype)
+        b_equiv = torch.zeros(W_equiv.shape[0])
     
     # Compute bounds using affine transformation
     W_pos = torch.clamp(W_equiv, min=0)
@@ -593,7 +593,7 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
         out_h, out_w = output_shape[-2:]
         b_equiv = bias.repeat(out_h * out_w)
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0], device=weight.device, dtype=weight.dtype)
+        b_equiv = torch.zeros(W_equiv.shape[0])
     
     # Compute bounds
     W_pos = torch.clamp(W_equiv, min=0)
@@ -704,7 +704,7 @@ def _conv1d_to_linear_matrix(
     input_flat_size = in_channels * in_w
     output_flat_size = out_channels * out_w
     
-    W_equiv = torch.zeros(output_flat_size, input_flat_size, device=weight.device, dtype=weight.dtype)
+    W_equiv = torch.zeros(output_flat_size, input_flat_size)
     
     kernel_w = weight.shape[2]
     
@@ -742,7 +742,7 @@ def _conv3d_to_linear_matrix(
     input_flat_size = in_channels * in_d * in_h * in_w
     output_flat_size = out_channels * out_d * out_h * out_w
     
-    W_equiv = torch.zeros(output_flat_size, input_flat_size, device=weight.device, dtype=weight.dtype)
+    W_equiv = torch.zeros(output_flat_size, input_flat_size)
     
     kernel_d, kernel_h, kernel_w = weight.shape[2], weight.shape[3], weight.shape[4]
     
@@ -825,7 +825,7 @@ def _convtranspose2d_to_linear_matrix(
     input_flat_size = in_channels * in_h * in_w
     output_flat_size = out_channels * out_h * out_w
     
-    W_equiv = torch.zeros(output_flat_size, input_flat_size, device=weight.device, dtype=weight.dtype)
+    W_equiv = torch.zeros(output_flat_size, input_flat_size)
     
     kernel_h, kernel_w = weight.shape[2], weight.shape[3]
     

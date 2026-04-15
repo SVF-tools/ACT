@@ -50,11 +50,11 @@ def dual_conv2d_backward(
         elif n > expected:
             v_4d = nu[..., :expected].view(B, oC, oH, oW)
         else:
-            v_pad = torch.zeros(B, expected, dtype=nu.dtype, device=nu.device)
+            v_pad = torch.zeros(B, expected)
             v_pad[..., :n] = nu
             v_4d = v_pad.view(B, oC, oH, oW)
     except RuntimeError:
-        contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
+        contrib = torch.zeros(B)
         if bias is not None:
             m = min(oC, n)
             contrib = -(nu[..., :m] * bias[:m]).sum(dim=-1)
@@ -68,7 +68,7 @@ def dual_conv2d_backward(
         v_per_ch = v_4d.sum(dim=(2, 3))  # [B, oC]
         contrib = -(v_per_ch * bias).sum(dim=-1)  # [B]
     else:
-        contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
+        contrib = torch.zeros(B)
     
     return v_out, contrib
 

@@ -40,13 +40,13 @@ def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_gelu(L: Layer, Bin: Bounds) -> Fact:
-    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi, dtype=x.dtype, device=x.device))*(x+0.044715*(x**3))))
+    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
     B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"gelu:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,3)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_att_scores(L: Layer, Bq: Bounds, Bk: Bounds) -> Fact:
-    s=torch.tensor(1.0/float(L.params["dk"]), dtype=Bq.lb.dtype, device=Bq.lb.device)
+    s=torch.tensor(1.0/float(L.params["dk"]))
     lo=torch.minimum(torch.minimum(Bq.lb*Bk.lb, Bq.lb*Bk.ub), torch.minimum(Bq.ub*Bk.lb, Bq.ub*Bk.ub))
     hi=torch.maximum(torch.maximum(Bq.lb*Bk.lb, Bq.lb*Bk.ub), torch.maximum(Bq.ub*Bk.lb, Bq.ub*Bk.ub))
     lb=s*lo.sum(dim=-1); ub=s*hi.sum(dim=-1)

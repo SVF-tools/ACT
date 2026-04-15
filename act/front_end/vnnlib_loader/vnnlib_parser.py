@@ -23,7 +23,6 @@ from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
 
 if TYPE_CHECKING:
     from act.front_end.spec_creator_base import LabeledInputTensor
-from act.util.device_manager import get_default_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ def parse_vnnlib_to_tensors(
                 center = 0.0
             input_values.append(center)
         
-        input_tensor = torch.tensor(input_values, dtype=get_default_dtype())
+        input_tensor = torch.tensor(input_values)
         
         # Reshape if shape provided (shape now includes batch dimension)
         if input_shape is not None:
@@ -156,8 +155,8 @@ def parse_vnnlib_to_specs(
             lb_values.append(lb)
             ub_values.append(ub)
         
-        lb_tensor = torch.tensor(lb_values, dtype=get_default_dtype())
-        ub_tensor = torch.tensor(ub_values, dtype=get_default_dtype())
+        lb_tensor = torch.tensor(lb_values)
+        ub_tensor = torch.tensor(ub_values)
         
         # Extract input_shape and true_label from labeled_tensor if provided
         input_shape = labeled_tensor.tensor.shape if labeled_tensor is not None else None
@@ -182,8 +181,8 @@ def parse_vnnlib_to_specs(
             c, d = output_constraints[0]
             output_spec = OutputSpec(
                 kind=OutKind.LINEAR_LE,
-                c=torch.tensor(c, dtype=get_default_dtype()),
-                d=torch.tensor(float(d), dtype=get_default_dtype()),
+                c=torch.tensor(c),
+                d=torch.tensor(float(d)),
             )
         else:
             # If true_label is provided, promote to TOP1_ROBUST
@@ -197,8 +196,8 @@ def parse_vnnlib_to_specs(
             else:
                 output_spec = OutputSpec(
                     kind=OutKind.RANGE,
-                    lb=torch.tensor([float('-inf')] * num_outputs, dtype=get_default_dtype()),
-                    ub=torch.tensor([float('inf')] * num_outputs, dtype=get_default_dtype())
+                    lb=torch.tensor([float('-inf')] * num_outputs),
+                    ub=torch.tensor([float('inf')] * num_outputs)
                 )
         
         logger.info(f"Created specs from VNNLIB: {input_spec.kind}, {output_spec.kind}")

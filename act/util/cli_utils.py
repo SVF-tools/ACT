@@ -40,9 +40,9 @@ def add_device_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--device",
         type=str,
-        default='cuda' if torch.cuda.is_available() else 'cpu',
-        choices=['cpu', 'cuda', 'gpu'],
-        help="Device to use for computation (default: cuda if available, else cpu)"
+        default='cuda' if torch.cuda.is_available() else 'mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu',
+        choices=['cpu', 'cuda', 'gpu', 'mps'],
+        help="Device to use for computation (default: best available)"
     )
     parser.add_argument(
         "--dtype",

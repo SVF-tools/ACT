@@ -304,7 +304,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     input_specs.append(InputSpec(
                         kind=InKind.LINF_BALL,
                         center=sample_tensor.clone(),
-                        eps=torch.tensor(eps, dtype=torch.get_default_dtype())
+                        eps=torch.tensor(eps)
                     ))
         
         return input_specs
@@ -338,7 +338,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     output_specs.append(OutputSpec(
                         kind=OutKind.MARGIN_ROBUST,
                         y_true=label.clone(),  # Use label tensor directly (already (1,) shape)
-                        margin=torch.tensor([margin], dtype=torch.get_default_dtype())
+                        margin=torch.tensor([margin])
                     ))
             
             elif kind == 'TOP1_ROBUST':
@@ -392,7 +392,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                         input_specs.append(InputSpec(
                             kind=InKind.LINF_BALL,
                             center=sample_tensor.clone(),
-                            eps=torch.tensor(eps, dtype=torch.get_default_dtype())
+                            eps=torch.tensor(eps)
                         ))
         
         logger.debug(f"Generated {len(input_specs)} input specs from {len(input_tensors)} samples")
@@ -428,7 +428,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                         output_specs.append(OutputSpec(
                             kind=OutKind.MARGIN_ROBUST,
                             y_true=torch.tensor([y_true], dtype=torch.int64),  # Batch: (1,) shape
-                            margin=torch.tensor([margin], dtype=torch.get_default_dtype())  # Batch: (1,) shape
+                            margin=torch.tensor([margin])  # Batch: (1,) shape
                         ))
                 
                 elif kind == 'TOP1_ROBUST':

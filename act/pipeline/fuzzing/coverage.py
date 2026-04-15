@@ -156,12 +156,12 @@ class BestInputCov(CoverageStrategy):
         total_neurons = int(sum(self._layer_neuron_counts.values()))
         if total_neurons == 0:
             N = input_tensor.shape[0]
-            return 0.0, torch.zeros(N, dtype=torch.bool, device=input_tensor.device)
+            return 0.0, torch.zeros(N, dtype=torch.bool)
         
         old_best = float(self.best_input_coverage)
         N = input_tensor.shape[0]
         
-        total_fired = torch.zeros(N, device=input_tensor.device)
+        total_fired = torch.zeros(N)
         for layer_name, activation in activations.items():
             mat = _activation_to_neuron_matrix(activation)
             if mat.numel() == 0:
@@ -255,7 +255,7 @@ class GlobalCov(CoverageStrategy):
         """
         N = input_tensor.shape[0]
         old_covered = self._total_covered()
-        interesting_mask = torch.zeros(N, dtype=torch.bool, device=input_tensor.device)
+        interesting_mask = torch.zeros(N, dtype=torch.bool)
         
         for layer_name, activation in activations.items():
             mat = _activation_to_neuron_matrix(activation)  # (N, neurons)

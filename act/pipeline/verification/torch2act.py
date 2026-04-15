@@ -467,7 +467,7 @@ class _LayerGraphBuilder:
         has_bias = mod.bias is not None
         
         W = mod.weight.detach()
-        b = mod.bias.detach() if has_bias else torch.zeros(out_features, dtype=W.dtype, device=W.device)
+        b = mod.bias.detach() if has_bias else torch.zeros(out_features)
         
         out_vars = self._alloc_ids(out_features)
         

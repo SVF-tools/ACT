@@ -45,6 +45,12 @@ def initialize_device(device: str = 'cuda', dtype: str = 'float64') -> None:
             else:
                 target_device = torch.device("cpu")
                 print(f"⚠️ CUDA not available, falling back to CPU")
+        elif device == 'mps':
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                target_device = torch.device("mps")
+            else:
+                target_device = torch.device("cpu")
+                print(f"⚠️ MPS not available, falling back to CPU")
         else:
             # Unknown device, default to CPU
             target_device = torch.device("cpu")

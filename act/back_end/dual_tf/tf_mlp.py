@@ -63,7 +63,7 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, 
     
     v_out = d * v
     
-    contrib = torch.zeros(v.shape[0], dtype=v.dtype, device=v.device)
+    contrib = torch.zeros(v.shape[0])
     if amb.any():
         crossing_contrib = torch.where(amb, v_out.clamp(min=0) * l, torch.zeros_like(l))
         contrib = crossing_contrib.sum(dim=-1)
@@ -81,7 +81,7 @@ def dual_dense_backward(nu: torch.Tensor, W: torch.Tensor, b: Optional[torch.Ten
     contrib = (
         -(nu * b).sum(dim=-1)
         if b is not None
-        else torch.zeros(nu.shape[0], dtype=nu.dtype, device=nu.device)
+        else torch.zeros(nu.shape[0])
     )
     return v_out, contrib
 
@@ -97,7 +97,7 @@ def dual_bias_backward(nu: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor,
 def dual_scale_backward(nu: torch.Tensor, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Scale backward (y=a*x): v_out=a*v, contrib=0."""
     a_aligned = _align(a, nu.shape[-1])
-    return a_aligned * nu, torch.zeros(nu.shape[0], dtype=nu.dtype, device=nu.device)
+    return a_aligned * nu, torch.zeros(nu.shape[0])
 
 
 @torch.no_grad()
@@ -112,4 +112,4 @@ def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor) -> Tupl
 @torch.no_grad()
 def dual_identity_backward(nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Identity backward (Flatten, Reshape, etc.): v_out=v, contrib=0."""
-    return nu, torch.zeros(nu.shape[0], dtype=nu.dtype, device=nu.device)
+    return nu, torch.zeros(nu.shape[0])

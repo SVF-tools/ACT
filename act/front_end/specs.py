@@ -36,27 +36,27 @@ class InputSpec:
         """Ensure all numeric fields are tensors for architecture."""
         # Convert eps (scalar → 1-D tensor)
         if self.eps is not None and not isinstance(self.eps, torch.Tensor):
-            self.eps = torch.tensor([float(self.eps)], dtype=torch.get_default_dtype())
+            self.eps = torch.tensor([float(self.eps)])
         
         # Convert d (scalar → 1-D tensor)
         if hasattr(self, 'd') and self.d is not None and not isinstance(self.d, torch.Tensor):
-            self.d = torch.tensor([float(self.d)], dtype=torch.get_default_dtype())
+            self.d = torch.tensor([float(self.d)])
         
         # Convert lb, ub, center (list or scalar → tensor)
         for field in ['lb', 'ub', 'center']:
             val = getattr(self, field, None)
             if val is not None and not isinstance(val, torch.Tensor):
                 if isinstance(val, (list, tuple)):
-                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
+                    setattr(self, field, torch.tensor(val))
                 else:
-                    setattr(self, field, torch.tensor([float(val)], dtype=torch.get_default_dtype()))
+                    setattr(self, field, torch.tensor([float(val)]))
         
         # Convert A, b (list → tensor, keep None as is)
         for field in ['A', 'b']:
             val = getattr(self, field, None)
             if val is not None and not isinstance(val, torch.Tensor):
                 if isinstance(val, (list, tuple)):
-                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
+                    setattr(self, field, torch.tensor(val))
 
 class OutKind:
     LINEAR_LE   = "LINEAR_LE"
@@ -85,17 +85,17 @@ class OutputSpec:
         
         # Convert margin (scalar → 1-D tensor)
         if self.margin is not None and not isinstance(self.margin, torch.Tensor):
-            self.margin = torch.tensor([float(self.margin)], dtype=torch.get_default_dtype())
+            self.margin = torch.tensor([float(self.margin)])
         
         # Convert d (scalar → 1-D tensor)
         if self.d is not None and not isinstance(self.d, torch.Tensor):
-            self.d = torch.tensor([float(self.d)], dtype=torch.get_default_dtype())
+            self.d = torch.tensor([float(self.d)])
         
         # Convert c, lb, ub (list or scalar → tensor)
         for field in ['c', 'lb', 'ub']:
             val = getattr(self, field, None)
             if val is not None and not isinstance(val, torch.Tensor):
                 if isinstance(val, (list, tuple)):
-                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
+                    setattr(self, field, torch.tensor(val))
                 else:
-                    setattr(self, field, torch.tensor([float(val)], dtype=torch.get_default_dtype()))
+                    setattr(self, field, torch.tensor([float(val)]))
