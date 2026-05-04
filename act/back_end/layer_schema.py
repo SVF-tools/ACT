@@ -312,6 +312,11 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "input_shape",
             "output_shape",
             "data_format",
+            "in_channels",
+            "out_channels",
+            "kernel_size",
+            "weight_pos",
+            "weight_neg",
         ],
     },
     # =====================
@@ -477,7 +482,10 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SUB.value: {
         "params_required": [],
-        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
+        "params_optional": [
+            "broadcast", "axis", "x_vars", "y_vars",
+            "input_shape", "output_shape",
+        ],
     },
     LayerKind.MUL.value: {
         "params_required": [],

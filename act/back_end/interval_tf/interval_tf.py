@@ -44,8 +44,11 @@ class IntervalTF(TransferFunction):
         "CLIP": lambda L, bounds, tf: tf_clip(L, bounds),
         
         # Multi-input operations  
-        "ADD": lambda L, bounds, tf: tf_add(L, 
-            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0), 
+        "ADD": lambda L, bounds, tf: tf_add(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1)),
+        "SUB": lambda L, bounds, tf: tf_sub(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1)),
         "MUL": lambda L, bounds, tf: tf_mul(L,
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),

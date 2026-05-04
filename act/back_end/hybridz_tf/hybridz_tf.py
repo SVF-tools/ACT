@@ -57,6 +57,7 @@ class HybridzTF(TransferFunction):
         LayerKind.BN.value: lambda L, b, tf: hz_mlp.tf_bn(L, b, tf),
         # Multi-input: HZ + interval
         LayerKind.ADD.value: lambda L, b, tf: hz_mlp.tf_add(L, b, tf),
+        LayerKind.SUB.value: lambda L, b, tf: hz_mlp.tf_sub(L, b, tf),
         LayerKind.MUL.value: lambda L, b, tf: hz_mlp.tf_mul(L, b, tf),
         LayerKind.CONCAT.value: lambda L, b, tf: hz_mlp.tf_concat(L, b, tf),
         # CNN: HZ + interval

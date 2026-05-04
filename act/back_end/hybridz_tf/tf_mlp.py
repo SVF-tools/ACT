@@ -171,6 +171,30 @@ def tf_add(L, bounds, tf):
     return fact
 
 
+def tf_sub(L, bounds, tf):
+    """SUB: y = x - z. HZ form: minkowski_sum(hz_x, -hz_z)."""
+    hz_in = tf._hz_cache.get(L.id)
+    if hz_in is not None:
+        preds = tf._net.preds.get(L.id, [])
+        hz2 = tf._hz_cache.get(preds[1]) if len(preds) > 1 else None
+        if hz2 is not None:
+            hz2_neg = HZono(
+                c=-hz2.c, Gc=-hz2.Gc, Gb=-hz2.Gb,
+                Ac=hz2.Ac.clone(), Ab=hz2.Ab.clone(), b=hz2.b.clone(),
+            )
+            tf._hz_cache[L.id] = hz_minkowski_sum(hz_in, hz2_neg)
+        else:
+            hz_in = None
+    fact = interval.tf_sub(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
+    if hz_in is not None:
+        return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
+    return fact
+
+
 def tf_mul(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:

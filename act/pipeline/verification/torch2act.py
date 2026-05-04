@@ -201,13 +201,39 @@ class _LayerGraphBuilder:
     def _extract_graph(self) -> None:
         """Extract computation graph using torch.fx symbolic tracing."""
         try:
-            # Use fx.symbolic_trace to obtain a graph representation of the model from torch
-            traced = fx.symbolic_trace(self.model)
+            traced = self._symbolic_trace_with_leaf_modules(self.model)
             self.fx_graph = traced.graph
             self.modules = dict(traced.named_modules())
             self._build_fx_graph_edges()
         except Exception as e:
             raise RuntimeError(f"Failed to trace model with torch.fx: {e}")
+
+    @staticmethod
+    def _symbolic_trace_with_leaf_modules(model):
+        """fx.symbolic_trace but treat onnx2torch's complex/control-flow modules
+        as leaves (don't trace into forward).
+        """
+        _ONNX2TORCH_LEAF_PREFIXES = (
+            "OnnxLoop", "OnnxScan", "OnnxIf",
+            "OnnxNonZero", "OnnxRange", "OnnxResize",
+            "OnnxReduceSum", "OnnxReduceMean",
+            "OnnxGather", "OnnxScatter", "OnnxScatterND",
+            "OnnxOneHot", "OnnxExpand",
+            "OnnxTopK", "OnnxArgMax", "OnnxArgMin",
+            "OnnxConstantOfShape",
+        )
+
+        class _LeafAwareTracer(fx.Tracer):
+            def is_leaf_module(self, m, module_qualified_name):
+                cn = type(m).__name__
+                if cn.startswith(_ONNX2TORCH_LEAF_PREFIXES):
+                    return True
+                return super().is_leaf_module(m, module_qualified_name)
+
+        tracer = _LeafAwareTracer()
+        graph = tracer.trace(model)
+        traced = fx.GraphModule(model, graph)
+        return traced
     
     def _build_fx_graph_edges(self) -> None:
         """Build graph edge dictionary from torch.fx graph."""
@@ -256,9 +282,12 @@ class _LayerGraphBuilder:
         
         handlers = {
             'add': self._process_add_operation,
+            'sub': self._process_sub_operation,
             'cat': self._process_concat_operation,
             'concat': self._process_concat_operation,
             'flatten': self._process_flatten_function,
+            'reshape': self._process_reshape_function,
+            'view': self._process_reshape_function,
             'mul': self._process_mul_operation,
             'mean': self._process_mean_operation,
             'getitem': self._process_getitem_operation,
@@ -411,6 +440,7 @@ class _LayerGraphBuilder:
             nn.Linear: self._convert_linear,
             nn.ReLU: lambda m: self._convert_activation(m, LayerKind.RELU),
             nn.Conv2d: self._convert_conv2d,
+            nn.ConvTranspose2d: self._convert_convtranspose2d,
             nn.MaxPool2d: self._convert_pool2d,
             nn.AvgPool2d: self._convert_pool2d,
             nn.AdaptiveAvgPool2d: self._convert_adaptive_avgpool2d,
@@ -528,7 +558,51 @@ class _LayerGraphBuilder:
         )
         self.shape = output_shape
         self.prev_out = out_vars
-    
+
+    def _convert_convtranspose2d(self, mod: nn.ConvTranspose2d) -> None:
+        """Convert nn.ConvTranspose2d (output shape uses transposed-conv formula)."""
+        weight = mod.weight.detach()
+        bias = mod.bias.detach() if mod.bias is not None else None
+
+        # Infer input shape if flattened (mirror _convert_conv2d)
+        if len(self.shape) == 2:
+            n_features = self.shape[1]
+            channels = mod.in_channels
+            spatial = int((n_features / channels) ** 0.5)
+            input_shape = (1, channels, spatial, spatial)
+        else:
+            input_shape = self.shape
+
+        batch, in_c, in_h, in_w = input_shape
+        out_c = mod.out_channels
+        op_h, op_w = (mod.output_padding if isinstance(mod.output_padding, tuple)
+                      else (mod.output_padding, mod.output_padding))
+        out_h = (in_h - 1) * mod.stride[0] - 2 * mod.padding[0] \
+                + mod.dilation[0] * (mod.kernel_size[0] - 1) + op_h + 1
+        out_w = (in_w - 1) * mod.stride[1] - 2 * mod.padding[1] \
+                + mod.dilation[1] * (mod.kernel_size[1] - 1) + op_w + 1
+        output_shape = (1, out_c, out_h, out_w)
+
+        params = {
+            "weight": weight,
+            "input_shape": input_shape, "output_shape": output_shape,
+            "kernel_size": mod.kernel_size, "stride": mod.stride,
+            "padding": mod.padding, "dilation": mod.dilation,
+            "output_padding": (op_h, op_w),
+            "groups": mod.groups, "transposed": True,
+            "in_channels": in_c, "out_channels": out_c,
+        }
+        if bias is not None:
+            params["bias"] = bias
+
+        out_vars = self._alloc_ids(out_c * out_h * out_w)
+        self._add_layer(
+            LayerKind.CONVTRANSPOSE2D.value, params,
+            self.prev_out, out_vars
+        )
+        self.shape = output_shape
+        self.prev_out = out_vars
+
     def _convert_pool2d(self, mod: Union[nn.MaxPool2d, nn.AvgPool2d]) -> None:
         """Convert MaxPool2d or AvgPool2d."""
         if len(self.shape) != 4:
@@ -723,6 +797,31 @@ class _LayerGraphBuilder:
         self.shape = x_shape
         self._register_node(node.name, layer_id)
     
+    def _process_sub_operation(self, node: fx.Node) -> None:
+        """Process SUB operation (z = x - y); same emission shape as ADD."""
+        inputs = [a for a in node.args if isinstance(a, fx.Node)]
+        if len(inputs) < 2:
+            return
+
+        x_name, y_name = inputs[0].name, inputs[1].name
+        if x_name not in self.node_outputs or y_name not in self.node_outputs:
+            return
+
+        x_vars = self.node_outputs[x_name]
+        y_vars = self.node_outputs[y_name]
+        x_shape = self.node_shapes[x_name]
+
+        out_vars = self._alloc_ids(len(x_vars))
+
+        params = {"x_vars": x_vars, "y_vars": y_vars, "input_shape": x_shape, "output_shape": x_shape}
+        layer_id = self._add_layer(
+            LayerKind.SUB.value, params,
+            x_vars + y_vars, out_vars
+        )
+        self.prev_out = out_vars
+        self.shape = x_shape
+        self._register_node(node.name, layer_id)
+    
     def _process_concat_operation(self, node: fx.Node) -> None:
         """Process CONCAT operation."""
         if node.args and isinstance(node.args[0], (list, tuple)):
@@ -765,7 +864,16 @@ class _LayerGraphBuilder:
         """Process torch.flatten()."""
         if self._get_predecessor_state(node):
             self._create_flatten_layer(node.name)
-    
+
+    def _process_reshape_function(self, node: fx.Node) -> None:
+        """Process torch.reshape() / torch.Tensor.view() at function level.
+
+        Treated as flatten when total element count is preserved (most common
+        in vnncomp models — reshape to (batch, features) before a linear).
+        """
+        if self._get_predecessor_state(node):
+            self._create_flatten_layer(node.name)
+
     def _process_mul_operation(self, node: fx.Node) -> None:
         """Process MUL operation."""
         inputs = [a for a in node.args if isinstance(a, fx.Node)]

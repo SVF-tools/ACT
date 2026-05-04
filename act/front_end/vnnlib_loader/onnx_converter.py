@@ -27,6 +27,109 @@ class ONNXConversionError(Exception):
     pass
 
 
+_O2T_SLICE_PATCHED = False
+
+
+def _patch_onnx2torch_slice() -> None:
+    """Idempotently monkey-patch onnx2torch._get_slices to return Python ints.
+
+    Newer OnnxSlice opset builds slice() literals at runtime from numpy
+    arrays, which fx.symbolic_trace cannot serialize. Done once per process.
+    """
+    global _O2T_SLICE_PATCHED
+    if _O2T_SLICE_PATCHED:
+        return
+    try:
+        import onnx2torch.node_converters.slice as _slice_mod
+        import numpy as _np
+    except ImportError:
+        return
+    _orig = _slice_mod._get_slices
+
+    def _patched(starts, ends, axes, steps):
+        flip_dims, pos_slices, neg_slices = _orig(starts, ends, axes, steps)
+
+        def _norm_slice(s):
+            if not isinstance(s, slice):
+                return s
+
+            def _to_int(x):
+                if x is None:
+                    return None
+                if isinstance(x, _np.integer):
+                    return int(x)
+                return x
+            return slice(_to_int(s.start), _to_int(s.stop), _to_int(s.step))
+
+        flip_dims = [int(d) if isinstance(d, _np.integer) else d for d in flip_dims]
+        pos_slices = [_norm_slice(s) for s in pos_slices]
+        neg_slices = [_norm_slice(s) if not (s is Ellipsis) else s
+                      for s in neg_slices]
+        return flip_dims, pos_slices, neg_slices
+
+    _slice_mod._get_slices = _patched
+    _O2T_SLICE_PATCHED = True
+
+
+def _sanitize_numpy_in_modules(model: nn.Module) -> None:
+    """Cast numpy scalars / slice objects in module attrs to Python natives.
+
+    Required for fx symbolic_trace compat with onnx2torch (OnnxSliceV9
+    stores numpy.int64 in slice() literals, which fx.create_arg rejects).
+    """
+    import numpy as _np
+
+    def _conv(v):
+        if isinstance(v, _np.integer):
+            return int(v)
+        if isinstance(v, _np.floating):
+            return float(v)
+        if isinstance(v, _np.bool_):
+            return bool(v)
+        if isinstance(v, _np.ndarray):
+            try:
+                return torch.from_numpy(v.copy())
+            except Exception:
+                return v.tolist()
+        if isinstance(v, slice):
+            def _norm(x):
+                if x is None:
+                    return None
+                if isinstance(x, _np.integer):
+                    return int(x)
+                return x
+            return slice(_norm(v.start), _norm(v.stop), _norm(v.step))
+        if isinstance(v, tuple):
+            return tuple(_conv(x) for x in v)
+        if isinstance(v, list):
+            return [_conv(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _conv(x) for k, x in v.items()}
+        return v
+
+    _SKIP = (
+        "_parameters", "_buffers", "_modules",
+        "_forward_hooks", "_forward_pre_hooks",
+        "_backward_hooks", "_state_dict_hooks",
+        "_load_state_dict_pre_hooks",
+        "_non_persistent_buffers_set",
+    )
+    for module in model.modules():
+        for attr_name in list(vars(module).keys()):
+            if attr_name in _SKIP:
+                continue
+            try:
+                val = getattr(module, attr_name)
+            except Exception:
+                continue
+            new_val = _conv(val)
+            if new_val is not val:
+                try:
+                    setattr(module, attr_name, new_val)
+                except (AttributeError, TypeError):
+                    pass
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -94,6 +197,7 @@ def convert_onnx_to_pytorch(
         # for that specific upstream error so unrelated conversion bugs
         # (unsupported ops, shape errors) still surface normally.
         logger.info("Converting ONNX to PyTorch")
+        _patch_onnx2torch_slice()
         try:
             pytorch_model = convert(onnx_model)
         except Exception as convert_err:
@@ -111,6 +215,7 @@ def convert_onnx_to_pytorch(
                 pytorch_model = convert(raw_model)
             else:
                 raise
+        _sanitize_numpy_in_modules(pytorch_model)
         pytorch_model.eval()
         
         # Convert model to match device_manager settings
