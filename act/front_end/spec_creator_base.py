@@ -327,7 +327,9 @@ class BaseSpecCreator(ABC):
             (is_valid, error_message) tuple
         """
         if spec.kind in [OutKind.MARGIN_ROBUST, OutKind.TOP1_ROBUST]:
-            if not (0 <= spec.y_true < num_classes):
+            y_true_valid_class = (0 <= spec.y_true).logical_and(spec.y_true < num_classes)
+
+            if not y_true_valid_class.all():
                 return False, f"Class label {spec.y_true} out of range [0, {num_classes})"
         
         elif spec.kind == OutKind.LINEAR_LE:
