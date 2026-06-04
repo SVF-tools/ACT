@@ -464,7 +464,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         
         for input_spec, output_spec in spec_pairs:
             try:
-                is_valid = self.validate_spec_pair_with_model(
+                is_valid, errors = self.validate_spec_pair_with_model(
                     input_spec,
                     output_spec,
                     pytorch_model,
@@ -474,9 +474,9 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                 if is_valid:
                     valid_pairs.append((input_spec, output_spec))
                 else:
-                    logger.debug(
-                        f"Spec pair validation failed: "
-                        f"{input_spec.kind}, {output_spec.kind}"
+                    logger.error(
+                        f"Spec pair validation failed: {input_spec.kind}, {output_spec.kind}, with errors:\n"
+                        f"{"\n".join(errors)}"
                     )
             
             except Exception as e:
