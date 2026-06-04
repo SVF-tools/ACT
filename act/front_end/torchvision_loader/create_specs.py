@@ -474,7 +474,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                 if is_valid:
                     valid_pairs.append((input_spec, output_spec))
                 else:
-                    logger.error(
+                    logger.debug(
                         f"Spec pair validation failed: {input_spec.kind}, {output_spec.kind}, with errors:\n"
                         f"{"\n".join(errors)}"
                     )
