@@ -13,6 +13,48 @@ License: AGPLv3+
 from typing import Dict, Any, List, Optional
 
 
+def _cub200_attributes_parse_line(line: str) -> Optional[tuple[int, int, bool]]:
+    """
+    Parses a line of the attributes file into the format required of attribute datasets,
+    `(image_id, attr_id, has_attr)`.
+    
+    For CUB, the original line is in the following format:
+    ```
+    <image_id> <attribute_id> <is_present> <certainty_id> <time>
+    ```
+    
+    The threshold for `has_attr` is if `is_present == 1` and `certainty_id >= 3`, which signifies
+    that an image is "probably" there. `certainty_id` is more certain the higher it is.
+    """
+    line_items = line.split()
+
+    try:
+        # There's an inconsistency with lines associated with image 2275 and 9364, which has an extra "0"
+        # between `<certainty_id>` and `<time>`
+        if line_items[0] in ["2275", "9364"] and int(line_items[1]) >= 10:
+            image_id, attr_id, is_present, certainty_id, _, _ = line_items
+        else:
+            image_id, attr_id, is_present, certainty_id, _ = line_items
+    except Exception:
+        print(f"Offending line: {line}")
+        return None
+    
+    # Images and attribute IDs are 1-indexed, make them 0-indexed
+    image_id = int(image_id) - 1
+    attr_id = int(attr_id) - 1
+    is_present = is_present == "1"
+    certainty_id = int(certainty_id)
+
+    # The higher the certainty ID, the more certain the dataset is of a
+    # certain attribute appearing
+    if is_present and certainty_id >= 3:
+        has_attr = True
+    else:
+        has_attr = False
+
+    return (image_id, attr_id, has_attr)
+
+
 # Comprehensive torchvision dataset to model mapping
 DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
     # ========== MNIST Family (28x28 grayscale) ==========
@@ -446,6 +488,28 @@ DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
             "image_root": "CUB_200_2011/images",
             "index_file": "CUB_200_2011/images.txt",
             "split_file": "CUB_200_2011/train_test_split.txt"
+        }
+    },
+    "CUB200Attributes": {
+        "models": ["resnet18"],
+        "input_size": (3, 224, 224),
+        "num_classes": 200,
+        "category": "classification",
+        "preprocessing": {
+            "resize_to": (224, 224)
+        },
+        "notes": "Caltech-UCSD Birds 200-2011; archive-distributed ImageFolder layout.",
+        "download": {
+            "url": "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz",
+            "md5": "97eceeb196236b17998738112f37df78",
+            "image_root": "CUB_200_2011/images",
+            "index_file": "CUB_200_2011/images.txt",
+            "split_file": "CUB_200_2011/train_test_split.txt",
+            "attributes": {
+                "index_file": "attributes.txt",
+                "label_file": "CUB_200_2011/attributes/image_attribute_labels.txt",
+                "label_parse_fn": _cub200_attributes_parse_line
+            }
         }
     }
 }

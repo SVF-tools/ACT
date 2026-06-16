@@ -10,11 +10,12 @@ Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """
 
-from typing import Dict, Any, List, Optional
-import os
 import json
-import torch
 from pathlib import Path
+from typing import Any, Callable, List, Optional
+
+import torch
+from torch.utils.data import Dataset
 
 # Import path configuration
 from act.util.path_config import get_torchvision_data_root
@@ -32,8 +33,39 @@ from act.front_end.torchvision_loader.data_model_mapping import (
 from act.front_end.torchvision_loader.model_definitions import _get_custom_model_definition
 
 
+class AttributeDataset(Dataset):
+    """
+    Given a classification dataset (one that fetches images and class) and an attribute
+    mapping (which maps an image to the attributes that the image has), creates a wrapper class
+    that matches up images, their class and their attributes.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        attr_names: list[str],
+        attr_mapping: dict[int, torch.Tensor]
+    ):
+        self.dataset = dataset
+        self.attr_names = attr_names
+        self.attr_mapping = attr_mapping
+
+    def __len__(self):
+        return len(self.dataset)  # type: ignore
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Given `index`, returns the tuple `(X, target, attrs)`, where `X` and `target` are
+        fetched from `self.dataset`.
+        """
+        X, target = self.dataset[index]
+        attrs = self.attr_mapping[index]
+
+        return X, target, attrs
+
+
 def _resolve_archive_dataset(
-    dataset_info: Dict[str, Any],
+    dataset_info: dict[str, Any],
     raw_dir: Path,
     train: bool,
     transform: Any = None,
@@ -52,45 +84,120 @@ def _resolve_archive_dataset(
     cfg = dataset_info["download"]
     raw_dir = Path(raw_dir)
     image_root = raw_dir / cfg["image_root"]
+
     if not image_root.exists():
         if not download:
             raise FileNotFoundError(
                 f"Archive dataset not found at {image_root}; download it first."
             )
+
         download_and_extract_archive(
             url=cfg["url"], download_root=str(raw_dir), md5=cfg.get("md5"),
         )
+
     dataset = ImageFolder(str(image_root), transform=transform)
+
     if "index_file" in cfg and "split_file" in cfg:
         dataset = Subset(
             dataset, _official_split_indices(dataset, raw_dir, cfg, train),
         )
+
+    # Parsing attributes, if they exist
+    if "attributes" in cfg:
+        attrs_cfg = cfg["attributes"]
+
+        # Assumes that `index_file` of attributes simply contains a list
+        # of the names of all attributes, line by line.
+        attr_names = _generate_attr_names(raw_dir / attrs_cfg["index_file"])
+        n_attrs = len(attr_names)
+
+        mapping = _generate_attr_mapping(
+            raw_dir / attrs_cfg["label_file"],
+            attrs_cfg["label_parse_fn"],
+            n_attrs
+        )
+
+        dataset = AttributeDataset(dataset, attr_names, mapping)
+
     return dataset
 
 
 def _official_split_indices(
-    dataset: Any, raw_dir: Path, cfg: Dict[str, Any], train: bool,
-) -> List[int]:
+    dataset: Any, raw_dir: Path, cfg: dict[str, Any], train: bool,
+) -> list[int]:
     """Deterministic official-split filter from index/split text files.
 
     Both files are whitespace-separated: index_file maps image_id to a path
     relative to image_root's parent; split_file maps image_id to 1 (train)
     or 0 (test).
     """
-    id_to_rel: Dict[int, str] = {}
+    id_to_rel: dict[int, str] = {}
+
     for line in (raw_dir / cfg["index_file"]).read_text().splitlines():
         img_id, rel_path = line.split()
+
         id_to_rel[int(img_id)] = rel_path
+
     wanted = set()
+
     for line in (raw_dir / cfg["split_file"]).read_text().splitlines():
         img_id, is_train = line.split()
+
         if bool(int(is_train)) == train and int(img_id) in id_to_rel:
             wanted.add(id_to_rel[int(img_id)])
+
     root = Path(dataset.root)
+
     return [
         idx for idx, (path, _) in enumerate(dataset.samples)
         if Path(path).relative_to(root).as_posix() in wanted
     ]
+
+
+def _generate_attr_names(index_path: Path) -> list[str]:
+    """
+    Given the path of a text file mapping attribute IDs to human-readable
+    names, generates a list of those human-readable names.
+    """
+    attr_names = []
+
+    with open(index_path, "r") as index_file:
+        for line in index_file.readlines():
+            # Assumes the attribute index file consists of lines that are
+            # of the format:
+            # <attr_id> <attr_name>
+            _, attr_name = line.split()
+            attr_names.append(attr_name)
+
+    return attr_names
+
+
+def _generate_attr_mapping(
+    label_path: Path,
+    parse_fn: Callable[[str], Optional[tuple[int, int, bool]]],
+    n_attrs: int,
+) -> dict[int, torch.Tensor]:
+    """
+    Creates a mapping of image IDs to the attributes that those images have,
+    in the form of a tensor of size `(n_attrs,)`.
+    """
+    from collections import defaultdict
+
+    mapping = defaultdict(lambda: torch.zeros((n_attrs,)))
+
+    with open(label_path, "r") as label_file:
+        for line in label_file.readlines():
+            parse_result = parse_fn(line)
+
+            if parse_result is None:
+                continue
+
+            index, attr, has_attr = parse_result
+
+            if has_attr:
+                mapping[index][attr] = 1
+
+    return mapping
 
 
 def download_dataset_model_pair(
@@ -332,6 +439,34 @@ def download_dataset_model_pair(
                 }
         else:
             print(f"\n[1/3] Dataset already present, skipping download...")
+
+            # Only triggers when a raw dataset is downloaded from a previous run, but
+            # an error occurred (either in downloading or creating the `Dataset` object).
+            if "download" in dataset_info:
+                import os
+                from torchvision.datasets.utils import check_integrity
+
+                cfg = dataset_info["download"]
+                filename = os.path.basename(cfg["url"])
+                print(raw_dir / filename)
+
+                # Check if the file that's already been downloaded is correct
+                if not check_integrity(raw_dir / filename, dataset_info["download"].get("md5")):
+                    print(f"    ⚠ Train split failed: downloaded raw dataset file corrupt/incomplete")
+                    return {
+                        'status': 'error',
+                        'message': f"Failed to download any splits for {dataset_name}"
+                    }
+                
+                # Assuming dataset is downloaded + extracted correctly
+                for split_name in ('test', 'train'):
+                    ds = _resolve_archive_dataset(
+                        dataset_info, raw_dir,
+                        train=(split_name == 'train'),
+                        download=False, # Already downloaded
+                    )
+                    downloaded_splits.append(split_name)
+                    print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
         
         # Save model architecture
         print(f"\n[2/3] Saving model architecture...")
