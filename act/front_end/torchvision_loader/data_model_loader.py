@@ -12,10 +12,9 @@ License: AGPLv3+
 
 import json
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 import torch
-from torch.utils.data import Dataset
 
 # Import path configuration
 from act.util.path_config import get_torchvision_data_root
