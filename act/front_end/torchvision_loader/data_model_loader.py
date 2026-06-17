@@ -344,34 +344,6 @@ def download_dataset_model_pair(
                 }
         else:
             print(f"\n[1/3] Dataset already present, skipping download...")
-
-            # Only triggers when a raw dataset is downloaded from a previous run, but
-            # an error occurred (either in downloading or creating the `Dataset` object).
-            if "download" in dataset_info:
-                import os
-                from torchvision.datasets.utils import check_integrity
-
-                cfg = dataset_info["download"]
-                filename = os.path.basename(cfg["url"])
-                print(raw_dir / filename)
-
-                # Check if the file that's already been downloaded is correct
-                if not check_integrity(raw_dir / filename, dataset_info["download"].get("md5")):
-                    print(f"    ⚠ Train split failed: downloaded raw dataset file corrupt/incomplete")
-                    return {
-                        'status': 'error',
-                        'message': f"Failed to download any splits for {dataset_name}"
-                    }
-                
-                # Assuming dataset is downloaded + extracted correctly
-                for split_name in ('test', 'train'):
-                    ds = _resolve_archive_dataset(
-                        dataset_info, raw_dir,
-                        train=(split_name == 'train'),
-                        download=False, # Already downloaded
-                    )
-                    downloaded_splits.append(split_name)
-                    print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
         
         # Save model architecture
         print(f"\n[2/3] Saving model architecture...")
