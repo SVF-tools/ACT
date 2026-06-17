@@ -33,37 +33,6 @@ from act.front_end.torchvision_loader.data_model_mapping import (
 from act.front_end.torchvision_loader.model_definitions import _get_custom_model_definition
 
 
-class AttributeDataset(Dataset):
-    """
-    Given a classification dataset (one that fetches images and class) and an attribute
-    mapping (which maps an image to the attributes that the image has), creates a wrapper class
-    that matches up images, their class and their attributes.
-    """
-
-    def __init__(
-        self,
-        dataset: Dataset,
-        attr_names: list[str],
-        attr_mapping: dict[int, torch.Tensor]
-    ):
-        self.dataset = dataset
-        self.attr_names = attr_names
-        self.attr_mapping = attr_mapping
-
-    def __len__(self):
-        return len(self.dataset)  # type: ignore
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Given `index`, returns the tuple `(X, target, attrs)`, where `X` and `target` are
-        fetched from `self.dataset`.
-        """
-        X, target = self.dataset[index]
-        attrs = self.attr_mapping[index]
-
-        return X, target, attrs
-
-
 def _resolve_archive_dataset(
     dataset_info: dict[str, Any],
     raw_dir: Path,
@@ -102,23 +71,6 @@ def _resolve_archive_dataset(
             dataset, _official_split_indices(dataset, raw_dir, cfg, train),
         )
 
-    # Parsing attributes, if they exist
-    if "attributes" in cfg:
-        attrs_cfg = cfg["attributes"]
-
-        # Assumes that `index_file` of attributes simply contains a list
-        # of the names of all attributes, line by line.
-        attr_names = _generate_attr_names(raw_dir / attrs_cfg["index_file"])
-        n_attrs = len(attr_names)
-
-        mapping = _generate_attr_mapping(
-            raw_dir / attrs_cfg["label_file"],
-            attrs_cfg["label_parse_fn"],
-            n_attrs
-        )
-
-        dataset = AttributeDataset(dataset, attr_names, mapping)
-
     return dataset
 
 
@@ -152,52 +104,6 @@ def _official_split_indices(
         idx for idx, (path, _) in enumerate(dataset.samples)
         if Path(path).relative_to(root).as_posix() in wanted
     ]
-
-
-def _generate_attr_names(index_path: Path) -> list[str]:
-    """
-    Given the path of a text file mapping attribute IDs to human-readable
-    names, generates a list of those human-readable names.
-    """
-    attr_names = []
-
-    with open(index_path, "r") as index_file:
-        for line in index_file.readlines():
-            # Assumes the attribute index file consists of lines that are
-            # of the format:
-            # <attr_id> <attr_name>
-            _, attr_name = line.split()
-            attr_names.append(attr_name)
-
-    return attr_names
-
-
-def _generate_attr_mapping(
-    label_path: Path,
-    parse_fn: Callable[[str], Optional[tuple[int, int, bool]]],
-    n_attrs: int,
-) -> dict[int, torch.Tensor]:
-    """
-    Creates a mapping of image IDs to the attributes that those images have,
-    in the form of a tensor of size `(n_attrs,)`.
-    """
-    from collections import defaultdict
-
-    mapping = defaultdict(lambda: torch.zeros((n_attrs,)))
-
-    with open(label_path, "r") as label_file:
-        for line in label_file.readlines():
-            parse_result = parse_fn(line)
-
-            if parse_result is None:
-                continue
-
-            index, attr, has_attr = parse_result
-
-            if has_attr:
-                mapping[index][attr] = 1
-
-    return mapping
 
 
 def download_dataset_model_pair(

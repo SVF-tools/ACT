@@ -489,28 +489,6 @@ DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
             "index_file": "CUB_200_2011/images.txt",
             "split_file": "CUB_200_2011/train_test_split.txt"
         }
-    },
-    "CUB200Attributes": {
-        "models": ["resnet18"],
-        "input_size": (3, 224, 224),
-        "num_classes": 200,
-        "category": "classification",
-        "preprocessing": {
-            "resize_to": (224, 224)
-        },
-        "notes": "Caltech-UCSD Birds 200-2011; archive-distributed ImageFolder layout.",
-        "download": {
-            "url": "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz",
-            "md5": "97eceeb196236b17998738112f37df78",
-            "image_root": "CUB_200_2011/images",
-            "index_file": "CUB_200_2011/images.txt",
-            "split_file": "CUB_200_2011/train_test_split.txt",
-            "attributes": {
-                "index_file": "attributes.txt",
-                "label_file": "CUB_200_2011/attributes/image_attribute_labels.txt",
-                "label_parse_fn": _cub200_attributes_parse_line
-            }
-        }
     }
 }
 
