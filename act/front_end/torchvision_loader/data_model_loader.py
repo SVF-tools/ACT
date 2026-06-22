@@ -32,7 +32,7 @@ from act.front_end.torchvision_loader.data_model_mapping import (
 from act.front_end.torchvision_loader.model_definitions import _get_custom_model_definition
 
 
-def _resolve_archive_dataset(
+def _resolve_external_dataset(
     dataset_info: dict[str, Any],
     raw_dir: Path,
     train: bool,
@@ -103,6 +103,88 @@ def _official_split_indices(
         idx for idx, (path, _) in enumerate(dataset.samples)
         if Path(path).relative_to(root).as_posix() in wanted
     ]
+
+
+def _download_dataset(
+    root_dir: str,
+    dataset_name: str,
+    dataset_info: dict[str, Any],
+    split: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Downloads `split` for a given `dataset_name`. Its `dataset_info` is retrieved from
+    `get_dataset_info`.
+
+    Returns a list of splits downloaded, plus any errors encountered in the download process.
+    """
+    raw_dir = Path(root_dir) / dataset_name / "raw"
+    # We determine an "external" (non-TorchVision) dataset through the `download`
+    # key, which also contains information on where the raw images are, how to split
+    # training/testing sets after extraction.
+    is_external = "download" in dataset_info
+    
+    downloaded_splits = []
+    errors = []
+
+    if is_external:
+        # Archive datasets ship train+test in one archive: download
+        # once, then both splits are available regardless of `split`.
+        print(f"  • Downloading archive from {dataset_info['download']['url']} ...")
+        try:
+            for split_name in ('test', 'train'):
+                ds = _resolve_external_dataset(
+                    dataset_info, raw_dir,
+                    train=(split_name == 'train'),
+                    download=True,
+                )
+                downloaded_splits.append(split_name)
+                print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
+        except Exception as e:
+            error = f"External archive download failed: {e}"
+            errors.append(error)
+            print("    ⚠ " + error)
+    else:
+        import torchvision.datasets
+        dataset_class = getattr(torchvision.datasets, dataset_name, None)
+
+        if dataset_class is None:
+            error = f"Dataset {dataset_name} not found in torchvision.datasets"
+            errors.append(error)
+            print("    ⚠ " + error)
+            
+            return [], errors
+
+        if split in ['test', 'both']:
+            print(f"  • Downloading test split...")
+            try:
+                test_dataset = dataset_class(
+                    root=str(raw_dir),
+                    train=False,
+                    download=True
+                )
+                downloaded_splits.append('test')
+                print(f"    ✓ Test split: {len(test_dataset)} samples")
+            except Exception as e:
+                error = f"Test split failed: {e}"
+                errors.append(error)
+                print("    ⚠ " + error)
+
+        if split in ['train', 'both']:
+            print(f"  • Downloading train split...")
+            try:
+                train_dataset = dataset_class(
+                    root=str(raw_dir),
+                    train=True,
+                    download=True
+                )
+                downloaded_splits.append('train')
+                print(f"    ✓ Train split: {len(train_dataset)} samples")
+            except Exception as e:
+                error = f"Train split failed: {e}"
+                errors.append(error)
+                print("    ⚠ " + error)
+    
+    return downloaded_splits, errors
 
 
 def download_dataset_model_pair(
@@ -286,61 +368,12 @@ def download_dataset_model_pair(
         if not dataset_exists:
             print(f"\n[1/3] Downloading dataset...")
 
-            if "download" in dataset_info:
-                # Archive datasets ship train+test in one archive: download
-                # once, then both splits are available regardless of `split`.
-                print(f"  • Downloading archive from {dataset_info['download']['url']} ...")
-                try:
-                    for split_name in ('test', 'train'):
-                        ds = _resolve_archive_dataset(
-                            dataset_info, raw_dir,
-                            train=(split_name == 'train'),
-                            download=True,
-                        )
-                        downloaded_splits.append(split_name)
-                        print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
-                except Exception as e:
-                    print(f"    ⚠ Archive download failed: {e}")
-            else:
-                import torchvision.datasets
-                dataset_class = getattr(torchvision.datasets, dataset_name, None)
+            downloaded_splits, errors = _download_dataset(root_dir, dataset_name, dataset_info, split)
 
-                if dataset_class is None:
-                    return {
-                        'status': 'error',
-                        'message': f"Dataset {dataset_name} not found in torchvision.datasets"
-                    }
-
-                if split in ['test', 'both']:
-                    print(f"  • Downloading test split...")
-                    try:
-                        test_dataset = dataset_class(
-                            root=str(raw_dir),
-                            train=False,
-                            download=True
-                        )
-                        downloaded_splits.append('test')
-                        print(f"    ✓ Test split: {len(test_dataset)} samples")
-                    except Exception as e:
-                        print(f"    ⚠ Test split failed: {e}")
-
-                if split in ['train', 'both']:
-                    print(f"  • Downloading train split...")
-                    try:
-                        train_dataset = dataset_class(
-                            root=str(raw_dir),
-                            train=True,
-                            download=True
-                        )
-                        downloaded_splits.append('train')
-                        print(f"    ✓ Train split: {len(train_dataset)} samples")
-                    except Exception as e:
-                        print(f"    ⚠ Train split failed: {e}")
-            
             if not downloaded_splits:
                 return {
                     'status': 'error',
-                    'message': f"Failed to download any splits for {dataset_name}"
+                    'message': f"Failed to download any splits for {dataset_name}, with errors: {"\n".join(errors)}"
                 }
         else:
             print(f"\n[1/3] Dataset already present, skipping download...")
@@ -705,7 +738,7 @@ def load_dataset_model_pair(
 
     try:
         if "download" in dataset_info:
-            dataset = _resolve_archive_dataset(
+            dataset = _resolve_external_dataset(
                 dataset_info, raw_dir,
                 train=is_train,
                 transform=preprocessing,
