@@ -110,6 +110,9 @@ def main() -> None:
               f"input-split BaB with per-node bound recompute", file=sys.stderr, flush=True)
 
     def raw_forward(x):
+        ref = sr[3][0].tensor if sr[3] else None
+        if ref is not None and x.numel() == ref.numel() and x.shape != ref.shape:
+            x = x.reshape(ref.shape)
         if param is not None:
             x = x.to(device=param.device, dtype=param.dtype)
         with torch.no_grad():
