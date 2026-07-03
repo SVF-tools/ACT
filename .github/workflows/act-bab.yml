@@ -78,7 +78,7 @@ jobs:
       - name: VNNLIB — download benchmarks
         run: |
           cd ${{ github.workspace }}
-          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 relusplitter_2026 isomorphic_acasxu_2026; do
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 relusplitter_2026 isomorphic_acasxu_2026 smart_turn_multimodal_2026; do
             coverage run -p -m act.front_end --download $cat
           done
 
@@ -103,6 +103,17 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify vnnlib --category relusplitter_2026 --max-instances 2 --merge-split-relus \
             --solvers dual --device cpu --dtype float64
+
+      # ===================================================================
+      # ONNX QuantizeLinear/DequantizeLinear ingestion: smart_turn is the only
+      # benchmark with QDQ nodes, exercising the onnx_converter Q/DQ converters
+      # + initializer folding.
+      # ===================================================================
+      - name: VNNLIB E2E — smart_turn_multimodal_2026 (ONNX Q/DQ ingestion)
+        run: |
+          cd ${{ github.workspace }}
+          timeout 30 coverage run -p -m act.pipeline --verify vnnlib --category smart_turn_multimodal_2026 \
+            --max-instances 1 --solvers dual --device cpu --dtype float64 --ignore-errors || true
 
       # ===================================================================
       # Isomorphic dual-network specs (2026): _isomorphic_multinet_rewrite,
@@ -136,6 +147,37 @@ jobs:
             --bab --bab-llm-probe-enabled --bab-llm-probe-backend mock \
             --bab-llm-probe-decisions split,frontier,refine,neuron --bab-llm-probe-log \
             --device cpu --dtype float64
+
+      # ===================================================================
+      # Gain branching + joint multi-neuron splitting: _multi_split_from_decision
+      # / _multi_split_from_groups and the gain-tier bab loop (2^k child cubes).
+      # ===================================================================
+      - name: BaB gain branching + multi-split
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_bab_deep.json \
+            --solver dual --bab --bab-branching gain --multi-split-levels 3 \
+            --bab-max-depth 4 --bab-max-subproblems 40 --device cpu --dtype float64
+
+      # ===================================================================
+      # SST/Yelp text-method selection: select_bert_method + BackendConfig
+      # text-method resolution (planar -> baf/alpha_mode/solver_tier).
+      # ===================================================================
+      - name: Text-method config resolution (planar)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_bab_deep.json \
+            --solver dual --method planar --device cpu --dtype float64
+
+      # ===================================================================
+      # Dual MATMUL bilinear kernel (tf_transformer): dual-tier soundness on
+      # the MATMUL layer-testing net (torchlp sweep never exercises dual here).
+      # ===================================================================
+      - name: Dual MATMUL kernel soundness
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify netfactory --validate-soundness \
+            --networks layer_testing_matmul --solvers dual --batch-sizes 1 --device cpu --dtype float64
 
       # ===================================================================
       # Core engine & solver tiers (default branching). Baseline coverage of

@@ -17,15 +17,6 @@
 from __future__ import annotations
 
 from act.front_end.bert_loader.create_specs import BertSpecCreator, create_bert_specs
-from act.front_end.bert_loader.certify import (
-    CertifiedRadiusResult,
-    RadiusSearchOptions,
-    RadiusStep,
-    certify_radius,
-    configure_bab_for_method,
-    falsified_counterexample_violates,
-    soundness_sample_certified,
-)
 from act.front_end.bert_loader.data_loader import (
     BertEmbeddingClassifier,
     BertExample,
@@ -41,14 +32,7 @@ __all__ = [
     "BertExample",
     "BertSpecCreator",
     "BertVocabulary",
-    "CertifiedRadiusResult",
-    "RadiusSearchOptions",
-    "RadiusStep",
-    "certify_radius",
-    "configure_bab_for_method",
     "create_bert_specs",
-    "falsified_counterexample_violates",
-    "soundness_sample_certified",
     "find_bert_dataset_name",
     "list_bert_datasets",
     "load_bert_dataset",
