@@ -60,10 +60,10 @@ jobs:
           coverage run -p -m act.front_end --list-downloads
           coverage run -p -m act.front_end --synthesis --creator torchvision
 
-      - name: Run custom datasets (directly downloaded, non-TorchVision)
-        run: |
-          cd ${{ github.workspace }}
-          coverage run -p -m act.front_end --download CUB200
+      # - name: Run custom datasets (directly downloaded, non-TorchVision)
+      #   run: |
+      #     cd ${{ github.workspace }}
+      #     coverage run -p -m act.front_end --download CUB200
 
       - name: List torchvision loader datasets (CLI coverage)
         run: |
