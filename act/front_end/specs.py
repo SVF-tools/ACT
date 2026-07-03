@@ -20,6 +20,56 @@ import torch
 
 ScalarTensor = torch.Tensor | float | int
 
+def normalize_position_mask(
+    positions: "torch.Tensor | Sequence[int] | Sequence[bool] | None",
+    token_count: int,
+    *,
+    batch_shape: "tuple[int, ...]" = (),
+    device: "torch.device | None" = None,
+) -> torch.Tensor:
+    """Normalize an LP_EMBEDDING ``perturbed_positions`` field to a boolean
+    token mask of shape ``(*batch_shape, token_count)``.
+
+    Single source of truth for every consumer (specs / verifier / bab / node /
+    branching / certify): ``None`` selects all positions; a boolean tensor is
+    accepted at the exact mask shape, as a per-token vector broadcast over
+    ``batch_shape``, or as a singleton-batch row; integer indices are
+    bounds-checked and scattered onto the last axis.
+
+    Raises:
+        ValueError: If a boolean mask shape is incompatible or an integer
+            index is out of range for ``token_count``.
+    """
+    shape = (*tuple(int(b) for b in batch_shape), int(token_count))
+    if positions is None:
+        return torch.ones(shape, dtype=torch.bool, device=device)
+    pos = positions if isinstance(positions, torch.Tensor) else torch.as_tensor(positions)
+    if device is not None:
+        pos = pos.to(device=device)
+    if pos.dtype == torch.bool:
+        if tuple(pos.shape) == shape:
+            return pos
+        if pos.numel() == token_count:
+            view = [1] * len(shape)
+            view[-1] = token_count
+            return pos.reshape(view).expand(shape)
+        if len(shape) > 1 and pos.dim() == len(shape) and pos.shape[-1] == token_count and pos.shape[0] == 1:
+            return pos.expand(shape)
+        raise ValueError(
+            f"boolean perturbed_positions shape {tuple(pos.shape)} incompatible with mask shape {shape}"
+        )
+    idx = pos.to(dtype=torch.long).flatten()
+    mask = torch.zeros(shape, dtype=torch.bool, device=pos.device)
+    if idx.numel() == 0:
+        return mask
+    if bool((idx < 0).any()) or bool((idx >= token_count).any()):
+        raise ValueError(
+            f"perturbed_positions contains out-of-range token index for length {token_count}"
+        )
+    mask.index_fill_(-1, idx, True)
+    return mask
+
+
 class InKind:
     """Supported input-constraint kinds for :class:`InputSpec`.
 
@@ -207,66 +257,13 @@ class InputSpec:
         """
         if center.dim() < 2:
             raise ValueError("LP_EMBEDDING center must have at least [L, D] shape")
-
-        mask_shape = center.shape[:-1]
-        if self.perturbed_positions is None:
-            return torch.ones(mask_shape, device=center.device, dtype=torch.bool)
-
-        raw_positions = self.perturbed_positions
-        if isinstance(raw_positions, torch.Tensor):
-            positions = raw_positions.to(device=center.device)
-        else:
-            positions = torch.tensor(raw_positions, device=center.device)
-        if positions.dtype == torch.bool:
-            return self._normalize_embedding_bool_mask(positions, mask_shape, center)
-
-        token_count = center.shape[-2]
-        index_positions = positions.to(dtype=torch.long).flatten()
-        if index_positions.numel() == 0:
-            return torch.zeros(mask_shape, device=center.device, dtype=torch.bool)
-        if (index_positions < 0).any() or (index_positions >= token_count).any():
-            raise ValueError(
-                "LP_EMBEDDING perturbed_positions contains out-of-range token "
-                f"index for length {token_count}"
-            )
-        mask = torch.zeros(mask_shape, device=center.device, dtype=torch.bool)
-        mask.index_fill_(-1, index_positions, True)
-        return mask
-
-    def _normalize_embedding_bool_mask(
-        self,
-        positions: torch.Tensor,
-        mask_shape: torch.Size,
-        center: torch.Tensor,
-    ) -> torch.Tensor:
-        """Normalize a boolean token mask to the embedding-prefix shape.
-
-        Args:
-            positions: Boolean tensor supplied as token mask.
-            mask_shape: Expected mask shape, equal to ``center.shape[:-1]``.
-            center: Clean embedding tensor with embedding dimension last.
-
-        Returns:
-            Boolean tensor matching ``mask_shape``.
-
-        Raises:
-            ValueError: If the mask shape is not compatible with ``center``.
-        """
-        if tuple(positions.shape) == tuple(mask_shape):
-            return positions.to(dtype=torch.bool)
-
-        token_count = center.shape[-2]
-        if positions.dim() == 1 and positions.shape[0] == token_count:
-            view_shape = [1] * len(mask_shape)
-            view_shape[-1] = token_count
-            return positions.reshape(view_shape).expand(mask_shape).to(
-                dtype=torch.bool
-            )
-
-        raise ValueError(
-            "LP_EMBEDDING boolean perturbed_positions must match "
-            "center.shape[:-1] or the token dimension"
+        return normalize_position_mask(
+            self.perturbed_positions,
+            int(center.shape[-2]),
+            batch_shape=tuple(center.shape[:-2]),
+            device=center.device,
         )
+
 
 class OutKind:
     LINEAR_LE   = "LINEAR_LE"

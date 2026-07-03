@@ -351,22 +351,14 @@ def _position_mask(
     center: torch.Tensor,
     perturbed_positions: torch.Tensor | Sequence[int] | None,
 ) -> torch.Tensor:
-    if perturbed_positions is None:
-        return torch.ones(center.shape[:-1], device=center.device, dtype=torch.bool)
-    positions = (
-        perturbed_positions.to(device=center.device)
-        if torch.is_tensor(perturbed_positions)
-        else torch.as_tensor(perturbed_positions, device=center.device)
+    from act.front_end.specs import normalize_position_mask
+
+    return normalize_position_mask(
+        perturbed_positions,
+        int(center.shape[-2]),
+        batch_shape=tuple(center.shape[:-2]),
+        device=center.device,
     )
-    if positions.dtype == torch.bool:
-        if tuple(positions.shape) == tuple(center.shape[:-1]):
-            return positions
-        view_shape = [1] * (center.dim() - 1)
-        view_shape[-1] = center.shape[-2]
-        return positions.reshape(view_shape).expand(center.shape[:-1]).to(dtype=torch.bool)
-    mask = torch.zeros(center.shape[:-1], device=center.device, dtype=torch.bool)
-    mask.index_fill_(-1, positions.to(dtype=torch.long).flatten(), True)
-    return mask
 
 
 def _sample_embedding_region(

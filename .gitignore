@@ -28,3 +28,5 @@ htmlcov/
 
 # LEAPS LLM API key for the VNN-COMP gain+llm config (never commit)
 act_llm_secrets.sh
+.sisyphus/
+tests/transformer/

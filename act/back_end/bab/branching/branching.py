@@ -436,17 +436,19 @@ def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) 
             continue
         token_count = int(center.shape[-2])
         embed_dim = int(center.shape[-1])
+        from act.front_end.specs import normalize_position_mask
+
         positions = layer.params.get("perturbed_positions")
-        if positions is None:
-            token_mask = torch.ones(token_count, device=batch.lb.device, dtype=torch.bool)
-        else:
-            pos = positions.to(device=batch.lb.device) if isinstance(positions, torch.Tensor) else torch.as_tensor(positions, device=batch.lb.device)
-            if pos.dtype == torch.bool:
-                token_mask = pos.reshape(-1)[-token_count:].to(dtype=torch.bool)
-            else:
-                token_mask = torch.zeros(token_count, device=batch.lb.device, dtype=torch.bool)
-                if pos.numel() > 0:
-                    token_mask.index_fill_(0, pos.to(dtype=torch.long).flatten(), True)
+        if (
+            isinstance(positions, torch.Tensor)
+            and positions.dtype == torch.bool
+            and positions.numel() != token_count
+            and positions.numel() % token_count == 0
+        ):
+            positions = positions.reshape(-1, token_count)[0]
+        token_mask = normalize_position_mask(
+            positions, token_count, device=batch.lb.device,
+        )
         flat = token_mask.unsqueeze(-1).expand(token_count, embed_dim).reshape(-1)
         if flat.numel() < batch.input_dim:
             pad = torch.zeros(batch.input_dim - flat.numel(), device=batch.lb.device, dtype=torch.bool)

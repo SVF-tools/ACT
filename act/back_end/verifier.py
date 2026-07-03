@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from act.back_end.analyze import AnalyzeCache
 
 # Front-end enums (kinds)
-from act.front_end.specs import InKind, OutKind
+from act.front_end.specs import InKind, OutKind, normalize_position_mask
 
 # Verification types (canonical location: act/util/stats.py)
 from act.util.stats import VerifyStatus, VerifyResult
@@ -219,21 +219,12 @@ def seed_from_input_specs(spec_layers) -> Bounds:
             e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
             lb = center.clone()
             ub = center.clone()
-            positions = spec_layer.params.get("perturbed_positions")
-            if positions is None:
-                mask = torch.ones(center.shape[:-1], device=center.device, dtype=torch.bool)
-            else:
-                pos_t = positions.to(device=center.device) if torch.is_tensor(positions) else torch.as_tensor(positions, device=center.device)
-                if pos_t.dtype == torch.bool:
-                    if tuple(pos_t.shape) == tuple(center.shape[:-1]):
-                        mask = pos_t.to(dtype=torch.bool)
-                    else:
-                        view_shape = [1] * (center.dim() - 1)
-                        view_shape[-1] = center.shape[-2]
-                        mask = pos_t.reshape(view_shape).expand(center.shape[:-1]).to(dtype=torch.bool)
-                else:
-                    mask = torch.zeros(center.shape[:-1], device=center.device, dtype=torch.bool)
-                    mask.index_fill_(-1, pos_t.to(dtype=torch.long).flatten(), True)
+            mask = normalize_position_mask(
+                spec_layer.params.get("perturbed_positions"),
+                int(center.shape[-2]),
+                batch_shape=tuple(center.shape[:-2]),
+                device=center.device,
+            )
             expanded = mask.unsqueeze(-1).expand_as(center)
             return Bounds(torch.where(expanded, center - e, lb), torch.where(expanded, center + e, ub))
     

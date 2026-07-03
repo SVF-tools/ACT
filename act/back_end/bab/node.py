@@ -208,23 +208,12 @@ def rederive_embedding_block_eps(
 
     if perturbed_positions is None:
         return radii
-    pos = perturbed_positions.to(device=lb.device) if isinstance(perturbed_positions, torch.Tensor) else torch.as_tensor(perturbed_positions, device=lb.device)
-    if pos.dtype == torch.bool:
-        if tuple(pos.shape) == (token_count,):
-            mask = pos.reshape(1, token_count).expand(n, -1)
-        elif tuple(pos.shape) == (n, token_count):
-            mask = pos
-        elif pos.numel() == token_count:
-            mask = pos.reshape(1, token_count).expand(n, -1)
-        else:
-            mask = pos.reshape(-1, token_count)
-            if mask.shape[0] == 1:
-                mask = mask.expand(n, -1)
-    else:
-        mask = torch.zeros((n, token_count), device=lb.device, dtype=torch.bool)
-        if pos.numel() > 0:
-            mask.index_fill_(1, pos.to(dtype=torch.long).flatten(), True)
-    return torch.where(mask.to(dtype=torch.bool), radii, torch.zeros_like(radii))
+    from act.front_end.specs import normalize_position_mask
+
+    mask = normalize_position_mask(
+        perturbed_positions, token_count, batch_shape=(n,), device=lb.device,
+    )
+    return torch.where(mask, radii, torch.zeros_like(radii))
 
 
 def split_input_nary(

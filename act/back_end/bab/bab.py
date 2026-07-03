@@ -66,7 +66,7 @@ from act.back_end.verifier import (
     setup_and_solve_batch,
 )
 from act.front_end.specs import OutKind, OutputSpec
-from act.front_end.specs import InKind
+from act.front_end.specs import InKind, normalize_position_mask
 from act.util.model_inference import infer_single_model
 from act.util.stats import VerifyStatus, VerifyResult
 
@@ -799,22 +799,12 @@ def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) 
         else:
             result &= torch.zeros_like(result)
             continue
-        positions = layer.params.get("perturbed_positions")
-        if positions is None:
-            mask = torch.ones(center_t.shape[:-1], device=x_batch.device, dtype=torch.bool)
-        else:
-            pos = positions.to(device=x_batch.device) if isinstance(positions, torch.Tensor) else torch.as_tensor(positions, device=x_batch.device)
-            if pos.dtype == torch.bool:
-                if tuple(pos.shape) == tuple(center_t.shape[:-1]):
-                    mask = pos.to(dtype=torch.bool)
-                else:
-                    view_shape = [1] * (center_t.dim() - 1)
-                    view_shape[-1] = center_t.shape[-2]
-                    mask = pos.reshape(view_shape).expand(center_t.shape[:-1]).to(dtype=torch.bool)
-            else:
-                mask = torch.zeros(center_t.shape[:-1], device=x_batch.device, dtype=torch.bool)
-                if pos.numel() > 0:
-                    _ = mask.index_fill_(-1, pos.to(dtype=torch.long).flatten(), True)
+        mask = normalize_position_mask(
+            layer.params.get("perturbed_positions"),
+            int(center_t.shape[-2]),
+            batch_shape=tuple(center_t.shape[:-2]),
+            device=x_batch.device,
+        )
         if mask.shape[0] == 1 and x_batch.shape[0] != 1:
             mask_b = mask.expand(x_batch.shape[0], *mask.shape[1:])
             center_b = center_t.expand_as(x_batch)
