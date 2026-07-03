@@ -76,12 +76,15 @@ def parse_vnnlib_to_tensors(
         # them to flat X_n/Y_n so the shared bound-extraction logic below applies.
         if "(vnnlib-version" in content or "(declare-network" in content:
             if len(re.findall(r"\(\s*declare-network\b", content)) >= 2:
-                raise UnsupportedSpecError("multi-network (f/g) not yet supported")
-            in_name, in_shape = _extract_vnnlib_2_decl(content, "input")
-            out_name, out_shape = _extract_vnnlib_2_decl(content, "output")
-            num_inputs = _numel(in_shape)
-            num_outputs = _numel(out_shape)
-            content = _rewrite_vnnlib_2_bracket_vars(content, in_name, in_shape, out_name, out_shape)
+                if "isomorphic-to" not in content:
+                    raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
+                content, num_inputs, num_outputs, _f_in_shape = _isomorphic_multinet_rewrite(content)
+            else:
+                in_name, in_shape = _extract_vnnlib_2_decl(content, "input")
+                out_name, out_shape = _extract_vnnlib_2_decl(content, "output")
+                num_inputs = _numel(in_shape)
+                num_outputs = _numel(out_shape)
+                content = _rewrite_vnnlib_2_bracket_vars(content, in_name, in_shape, out_name, out_shape)
         else:
             num_inputs = _extract_num_inputs(content)
             num_outputs = _extract_num_outputs(content)
@@ -368,7 +371,9 @@ def parse_vnnlib_2_0(
         raise VNNLibParseError(f"Failed to read {vnnlib_path}: {e}") from e
 
     if len(re.findall(r"\(\s*declare-network\b", content)) >= 2:
-        raise UnsupportedSpecError("multi-network (f/g) not yet supported")
+        if "isomorphic-to" in content:
+            return _parse_vnnlib_2_0_isomorphic(content, labeled_tensor)
+        raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
 
     input_name, input_shape = _extract_vnnlib_2_decl(content, "input")
     output_name, output_shape = _extract_vnnlib_2_decl(content, "output")
@@ -390,6 +395,21 @@ def parse_vnnlib_2_0(
         output_name=output_name,
         output_shape=output_shape,
     )
+    return _queries_from_rewritten(
+        rewritten, num_inputs, num_outputs, tensor_shape, true_label, vnnlib_path.name
+    )
+
+
+def _queries_from_rewritten(
+    rewritten: str,
+    num_inputs: int,
+    num_outputs: int,
+    tensor_shape: Tuple[int, ...],
+    true_label,
+    name: str,
+) -> List[Tuple[InputSpec, OutputSpec]]:
+    """Shared core: turn a flat-name-rewritten 2.0 body into (InputSpec, OutputSpec)
+    queries. Used by both single-network and isomorphic dual-network 2.0 parsing."""
     try:
         forms = _parse_all_forms(rewritten)
     except VNNLibParseError:
@@ -410,7 +430,7 @@ def parse_vnnlib_2_0(
 
     if not complex_assert_bodies:
         out_spec = _build_output_spec([], num_outputs, true_label)
-        logger.info(f"Parsed {vnnlib_path.name}: 1 query(ies) [vnnlib 2.0 input-only]")
+        logger.info(f"Parsed {name}: 1 query(ies) [vnnlib 2.0 input-only]")
         return [(base_in_spec, out_spec)]
 
     per_assert: List[List[_Query]] = []
@@ -446,8 +466,82 @@ def parse_vnnlib_2_0(
         if promoted is not None:
             results = [promoted]
 
-    logger.info(f"Parsed {vnnlib_path.name}: {len(results)} query(ies) [vnnlib 2.0]")
+    if len(results) > 1:
+        promoted = _try_promote_to_top1_unlabeled(results, num_outputs)
+        if promoted is not None:
+            results = [promoted]
+
+    logger.info(f"Parsed {name}: {len(results)} query(ies) [vnnlib 2.0]")
     return results
+
+
+def _extract_all_vnnlib_2_decls(content: str, io_kind: str) -> List[Tuple[str, Tuple[int, ...]]]:
+    """All declare-input/output entries (multi-network files have one per network)."""
+    pattern = re.compile(
+        rf"\(\s*declare-{io_kind}\s+([A-Za-z_]\w*)\s+\S+\s+\[([^\]]+)\]\s*\)",
+        re.MULTILINE,
+    )
+    decls: List[Tuple[str, Tuple[int, ...]]] = []
+    for m in pattern.finditer(content):
+        dims = tuple(int(p.strip()) for p in m.group(2).split(",") if p.strip())
+        if not dims or any(d <= 0 for d in dims):
+            raise VNNLibParseError(f"Invalid VNNLIB 2.0 declare-{io_kind} shape: {m.group(2)}")
+        decls.append((m.group(1), dims))
+    if not decls:
+        raise VNNLibParseError(f"VNNLIB 2.0 missing declare-{io_kind}")
+    return decls
+
+
+def _isomorphic_multinet_rewrite(content: str) -> Tuple[str, int, int, Tuple[int, ...]]:
+    """Flatten an isomorphic (f,g) dual-network file to one variable namespace.
+
+    Inputs X_f/X_g are SHARED (tied by ``(== X_f[i] X_g[i])``) so both map to the
+    same X_<flat>; outputs concatenate as [Y_f ; Y_g], i.e. Y_f[j]->Y_<flat>,
+    Y_g[j]->Y_<numel(Y_f)+flat>. The self-equality link asserts collapse to the
+    trivial ``0<=0`` and are ignored downstream. Returns
+    (rewritten, num_inputs, num_outputs_concat, f_input_shape).
+    """
+    inputs = _extract_all_vnnlib_2_decls(content, "input")
+    outputs = _extract_all_vnnlib_2_decls(content, "output")
+    if len(inputs) < 2 or len(outputs) < 2:
+        raise UnsupportedSpecError("isomorphic spec requires two networks")
+    (f_in_name, f_in_shape), (g_in_name, g_in_shape) = inputs[0], inputs[1]
+    (f_out_name, f_out_shape), (g_out_name, g_out_shape) = outputs[0], outputs[1]
+    f_out_numel = _numel(f_out_shape)
+    num_inputs = _numel(f_in_shape)
+    num_outputs = f_out_numel + _numel(g_out_shape)
+    name_map = {
+        f_in_name: ("X", f_in_shape, 0),
+        g_in_name: ("X", g_in_shape, 0),
+        f_out_name: ("Y", f_out_shape, 0),
+        g_out_name: ("Y", g_out_shape, f_out_numel),
+    }
+    var_re = re.compile(r"\b([A-Za-z_]\w*)\s*\[([^\]]+)\]")
+
+    def repl(m: "re.Match[str]") -> str:
+        info = name_map.get(m.group(1))
+        if info is None:
+            return m.group(0)
+        prefix, shape, base = info
+        idx = tuple(int(p.strip()) for p in m.group(2).split(",") if p.strip())
+        return f"{prefix}_{base + _ravel_c_order(idx, shape)}"
+
+    return var_re.sub(repl, content), num_inputs, num_outputs, f_in_shape
+
+
+def _parse_vnnlib_2_0_isomorphic(
+    content: str,
+    labeled_tensor: Optional['LabeledInputTensor'] = None,
+) -> List[Tuple[InputSpec, OutputSpec]]:
+    """Isomorphic equivalence: verify f and g (shared input) agree; specs are
+    built over the concatenated output [Y_f ; Y_g] of the combined model."""
+    rewritten, num_inputs, num_outputs, f_in_shape = _isomorphic_multinet_rewrite(content)
+    tensor_shape = tuple(labeled_tensor.tensor.shape) if labeled_tensor is not None else tuple(f_in_shape)
+    if _numel(tensor_shape) != num_inputs:
+        raise VNNLibParseError(
+            f"isomorphic input shape {f_in_shape} ({num_inputs} elems) != sample {tensor_shape}"
+        )
+    return _queries_from_rewritten(rewritten, num_inputs, num_outputs, tensor_shape, None, "isomorphic")
 
 
 def _extract_vnnlib_2_decl(content: str, io_kind: str) -> Tuple[str, Tuple[int, ...]]:
@@ -512,7 +606,7 @@ def _normalize_vnnlib_2_body(body: Any) -> Any:
         return ["<=", children[0], children[1]]
     if op == ">" and len(children) == 2:
         return [">=", children[0], children[1]]
-    if op == "=" and len(children) == 2:
+    if op in ("=", "==") and len(children) == 2:
         return ["and", ["<=", children[0], children[1]], [">=", children[0], children[1]]]
     return [op] + children
 
@@ -1023,3 +1117,35 @@ def _try_promote_to_top1(
         return None
     y_true = _coerce_label_to_tensor(true_label)
     return queries[0][0], OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true)
+
+
+def _try_promote_to_top1_unlabeled(
+    queries: List[Tuple[InputSpec, OutputSpec]],
+    num_outputs: int,
+) -> Optional[Tuple[InputSpec, OutputSpec]]:
+    """Label-agnostic TOP1 recognition for 2.0 files that omit the label comment.
+
+    Soundness invariant: the shared class ``t`` must be one of the two nonzero
+    indices of the first canonicalised row ``e_t - e_j``, so only those two are
+    trialled; the full structural + full-coverage check is delegated to
+    :func:`_try_promote_to_top1`, which rejects any non-top-1 OR (mixed labels,
+    extra conjuncts, nonzero RHS) — so no unsound collapse is possible.
+    """
+    if len(queries) < 2:
+        return None
+    first_out = queries[0][1]
+    if first_out.kind != OutKind.UNSAFE_LINEAR or first_out.c is None:
+        return None
+    c0 = first_out.c
+    if c0.dim() == 1:
+        c0 = c0.unsqueeze(0)
+    if c0.shape[0] != 1:
+        return None
+    candidates = [i for i, v in enumerate(c0[0].tolist()) if abs(v) > 1e-9]
+    if len(candidates) != 2:
+        return None
+    for cand in candidates:
+        promoted = _try_promote_to_top1(queries, num_outputs, cand)
+        if promoted is not None:
+            return promoted
+    return None

@@ -1241,9 +1241,14 @@ class DualSolver(Solver):
         # 100 ulp = the same arithmetic-noise-floor convention as the
         # per-neuron 'auto' bounds tolerance (act/pipeline/cli.py
         # _per_neuron_config): pairwise-reduction drift of the largest
-        # layers is ~log2(n)*eps, so 100 ulp bounds it with margin
-        # (float32 ~1.2e-5, float64 ~2.2e-14).
-        cert_eps = 100.0 * torch.finfo(dtype).eps
+        # layers is ~log2(n)*eps. The 1e-11 floor additionally covers the
+        # ACCUMULATED rounding of the dual bound computation itself over
+        # deep conv chains in float64 (~1e-12): netfactory random draws can
+        # land a true margin within that band of zero, and a 100-ulp-only
+        # f64 tolerance (2.2e-14) was observed to false-CERTIFY such a draw
+        # in CI while a concrete counterexample existed. float32 is
+        # unaffected (100 ulp = 1.2e-5 > 1e-11).
+        cert_eps = max(100.0 * torch.finfo(dtype).eps, 1e-11)
         if sample.lb.dim() < 2:
             raise ValueError(
                 "DualSolver.evaluate_spec: bounds_dict entries must be batched "

@@ -27,6 +27,54 @@ class ONNXConversionError(Exception):
     pass
 
 
+def _fold_dequantize_initializers(onnx_model):
+    """Fold DequantizeLinear nodes whose data input is an initializer.
+
+    onnx2torch Conv/Gemm converters expect weights/biases as initializers, not
+    computed node outputs. This rewrite is exact: y = scale * (q - zero_point),
+    including per-axis scale/zero_point via the ONNX axis attribute.
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper
+
+    init_map = {init.name: numpy_helper.to_array(init) for init in onnx_model.graph.initializer}
+    keep_nodes = []
+    folded = 0
+    for node in onnx_model.graph.node:
+        if node.op_type != 'DequantizeLinear' or len(node.input) < 3 or node.input[0] not in init_map:
+            keep_nodes.append(node)
+            continue
+        q = init_map[node.input[0]]
+        scale = init_map.get(node.input[1])
+        zp = init_map.get(node.input[2])
+        if scale is None or zp is None:
+            keep_nodes.append(node)
+            continue
+        axis = None
+        for attr in node.attribute:
+            if attr.name == 'axis':
+                axis = int(onnx.helper.get_attribute_value(attr))
+                break
+        qf = q.astype(np.float32)
+        sf = scale.astype(np.float32)
+        zpf = zp.astype(np.float32)
+        if axis is not None and sf.ndim == 1 and sf.size != 1 and qf.ndim > 0:
+            ax = axis + qf.ndim if axis < 0 else axis
+            shape = [1] * qf.ndim
+            shape[ax] = sf.size
+            sf = sf.reshape(shape)
+            zpf = zpf.reshape(shape)
+        value = (sf * (qf - zpf)).astype(np.float32)
+        onnx_model.graph.initializer.append(numpy_helper.from_array(value, name=node.output[0]))
+        folded += 1
+    if folded:
+        del onnx_model.graph.node[:]
+        onnx_model.graph.node.extend(keep_nodes)
+        logger.info(f"Folded {folded} constant DequantizeLinear node(s) into initializers")
+    return onnx_model
+
+
 def _preprocess_onnx_for_onnx2torch(onnx_model):
     """Workarounds for onnx2torch quirks. Called on both main and retry paths.
 
@@ -46,6 +94,7 @@ def _preprocess_onnx_for_onnx2torch(onnx_model):
         if node.op_type == 'Clip':
             while len(node.input) > 1 and not node.input[-1]:
                 del node.input[-1]
+    onnx_model = _fold_dequantize_initializers(onnx_model)
     return onnx_model
 
 
@@ -72,6 +121,7 @@ def convert_onnx_to_pytorch(
     try:
         # Import here to avoid requiring onnx for non-VNNLIB workflows
         import onnx
+        import act.pipeline.verification.onnx_quantization  # registers ACT-local Q/DQ converters
         from onnx2torch import convert
         
         # Load ONNX model

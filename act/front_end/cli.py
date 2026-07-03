@@ -21,6 +21,7 @@ from act.front_end.torchvision_loader import data_model_mapping as tv_mapping
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.vnnlib_loader import category_mapping as vnnlib_mapping
 from act.front_end.bert_loader import data_loader as bert_loader
+from act.back_end.config import VALID_BERT_METHODS
 
 
 def print_unified_list(creator: Optional[str] = None):
@@ -598,6 +599,39 @@ Examples:
         "--inference",
         action="store_true",
         help="Run inference on synthesized models to validate correctness (defaults to TorchVision, use --creator to specify)"
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=[name.replace("_", "-") for name in VALID_BERT_METHODS],
+        default=None,
+        help="Text verifier method selector for SST/Yelp workflows.",
+    )
+    parser.add_argument("--p", type=float, default=None, help="Text embedding perturbation norm.")
+    parser.add_argument(
+        "--perturbed-words",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        dest="perturbed_words",
+        help="Number of text token positions perturbed together.",
+    )
+    parser.add_argument("--eps", type=float, default=None, help="Text verification radius.")
+    parser.add_argument("--max-eps", type=float, default=None, dest="max_eps", help="Text certified-radius upper bound.")
+    parser.add_argument(
+        "--num-verify-iters",
+        type=int,
+        default=None,
+        dest="num_verify_iters",
+        help="Certified-radius binary-search iterations.",
+    )
+    parser.add_argument("--k", type=int, default=None, help="Rule-slope alpha rule threshold.")
+    parser.add_argument(
+        "--alpha-opt-steps",
+        type=int,
+        default=None,
+        dest="alpha_opt_steps",
+        help="Optimized-alpha optimization steps.",
     )
     
     # Add standard device/dtype arguments

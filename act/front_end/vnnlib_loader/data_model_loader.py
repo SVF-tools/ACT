@@ -69,6 +69,24 @@ def _parse_onnx_field(onnx_field: str) -> List[Tuple[Optional[str], str]]:
     return [(None, _normalize_rel_path(onnx_field))]
 
 
+class _CombinedDualModel(nn.Module):
+    """Run two networks on a SHARED input and concatenate outputs as [f(x); g(x)].
+
+    Used for isomorphic-equivalence specs; the concat order matches the parser's
+    Y_f -> Y_<j>, Y_g -> Y_<numel(Y_f)+j> indexing.
+    """
+
+    def __init__(self, model_f: nn.Module, model_g: nn.Module):
+        super().__init__()
+        self.model_f = model_f
+        self.model_g = model_g
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        yf = self.model_f(x)
+        yg = self.model_g(x)
+        return torch.cat([yf.flatten(1), yg.flatten(1)], dim=1)
+
+
 def download_vnnlib_category(
     category: str,
     root_dir: Optional[str] = None,
@@ -567,6 +585,8 @@ def load_vnnlib_pair(
         'vnnlib_spec': vnnlib_spec
     }
     if pytorch_model_g is not None and onnx_path_g is not None:
+        result['model'] = _CombinedDualModel(pytorch_model, pytorch_model_g)
+        result['model_f'] = pytorch_model
         result['model_g'] = pytorch_model_g
         result['onnx_path_g'] = str(onnx_path_g)
     return result

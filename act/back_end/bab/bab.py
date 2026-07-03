@@ -1337,6 +1337,9 @@ def verify_bab_batched(
     llm_probe: Any = None
     _llm: Any = None
     _wave_index = 0
+    if getattr(config, "llm_probe_enabled", False):
+        from act.pipeline.verification import llm_probe as _llm
+        llm_probe = _llm.build_llm_probe(config)
 
     provenance = bool(getattr(config, "provenance_enabled", False))
     if provenance and not isinstance(pool, TopKBounding):

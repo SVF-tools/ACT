@@ -48,6 +48,7 @@ class InKind:
     # Unselected positions are pinned to center.
     # Analysis seeds the enclosing box; finite-p tightness is recovered by dual per-position input terms.
     LP_EMBEDDING = "LP_EMBEDDING"
+    SYNONYM_SUB = "SYNONYM_SUB"
 
 @dataclass
 class InputSpec:
@@ -89,6 +90,8 @@ class InputSpec:
     b: Optional[torch.Tensor] = None
     p_norm: ScalarTensor = float("inf")
     perturbed_positions: torch.Tensor | Sequence[int] | Sequence[bool] | None = None
+    budget: torch.Tensor | int | None = None
+    synonym_table: Optional[Any] = None
     
     def __post_init__(self):
         """Ensure all numeric fields are tensors for architecture."""
@@ -98,6 +101,9 @@ class InputSpec:
 
         if self.p_norm is not None and not isinstance(self.p_norm, torch.Tensor):
             self.p_norm = torch.tensor([float(self.p_norm)])
+
+        if self.budget is not None and not isinstance(self.budget, torch.Tensor):
+            self.budget = torch.tensor([int(self.budget)], dtype=torch.int64)
 
         if (
             self.perturbed_positions is not None

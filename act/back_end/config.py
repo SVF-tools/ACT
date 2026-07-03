@@ -198,12 +198,18 @@ class BaBConfig:
     llm_probe_base_url: str = ""
     llm_probe_api_key_env: str = ""
     llm_probe_temperature: float = 0.0
+    llm_probe_timeout: float = 30.0
     llm_probe_max_candidates: int = 8
-    llm_probe_max_candidates_total: int = 4096
+    llm_probe_max_candidates_total: int = 1024
+    llm_probe_neuron_topk: int = 512
     llm_probe_cadence: int = 1
     llm_probe_history: int = 8
     llm_probe_max_failures: int = 3
     llm_probe_decisions: str = "split,frontier,refine"
+    """Comma-separated decision types the LLM may steer: 'split' (joint neuron
+    split depth), 'frontier' (wave width), 'refine' (per-subproblem refinement),
+    'neuron' (joint neuron-group selection), 'input_split' (which input
+    dimension to bisect and its fanout, input-domain-splitting BaB only)."""
     llm_probe_log: bool = False
 
     verbose: bool = False
