@@ -354,3 +354,41 @@ def create_vnnlib_specs(
         categories=categories,
         max_instances=max_instances
     )
+
+
+def create_specs_from_paths(onnx_path, vnnlib_path, category: str = "custom"):
+    """Build one spec_result from an arbitrary (onnx, vnnlib) pair (ONNX->torch,
+    input-shape probe, VNNLIB parse+validate). Raises SystemExit on missing or
+    invalid inputs. This is the single-instance entry point used by the
+    VNN-COMP harness runner (act_run_instance.py)."""
+    import torch as _torch
+
+    from act.front_end.spec_creator_base import LabeledInputTensor
+    from act.front_end.vnnlib_loader.data_model_loader import _parse_vnnlib_with_shape_probe
+    from act.front_end.vnnlib_loader.onnx_converter import convert_onnx_to_pytorch, get_onnx_input_shape
+    from act.front_end.vnnlib_loader.vnnlib_parser import extract_label_from_vnnlib
+
+    onnx_p, vnnlib_p = Path(onnx_path), Path(vnnlib_path)
+    if not onnx_p.exists():
+        raise SystemExit(f"ONNX not found: {onnx_p}")
+    if not vnnlib_p.exists():
+        raise SystemExit(f"VNNLIB not found: {vnnlib_p}")
+    model = convert_onnx_to_pytorch(onnx_p, simplify=True)
+    model.eval()
+    try:
+        input_shape = get_onnx_input_shape(onnx_p)
+    except Exception:
+        input_shape = None
+    input_tensor, _meta = _parse_vnnlib_with_shape_probe(vnnlib_p, model, input_shape)
+    lbl = extract_label_from_vnnlib(vnnlib_p)
+    label = _torch.tensor([lbl], dtype=_torch.int64) if lbl is not None else None
+    instance_data = {
+        "model": model,
+        "labeled_tensor": LabeledInputTensor(tensor=input_tensor, label=label),
+        "vnnlib_path": str(vnnlib_p),
+    }
+    sr = VNNLibSpecCreator()._create_specs_for_single_instance(
+        category, f"{onnx_p.stem}__{vnnlib_p.stem}", instance_data, validate_shapes=True)
+    if sr is None:
+        raise SystemExit(f"Spec creation failed (unsupported/invalid spec) for {vnnlib_p.name}")
+    return sr

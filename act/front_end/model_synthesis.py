@@ -23,7 +23,9 @@ if __name__ == "__main__" and __package__ is None:
     print("="*80 + "\n")
     sys.exit(1)
 
+import copy
 import torch
+import torch.fx as fx
 import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple, Union
@@ -512,3 +514,160 @@ if __name__ == "__main__":
     
     print(f"\n✅ Successfully inferred {len(successful_models)} out of {len(wrapped_models)} models")
     print(f"\n🎯 NEW SPEC CREATOR INTEGRATION: COMPLETE ✅")
+
+
+# Merge split-ReLUs: invert the ReluSplitter benchmark transformation.
+#
+# ReluSplitter rewrites a linear pre-activation  z = W_orig x + b_orig  into a
+# DENSE -> ReLU -> DENSE "sandwich" that computes the SAME affine map by
+# exploiting  a = ReLU(a) - ReLU(-a): each base row (w,b) is emitted as an
+# anti-parallel pair (+(w,b), -(w,b)) in the first DENSE, and the second DENSE
+# recombines the pair with opposite-sign weights so its output is again the
+# linear z. The spurious (always-unstable) ReLUs only loosen the dual
+# relaxation, leaving pct>=0.4 instances "unknown". This pass detects any
+# DENSE -> ReLU -> DENSE sandwich that is PROVABLY a global affine map and
+# collapses it back to a single DENSE -- exactly semantics-preserving. It is a
+# strict no-op unless global affinity is certified, so genuine ReLU layers
+# (e.g. ACAS Xu) are left untouched.
+#
+# Exact soundness certificate (over R^d): group the first DENSE's rows by their
+# AUGMENTED direction (w_i | b_i); rows n in a group satisfy a_n = t_n * a_rep.
+# With ReLU(t*a)=t*ReLU(a) (t>0) and ReLU(t*a)=|t|*(ReLU(a)-a) (t<0), output k
+# receives  R_g[k]*ReLU(a_rep) + L_g[k]*a_rep, where R_g[k]=sum_n W2[k,n]|t_n|.
+# The sandwich is affine  <=>  R_g[k]==0 for every group g and output k. The
+# collapsed map is  M[k]=sum_g L_g[k]*w_rep_g,  m[k]=b2[k]+sum_g L_g[k]*b_rep_g
+# with  L_g[k] = -sum_{n: t_n<0} W2[k,n]|t_n|  (closed form, exact).
+
+
+
+# grouping tolerance on |cos| between augmented rows (exact copies give |cos|==1)
+_MERGE_RTOL = 1e-6
+# affinity certificate threshold: R is exactly 0 for a true split, O(0.1..1) for
+# a genuine ReLU layer, so this cleanly separates them while tolerating ULP.
+_MERGE_AFFINE_TOL = 1e-8
+
+
+def _iter_dense_relu_dense(gm: fx.GraphModule):
+    """Yield (l1_node, relu_node, l2_node) for sole-consumer Linear->ReLU->Linear chains.
+
+    Only fires when the ReLU output feeds nothing but the next Linear (and the
+    first Linear feeds nothing but the ReLU), so merging cannot affect any other
+    consumer of the intermediate activations.
+    """
+    modules = dict(gm.named_modules())
+    for node in gm.graph.nodes:
+        if node.op != "call_module" or not isinstance(modules.get(node.target), nn.Linear):
+            continue
+        if len(node.users) != 1:
+            continue
+        relu = next(iter(node.users))
+        if relu.op != "call_module" or not isinstance(modules.get(relu.target), nn.ReLU):
+            continue
+        if len(relu.users) != 1 or len(relu.args) != 1 or relu.args[0] is not node:
+            continue
+        l2 = next(iter(relu.users))
+        if l2.op != "call_module" or not isinstance(modules.get(l2.target), nn.Linear):
+            continue
+        if not l2.args or l2.args[0] is not relu:
+            continue
+        yield node, relu, l2
+
+
+def _certify_affine_collapse(l1: nn.Linear, l2: nn.Linear):
+    """Return (M, m, n_merged) in float64 if l1->ReLU->l2 is a global affine map, else None.
+
+    n_merged = number of rows removed = sum over augmented-direction groups of
+    (group_size - 1). Computation is in float64; the caller casts to model dtype.
+    """
+    dev = l1.weight.device
+    W1 = l1.weight.detach().double()
+    out1, in1 = W1.shape
+    b1 = l1.bias.detach().double() if l1.bias is not None else torch.zeros(out1, dtype=torch.float64, device=dev)
+    W2 = l2.weight.detach().double()
+    out2 = W2.shape[0]
+    b2 = l2.bias.detach().double() if l2.bias is not None else torch.zeros(out2, dtype=torch.float64, device=dev)
+
+    aug = torch.cat([W1, b1.unsqueeze(1)], dim=1)
+    norms = aug.norm(dim=1)
+    unit = aug / norms.clamp_min(1e-30).unsqueeze(1)
+
+    visited = [False] * out1
+    groups: list[list[tuple[int, float]]] = []
+    for i in range(out1):
+        if visited[i]:
+            continue
+        visited[i] = True
+        grp = [(i, 1.0)]
+        if norms[i] > 1e-30:
+            ui = unit[i]
+            for j in range(i + 1, out1):
+                if visited[j] or norms[j] <= 1e-30:
+                    continue
+                if abs(abs(float(ui @ unit[j])) - 1.0) <= _MERGE_RTOL:
+                    t = float(aug[j] @ aug[i] / (aug[i] @ aug[i]))
+                    grp.append((j, t))
+                    visited[j] = True
+        groups.append(grp)
+
+    thr = _MERGE_AFFINE_TOL * max(1.0, float(W2.abs().max()) if W2.numel() else 1.0)
+    M = torch.zeros(out2, in1, dtype=torch.float64, device=dev)
+    m = b2.clone()
+    n_merged = 0
+    for grp in groups:
+        idx = [n for n, _ in grp]
+        ts = torch.tensor([t for _, t in grp], dtype=torch.float64, device=dev)
+        cols = W2[:, idx]
+        relu_coeff = (cols * ts.abs().unsqueeze(0)).sum(dim=1)
+        if float(relu_coeff.abs().max()) > thr:
+            return None
+        neg = ts < 0
+        if bool(neg.any()):
+            lin_coeff = -(cols[:, neg] * ts[neg].abs().unsqueeze(0)).sum(dim=1)
+            rep = grp[0][0]
+            M += torch.outer(lin_coeff, W1[rep])
+            m += lin_coeff * b1[rep]
+        n_merged += len(grp) - 1
+
+    return None if n_merged == 0 else (M, m, n_merged)
+
+
+def _splice_affine(gm: fx.GraphModule, l1_node, relu_node, l2_node, M, m) -> None:
+    """Replace the sandwich with a single Linear: reuse l1's node (rewrite its
+    weights), rewire l2's consumers to l1, and erase the dead ReLU + l2 nodes."""
+    l1 = dict(gm.named_modules())[l1_node.target]
+    dtype, dev = l1.weight.dtype, l1.weight.device
+    l1.weight = nn.Parameter(M.to(dtype=dtype, device=dev), requires_grad=False)
+    l1.bias = nn.Parameter(m.to(dtype=dtype, device=dev), requires_grad=False)
+    l1.out_features, l1.in_features = int(M.shape[0]), int(M.shape[1])
+    for consumer in list(l2_node.users):
+        consumer.replace_input_with(l2_node, l1_node)
+    gm.graph.erase_node(l2_node)
+    gm.graph.erase_node(relu_node)
+    gm.graph.lint()
+    gm.recompile()
+
+
+def merge_split_relus(model: nn.Module):
+    """Collapse every provably-affine DENSE->ReLU->DENSE sandwich into one DENSE.
+
+    Returns (merged_model, n_merged). The input ``model`` is never mutated (work
+    happens on a deepcopy); when nothing is merged the ORIGINAL object is
+    returned so callers can keep using it unchanged.
+    """
+    if not isinstance(model, fx.GraphModule):
+        return model, 0
+    gm = copy.deepcopy(model)
+    total = 0
+    while True:
+        for l1_node, relu_node, l2_node in _iter_dense_relu_dense(gm):
+            mods = dict(gm.named_modules())
+            certified = _certify_affine_collapse(mods[l1_node.target], mods[l2_node.target])
+            if certified is None:
+                continue
+            M, m, n = certified
+            _splice_affine(gm, l1_node, relu_node, l2_node, M, m)
+            total += n
+            break
+        else:
+            break
+    return (gm, total) if total else (model, 0)

@@ -585,3 +585,30 @@ class ACTFuzzer:
             self.tracer.close()
 
         return report
+
+
+def pgd_preattack(wrapped_model, seeds, budget, scale=0.5):
+    """Anisotropic-PGD pre-attack (the FALSIFY path of the VNN-COMP runner);
+    returns (counterexample_or_None, elapsed_s)."""
+    from act.util.device_manager import get_default_device
+
+    device = get_default_device()
+    wrapped_model = wrapped_model.to(device)
+    seeds = [
+        type(s)(tensor=s.tensor.to(device), label=(s.label.to(device) if s.label is not None else None))
+        for s in seeds
+    ]
+    cfg = FuzzingConfig.from_yaml(
+        timeout_seconds=float(budget),
+        max_iterations=10_000_000,
+        mutation_weights={"gradient": 0.0, "pgd": 1.0, "activation": 0.0,
+                          "boundary": 0.0, "random": 0.0},
+        perturb_mode="adaptive_perdim",
+        perturb_scale=scale,
+        save_counterexamples=False,
+        stop_on_first_violation=True,
+        verbose=0,
+    )
+    report = ACTFuzzer(wrapped_model=wrapped_model, initial_seeds=seeds, config=cfg).fuzz()
+    ce = report.counterexamples[0] if report.counterexamples else None
+    return ce, report.total_time

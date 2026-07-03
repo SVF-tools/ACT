@@ -585,3 +585,60 @@ if __name__ == "__main__":
 
     print(f"\n{passed}/{passed + failed} passed")
     sys.exit(0 if failed == 0 else 1)
+
+
+def build_vnncomp_bab_config(
+    config_label: str,
+    *,
+    llm_backend: str = "mock",
+    llm_decisions: str = "split,frontier,refine,input_split",
+    llm_timeout: float = 30.0,
+    llm_model: str = "",
+    llm_cadence: int = 1,
+    llm_neuron_topk: int = 0,
+    llm_log: bool = False,
+    multi_split_levels: int = 4,
+    max_depth: int = 1_000_000,
+    max_nodes: int = 1_000_000_000,
+    solver_tier: str = "dual_alpha_eta",
+    dual_n_iters: int = 100,
+) -> BaBConfig:
+    """BaBConfig for real VNNLIB instances (the VNN-COMP runner profile):
+    ``fsb``/``babsr`` keep single-neuron splits, ``gain``/``gain+llm`` use joint-split
+    depth, and only ``gain+llm`` enables the LLM probe."""
+    branching_method = config_label if config_label in ("fsb", "babsr") else "gain"
+    common: dict[str, Any] = dict(
+        solver_tier=solver_tier,
+        branching_method=branching_method,
+        bounding_method="topk",
+        bounding_order="depth_lb",
+        frontier_cap=25000,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+        dual_n_iters=dual_n_iters,
+        lr_alpha=0.25,
+        lr_beta=0.1,
+        lr_decay=0.98,
+        incremental_start_enabled=True,
+        per_class_alpha=True,
+        reuse_root_bounds=True,
+        intermediate_refine="all",
+        presplit_levels=0,
+        eta_only_children=False,
+        multi_split_levels=1 if branching_method != "gain" else max(1, int(multi_split_levels)),
+    )
+    if config_label != "gain+llm":
+        return BaBConfig(**common)
+    cfg = BaBConfig(
+        llm_probe_enabled=True,
+        llm_probe_backend=llm_backend,
+        llm_probe_decisions=llm_decisions,
+        llm_probe_timeout=llm_timeout,
+        llm_probe_cadence=llm_cadence,
+        llm_probe_neuron_topk=llm_neuron_topk,
+        llm_probe_log=llm_log,
+        **common,
+    )
+    if llm_model:
+        cfg.llm_probe_model = llm_model
+    return cfg

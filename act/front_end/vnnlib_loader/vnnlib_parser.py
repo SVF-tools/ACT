@@ -1149,3 +1149,19 @@ def _try_promote_to_top1_unlabeled(
         if promoted is not None:
             return promoted
     return None
+
+
+def write_vnncomp_result(out_path, token: str, *, x=None, y=None) -> None:
+    """Emit the VNN-COMP result token, plus a ``sat`` witness as a flat
+    ``((X_i v)...(Y_j v)...)`` assignment. VNN-COMP scoring parses only this
+    VNNLIB-1.0 flat form (row-major ``X_i``), so it is used for every spec
+    version; a tensor layout would fail the CE re-check."""
+    with open(out_path, "w") as f:
+        if token != "sat" or x is None or y is None:
+            f.write(token + "\n")
+            return
+        xf = x.detach().cpu().flatten().tolist()
+        yf = y.detach().cpu().flatten().tolist()
+        pairs = [f"(X_{i} {v:.16g})" for i, v in enumerate(xf)]
+        pairs += [f"(Y_{j} {v:.16g})" for j, v in enumerate(yf)]
+        f.write("sat\n(" + "\n".join(pairs) + ")\n")
