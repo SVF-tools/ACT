@@ -1895,7 +1895,7 @@ def _lt_spec_reshape() -> Dict[str, Any]:
 def _lt_spec_transpose() -> Dict[str, Any]:
     return {"layers": _lt_input([1, 2, 3], -1.0, 1.0) + [
         {"kind": LayerKind.TRANSPOSE.value,
-         "params": {"perm": [0, 2, 1]}},
+         "params": {"perm": [0, 2, 1], "input_shape": [1, 2, 3]}},
         {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
         _lt_assert_le([1.0] + [0.0] * 5, 100.0),
     ]}

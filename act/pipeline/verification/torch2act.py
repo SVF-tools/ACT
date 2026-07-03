@@ -270,7 +270,8 @@ class _LayerGraphBuilder:
         patch_seq_vars = self._alloc_ids(len(flat_vars))
         patch_seq_shape = (flat_shape[0], flat_shape[2], flat_shape[1])
         transpose_id = self._add_manual_layer(
-            LayerKind.TRANSPOSE.value, {"perm": (0, 2, 1)}, flat_vars, patch_seq_vars, [flat_id],
+            LayerKind.TRANSPOSE.value, {"perm": (0, 2, 1), "input_shape": tuple(flat_shape)},
+            flat_vars, patch_seq_vars, [flat_id],
         )
 
         cls_shape = tuple(int(d) for d in cls_token.shape)
@@ -1282,6 +1283,7 @@ class _LayerGraphBuilder:
     def _create_transpose_method_layer(self, node: fx.Node) -> List[int]:
         """Create a TRANSPOSE layer for tensor transpose/permute methods."""
         rank = len(self.shape)
+        input_shape_t = tuple(self.shape)
         if node.target == 'transpose':
             if len(node.args) < 3:
                 raise ValueError(f"transpose at {node.name} requires two dimensions.")
@@ -1304,7 +1306,7 @@ class _LayerGraphBuilder:
         out_vars = self._same_size_forward()
         layer_id = self._add_layer(
             LayerKind.TRANSPOSE.value,
-            {"perm": tuple(perm)},
+            {"perm": tuple(perm), "input_shape": input_shape_t},
             self.prev_out, out_vars,
         )
         self.prev_out = out_vars
@@ -2114,10 +2116,12 @@ class TorchToACT:
                 continue
             x_vars = layer.params.get("x_vars")
             y_vars = layer.params.get("y_vars")
+            if not isinstance(x_vars, (list, tuple)) or not isinstance(y_vars, (list, tuple)):
+                continue
             if not x_vars or not y_vars:
                 continue
-            px = producer.get(x_vars[0])
-            py = producer.get(y_vars[0])
+            px = producer.get(int(x_vars[0]))
+            py = producer.get(int(y_vars[0]))
             if px is None or py is None:
                 continue
             want = [px, py]
