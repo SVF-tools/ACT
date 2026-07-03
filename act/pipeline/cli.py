@@ -900,7 +900,14 @@ def _run_netfactory_verify(args) -> bool:
                             validator.record_skip(name, solver, tf_mode, batch_size, reason)
                             continue
 
-                        model = validator.factory.create_model(name, load_weights=True)
+                        # Reconstruct the model from the SAME (batchified) net being
+                        # verified: create_model(name) returns the single-lane model
+                        # whose OutputSpecLayer carries only y_true[0], so the CE
+                        # probe's per-sample satisfied flags would test lane 0's
+                        # class on every lane -- misattributing a CE to certified
+                        # lanes (false [soundness] FAILED).
+                        from act.pipeline.verification.act2torch import ACTToTorch
+                        model = ACTToTorch(act_net).run()
                         label = solver if solver == "dual" else f"{tf_mode}/{solver}"
                         _verify_and_validate_cell(
                             tag=name,
