@@ -2319,6 +2319,51 @@ def _lt_spec_unsafe_linear() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_erf() -> Dict[str, Any]:
+    # ERF: input [-2, 2] spans the sigmoid-like curve's convex/concave halves.
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.ERF.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_sqrt() -> Dict[str, Any]:
+    # SQRT: strictly positive domain (clamped op) exercising the concave hull.
+    return {"layers": _lt_input([1, 4], 0.1, 4.0) + [
+        {"kind": LayerKind.SQRT.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
+    ]}
+
+
+def _lt_spec_sin() -> Dict[str, Any]:
+    # SIN: [-4, 4] contains interior max AND min (periodic critical points).
+    return {"layers": _lt_input([1, 4], -4.0, 4.0) + [
+        {"kind": LayerKind.SIN.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_cos() -> Dict[str, Any]:
+    # COS: [-1, 7] covers the has-max / has-min / near-full-period branches.
+    return {"layers": _lt_input([1, 4], -1.0, 7.0) + [
+        {"kind": LayerKind.COS.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_quantize() -> Dict[str, Any]:
+    # QUANTIZE: int8-style QDQ over [-2, 2] hitting both saturated and
+    # unsaturated code paths of the +-scale/2 band relaxation.
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.QUANTIZE.value,
+         "params": {"scale": torch.tensor([0.05], dtype=dtype),
+                    "zero_point": torch.tensor([0.0], dtype=dtype),
+                    "qmin": -128, "qmax": 127}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 9.0),
+    ]}
+
+
 def _lt_spec_tanh() -> Dict[str, Any]:
     # TANH: input [-3, 3] hits the saturation region (|tanh(3)| ≈ 0.995),
     # exercising tf_tanh's concave/convex branches in tf_mlp.py.
@@ -2418,6 +2463,11 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}pow":            _lt_spec_pow,
     # Multi-input MAX / MIN need preds=[i,j] so the factory builds
     # y_vars_list from predecessors and tf_max/tf_min get a List[Bounds].
+    f"{LAYER_TESTING_NAME_PREFIX}erf":             _lt_spec_erf,
+    f"{LAYER_TESTING_NAME_PREFIX}sqrt":            _lt_spec_sqrt,
+    f"{LAYER_TESTING_NAME_PREFIX}sin":             _lt_spec_sin,
+    f"{LAYER_TESTING_NAME_PREFIX}cos":             _lt_spec_cos,
+    f"{LAYER_TESTING_NAME_PREFIX}quantize":        _lt_spec_quantize,
     f"{LAYER_TESTING_NAME_PREFIX}tanh":            _lt_spec_tanh,
     f"{LAYER_TESTING_NAME_PREFIX}sigmoid":         _lt_spec_sigmoid,
     f"{LAYER_TESTING_NAME_PREFIX}lrelu":           _lt_spec_lrelu,

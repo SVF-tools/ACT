@@ -78,9 +78,64 @@ jobs:
       - name: VNNLIB — download benchmarks
         run: |
           cd ${{ github.workspace }}
-          for cat in acasxu_2023 dist_shift_2023 safenlp_2024; do
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 relusplitter_2026 isomorphic_acasxu_2026; do
             coverage run -p -m act.front_end --download $cat
           done
+
+      # ===================================================================
+      # Input-domain-splitting BaB on acasxu (width branching + n-ary input
+      # splits): exercises InputBranching, split_input_nary, and the bab
+      # input-split loop that neuron-splitting steps never reach.
+      # ===================================================================
+      - name: BaB on VNNLIB — acasxu input splitting (width branching)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 1 \
+            --solvers dual --bab --bab-branching-method width --bab-input-split-fanout 2 \
+            --bab-max-depth 8 --bab-max-nodes 200 --device cpu --dtype float64
+
+      # ===================================================================
+      # ReluSplitter 2026: download + ONNX load + verify E2E over the base
+      # model and a split (pct) variant of the same instance.
+      # ===================================================================
+      - name: VNNLIB E2E — relusplitter_2026 (base + split model load)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category relusplitter_2026 --max-instances 2 --merge-split-relus \
+            --solvers dual --device cpu --dtype float64
+
+      # ===================================================================
+      # Isomorphic dual-network specs (2026): _isomorphic_multinet_rewrite,
+      # _CombinedDualModel loading, multi-row LINEAR_LE conjunction encode.
+      # ===================================================================
+      - name: VNNLIB E2E — isomorphic_acasxu_2026 (dual-network specs)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category isomorphic_acasxu_2026 --max-instances 1 \
+            --solvers dual --device cpu --dtype float64
+
+      # ===================================================================
+      # LP_EMBEDDING input-domain splits on safenlp: perturbed-embedding
+      # branching mask + per-token radius rederivation on BaB children.
+      # ===================================================================
+      - name: BaB on VNNLIB — safenlp LP_EMBEDDING input splitting
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category safenlp_2024 --max-instances 1 \
+            --solvers dual --bab --bab-branching-method width --bab-input-split-fanout 2 \
+            --bab-max-depth 6 --bab-max-nodes 100 --device cpu --dtype float64
+
+      # ===================================================================
+      # LLM-probe BaB controller with the offline deterministic mock backend:
+      # begin_wave/advise/end_wave plumbing in verify_bab_batched.
+      # ===================================================================
+      - name: BaB LLM-probe controller (mock backend)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_bab_deep.json \
+            --bab --bab-llm-probe-enabled --bab-llm-probe-backend mock \
+            --bab-llm-probe-decisions split,frontier,refine,neuron --bab-llm-probe-log \
+            --device cpu --dtype float64
 
       # ===================================================================
       # Core engine & solver tiers (default branching). Baseline coverage of

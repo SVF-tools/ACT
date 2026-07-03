@@ -620,6 +620,18 @@ def _run_vnnlib_verify(args) -> bool:
     if not spec_results:
         raise RuntimeError(f"VNNLibSpecCreator produced no spec_results for category={args.category!r}")
 
+    if getattr(args, "merge_split_relus", False):
+        from act.front_end.model_synthesis import merge_split_relus
+
+        merged_results = []
+        for sr in spec_results:
+            merged_model, n_merged = merge_split_relus(sr[2])
+            if n_merged:
+                print(f"[merge] fused {n_merged} split-ReLU neurons in {sr[1]}")
+                sr = tuple(merged_model if i == 2 else v for i, v in enumerate(sr))
+            merged_results.append(sr)
+        spec_results = merged_results
+
     wrapped = synthesize_models_from_specs(spec_results)
     if not wrapped:
         raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
@@ -1230,7 +1242,7 @@ Examples:
         "--bab-branching-method",
         type=str,
         default="random",
-        choices=["random", "babsr", "fsb"],
+        choices=["random", "babsr", "fsb", "gain", "width"],
         help="BaB branching strategy when --bab is set (default: random)",
     )
     bab_group.add_argument(
@@ -1423,6 +1435,13 @@ Examples:
         "--ignore-errors",
         action="store_true",
         help="Always exit 0 (ignore failures and errors for CI)",
+    )
+    validation_group.add_argument(
+        "--merge-split-relus",
+        action="store_true",
+        dest="merge_split_relus",
+        help="Collapse provably-affine DENSE->ReLU->DENSE sandwiches (ReluSplitter "
+             "inverse) on loaded models before verification",
     )
 
     # Add standard device/dtype arguments (shared across all ACT CLIs)
