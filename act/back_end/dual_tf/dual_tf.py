@@ -17,13 +17,14 @@ from act.back_end.core import Bounds, Layer, Net
 from act.back_end.layer_schema import LayerKind
 from .tf_mlp import (
     backward_dense, backward_relu, backward_bias, backward_scale,
-    backward_bn, backward_identity, backward_mean,
+    backward_bn, backward_identity, backward_mean, backward_reduce_sum, backward_sign,
     forward_dense, forward_relu, forward_bias, forward_scale,
     forward_bn, forward_lrelu, forward_identity, forward_reshape, forward_mean,
+    forward_reduce_sum, forward_sign,
 )
 from .tf_cnn import (
-    backward_conv2d, backward_maxpool2d, backward_avgpool2d,
-    forward_conv2d, forward_maxpool2d, forward_avgpool2d,
+    backward_conv2d, backward_maxpool2d, backward_avgpool2d, backward_upsample,
+    forward_conv2d, forward_maxpool2d, forward_avgpool2d, forward_upsample,
 )
 from .tf_smooth import (
     backward_sigmoid, backward_tanh, backward_erf, backward_sqrt, backward_sin, backward_cos, backward_quantize,
@@ -33,6 +34,7 @@ from .tf_rnn import forward_lstm, backward_lstm, forward_gru, backward_gru
 from .tf_transformer import (
     forward_attention, backward_attention,
     forward_matmul, backward_matmul,
+    forward_mul, backward_mul,
     forward_mha, backward_mha,
     forward_layernorm, backward_layernorm,
     forward_softmax, backward_softmax,
@@ -96,6 +98,26 @@ def forward_expand(
     return out, out, lin, frame
 
 
+def backward_expand(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                    preds: List[int], M: int = 1, alpha=None
+                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """EXPAND backward: the adjoint of a broadcast is a reduce-sum over the
+    broadcast axes (each input replica collects the ν of all its copies). Exact,
+    contrib zero. Identity here would be unsound and mis-shaped when in != out."""
+    assert len(preds) == 1, f"EXPAND expects 1 predecessor, got {len(preds)}"
+    in_val = L.params.get("input_shape", (nu.shape[1],))
+    out_val = L.params.get("output_shape", L.params.get("shape", in_val))
+    in_shape = tuple(int(d) for d in cast(Tuple[int, ...], in_val))
+    out_shape = tuple(int(d) for d in cast(Tuple[int, ...], out_val))
+    BM = nu.shape[0]
+    nu_out = nu.reshape(BM, *out_shape)
+    padded_in = (1,) * (len(out_shape) - len(in_shape)) + in_shape
+    sum_dims = [i + 1 for i in range(len(out_shape)) if padded_in[i] == 1 and out_shape[i] != 1]
+    nu_in = nu_out.sum(dim=sum_dims, keepdim=True) if sum_dims else nu_out
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return [nu_in.reshape(BM, -1)], contrib
+
+
 def forward_gather(
     L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
     parent_frames: List[Frame], preds: List[int], post_activation: bool,
@@ -106,6 +128,8 @@ def forward_gather(
     batch_size = parent.lb.shape[0]
     input_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
     axis = int(L.params.get("axis", 0))
+    if axis < 0:
+        axis += len(input_shape)
     raw_idx = L.params["indices"]
     indices = raw_idx.to(device=device, dtype=torch.long) if isinstance(raw_idx, torch.Tensor) else torch.as_tensor(raw_idx, device=device, dtype=torch.long)
     x_lb = parent.lb.reshape(batch_size, *input_shape)
@@ -115,6 +139,83 @@ def forward_gather(
     lin, frame = _reset_forward_box(lb, ub, device, dtype)
     out = Bounds(lb, ub)
     return out, out, lin, frame
+
+
+def backward_gather(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                    preds: List[int], M: int = 1, alpha=None
+                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """GATHER backward: the adjoint of index_select is index_add (scatter-add) --
+    each output position's ν returns to the input index it was selected from,
+    SUMMING duplicate indices. Exact, contrib zero. Identity would be unsound
+    (misroutes ν to output-position k instead of indices[k]) and mis-shaped."""
+    assert len(preds) == 1, f"GATHER expects 1 predecessor, got {len(preds)}"
+    input_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
+    axis = int(L.params.get("axis", 0))
+    if axis < 0:
+        axis += len(input_shape)
+    raw_idx = L.params["indices"]
+    indices = (raw_idx.to(device=nu.device, dtype=torch.long) if isinstance(raw_idx, torch.Tensor)
+               else torch.as_tensor(raw_idx, device=nu.device, dtype=torch.long))
+    BM = nu.shape[0]
+    out_shape = list(input_shape)
+    out_shape[axis] = int(indices.numel())
+    nu_out = nu.reshape(BM, *out_shape)
+    nu_in = torch.zeros(BM, *input_shape, dtype=nu.dtype, device=nu.device)
+    nu_in.index_add_(axis + 1, indices, nu_out)
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return [nu_in.reshape(BM, -1)], contrib
+
+
+def forward_transpose(
+    L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """TRANSPOSE forward: permute the flattened features per ``perm`` so downstream
+    layers read correctly-ordered bounds (identity mis-orders them -> unsound). A
+    dense linear track is permuted exactly (precision-preserving, O(n) reindex); the
+    lazy-identity frame resets to avoid materializing an O(n^2) permutation matrix."""
+    parent = parent_boxes[0]
+    input_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
+    perm = tuple(int(p) for p in cast(Tuple[int, ...], L.params["perm"]))
+    n = 1
+    for d in input_shape:
+        n *= d
+    idx = torch.arange(n, device=parent.lb.device).reshape(input_shape).permute(*perm).reshape(-1)
+    lb = parent.lb.index_select(1, idx)
+    ub = parent.ub.index_select(1, idx)
+    out = Bounds(lb, ub)
+    lin_in = parent_lins[0]
+    if lin_in.A_lb is None or lin_in.A_ub is None:
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    else:
+        lin = LinearBound(
+            A_lb=lin_in.A_lb.index_select(1, idx),
+            b_lb=lin_in.b_lb.index_select(1, idx),
+            A_ub=lin_in.A_ub.index_select(1, idx),
+            b_ub=lin_in.b_ub.index_select(1, idx),
+        )
+        frame = parent_frames[0]
+    return out, out, lin, frame
+
+
+def backward_transpose(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                       preds: List[int], M: int = 1, alpha=None
+                       ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """TRANSPOSE backward: inverse permutation, the exact adjoint of the coordinate
+    permutation -- nu_in[idx[k]] = nu[k] (idx is a bijection). contrib zero."""
+    assert len(preds) == 1, f"TRANSPOSE expects 1 predecessor, got {len(preds)}"
+    input_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
+    perm = tuple(int(p) for p in cast(Tuple[int, ...], L.params["perm"]))
+    n = 1
+    for d in input_shape:
+        n *= d
+    idx = torch.arange(n, device=nu.device).reshape(input_shape).permute(*perm).reshape(-1)
+    BM = nu.shape[0]
+    nu_in = torch.zeros(BM, n, dtype=nu.dtype, device=nu.device)
+    nu_in.index_copy_(1, idx, nu)
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return [nu_in], contrib
 
 
 def _slice_tuple(input_shape: Tuple[int, ...], L: Layer, batch_offset: int) -> Tuple[slice, ...]:
@@ -249,6 +350,45 @@ def backward_add(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
     return [nu for _ in preds], contrib
 
 
+def forward_sub(
+    L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """SUB two-predecessor forward: z = x - y (element-wise, affine).
+
+    Exact box subtraction z_lb = x_lb - y_ub, z_ub = x_ub - y_lb. The dual
+    linear track is reset on the concrete box (keeps the lazy-identity frame
+    from densifying); the certified bound stays exact on affine paths because
+    backward_sub routes ν exactly (+ν to x, -ν to y).
+    """
+    assert len(parent_boxes) == 2, "forward_sub: requires exactly 2 predecessors (x - y)"
+    xl = parent_boxes[0].lb.flatten(start_dim=1)
+    xu = parent_boxes[0].ub.flatten(start_dim=1)
+    yl = parent_boxes[1].lb.flatten(start_dim=1)
+    yu = parent_boxes[1].ub.flatten(start_dim=1)
+    n = min(xl.shape[1], yl.shape[1])
+    lb = xl[:, :n] - yu[:, :n]
+    ub = xu[:, :n] - yl[:, :n]
+    out = Bounds(lb, ub)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    return out, out, lin, frame
+
+
+def backward_sub(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                 preds: List[int], M: int = 1, alpha=None
+                 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """SUB backward: z = x - y ⇒ +ν to x (preds[0]), -ν to y (preds[1]).
+
+    Exact affine adjoint (∂z/∂x=+1, ∂z/∂y=-1); no relaxation, no bias, contrib=0.
+    Operand order is guaranteed by torch2act preds=[producer(x_vars), producer(y_vars)].
+    """
+    if len(preds) != 2:
+        raise ValueError(f"backward_sub: layer {L.id} expects 2 predecessors, got {len(preds)}")
+    contrib = torch.zeros(nu.shape[0], dtype=nu.dtype, device=nu.device)
+    return [nu, -nu], contrib
+
+
 # ---- CONCAT ----
 def forward_concat(
     L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
@@ -360,22 +500,27 @@ class DualTF:
         LayerKind.CONV2D.value:     forward_conv2d,
         LayerKind.MAXPOOL2D.value:  forward_maxpool2d,
         LayerKind.AVGPOOL2D.value:  forward_avgpool2d,
+        LayerKind.UPSAMPLE.value:   forward_upsample,
         LayerKind.FLATTEN.value:    forward_reshape,
         LayerKind.RESHAPE.value:    forward_reshape,
-        LayerKind.TRANSPOSE.value:  forward_identity,
+        LayerKind.TRANSPOSE.value:  forward_transpose,
         LayerKind.SQUEEZE.value:    forward_identity,
         LayerKind.UNSQUEEZE.value:  forward_identity,
         LayerKind.EXPAND.value:     forward_expand,
         LayerKind.GATHER.value:     forward_gather,
         LayerKind.SLICE.value:      forward_slice,
         LayerKind.MEAN.value:       forward_mean,
+        LayerKind.REDUCE_SUM.value: forward_reduce_sum,
         LayerKind.ADD.value:        forward_add,
+        LayerKind.SUB.value:        forward_sub,
         LayerKind.CONCAT.value:     forward_concat,
         LayerKind.LSTM.value:       forward_lstm,
         LayerKind.GRU.value:        forward_gru,
         LayerKind.ATT_SCORES.value: forward_attention,
         LayerKind.ATT_MIX.value:    forward_attention,
         LayerKind.MATMUL.value:     forward_matmul,
+        LayerKind.MUL.value:        forward_mul,
+        LayerKind.SIGN.value:       forward_sign,
         LayerKind.MHA_SPLIT.value:  forward_mha,
         LayerKind.MHA_JOIN.value:   forward_mha,
         LayerKind.MASK_ADD.value:   forward_mha,
@@ -423,22 +568,27 @@ class DualTF:
         LayerKind.CONV2D.value:     backward_conv2d,
         LayerKind.MAXPOOL2D.value:  backward_maxpool2d,
         LayerKind.AVGPOOL2D.value:  backward_avgpool2d,
+        LayerKind.UPSAMPLE.value:   backward_upsample,
         LayerKind.FLATTEN.value:    backward_identity,
         LayerKind.RESHAPE.value:    backward_identity,
-        LayerKind.TRANSPOSE.value:  backward_identity,
+        LayerKind.TRANSPOSE.value:  backward_transpose,
         LayerKind.SQUEEZE.value:    backward_identity,
         LayerKind.UNSQUEEZE.value:  backward_identity,
-        LayerKind.EXPAND.value:     backward_identity,
-        LayerKind.GATHER.value:     backward_identity,
+        LayerKind.EXPAND.value:     backward_expand,
+        LayerKind.GATHER.value:     backward_gather,
         LayerKind.SLICE.value:      backward_slice,
         LayerKind.MEAN.value:       backward_mean,
+        LayerKind.REDUCE_SUM.value: backward_reduce_sum,
         LayerKind.ADD.value:        backward_add,
+        LayerKind.SUB.value:        backward_sub,
         LayerKind.CONCAT.value:     backward_concat,
         LayerKind.LSTM.value:       backward_lstm,
         LayerKind.GRU.value:        backward_gru,
         LayerKind.ATT_SCORES.value: backward_attention,
         LayerKind.ATT_MIX.value:    backward_attention,
         LayerKind.MATMUL.value:     backward_matmul,
+        LayerKind.MUL.value:        backward_mul,
+        LayerKind.SIGN.value:       backward_sign,
         LayerKind.MHA_SPLIT.value:  backward_mha,
         LayerKind.MHA_JOIN.value:   backward_mha,
         LayerKind.MASK_ADD.value:   backward_mha,

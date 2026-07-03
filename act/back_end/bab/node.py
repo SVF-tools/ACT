@@ -170,6 +170,63 @@ def split_input(
     return children, parent_index
 
 
+def rederive_embedding_block_eps(
+    lb: torch.Tensor,
+    ub: torch.Tensor,
+    input_shape: tuple[int, ...],
+    perturbed_positions: Optional[torch.Tensor],
+    p_norm: float,
+) -> torch.Tensor:
+    """Return child per-token Lp radii for split embedding boxes.
+
+    BaB input splits partition the enclosing embedding box.  For finite-p
+    LP_EMBEDDING children, the dual A2 term must use a radius for each token
+    block that contains the split child box around its midpoint.  The radius is
+    therefore the primal-p norm of the child half-width vector in that block;
+    non-perturbed token blocks keep radius zero.
+    """
+    if len(input_shape) < 2:
+        raise ValueError(f"embedding input_shape must include token and embedding axes, got {input_shape}")
+    n = int(lb.shape[0])
+    token_count = int(input_shape[-2])
+    embed_dim = int(input_shape[-1])
+    flat_dim = token_count * embed_dim
+    if int(lb.shape[-1]) < flat_dim or int(ub.shape[-1]) < flat_dim:
+        raise ValueError(
+            f"input bounds have dim {lb.shape[-1]}/{ub.shape[-1]}, expected at least {flat_dim}"
+        )
+    half = ((ub[:, :flat_dim] - lb[:, :flat_dim]) * 0.5).reshape(n, token_count, embed_dim)
+
+    if p_norm == float("inf"):
+        radii = half.abs().amax(dim=-1)
+    elif p_norm == 1.0:
+        radii = half.abs().sum(dim=-1)
+    elif p_norm == 2.0:
+        radii = torch.linalg.vector_norm(half, ord=2, dim=-1)
+    else:
+        radii = torch.linalg.vector_norm(half, ord=p_norm, dim=-1)
+
+    if perturbed_positions is None:
+        return radii
+    pos = perturbed_positions.to(device=lb.device) if isinstance(perturbed_positions, torch.Tensor) else torch.as_tensor(perturbed_positions, device=lb.device)
+    if pos.dtype == torch.bool:
+        if tuple(pos.shape) == (token_count,):
+            mask = pos.reshape(1, token_count).expand(n, -1)
+        elif tuple(pos.shape) == (n, token_count):
+            mask = pos
+        elif pos.numel() == token_count:
+            mask = pos.reshape(1, token_count).expand(n, -1)
+        else:
+            mask = pos.reshape(-1, token_count)
+            if mask.shape[0] == 1:
+                mask = mask.expand(n, -1)
+    else:
+        mask = torch.zeros((n, token_count), device=lb.device, dtype=torch.bool)
+        if pos.numel() > 0:
+            mask.index_fill_(1, pos.to(dtype=torch.long).flatten(), True)
+    return torch.where(mask.to(dtype=torch.bool), radii, torch.zeros_like(radii))
+
+
 def split_input_nary(
     batch: SubproblemBatch,
     cut_dim: torch.Tensor,

@@ -118,7 +118,7 @@ def _reverse_topological_sort(net: Net) -> List[int]:
     while queue:
         lid = queue.pop(0)
         order.append(lid)
-        for pred in net.preds.get(lid, []):
+        for pred in set(net.preds.get(lid, [])):
             in_deg[pred] -= 1
             if in_deg[pred] == 0:
                 queue.append(pred)

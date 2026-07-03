@@ -1046,6 +1046,13 @@ Examples:
         help="LLM-probe consult cadence in waves (default: from config.yaml)",
     )
     verify_group.add_argument(
+        "--multi-split-levels",
+        type=int,
+        default=None,
+        dest="bab_multi_split_levels",
+        help="Simultaneous neuron splits per branching step for gain branching (default: from config.yaml)",
+    )
+    verify_group.add_argument(
         "--bab-input-split-fanout",
         type=int,
         default=None,
@@ -1172,6 +1179,7 @@ _BACKEND_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
     ("bab_llm_probe_model",   "bab_llm_probe_model",    None,             None, "not_none"),
     ("bab_llm_probe_base_url", "bab_llm_probe_base_url", None,            None, "not_none"),
     ("bab_llm_probe_cadence", "bab_llm_probe_cadence",  None,             int,  "not_none"),
+    ("bab_multi_split_levels",           "bab_multi_split_levels",           None, int,   "not_none"),
     ("gen_gen_config_path",  "config",              None,             None, "not_none"),
     ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
     ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),

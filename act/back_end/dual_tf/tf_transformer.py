@@ -445,6 +445,59 @@ def backward_matmul(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     return [nu_x, nu_y], contrib
 
 
+# ---------------------------------------------------------------------------
+# Element-wise bilinear MUL (var x var):  Z[n] = X[n] * Y[n]
+# ---------------------------------------------------------------------------
+# Element-wise multiply is a batched MATMUL with one scalar product per output:
+# G = N (batch over the N flattened elements), I = K = J = 1. Reusing the exact
+# four-corner McCormick box and the fused-plane bilinear backward guarantees the
+# same soundness as MATMUL, fully tensorised (no per-element loop) across the
+# subproblem batch B and spec multiplicity M. Broadcasting operands (unequal
+# element counts) are not reframed this way and fail loudly.
+
+
+def _mul_flatten(x_box, y_box):
+    B = x_box.lb.shape[0]
+    xl = x_box.lb.reshape(B, -1); xu = x_box.ub.reshape(B, -1)
+    yl = y_box.lb.reshape(B, -1); yu = y_box.ub.reshape(B, -1)
+    n = xl.shape[-1]
+    if yl.shape[-1] != n:
+        raise NotImplementedError(
+            f"dual MUL: broadcasting operands (x has {n}, y has {yl.shape[-1]} "
+            f"elements) is not supported; only element-wise same-shape MUL.")
+    return xl, xu, yl, yu, n
+
+
+def forward_mul(L, parent_boxes, parent_lins, parent_frames, preds,
+                post_activation, device, dtype):
+    """Dual forward interval box for an element-wise bilinear MUL (var x var)."""
+    from act.back_end.core import Bounds
+    from .tf_forward import _reset_forward_box
+
+    if len(parent_boxes) < 2:
+        raise NotImplementedError(
+            f"dual MUL layer {L.id}: needs both operands as predecessor edges but only "
+            f"{len(parent_boxes)} present (preds={preds}). The other operand references a "
+            f"non-adjacent variable block (params x_vars/y_vars) that torch2act did not wire "
+            f"as a graph edge — this also breaks the interval path's get_predecessor_bounds "
+            f"index and must be fixed in the converter, not the TF.")
+    xl, xu, yl, yu, n = _mul_flatten(parent_boxes[0], parent_boxes[1])
+    lo, hi = _matmul_mccormick_box(xl, xu, yl, yu, n, 1, 1, 1)
+    out = Bounds(lo, hi)
+    lin, frame = _reset_forward_box(lo, hi, device, dtype)
+    return out, out, lin, frame
+
+
+def backward_mul(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
+    """Element-wise bilinear dual backward for MUL; one ν per operand."""
+    if len(preds) != 2:
+        raise ValueError(
+            f"backward_mul: layer {L.id} expects 2 predecessors, got {len(preds)}")
+    xl, xu, yl, yu, n = _mul_flatten(bounds_dict[int(preds[0])], bounds_dict[int(preds[1])])
+    nu_x, nu_y, contrib = _matmul_bilinear_backward(nu, xl, xu, yl, yu, n, 1, 1, 1, M)
+    return [nu_x, nu_y], contrib
+
+
 def _local_vector_planes(
     l: torch.Tensor, u: torch.Tensor,
     build: "Callable[[LinearBounds], LinearBounds]",

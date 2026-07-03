@@ -14,7 +14,7 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, cast
 from act.back_end.core import Bounds, Layer
 
 from .tf_forward import (
@@ -361,3 +361,58 @@ def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
 
     assert len(preds) == 1, f"AVGPOOL2D expects 1 predecessor, got {len(preds)}"
     return [v_out], contrib
+
+
+def _upsample_kwargs(L: Layer, mode: str, in_shape: Tuple[int, ...]) -> Dict[str, Any]:
+    n_spatial = max(1, len(in_shape) - 2)
+    size = L.params.get("size")
+    scale = L.params.get("scale_factor")
+    if isinstance(size, (list, tuple)) and len(size) > n_spatial:
+        size = tuple(int(s) for s in size[-n_spatial:])
+    if isinstance(scale, (list, tuple)) and len(scale) > n_spatial:
+        scale = tuple(float(s) for s in scale[-n_spatial:])
+    return {
+        "size": size,
+        "scale_factor": scale,
+        "mode": mode,
+        "align_corners": bool(L.params.get("align_corners", False)) if "linear" in mode else None,
+    }
+
+
+def forward_upsample(
+    L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """UPSAMPLE forward: interpolation is monotone (nearest replicates, linear is a
+    positive-weight average), so interpolating lb/ub separately is the exact interval
+    image; the dual frame resets over it (upsample grows n, so keep the track O(n))."""
+    parent = parent_boxes[0]
+    B = parent.lb.shape[0]
+    in_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
+    mode = str(L.params.get("mode", "nearest"))
+    kw = _upsample_kwargs(L, mode, in_shape)
+    lb = F.interpolate(parent.lb.reshape(B, *in_shape[1:]), **kw).reshape(B, -1)
+    ub = F.interpolate(parent.ub.reshape(B, *in_shape[1:]), **kw).reshape(B, -1)
+    out = Bounds(lb, ub)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    return out, out, lin, frame
+
+
+def backward_upsample(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                      preds: List[int], M: int = 1, alpha=None
+                      ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """UPSAMPLE backward: interpolation is a linear map, so its exact adjoint is the
+    vjp of F.interpolate (autograd of a linear op computes its transpose). Sound for
+    every mode; contrib zero."""
+    assert len(preds) == 1, f"UPSAMPLE expects 1 predecessor, got {len(preds)}"
+    in_shape = tuple(int(d) for d in cast(Tuple[int, ...], L.params["input_shape"]))
+    mode = str(L.params.get("mode", "nearest"))
+    kw = _upsample_kwargs(L, mode, in_shape)
+    BM = nu.shape[0]
+    x = torch.zeros(BM, *in_shape[1:], device=nu.device, dtype=nu.dtype, requires_grad=True)
+    with torch.enable_grad():
+        y = F.interpolate(x, **kw)
+        (grad,) = torch.autograd.grad(y, x, grad_outputs=nu.reshape(y.shape))
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return [grad.reshape(BM, -1)], contrib

@@ -1,13 +1,10 @@
 name: act-py312
 channels:
   - gurobi
-  - pytorch
   - conda-forge
+  - nodefaults
 dependencies:
   - python=3.12
-  - pytorch
-  - torchvision
-  - torchaudio
   - onnx
   - onnxruntime
   - pandas
@@ -22,6 +19,12 @@ dependencies:
   - psutil  # Memory monitoring in pipeline
   - pip
   - pip:
+      # PyTorch via pip: the default Linux wheels are CUDA-enabled (cu124), whereas the
+      # conda 'pytorch' channel yields a CPU-only build when this env is created on a
+      # machine with no NVIDIA driver (the VNN-COMP installer). Pinned to 2.5.1/cu124
+      # (needs driver >= 525) so the GPU build works on standard AWS run instances.
+      - torch==2.5.1
+      - torchvision==0.20.1
       # ONNX ecosystem - for VNNLib benchmarks
       - onnx2torch
       - onnxconverter-common

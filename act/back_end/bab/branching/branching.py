@@ -53,6 +53,7 @@ import torch
 
 from act.back_end.bab.node import SubproblemBatch
 from act.back_end.core import Bounds, Net
+from act.front_end.specs import InKind
 
 
 # ---------------------------------------------------------------------------
@@ -169,20 +170,46 @@ class RandomBranching(BranchingStrategy):
         N, D = batch.batch_size, batch.input_dim
         device = batch.lb.device
 
-        scores = torch.rand(N, D)
-
         if unstable_mask is not None:
             # Neuron-split mode: zero-out stable neurons
+            scores = torch.rand(N, D, device=device)
             mask = unstable_mask.float()
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0).expand(N, -1)  # (D,) → (N, D)
             scores = scores * mask
         else:
-            # Input-split mode: weight by width (zero-width → score 0)
+            embedding_mask = _perturbed_embedding_input_mask(net, batch)
             widths = batch.widths()  # (N, D)
-            scores = scores * (widths > 0).float()
+            if embedding_mask is None:
+                scores = torch.rand(N, D, device=device) * (widths > 0).float()
+            else:
+                mask = embedding_mask.unsqueeze(0).expand(N, -1)
+                scores = widths.masked_fill(~mask, float("-inf"))
 
         return scores
+
+
+class InputBranching(BranchingStrategy):
+    """Deterministic widest-dimension input branching.
+
+    Scores each input dimension by its current domain width, so ``select``
+    bisects the widest side of the box - the classic input-split rule for
+    low-dimensional domains (e.g. ACAS Xu), where halving the dominant side
+    maximizes the worst-case per-child bound tightening.
+    """
+
+    def compute_scores(
+        self,
+        batch: SubproblemBatch,
+        net: Net,
+        unstable_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        widths = batch.widths()
+        embedding_mask = _perturbed_embedding_input_mask(net, batch)
+        if embedding_mask is not None:
+            mask = embedding_mask.unsqueeze(0).expand_as(widths)
+            return widths.masked_fill(~mask, float("-inf"))
+        return widths
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +250,7 @@ class BaBSRBranching(BranchingStrategy):
         nu_per_layer: Optional[Dict[int, torch.Tensor]] = None,
     ) -> BranchingScores:
         if bounds_dict is None or nu_per_layer is None:
-            return BranchingScores(flat=self._baseline_scores(batch, unstable_mask))
+            return BranchingScores(flat=self._baseline_scores(batch, unstable_mask, net))
 
         per_layer: Dict[int, torch.Tensor] = {}
         intercept_per_layer: Dict[int, torch.Tensor] = {}
@@ -268,7 +295,7 @@ class BaBSRBranching(BranchingStrategy):
             intercept_per_layer[lid] = intercept
 
         if not per_layer:
-            return BranchingScores(flat=self._baseline_scores(batch, unstable_mask))
+            return BranchingScores(flat=self._baseline_scores(batch, unstable_mask, net))
         return BranchingScores(
             flat=None,
             per_layer=per_layer,
@@ -279,10 +306,14 @@ class BaBSRBranching(BranchingStrategy):
         self,
         batch: SubproblemBatch,
         unstable_mask: Optional[torch.Tensor] = None,
+        net: Optional[Net] = None,
     ) -> torch.Tensor:
         widths = batch.ub - batch.lb
 
-        if batch.incremental_alpha is None:
+        embedding_mask = _perturbed_embedding_input_mask(net=net, batch=batch)
+        if embedding_mask is not None:
+            scores = widths.masked_fill(~embedding_mask.unsqueeze(0), float("-inf"))
+        elif batch.incremental_alpha is None:
             scores = widths * torch.rand_like(widths)
         else:
             scores = widths
@@ -384,6 +415,62 @@ def _preact_bias_of(net: Net, lid: int) -> torch.Tensor:
             device = value.device
             break
     return torch.zeros(n_neurons, dtype=dtype, device=device)
+
+
+def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) -> Optional[torch.Tensor]:
+    """Flat input mask for LP_EMBEDDING perturbed token coordinates.
+
+    The mask is stored on the batch after first discovery so fallback input
+    branching can still reuse it when a strategy helper lacks the net handle.
+    """
+    cached = getattr(batch, "_perturbed_embedding_mask", None)
+    if isinstance(cached, torch.Tensor):
+        return cached.to(device=batch.lb.device, dtype=torch.bool)
+    if net is None:
+        return None
+    for layer in net.layers:
+        if layer.kind != "INPUT_SPEC" or layer.params.get("kind") != InKind.LP_EMBEDDING:
+            continue
+        center = layer.params.get("center")
+        if not isinstance(center, torch.Tensor) or center.dim() < 2:
+            continue
+        token_count = int(center.shape[-2])
+        embed_dim = int(center.shape[-1])
+        positions = layer.params.get("perturbed_positions")
+        if positions is None:
+            token_mask = torch.ones(token_count, device=batch.lb.device, dtype=torch.bool)
+        else:
+            pos = positions.to(device=batch.lb.device) if isinstance(positions, torch.Tensor) else torch.as_tensor(positions, device=batch.lb.device)
+            if pos.dtype == torch.bool:
+                token_mask = pos.reshape(-1)[-token_count:].to(dtype=torch.bool)
+            else:
+                token_mask = torch.zeros(token_count, device=batch.lb.device, dtype=torch.bool)
+                if pos.numel() > 0:
+                    token_mask.index_fill_(0, pos.to(dtype=torch.long).flatten(), True)
+        flat = token_mask.unsqueeze(-1).expand(token_count, embed_dim).reshape(-1)
+        if flat.numel() < batch.input_dim:
+            pad = torch.zeros(batch.input_dim - flat.numel(), device=batch.lb.device, dtype=torch.bool)
+            flat = torch.cat([flat, pad], dim=0)
+        elif flat.numel() > batch.input_dim:
+            flat = flat[:batch.input_dim]
+        setattr(batch, "_perturbed_embedding_mask", flat)
+        return flat
+    return None
+
+
+def attention_nu_exposure_candidates(
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Deferred hook for future attention-neuron splitting.
+
+    Attention BaBSR needs a stable exposure of catalytic attention ν and
+    pre-activation intervals.  Phase P4 intentionally ships input splitting
+    only, so this hook documents the integration point and returns no
+    candidates until that exposure contract exists.
+    """
+    del bounds_dict, nu_per_layer
+    return None
 
 
 class FSBBranching(BaBSRBranching):
@@ -621,6 +708,8 @@ def _build_branching_strategy(
 ) -> BranchingStrategy:
     if method == "random":
         return RandomBranching()
+    if method == "width":
+        return InputBranching()
     if method == "babsr":
         return BaBSRBranching()
     if method == "fsb":
@@ -680,41 +769,54 @@ def _collect_neuron_candidates(
     )
 
 
-def _multi_split_from_decision(
-    batch: SubproblemBatch,
-    net: Net,
+def enumerate_unstable_candidates(
+    branch_batch: SubproblemBatch,
     bounds_dict: Optional[Dict[int, Bounds]],
     nu_per_layer: Optional[Dict[int, torch.Tensor]],
-    k_levels: int,
-) -> Optional[Tuple[SubproblemBatch, torch.Tensor]]:
-    """Joint top-k neuron split: each lane emits all 2^k sign combinations.
-
-    Verdict-boundary multi-neuron splitting — "Mining Verdict Boundaries for
-    Neural Network Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang,
-    Yulei Sui, FM 2026. Candidates are scored by the BaBSR heuristic
-    (``_collect_neuron_candidates``).
-
-    The 2^k children exactly partition each lane's region (every selected
-    neuron is constrained to >=0 or <=0 in both directions across the
-    combination set), so replacing the lane by its children is sound. Joint
-    splits are super-additive in bound gain versus greedy single splits.
-    Returns None when fewer than ``k_levels`` finite candidates exist in some
-    lane (caller falls back to single-split).
-    """
+    *,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     if bounds_dict is None or nu_per_layer is None:
-        return None
-    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer)
+        return []
+    cand = _collect_neuron_candidates(branch_batch, bounds_dict, nu_per_layer)
     if cand is None:
-        return None
-    all_scores, all_layers, all_neurons = cand
-    finite_per_lane = torch.isfinite(all_scores).sum(dim=1)
-    k_eff = min(k_levels, int(finite_per_lane.min().item()))
-    if k_eff < 2:
-        return None
-    top = torch.topk(all_scores, k=k_eff, dim=1).indices
-    top_layers = all_layers.gather(1, top)
-    top_neurons = all_neurons.gather(1, top)
+        return []
+    scores, layers, neurons = cand
+    finite_mask = torch.isfinite(scores)
+    total = int(finite_mask.sum().item())
+    if total == 0 or (limit is not None and total > int(limit)):
+        return []
+    out: List[Dict[str, Any]] = []
+    for lane in range(scores.shape[0]):
+        flat_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for col in torch.where(finite_mask[lane])[0].tolist():
+            lid = int(layers[lane, col].item())
+            nidx = int(neurons[lane, col].item())
+            b = bounds_dict.get(lid)
+            if b is not None and lid not in flat_cache:
+                flat_cache[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
+            lb = float(flat_cache[lid][0][lane, nidx].item()) if lid in flat_cache else 0.0
+            ub = float(flat_cache[lid][1][lane, nidx].item()) if lid in flat_cache else 0.0
+            denom = ub - lb
+            area = float(max(0.0, (-lb * ub) / denom)) if denom > 1e-12 else 0.0
+            score = float(scores[lane, col].item())
+            out.append({
+                "lane": lane, "layer_id": lid, "neuron_idx": nidx,
+                "score": score, "lb": lb, "ub": ub,
+                "nu": (score / area) if area > 1e-12 else None, "area": area,
+            })
+    return out
 
+
+def _multi_split_from_groups(
+    batch: SubproblemBatch,
+    net: Net,
+    top_layers: torch.Tensor,
+    top_neurons: torch.Tensor,
+    k_eff: int,
+) -> Tuple[SubproblemBatch, torch.Tensor]:
+    # Soundness: the 2^k_eff sign-combination children exactly partition each
+    # lane's region for ANY (top_layers, top_neurons) — BaBSR- or LLM-chosen.
     n_lanes = batch.batch_size
     n_children = 2 ** k_eff
     device = batch.lb.device
@@ -774,3 +876,40 @@ def _multi_split_from_decision(
         ),
     )
     return children, parent_index
+
+
+def _multi_split_from_decision(
+    batch: SubproblemBatch,
+    net: Net,
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+    k_levels: int,
+) -> Optional[Tuple[SubproblemBatch, torch.Tensor]]:
+    """Joint top-k neuron split: each lane emits all 2^k sign combinations.
+
+    Verdict-boundary multi-neuron splitting — "Mining Verdict Boundaries for
+    Neural Network Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang,
+    Yulei Sui, FM 2026. Candidates are scored by the BaBSR heuristic
+    (``_collect_neuron_candidates``).
+
+    The 2^k children exactly partition each lane's region (every selected
+    neuron is constrained to >=0 or <=0 in both directions across the
+    combination set), so replacing the lane by its children is sound. Joint
+    splits are super-additive in bound gain versus greedy single splits.
+    Returns None when fewer than ``k_levels`` finite candidates exist in some
+    lane (caller falls back to single-split).
+    """
+    if bounds_dict is None or nu_per_layer is None:
+        return None
+    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer)
+    if cand is None:
+        return None
+    all_scores, all_layers, all_neurons = cand
+    finite_per_lane = torch.isfinite(all_scores).sum(dim=1)
+    k_eff = min(k_levels, int(finite_per_lane.min().item()))
+    if k_eff < 2:
+        return None
+    top = torch.topk(all_scores, k=k_eff, dim=1).indices
+    top_layers = all_layers.gather(1, top)
+    top_neurons = all_neurons.gather(1, top)
+    return _multi_split_from_groups(batch, net, top_layers, top_neurons, k_eff)

@@ -22,7 +22,7 @@ import tempfile
 import time
 import inspect
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
 
 import torch
 
@@ -31,6 +31,7 @@ from act.back_end.bab.node import (
     BabNode,
     SubproblemBatch,
     concat_children,
+    rederive_embedding_block_eps,
     split_input,
     split_input_nary,
     split_neuron_subproblems,
@@ -43,6 +44,8 @@ from act.back_end.bab.branching.branching import (
     _build_branching_strategy as _build_branching_strategy_impl,
     _collect_neuron_candidates,
     _multi_split_from_decision,
+    _multi_split_from_groups,
+    enumerate_unstable_candidates,
 )
 from act.back_end.bab.branching.bounding import (
     BoundingStrategy,
@@ -63,8 +66,12 @@ from act.back_end.verifier import (
     setup_and_solve_batch,
 )
 from act.front_end.specs import OutKind, OutputSpec
+from act.front_end.specs import InKind
 from act.util.model_inference import infer_single_model
 from act.util.stats import VerifyStatus, VerifyResult
+
+if TYPE_CHECKING:
+    from act.back_end.interval_tf.tf_attention import LinearBounds
 
 log = logging.getLogger(__name__)
 
@@ -195,11 +202,13 @@ def _interval_refresh_bounds(
             elif k == "DENSE":
                 w = layer.params["weight"]
                 bias = layer.params.get("bias")
+                if not isinstance(w, torch.Tensor):
+                    return None
                 plb, pub = vals[preds[0]]
                 w_pos, w_neg = w.clamp(min=0), w.clamp(max=0)
                 lb = plb @ w_pos.T + pub @ w_neg.T
                 ub = pub @ w_pos.T + plb @ w_neg.T
-                if bias is not None:
+                if isinstance(bias, torch.Tensor):
                     lb, ub = lb + bias, ub + bias
             elif k == "ADD":
                 (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
@@ -253,7 +262,7 @@ def _gain_tested_decision(
     root_bounds_dict: Optional[Dict[int, Bounds]],
     bounds_dict: Optional[Dict[int, Bounds]],
     nu_per_layer: Optional[Dict[int, torch.Tensor]],
-    input_shape: tuple,
+    input_shape: tuple[int, ...],
     n_candidates: int = 3,
 ) -> Optional[SplitDecision]:
     """Pick each lane's split by measured child bounds, not by score proxy.
@@ -568,6 +577,16 @@ def clear_violation_check_module_cache() -> None:
     _VIOLATION_CHECK_MODULE_CACHE.clear()
 
 
+def _module_float_dtype(module: torch.nn.Module, default: torch.dtype) -> torch.dtype:
+    for tensor in module.parameters():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    for tensor in module.buffers():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    return default
+
+
 def _forward_for_violation_check(net: object, x_batch: torch.Tensor) -> torch.Tensor:
     if isinstance(net, torch.nn.Module):
         module = net
@@ -578,13 +597,14 @@ def _forward_for_violation_check(net: object, x_batch: torch.Tensor) -> torch.Te
             from act.pipeline.verification.act2torch import ACTToTorch
 
             cached = ACTToTorch(cast(Net, net)).run()
+            # ACTToTorch emits mixed float32 weights + float64 buffers; unify to
+            # the analysis dtype or the internal forward clashes float32/float64.
+            if x_batch.is_floating_point():
+                cached = cached.to(dtype=x_batch.dtype)
             _VIOLATION_CHECK_MODULE_CACHE[key] = cached
         module = cached
     _ = module.eval()
-    try:
-        target_dtype = next(module.parameters()).dtype
-    except StopIteration:
-        target_dtype = x_batch.dtype
+    target_dtype = _module_float_dtype(module, x_batch.dtype)
     if x_batch.dtype != target_dtype:
         x_batch = x_batch.to(dtype=target_dtype)
     success, output, error = infer_single_model("ce_validate_batched", module, x_batch)
@@ -645,9 +665,34 @@ def check_violations_batched(net: object, x_batch: torch.Tensor, assert_layer: L
         return (other_scores.max(dim=1).values - y_true_scores) >= margin
 
     if kind == OutKind.LINEAR_LE:
-        coeff = _as_batched_vector(params["c"], n_batch, n_out, device, dtype, "c")
-        bound = _as_batched_vector(params["d"], n_batch, 1, device, dtype, "d").reshape(n_batch)
-        return (coeff * y_batch).sum(dim=1) >= bound + eps
+        c_raw = params["c"]
+        c_t = (c_raw if isinstance(c_raw, torch.Tensor) else torch.as_tensor(c_raw)).to(device=device, dtype=dtype)
+        if c_t.dim() <= 1:
+            rows = 1
+        elif c_t.dim() == 2:
+            if c_t.shape[1] != n_out:
+                raise ValueError(f"LINEAR_LE: c cols {c_t.shape[1]} != n_out {n_out}")
+            rows = int(c_t.shape[0])
+        else:
+            rows = int(c_t.shape[1])
+        if rows <= 1:
+            coeff = _as_batched_vector(params["c"], n_batch, n_out, device, dtype, "c")
+            bound = _as_batched_vector(params["d"], n_batch, 1, device, dtype, "d").reshape(n_batch)
+            return (coeff * y_batch).sum(dim=1) >= bound + eps
+        if c_t.dim() == 2:
+            c_view = c_t.unsqueeze(0).expand(n_batch, -1, -1)
+        else:
+            c_view = c_t if c_t.shape[0] == n_batch else c_t.expand(n_batch, -1, -1)
+        d_raw = params["d"]
+        d_t = (d_raw if isinstance(d_raw, torch.Tensor) else torch.as_tensor(d_raw)).to(device=device, dtype=dtype).flatten()
+        if d_t.numel() == rows:
+            d_view = d_t.unsqueeze(0).expand(n_batch, -1)
+        elif d_t.numel() == n_batch * rows:
+            d_view = d_t.reshape(n_batch, rows)
+        else:
+            raise ValueError(f"LINEAR_LE: d numel {d_t.numel()} incompatible with rows {rows}")
+        lhs = torch.einsum("bmo,bo->bm", c_view.contiguous(), y_batch)
+        return (lhs > d_view + eps).any(dim=1)
 
     if kind == OutKind.RANGE:
         result = torch.zeros(n_batch, dtype=torch.bool, device=device)
@@ -718,6 +763,84 @@ def check_violations_batched(net: object, x_batch: torch.Tensor, assert_layer: L
     raise NotImplementedError(f"ASSERT kind not supported: {kind}")
 
 
+def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) -> torch.Tensor:
+    result = torch.ones(x_batch.shape[0], device=x_batch.device, dtype=torch.bool)
+    tol = 1e-7
+    for layer in spec_layers:
+        kind = layer.params.get("kind")
+        if kind not in (InKind.BOX, InKind.LINF_BALL, InKind.LP_EMBEDDING):
+            continue
+        lb = layer.params.get("lb")
+        ub = layer.params.get("ub")
+        if isinstance(lb, torch.Tensor) and isinstance(ub, torch.Tensor):
+            lb_t = lb.to(device=x_batch.device, dtype=x_batch.dtype)
+            ub_t = ub.to(device=x_batch.device, dtype=x_batch.dtype)
+            result &= ((x_batch >= lb_t - tol) & (x_batch <= ub_t + tol)).flatten(start_dim=1).all(dim=1)
+        if kind != InKind.LP_EMBEDDING:
+            continue
+        center = layer.params.get("center")
+        eps = layer.params.get("eps")
+        p_norm = layer.params.get("p_norm")
+        if not isinstance(center, torch.Tensor) or eps is None or p_norm is None:
+            result &= torch.zeros_like(result)
+            continue
+        center_t = center.to(device=x_batch.device, dtype=x_batch.dtype)
+        if isinstance(eps, torch.Tensor):
+            eps_t = eps.to(device=x_batch.device, dtype=x_batch.dtype)
+        elif isinstance(eps, (int, float, bool)):
+            eps_t = center_t.new_tensor(float(eps))
+        else:
+            result &= torch.zeros_like(result)
+            continue
+        if isinstance(p_norm, torch.Tensor):
+            p_value = float(p_norm.reshape(-1)[0].item())
+        elif isinstance(p_norm, (int, float, bool)):
+            p_value = float(p_norm)
+        else:
+            result &= torch.zeros_like(result)
+            continue
+        positions = layer.params.get("perturbed_positions")
+        if positions is None:
+            mask = torch.ones(center_t.shape[:-1], device=x_batch.device, dtype=torch.bool)
+        else:
+            pos = positions.to(device=x_batch.device) if isinstance(positions, torch.Tensor) else torch.as_tensor(positions, device=x_batch.device)
+            if pos.dtype == torch.bool:
+                if tuple(pos.shape) == tuple(center_t.shape[:-1]):
+                    mask = pos.to(dtype=torch.bool)
+                else:
+                    view_shape = [1] * (center_t.dim() - 1)
+                    view_shape[-1] = center_t.shape[-2]
+                    mask = pos.reshape(view_shape).expand(center_t.shape[:-1]).to(dtype=torch.bool)
+            else:
+                mask = torch.zeros(center_t.shape[:-1], device=x_batch.device, dtype=torch.bool)
+                if pos.numel() > 0:
+                    _ = mask.index_fill_(-1, pos.to(dtype=torch.long).flatten(), True)
+        if mask.shape[0] == 1 and x_batch.shape[0] != 1:
+            mask_b = mask.expand(x_batch.shape[0], *mask.shape[1:])
+            center_b = center_t.expand_as(x_batch)
+        else:
+            mask_b = mask
+            center_b = center_t.expand_as(x_batch)
+        delta = x_batch - center_b
+        clean = (~mask_b).unsqueeze(-1).expand_as(delta)
+        if bool(clean.any().item()):
+            clean_ok = torch.where(clean, delta.abs(), torch.zeros_like(delta)).flatten(start_dim=1).amax(dim=1) <= tol
+            result &= clean_ok
+        perturbed_delta = delta[mask_b.unsqueeze(-1).expand_as(delta)].reshape(x_batch.shape[0], -1, center_t.shape[-1])
+        if perturbed_delta.numel() == 0:
+            continue
+        if p_value == float("inf"):
+            norms = perturbed_delta.abs().amax(dim=-1)
+        elif p_value == 1.0:
+            norms = perturbed_delta.abs().sum(dim=-1)
+        elif p_value == 2.0:
+            norms = torch.linalg.vector_norm(perturbed_delta, ord=2, dim=-1)
+        else:
+            norms = torch.linalg.vector_norm(perturbed_delta, ord=p_value, dim=-1)
+        result &= (norms <= eps_t.reshape(-1)[0] + tol).all(dim=1)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Strategy factories
 # ---------------------------------------------------------------------------
@@ -751,6 +874,26 @@ def _build_bounding(
     raise ValueError(f"Unknown bounding method: {method!r}")
 
 
+def _groups_to_tensors(groups: Dict[int, Any], batch: SubproblemBatch):
+    bb = batch.batch_size
+    if len(groups) != bb:
+        return None, None, 0
+    k_eff = len(groups.get(0, []))
+    if k_eff < 1:
+        return None, None, 0
+    device = batch.lb.device
+    top_layers = torch.zeros(bb, k_eff, dtype=torch.long, device=device)
+    top_neurons = torch.zeros(bb, k_eff, dtype=torch.long, device=device)
+    for lane in range(bb):
+        entries = groups.get(lane, [])
+        if len(entries) != k_eff:
+            return None, None, 0
+        for j, (lid, nidx) in enumerate(entries):
+            top_layers[lane, j] = int(lid)
+            top_neurons[lane, j] = int(nidx)
+    return top_layers, top_neurons, k_eff
+
+
 def _dispatch_dual_solve(
     *,
     net: Net,
@@ -762,6 +905,7 @@ def _dispatch_dual_solve(
     optimize: bool,
     keep_rows: Optional[torch.Tensor] = None,
     root_bounds_dict: Optional[Dict[int, Bounds]] = None,
+    round_policy: Optional[Any] = None,
 ) -> DualSolveResult:
     """Run one dual-family BaB bound pass and decode lane statuses.
 
@@ -775,6 +919,7 @@ def _dispatch_dual_solve(
     from act.back_end.solver.solver_dual import DualSolver, expand_bounds_dict
 
     solver_tier = getattr(config, "solver_tier", "lp")
+    block_eps_updates = _install_embedding_child_block_eps(net, batched_bounds, batch)
     if root_bounds_dict is not None:
         bounds_dict_dual = expand_bounds_dict(root_bounds_dict, k_actual)
         lane_box = Bounds(batched_bounds.lb, batched_bounds.ub)
@@ -787,14 +932,23 @@ def _dispatch_dual_solve(
             if refreshed is not None:
                 bounds_dict_dual = refreshed
             psr_mode = getattr(config, "per_subproblem_refine", "none")
+            psr_rows_cap = getattr(config, "per_subproblem_refine_rows_cap", 64)
+            psr_iters = getattr(config, "per_subproblem_refine_iters", 0)
+            if round_policy is not None:
+                if round_policy.refine_mode is not None:
+                    psr_mode = round_policy.refine_mode
+                if round_policy.refine_rows_cap is not None:
+                    psr_rows_cap = round_policy.refine_rows_cap
+                if round_policy.refine_iters is not None:
+                    psr_iters = round_policy.refine_iters
             if psr_mode != "none":
                 bounds_dict_dual = DualSolver().refine_intermediate_bounds_batched(
                     net,
                     bounds_dict_dual,
                     split_signs=batch.split_signs,
                     mode=psr_mode,
-                    rows_cap=getattr(config, "per_subproblem_refine_rows_cap", 64),
-                    optimize_iters=getattr(config, "per_subproblem_refine_iters", 0),
+                    rows_cap=psr_rows_cap,
+                    optimize_iters=psr_iters,
                 )
     else:
         bounds_dict_dual = compute_forward_bounds(net, batched_bounds.lb, batched_bounds.ub)
@@ -986,12 +1140,72 @@ def _dispatch_dual_solve(
             ),
             per_class_alpha=config.per_class_alpha,
         )
-    return DualSolveResult(
-        solution=solution,
-        bounds_dict=branch_bounds,
-        nu_per_layer=branch_nu,
-        row_slack=slack.detach(),
+    try:
+        return DualSolveResult(
+            solution=solution,
+            bounds_dict=branch_bounds,
+            nu_per_layer=branch_nu,
+            row_slack=slack.detach(),
+        )
+    finally:
+        _restore_embedding_child_block_eps(block_eps_updates)
+
+
+def _finite_embedding_spec(net: Net) -> Optional[Layer]:
+    for layer in net.layers:
+        if layer.kind == "INPUT_SPEC" and layer.params.get("kind") == InKind.LP_EMBEDDING:
+            p_norm = layer.params.get("p_norm", float("inf"))
+            if isinstance(p_norm, torch.Tensor):
+                p_value = float(p_norm.reshape(-1)[0].item())
+            elif isinstance(p_norm, (int, float, bool)):
+                p_value = float(p_norm)
+            else:
+                continue
+            if p_value != float("inf"):
+                return layer
+    return None
+
+
+def _install_embedding_child_block_eps(
+    net: Net,
+    batched_bounds: Bounds,
+    batch: SubproblemBatch,
+) -> list[tuple[Layer, ParamValue]]:
+    spec = _finite_embedding_spec(net)
+    if spec is None or batch.depths.numel() == 0 or int(batch.depths.max().item()) == 0:
+        return []
+    p_raw = spec.params.get("p_norm", float("inf"))
+    if isinstance(p_raw, torch.Tensor):
+        p_norm = float(p_raw.reshape(-1)[0].item())
+    elif isinstance(p_raw, (int, float, bool)):
+        p_norm = float(p_raw)
+    else:
+        return []
+    input_shape = tuple(batched_bounds.lb.shape[1:])
+    positions_raw = spec.params.get("perturbed_positions")
+    positions = positions_raw if isinstance(positions_raw, torch.Tensor) else None
+    block_eps = rederive_embedding_block_eps(
+        batched_bounds.lb.flatten(start_dim=1),
+        batched_bounds.ub.flatten(start_dim=1),
+        input_shape,
+        positions,
+        p_norm,
     )
+    old_values: list[tuple[Layer, ParamValue]] = []
+    for layer in net.layers:
+        kind_up = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+        if kind_up in ("INPUT", "INPUT_SPEC"):
+            old_values.append((layer, layer.params.get("bab_block_eps", None)))
+            layer.params["bab_block_eps"] = block_eps
+    return old_values
+
+
+def _restore_embedding_child_block_eps(updates: list[tuple[Layer, ParamValue]]) -> None:
+    for layer, old in updates:
+        if old is None:
+            layer.params.pop("bab_block_eps", None)
+        else:
+            layer.params["bab_block_eps"] = old
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1334,10 @@ def verify_bab_batched(
         order_name=getattr(config, "bounding_order", "depth_lb"),
         cooling_rate=getattr(config, "sa_cooling_rate", 0.99),
     )
+    llm_probe: Any = None
+    _llm: Any = None
+    _wave_index = 0
+
     provenance = bool(getattr(config, "provenance_enabled", False))
     if provenance and not isinstance(pool, TopKBounding):
         raise ValueError("provenance_enabled requires bounding_method='topk'")
@@ -1177,6 +1395,14 @@ def verify_bab_batched(
                 mode=refine_mode,
                 blowup_ratio=getattr(config, "intermediate_refine_ratio", 10.0),
             )
+    # Per-node bound reuse is governed solely by reuse_root_bounds: root_fwd may
+    # exist just for the root presolve/refine above, and passing it to descendant
+    # solves would freeze every child's intermediate bounds at root tightness
+    # (fatal for input-split BaB, where the whole gain comes from recomputing
+    # intermediates on the smaller box).
+    node_root_fwd: Optional[Dict[int, Bounds]] = (
+        root_fwd if getattr(config, "reuse_root_bounds", False) else None
+    )
     if (
         presolve_tier in ("dual", "dual_alpha", "dual_alpha_eta")
         and assert_layer.params.get("kind") != OutKind.UNSAFE_LINEAR
@@ -1240,6 +1466,7 @@ def verify_bab_batched(
     start = time.time()
     processed = 0
     any_dropped_max_depth = False
+    _last_input_widths: Optional[list[float]] = None
 
     while not pool.empty:
         elapsed = time.time() - start
@@ -1250,6 +1477,23 @@ def verify_bab_batched(
         k_requested = min(len(pool), effective_batch, remaining_nodes)
         if k_requested <= 0:
             break
+
+        _wave_t0 = time.time()
+        _pool_before = len(pool)
+        _wave_policy = None
+        _wave_split_used = None
+        if llm_probe is not None and _llm is not None:
+            _wave_policy = llm_probe.begin_wave(_llm.build_frontier_stats(
+                wave_index=_wave_index,
+                pool_size=len(pool),
+                effective_batch=effective_batch,
+                remaining_nodes=remaining_nodes,
+                elapsed_s=elapsed,
+                remaining_s=max(0.0, budget_s - elapsed),
+                input_widths=_last_input_widths,
+            ))
+            if _wave_policy.k_requested is not None:
+                k_requested = max(1, min(_wave_policy.k_requested, len(pool), effective_batch, remaining_nodes))
 
         batch = pool.pop(batch_size=k_requested)
         k_actual = batch.batch_size
@@ -1283,7 +1527,8 @@ def verify_bab_batched(
                 config=config,
                 optimize=False,
                 keep_rows=spec_keep_rows,
-                root_bounds_dict=root_fwd,
+                root_bounds_dict=node_root_fwd,
+                round_policy=_wave_policy,
             )
             solution = dual_solve_result.solution
         elif solver_tier in ("dual_alpha", "dual_alpha_eta"):
@@ -1296,7 +1541,8 @@ def verify_bab_batched(
                 config=config,
                 optimize=True,
                 keep_rows=spec_keep_rows,
-                root_bounds_dict=root_fwd,
+                root_bounds_dict=node_root_fwd,
+                round_policy=_wave_policy,
             )
             solution = dual_solve_result.solution
             bounds_dict_for_branching = dual_solve_result.bounds_dict
@@ -1334,7 +1580,8 @@ def verify_bab_batched(
                 if input_shape
                 else x_input_flat
             )
-            violations = check_violations_batched(net, x_input_shaped, assert_layer)
+            in_region = _check_input_specs_batched(x_input_shaped, spec_layers)
+            violations = check_violations_batched(net, x_input_shaped, assert_layer) & in_region
             for j, lane in enumerate(sat_lane_idx):
                 if bool(violations[j].item()):
                     return VerifyResult(
@@ -1437,7 +1684,34 @@ def verify_bab_batched(
                     )
                     multi = None
                     multi_k = int(getattr(config, "multi_split_levels", 1))
-                    if config.branching_method == "gain" and multi_k > 1:
+                    if llm_probe is not None and _llm is not None and llm_probe.wants_neuron:
+                        # neuron_topk>0 => never bail on candidate count: enumerate the
+                        # full set (limit=None) and let advise_neuron_groups truncate to
+                        # the top-K by score, so the LLM always decides (with a bounded
+                        # view) instead of falling back to FSB. neuron_topk==0 keeps the
+                        # legacy "bail to FSB when > max_candidates_total" behavior.
+                        _neuron_topk = int(getattr(config, "llm_probe_neuron_topk", 0))
+                        _cand_dicts = enumerate_unstable_candidates(
+                            branch_batch, bd_branch, nu_branch,
+                            limit=None if _neuron_topk > 0
+                            else getattr(config, "llm_probe_max_candidates_total", 1024),
+                        )
+                        if _cand_dicts:
+                            _ngroups = llm_probe.advise_neuron_groups(_llm.build_frontier_stats(
+                                wave_index=_wave_index,
+                                pool_size=len(pool),
+                                effective_batch=effective_batch,
+                                remaining_nodes=remaining_nodes,
+                                elapsed_s=elapsed,
+                                branch_batch_size=branch_batch.batch_size,
+                                candidates=[_llm.CandidateSummary(**_d) for _d in _cand_dicts],
+                            ))
+                            if _ngroups is not None:
+                                _tl, _tn, _keff = _groups_to_tensors(_ngroups, branch_batch)
+                                if _tl is not None and _tn is not None:
+                                    multi = _multi_split_from_groups(branch_batch, net, _tl, _tn, _keff)
+                                    _wave_split_used = _keff
+                    if multi is None and config.branching_method == "gain" and multi_k > 1:
                         # Adaptive split depth: fan out so children roughly
                         # fill one bounding batch; n_branch lanes x 2^k <=
                         # max_batch_size keeps the frontier from flooding
@@ -1449,6 +1723,14 @@ def verify_bab_batched(
                                 int(math.log2(max(2, effective_batch // max(1, branch_batch.batch_size)))),
                             ),
                         )
+                        if _wave_policy is not None and _wave_policy.split_k is not None and _llm is not None:
+                            k_adaptive = _llm.clip_split_k(
+                                _wave_policy.split_k,
+                                branch_batch_size=branch_batch.batch_size,
+                                effective_batch=effective_batch,
+                                multi_split_levels=multi_k,
+                            )
+                        _wave_split_used = k_adaptive
                         if k_adaptive > 1:
                             multi = _multi_split_from_decision(
                                 branch_batch, net, bd_branch, nu_branch, k_adaptive,
@@ -1464,7 +1746,7 @@ def verify_bab_batched(
                                 assert_layer,
                                 config,
                                 spec_keep_rows,
-                                root_fwd,
+                                node_root_fwd,
                                 bd_branch,
                                 nu_branch,
                                 input_shape,
@@ -1504,6 +1786,19 @@ def verify_bab_batched(
                             device=branch_batch.lb.device,
                             dtype=torch.long,
                         ).reshape(-1)
+                    widths = branch_batch.widths()
+                    _last_input_widths = (
+                        widths.mean(dim=0).tolist() if widths.shape[1] <= 32 else None
+                    )
+                    if _wave_policy is not None and getattr(_wave_policy, "input_split_dim", None) is not None:
+                        # LLM-advised input dimension (already range-clipped). Lanes where
+                        # the advised dim has zero width keep the brancher's choice:
+                        # splitting a zero-width dim yields identical children (livelock).
+                        advised = torch.full_like(split_dims, int(_wave_policy.input_split_dim))
+                        has_width = widths.gather(1, advised.unsqueeze(1)).squeeze(1) > 0
+                        split_dims = torch.where(has_width, advised, split_dims)
+                    if _wave_policy is not None and getattr(_wave_policy, "input_split_fanout", None) is not None:
+                        split_fanout = int(_wave_policy.input_split_fanout)
                     if split_fanout == 2:
                         children, parent_index = split_input(branch_batch, split_dims)
                     else:
@@ -1533,6 +1828,24 @@ def verify_bab_batched(
             effective_batch = _auto_recalibrate_batch(
                 torch.cuda.max_memory_allocated(), max_k_seen, config,
             )
+
+        if llm_probe is not None and _llm is not None:
+            llm_probe.end_wave(_llm.WaveOutcome(
+                wave_index=_wave_index,
+                pool_before=_pool_before,
+                pool_after=len(pool),
+                k_requested_used=k_actual,
+                split_k_used=_wave_split_used if _wave_split_used is not None else 1,
+                refine_iters_used=(_wave_policy.refine_iters if (_wave_policy is not None and _wave_policy.refine_iters is not None) else 0),
+                certified_count=0,
+                falsified_found=False,
+                branched_count=0,
+                best_lb_before=None,
+                best_lb_after=None,
+                wave_time_s=time.time() - _wave_t0,
+                fallback_used=False,
+            ))
+            _wave_index += 1
 
     pool_remaining = len(pool)
     elapsed_total = time.time() - start

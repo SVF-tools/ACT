@@ -1751,6 +1751,8 @@ def _emit_assert_canonical(
         )
         if d_t.dim() == 1 and d_t.numel() == M:
             d_t = d_t.unsqueeze(0).expand(N, -1)
+        elif d_t.shape == (1, M):
+            d_t = d_t.expand(N, -1)
         if d_t.shape != (N, M):
             raise ValueError(
                 f"UNSAFE_LINEAR: d shape {tuple(d_t.shape)} != ({N}, {M})"

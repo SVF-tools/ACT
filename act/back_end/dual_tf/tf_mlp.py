@@ -158,6 +158,55 @@ def backward_mean(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
     return [nu_in], contrib
 
 
+def _reduce_sum_axes(L: Any):
+    raw = L.params.get("input_shape")
+    in_shape = tuple(int(s) for s in raw) if raw else None
+    axes = L.params.get("axes")
+    keepdim = bool(L.params.get("keepdims", 0))
+    return in_shape, list(axes) if axes else None, keepdim
+
+
+def forward_reduce_sum(
+    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Forward box for REDUCE_SUM: the sum is monotone-linear, so summing the
+    per-element lb/ub is the exact interval image; the dual frame resets over it."""
+    parent = parent_boxes[0]
+    B = parent.lb.shape[0]
+    in_shape, axes, keepdim = _reduce_sum_axes(L)
+    lb_in, ub_in = parent.lb, parent.ub
+    if in_shape:
+        lb_in = lb_in.reshape(B, *in_shape)
+        ub_in = ub_in.reshape(B, *in_shape)
+    dims = tuple(a + 1 for a in axes) if axes else tuple(range(1, lb_in.dim()))
+    lb = lb_in.sum(dim=dims, keepdim=keepdim).reshape(B, -1)
+    ub = ub_in.sum(dim=dims, keepdim=keepdim).reshape(B, -1)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    out = Bounds(lb, ub)
+    return out, out, lin, frame
+
+
+def backward_reduce_sum(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                        preds: List[int], M: int = 1, alpha=None
+                        ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """REDUCE_SUM backward: the transpose of a sum broadcasts each output's ν
+    back to every input that fed it (no 1/N scaling, unlike MEAN). Exact, contrib zero."""
+    assert len(preds) == 1, f"REDUCE_SUM expects 1 predecessor, got {len(preds)}"
+    BM = nu.shape[0]
+    in_shape, axes, _ = _reduce_sum_axes(L)
+    if in_shape is None:
+        n_in = bounds_dict[preds[0]].lb.flatten(start_dim=1).shape[-1]
+        nu_in = nu.reshape(BM, -1)[:, :1].expand(BM, n_in)
+        return [nu_in], torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    dims0 = axes if axes else list(range(len(in_shape)))
+    broadcast_shape = [s if i not in dims0 else 1 for i, s in enumerate(in_shape)]
+    nu_in = nu.reshape(BM, *broadcast_shape).expand(BM, *in_shape).reshape(BM, -1)
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return [nu_in], contrib
+
+
 # ---- RESHAPE ----
 def forward_reshape(
     L: Any,
@@ -287,7 +336,7 @@ def forward_relu(
     if new_lin is None:
         lb, ub = int_lb, int_ub
         out = Bounds(lb, ub)
-        stored = out
+        stored = out if post_activation else Bounds(pre_lb, pre_ub)
         lin, frame = _reset_forward_box(lb, ub, device, dtype)
         return stored, out, lin, frame
     lin = new_lin
@@ -326,8 +375,13 @@ def forward_lrelu(
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
     alpha = L.params.get("alpha", 0.01)
     lin = _fwd_lrelu(parent_lin, pre_lb, pre_ub, alpha)
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_lrelu(pre_lb, pre_ub, alpha)
+    if lin is None:
+        out = Bounds(int_lb, int_ub)
+        stored = out if post_activation else Bounds(pre_lb, pre_ub)
+        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
+        return stored, out, lin, frame
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
@@ -416,6 +470,63 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1,
     return v_out.view(BM, n), contrib
 
 
+# ---- SIGN ----
+def forward_sign(
+    L: Any,
+    parent_boxes: List[Bounds],
+    parent_lins: List[LinearBound],
+    parent_frames: List[Frame],
+    preds: List[int],
+    post_activation: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Forward handler for SIGN (step function y = sign(x) in {-1, 0, 1}).
+
+    sign is monotone non-decreasing, so the sound interval box is exactly
+    [sign(lb), sign(ub)]. The step has zero slope everywhere, so no linear
+    plane is carried: the frame resets to identity over the new box (like the
+    RELU no-linearisation branch).
+    """
+    pre = parent_boxes[0]
+    lb = torch.sign(pre.lb)
+    ub = torch.sign(pre.ub)
+    out = Bounds(lb, ub)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    return out, out, lin, frame
+
+
+def backward_sign(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                  preds: List[int], M: int = 1, alpha=None
+                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Backward for SIGN: a step relaxed by two ZERO-slope constant planes.
+
+    Sound relaxation over [l, u]: sign(l) <= sign(x) <= sign(u) (constants,
+    since sign is monotone). Both planes have slope 0, so no ν flows to the
+    input (nu_in = 0) and each output contributes its constant plane, selected
+    by the sign of ν (>=0 -> lower plane sign(l), <0 -> upper plane sign(u)).
+    The stored box already holds sign(l)/sign(u). Fully batched over B and M.
+    """
+    bounds = bounds_dict.get(L.id)
+    if bounds is None:
+        raise ValueError(f"backward_sign: layer {L.id} missing bounds in bounds_dict")
+    assert len(preds) == 1, f"SIGN expects 1 predecessor, got {len(preds)}"
+    BM = nu.shape[0]
+    assert BM % M == 0, f"backward_sign: nu batch {BM} not divisible by M={M}"
+    B = BM // M
+    v_flat = nu.flatten(start_dim=1)
+    lo_B = bounds.lb.flatten(start_dim=1)
+    hi_B = bounds.ub.flatten(start_dim=1)
+    n = min(v_flat.shape[-1], lo_B.shape[-1])
+    v = v_flat[..., :n].view(B, M, n)
+    lo = lo_B[..., :n].unsqueeze(1)
+    hi = hi_B[..., :n].unsqueeze(1)
+    const = torch.where(v >= 0, lo.expand_as(v), hi.expand_as(v))
+    contrib = (v * const).sum(dim=-1).reshape(BM)
+    nu_in = torch.zeros(BM, n, dtype=nu.dtype, device=nu.device)
+    return [nu_in], contrib
+
+
 # ---- BIAS ----
 def forward_bias(
     L: Any,
@@ -485,8 +596,12 @@ def forward_scale(
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_scale(L, parent_lin)
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_scale(L, prev_lb, prev_ub)
+    if lin is None:
+        out = Bounds(int_lb, int_ub)
+        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
+        return out, out, lin, frame
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
@@ -534,8 +649,12 @@ def forward_bn(
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bn(L, parent_lin)
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_bn(L, prev_lb, prev_ub)
+    if lin is None:
+        out = Bounds(int_lb, int_ub)
+        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
+        return out, out, lin, frame
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out

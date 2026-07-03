@@ -252,7 +252,7 @@ def _reset_forward_box(lb: torch.Tensor, ub: torch.Tensor, device, dtype
 def _topological_sort(net: Net) -> List[int]:
     """Return a Kahn topological order over the ACT DAG."""
     layer_ids = [layer.id for layer in net.layers]
-    in_deg: Dict[int, int] = {lid: len(net.preds.get(lid, [])) for lid in layer_ids}
+    in_deg: Dict[int, int] = {lid: len(set(net.preds.get(lid, []))) for lid in layer_ids}
     queue = deque(lid for lid in layer_ids if in_deg[lid] == 0)
     order: List[int] = []
     while queue:
@@ -422,7 +422,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             if new_lin is None:
                 lb, ub = int_lb, int_ub
                 out = Bounds(lb, ub)
-                stored = out
+                stored = out if post_activation else Bounds(pre_lb, pre_ub)
                 lin, frame = _reset_forward_box(lb, ub, device, dtype)
             else:
                 lin = new_lin
@@ -563,7 +563,7 @@ def _fwd_bias(layer: Layer, lin: LinearBound) -> LinearBound:
     )
 
 
-def _fwd_scale(layer: Layer, lin: LinearBound) -> LinearBound:
+def _fwd_scale(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     """Compose dual-track affine bounds through an element-wise scale.
 
     Lazy identity: SCALE following INPUT is rare; if input A is None,
@@ -578,6 +578,8 @@ def _fwd_scale(layer: Layer, lin: LinearBound) -> LinearBound:
 
     if lin.A_lb is None or lin.A_ub is None:
         B, n = lin.b_lb.shape
+        if n > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
         eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
         A_lb_in = lin.A_lb if lin.A_lb is not None else eye
         A_ub_in = lin.A_ub if lin.A_ub is not None else eye
@@ -595,7 +597,7 @@ def _fwd_scale(layer: Layer, lin: LinearBound) -> LinearBound:
     )
 
 
-def _fwd_bn(layer: Layer, lin: LinearBound) -> LinearBound:
+def _fwd_bn(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     """Compose dual-track affine bounds through batch normalization.
 
     Lazy identity: BN following INPUT (rare) materializes diagonal.
@@ -609,6 +611,8 @@ def _fwd_bn(layer: Layer, lin: LinearBound) -> LinearBound:
 
     if lin.A_lb is None or lin.A_ub is None:
         B, n = lin.b_lb.shape
+        if n > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
         eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
         A_lb_in = lin.A_lb if lin.A_lb is not None else eye
         A_ub_in = lin.A_ub if lin.A_ub is not None else eye
@@ -626,7 +630,7 @@ def _fwd_bn(layer: Layer, lin: LinearBound) -> LinearBound:
     )
 
 
-def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: float) -> LinearBound:
+def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: float) -> Optional[LinearBound]:
     """Apply forward triangle linear relaxation for LeakyReLU.
 
     Lazy identity: LReLU after INPUT (rare) materializes diagonal.
@@ -646,6 +650,8 @@ def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: floa
 
     if lin.A_lb is None or lin.A_ub is None:
         B, n = lb.shape
+        if n > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
         eye = torch.eye(n, device=lb.device, dtype=lb.dtype).unsqueeze(0).expand(B, n, n)
         A_lb_in = lin.A_lb if lin.A_lb is not None else eye
         A_ub_in = lin.A_ub if lin.A_ub is not None else eye
