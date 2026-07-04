@@ -49,6 +49,7 @@ ignore:
   - "act/pipeline/cli.py"
   - "act/front_end/torchvision_loader/cli.py"
   - "act/back_end/serialization/test_serialization.py"
+  - "vnncomp/"
 
 # Flag definitions matching the workflow upload steps. Each CI job uploads with
 # a flag so codecov can show per-job coverage in the PR comment / dashboard.

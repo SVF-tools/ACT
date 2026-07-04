@@ -5,8 +5,9 @@ Wraps the ACT pipeline (arbitrary onnx+vnnlib load, ACTFuzzer mutation pre-attac
 FALSIFICATION, dual_alpha_eta BaB for CERTIFICATION) and emits the VNN-COMP result contract:
 
     line 1 : unsat | sat | timeout | unknown
-    if sat : lines 2+ = the counterexample as a VNNLIB-1.0 flat assignment
-             ``((X_0 v)...(Y_0 v)...)`` (see vnnlib_parser.write_vnncomp_result).
+    if sat : lines 2+ = the counterexample as a VNNLIB 2.0 command-line assignment
+             (per-variable ``<name> <dtype> [shape]`` header + row-major values;
+             see vnnlib_parser.write_vnncomp_result).
 
 Both the verifier's CE (result.counterexample) and the fuzzer's CE (.input) are
 in model input space; the output Y is (re)computed by running the raw
@@ -29,7 +30,10 @@ import sys
 import time
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent
+# This runner lives in <repo>/vnncomp/; the repo root (which holds the `act`
+# package) is one level up. Put it on sys.path so `import act` resolves without
+# an editable install.
+_REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 import torch
@@ -85,7 +89,8 @@ def main() -> None:
     from act.front_end.model_synthesis import merge_split_relus
     from act.front_end.model_synthesis import synthesize_models_from_specs
     from act.front_end.vnnlib_loader.create_specs import create_specs_from_paths
-    from act.front_end.vnnlib_loader.vnnlib_parser import write_vnncomp_result
+    from act.front_end.vnnlib_loader.vnnlib_parser import (
+        extract_vnnlib_2_io_decls, write_vnncomp_result)
     from act.pipeline.fuzzing.actfuzzer import pgd_preattack
     from act.pipeline.verification.torch2act import TorchToACT
     from act.util.stats import VerifyStatus
@@ -102,6 +107,7 @@ def main() -> None:
 
     raw_model = sr[2]
     param = next(raw_model.parameters(), None)
+    io_decls = extract_vnnlib_2_io_decls(args.vnnlib)
 
     input_dim = int(sr[3][0].tensor.numel()) if sr[3] else 0
     low_dim = 0 < input_dim <= args.input_split_dims
@@ -143,7 +149,11 @@ def main() -> None:
                 print(f"[attack skipped] {exc}", file=sys.stderr)
             if ce is not None:
                 x = ce.input if hasattr(ce, "input") else ce
-                write_vnncomp_result(args.output, "sat", x=x, y=raw_forward(x))
+                if io_decls is None:
+                    write_vnncomp_result(args.output, "unknown")
+                else:
+                    write_vnncomp_result(args.output, "sat", x=x, y=raw_forward(x),
+                                         in_decl=io_decls[0], out_decl=io_decls[1])
                 return
 
     if remaining() <= 1.0:
@@ -222,7 +232,12 @@ def main() -> None:
         return
 
     if falsified_ce is not None:
-        write_vnncomp_result(args.output, "sat", x=falsified_ce, y=raw_forward(falsified_ce))
+        if io_decls is None:
+            write_vnncomp_result(args.output, "unknown")
+        else:
+            write_vnncomp_result(args.output, "sat", x=falsified_ce,
+                                 y=raw_forward(falsified_ce),
+                                 in_decl=io_decls[0], out_decl=io_decls[1])
     elif len(statuses) == n_models and all(s == VerifyStatus.CERTIFIED for s in statuses):
         write_vnncomp_result(args.output, "unsat")
     elif any(s not in (VerifyStatus.CERTIFIED, VerifyStatus.TIMEOUT) for s in statuses):

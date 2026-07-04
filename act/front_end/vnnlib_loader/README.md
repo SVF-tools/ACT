@@ -646,31 +646,34 @@ Each row defines a verification instance:
 
 ## VNNLIB Format
 
-VNNLIB files define verification properties using SMT-LIB 2.0 syntax:
+ACT supports **VNNLIB 2.0 only**; legacy 1.0 flat files (bare `(declare-const X_0 Real)`)
+are rejected with `UnsupportedSpecError`. VNNLIB 2.0 declares inputs/outputs as **tensors**
+with a shape and uses bracket-indexed variables `X[i,j,..]` / `Y[k,..]` (row-major / C-order);
+ACT ravels these internally to flat `X_n` / `Y_n` for constraint solving.
 
-### Input Constraints (BOX)
-
-Input constraints define box bounds for each input variable:
+### Network + Input Constraints (BOX)
 
 ```lisp
-; Declare input variables
-(declare-const X_0 Real)
-(declare-const X_1 Real)
-(declare-const X_2 Real)
+(vnnlib-version <2.0>)
 
-; Assert box bounds [lb, ub]
-(assert (>= X_0 0.6))
-(assert (<= X_0 0.6798577687))
-(assert (>= X_1 -0.5))
-(assert (<= X_1 -0.4528301887))
-(assert (>= X_2 -0.5))
-(assert (<= X_2 0.5))
+(declare-network N
+    (declare-input  X float32 [1, 1, 1, 5])
+    (declare-output Y float32 [1, 5])
+)
+
+; Assert box bounds [lb, ub] on tensor-indexed inputs
+(assert (>= X[0,0,0,0] 0.6))
+(assert (<= X[0,0,0,0] 0.6798577687))
+(assert (>= X[0,0,0,1] -0.5))
+(assert (<= X[0,0,0,1] -0.4528301887))
+(assert (>= X[0,0,0,2] -0.5))
+(assert (<= X[0,0,0,2] 0.5))
 ```
 
-**Parsing Result:**
-- Variable `X_0`: bounds [0.6, 0.6798577687]
-- Variable `X_1`: bounds [-0.5, -0.4528301887]
-- Variable `X_2`: bounds [-0.5, 0.5]
+**Parsing Result** (bracket indices ravel to flat positions in C-order):
+- `X[0,0,0,0]` → `X_0`: bounds [0.6, 0.6798577687]
+- `X[0,0,0,1]` → `X_1`: bounds [-0.5, -0.4528301887]
+- `X[0,0,0,2]` → `X_2`: bounds [-0.5, 0.5]
 
 **ACT Representation:**
 ```python
@@ -683,27 +686,20 @@ InputSpec(
 
 ### Output Constraints (LINEAR_LE)
 
-Output constraints define safety properties as disjunctive linear inequalities:
+Output properties are disjunctive linear inequalities over the declared output tensor:
 
 ```lisp
-; Declare output variables
-(declare-const Y_0 Real)
-(declare-const Y_1 Real)
-(declare-const Y_2 Real)
-(declare-const Y_3 Real)
-(declare-const Y_4 Real)
-
-; Safety property: Y_0 >= Y_i for all i != 0
+; Safety property: Y[0,0] >= Y[0,i] for all i != 0
 (assert (or
-    (and (>= Y_0 Y_1)
-         (>= Y_0 Y_2)
-         (>= Y_0 Y_3)
-         (>= Y_0 Y_4))
+    (and (>= Y[0,0] Y[0,1])
+         (>= Y[0,0] Y[0,2])
+         (>= Y[0,0] Y[0,3])
+         (>= Y[0,0] Y[0,4]))
 ))
 ```
 
 **Interpretation:**
-- Verify that output Y_0 (advisory 0) is the maximum
+- Verify that output `Y[0,0]` (advisory 0) is the maximum
 - Equivalent to: Y_1 - Y_0 ≤ 0, Y_2 - Y_0 ≤ 0, Y_3 - Y_0 ≤ 0, Y_4 - Y_0 ≤ 0
 
 **ACT Representation:**
@@ -726,20 +722,40 @@ OutputSpec(
 VNNLIB supports complex disjunctive properties:
 
 ```lisp
-; Property: Either Y_0 >= Y_1 OR Y_2 >= Y_3
+; Property: Either Y[0,0] >= Y[0,1] OR Y[0,2] >= Y[0,3]
 (assert (or
-    (and (>= Y_0 Y_1))
-    (and (>= Y_2 Y_3))
+    (and (>= Y[0,0] Y[0,1]))
+    (and (>= Y[0,2] Y[0,3]))
 ))
 ```
 
 Each disjunct becomes a separate verification query (split into multiple specs).
 
+### Counterexample / Result Format
+
+A `sat` result is emitted as a VNNLIB 2.0 **command-line assignment** (VNNLIB-Standard §5.3):
+the result token, then for each declared variable a header `<name> <dtype> [d0,d1,..]`
+followed by its values one-per-line in row-major (C) order. This is the witness form the
+VNN-COMP 2026 counterexample checker parses (NOT the legacy flat `((X_0 v)...)` pairs):
+
+```
+sat
+X float32 [1,1,1,5]
+0.61
+-0.5
+-0.5
+-0.5
+-0.45
+Y float32 [1,5]
+3.99
+...
+```
+
 ### Variable Naming Conventions
 
-- **Input variables**: `X_0`, `X_1`, ..., `X_n` (network inputs)
-- **Output variables**: `Y_0`, `Y_1`, ..., `Y_m` (network outputs)
-- **Intermediate variables**: `X_hat_0`, `X_hat_1`, ... (optional, for intermediate layers)
+- **Declared tensors**: `X`, `Y` (or whatever names appear in `declare-input`/`declare-output`)
+- **Input variables**: bracket-indexed `X[i,j,..]` → ravel to flat `X_0`, `X_1`, ... (C-order)
+- **Output variables**: bracket-indexed `Y[k,..]` → ravel to flat `Y_0`, `Y_1`, ... (C-order)
 
 ## ONNX Model Support
 

@@ -10,7 +10,9 @@ if [ "$1" != "$VERSION_STRING" ]; then
     exit 1
 fi
 
-REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+# This script lives in <repo>/vnncomp/; the repo root (environment.yml and the
+# act package) is one level up.
+REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." >/dev/null 2>&1 && pwd )"
 
 # machine info (licensing / debugging), mirrors the CORA example toolkit
 ip link show || true
@@ -52,5 +54,5 @@ if ! conda env list | grep -qE '/act-py312$'; then
     fi
 fi
 
-conda run -n act-py312 python -c "import torch, act; print('ACT import OK; torch', torch.__version__, 'cuda-build', torch.version.cuda, 'avail', torch.cuda.is_available())"
+PYTHONPATH="$REPO_DIR" conda run -n act-py312 python -c "import torch, act; print('ACT import OK; torch', torch.__version__, 'cuda-build', torch.version.cuda, 'avail', torch.cuda.is_available())"
 echo "install_tool.sh: done"

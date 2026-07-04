@@ -28,6 +28,7 @@ from act.front_end.vnnlib_loader.data_model_loader import (
 )
 from act.front_end.vnnlib_loader.vnnlib_parser import (
     UnsupportedSpecError,
+    VNNLibParseError,
     parse_vnnlib_queries,
 )
 
@@ -379,7 +380,10 @@ def create_specs_from_paths(onnx_path, vnnlib_path, category: str = "custom"):
         input_shape = get_onnx_input_shape(onnx_p)
     except Exception:
         input_shape = None
-    input_tensor, _meta = _parse_vnnlib_with_shape_probe(vnnlib_p, model, input_shape)
+    try:
+        input_tensor, _meta = _parse_vnnlib_with_shape_probe(vnnlib_p, model, input_shape)
+    except (UnsupportedSpecError, VNNLibParseError) as exc:
+        raise SystemExit(f"Unsupported/invalid VNNLIB spec for {vnnlib_p.name}: {exc}")
     lbl = extract_label_from_vnnlib(vnnlib_p)
     label = _torch.tensor([lbl], dtype=_torch.int64) if lbl is not None else None
     instance_data = {
