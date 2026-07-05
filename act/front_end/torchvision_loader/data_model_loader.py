@@ -18,6 +18,7 @@ import torch
 
 # Import path configuration
 from act.util.path_config import get_torchvision_data_root
+from act.util.format_utils import format_bytes as _format_size, dir_size as _get_directory_size
 
 # Import from data_model_mapping
 from act.front_end.torchvision_loader.data_model_mapping import (
@@ -492,43 +493,6 @@ print(f"Parameters: {{sum(p.numel() for p in model.parameters()):,}}")
             'message': f"Download failed: {str(e)}",
             'traceback': traceback.format_exc()
         }
-
-
-def _get_directory_size(path) -> int:
-    """
-    Calculate total size of a directory in bytes.
-    
-    Args:
-        path: Path to directory
-        
-    Returns:
-        Total size in bytes
-    """
-    total_size = 0
-    try:
-        for item in Path(path).rglob('*'):
-            if item.is_file():
-                total_size += item.stat().st_size
-    except Exception as e:
-        pass  # Silently ignore permission errors
-    return total_size
-
-
-def _format_size(size_bytes: int) -> str:
-    """
-    Format size in bytes to human-readable string.
-    
-    Args:
-        size_bytes: Size in bytes
-        
-    Returns:
-        Formatted string (e.g., "1.5 GB", "234 MB")
-    """
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} PB"
 
 
 def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:

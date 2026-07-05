@@ -772,25 +772,3 @@ def get_category_info(category: str, root_dir: Optional[str] = None) -> Optional
     except Exception as e:
         logger.error(f"Failed to read category info: {e}")
         return None
-
-
-def _format_size(size_bytes: int) -> str:
-    """Format byte size to human-readable string."""
-    size_value = float(size_bytes)
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_value < 1024:
-            return f"{size_value:.2f} {unit}"
-        size_value /= 1024
-    return f"{size_value:.2f} TB"
-
-
-def _get_directory_size(path: Path) -> int:
-    """Calculate total size of directory in bytes."""
-    total = 0
-    try:
-        for entry in path.rglob('*'):
-            if entry.is_file():
-                total += entry.stat().st_size
-    except Exception as e:
-        logger.warning(f"Failed to calculate directory size: {e}")
-    return total

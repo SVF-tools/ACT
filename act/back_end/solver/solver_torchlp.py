@@ -9,6 +9,7 @@ from act.back_end.solver.solver_base import (
     SolverCaps,
     BatchLPProblem,
     BatchLPSolution,
+    _empty_blockdiag,
 )
 from act.util.device_manager import get_default_device, get_default_dtype
 
@@ -206,14 +207,6 @@ class TorchLPSolver(Solver):
         )
 
 
-def _empty_blockdiag_local(N: int, m: int, nvars: int) -> torch.Tensor:
-    return torch.sparse_coo_tensor(
-        torch.zeros((2, 0), dtype=torch.long),
-        torch.zeros(0),
-        (N * m, N * nvars),
-    )
-
-
 def _test_solve_batch_n1_sat_feasible():
     N, nvars = 1, 1
     problem = BatchLPProblem(
@@ -222,9 +215,9 @@ def _test_solve_batch_n1_sat_feasible():
         m_le=0,
         lb=torch.zeros(N, nvars),
         ub=torch.ones(N, nvars),
-        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_eq_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_eq=torch.zeros(N, 0),
-        A_le_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_le_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_le=torch.zeros(N, 0),
         obj_c=torch.tensor([[1.0]]),
         obj_const=torch.zeros(N),
@@ -248,9 +241,9 @@ def _test_solve_batch_n4_homogeneous():
         m_le=0,
         lb=torch.zeros(N, nvars),
         ub=torch.ones(N, nvars),
-        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_eq_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_eq=torch.zeros(N, 0),
-        A_le_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_le_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_le=torch.zeros(N, 0),
         obj_c=torch.ones(N, nvars),
         obj_const=torch.zeros(N),
@@ -286,7 +279,7 @@ def _test_solve_batch_n4_mixed():
         m_le=m_le,
         lb=torch.zeros(N, nvars),
         ub=torch.ones(N, nvars),
-        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_eq_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_eq=torch.zeros(N, 0),
         A_le_blockdiag=A_le,
         b_le=b_le,
@@ -318,7 +311,7 @@ def _test_solve_batch_max_viol_correct():
         m_le=m_le,
         lb=torch.zeros(N, nvars),
         ub=torch.ones(N, nvars),
-        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        A_eq_blockdiag=_empty_blockdiag(N, 0, nvars),
         b_eq=torch.zeros(N, 0),
         A_le_blockdiag=A_le,
         b_le=b_le,

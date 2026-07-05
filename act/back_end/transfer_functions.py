@@ -14,30 +14,6 @@
 #===---------------------------------------------------------------------===#
 
 """
-for different layer types during the analysis phase.
-
-The interface supports multiple implementations:
-- IntervalTF: Interval-based bounds propagation  
-- HybridzTF: HybridZ zonotope-based analysis with enhanced precision
-"""
-
-import torch
-#===- act/back_end/transfer_functions.py - Transfer Function Interface --===#
-# ACT: Abstract Constraint Transformer
-# Copyright (C) 2025– ACT Team
-#
-# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
-# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
-#===---------------------------------------------------------------------===#
-#
-# Purpose:
-#   Transfer Function Interface. Defines the abstract interface for transfer
-#   function implementations in the ACT verification framework. Transfer
-#   functions compute bounds and constraints.
-#
-#===---------------------------------------------------------------------===#
-
-"""
 Transfer function dispatch interface used by the backend analysis.
 
 This module defines a small abstract interface for transfer function
