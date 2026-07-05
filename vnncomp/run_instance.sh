@@ -18,7 +18,6 @@ VNNLIB="$4"
 RESULTS="$5"
 TIMEOUT="$6"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-REPO_DIR="$( cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd )"
 
 echo "ACT run: benchmark='$BENCHMARK' onnx='$ONNX' vnnlib='$VNNLIB' results='$RESULTS' timeout=$TIMEOUT"
 nvidia-smi || true
@@ -48,9 +47,9 @@ if [ -z "$CONDA_BASE" ] || [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
 fi
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
-# Optional post-install secrets (e.g. the LLM API key) kept out of this public repo;
-# create it on the run machine, it is gitignored (see act_llm_secrets.sh.example).
-[ -f "$REPO_DIR/act_llm_secrets.sh" ] && source "$REPO_DIR/act_llm_secrets.sh"
+# Optional LLM API key for the gain+llm search. Export OPENROUTER_API_KEY in the
+# environment that launches this harness (e.g. `export OPENROUTER_API_KEY=sk-or-...`);
+# child processes inherit it. With no key set, ACT stays on the offline 'gain' config.
 
 # 'gain' is the offline dual_alpha_eta+gain config (no network). With an LLM API key
 # present, switch to the LEAPS closed-loop 'gain+llm' search under a short per-call

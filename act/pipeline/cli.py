@@ -495,6 +495,25 @@ def cmd_fuzz(args):
         print(f"Seeds explored: {report.seeds_explored}")
         print(f"{'=' * 80}\n")
 
+        if report.counterexamples and not args.no_save:
+            import os
+            import torch as _torch
+            from act.front_end.vnnlib_loader.vnnlib_parser import write_vnncomp_result
+
+            os.makedirs(args.output, exist_ok=True)
+            ce0 = report.counterexamples[0]
+            x = ce0.input if hasattr(ce0, "input") else ce0
+            with _torch.no_grad():
+                y = wrapped_model(x)
+            fname = "_".join(map(str, model_id)) if isinstance(model_id, tuple) else str(model_id)
+            write_vnncomp_result(
+                os.path.join(args.output, f"{fname}_result.txt"),
+                "sat", x=x, y=y,
+                in_decl=("X", "float32", tuple(x.shape)),
+                out_decl=("Y", "float32", tuple(y.shape)),
+            )
+            print(f"✓ counterexample witness written for {fname}")
+
     except Exception as e:
         print(f"❌ Fuzzing failed: {e}")
         import traceback
