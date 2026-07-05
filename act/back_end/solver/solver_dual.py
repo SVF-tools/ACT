@@ -1337,8 +1337,11 @@ class DualSolver(Solver):
 
             margins = margins_flat.view(B, M)
             slack = margins - thresholds_neg
-            cert_tol = cert_eps * margins.abs().clamp(min=1.0)
-            violations = (slack < cert_tol) & active_mask
+            # margins is a SOUND LOWER bound on the true margin: certify iff
+            # every active row has slack >= 0. A positive tolerance band flags
+            # safe near-boundary rows (false UNKNOWN); slack < -cert_tol would be
+            # unsound. Hard zero boundary, matching bab.py.
+            violations = (slack < 0) & active_mask
             certified = ~violations.any(dim=-1)
 
         return SpecBatchResult(
