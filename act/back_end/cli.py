@@ -17,6 +17,7 @@ from dataclasses import fields
 import datetime
 import glob
 import json
+import logging
 import os
 import statistics
 import sys
@@ -32,6 +33,7 @@ from act.util.cli_utils import add_device_args, initialize_from_args
 
 _TF_MODES: tuple[str, ...] = ("interval", "hybridz")
 _SOLVERS: tuple[str, ...] = tuple(sorted(_VALID_SOLVERS))
+logger = logging.getLogger(__name__)
 
 
 def _strip_optional(tp: Any) -> Any:
@@ -965,11 +967,13 @@ Examples:
         default=None,
         dest="solver",
         help=(
-            "Solver backend.  Three alternative families:\n"
+            "Solver backend:\n"
             "  'gurobi'  — commercial MILP/LP (license required).  LP cascade.\n"
             "  'torchlp' — PyTorch-tensor LP (Adam + penalty + box projection,\n"
             "              GPU-capable).  LP cascade.\n"
-                "  'dual'    — DualSolver, linear-relaxation dual certified bounds via\n"
+            "  'hybridz' — Hybrid Zonotope propagation with a standalone open-source\n"
+            "              MILP verdict; automatically selects HybridzTF.\n"
+            "  'dual'    — DualSolver, linear-relaxation dual certified bounds via\n"
             "              backward propagation.  No LP cascade (DualSolver is\n"
             "              its own verification pipeline).\n"
             "  'auto'    — try gurobi, fall back to torchlp.\n"
@@ -993,8 +997,8 @@ Examples:
             "Forward-bounds transfer function: 'interval' or 'hybridz'.  Selects "
             "the abstract interpretation used during analyze() to seed bounds "
             "for the LP cascade.  Default: configured default (typically "
-            "'interval').  For dual certified bounds, use --solver dual instead "
-            "(dual is a solver, not a TF — see --solver help)."
+            "'interval').  The standalone hybridz solver selects HybridzTF "
+            "automatically; dual does not use this option."
         ),
     )
     verify_group.add_argument(
@@ -1295,10 +1299,20 @@ Examples:
         _ap.Namespace(device=backend_cfg.device, dtype=backend_cfg.dtype)
     )
 
-    if args.tf_mode is not None:
+    tf_mode = args.tf_mode
+    if backend_cfg.solver == "hybridz":
+        if tf_mode is not None and tf_mode != "hybridz":
+            logger.warning(
+                "--solver hybridz requires the hybridz transformer; overriding "
+                "--tf-mode %s",
+                tf_mode,
+            )
+        tf_mode = "hybridz"
+
+    if tf_mode is not None:
         from act.back_end.analyze import initialize_tf_mode
 
-        initialize_tf_mode(args.tf_mode)
+        initialize_tf_mode(tf_mode)
 
     # Set the solver-mode global so verify_once / _verify_one_net can dispatch
     # dual ↔ LP-cascade without consulting the TF mode (refactor decoupled
