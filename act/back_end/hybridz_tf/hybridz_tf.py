@@ -47,9 +47,14 @@ class HybridzTF(RegistryTF):
         self._hz_cache: Dict[int, HZono] = {}
         self._sparse_hz_cache: Dict[int, SparseHZono] = {}
         self._sparse_drop_reasons: Dict[int, str] = {}
+        self._sigmoid_affine_targets: Dict[int, int] = {}
+        self._sigmoid_affine_inputs: Dict[int, HZono] = {}
         self._cache_net_id: Optional[int] = None
         self._tanh_K: int = 2
-        self._sigmoid_K: int = 2
+        self._sigmoid_K: int = int(cfg.sigmoid_segments)
+        if self._sigmoid_K < 1:
+            raise ValueError("HybridZ sigmoid_segments must be positive")
+        self._fuse_sigmoid_affine: bool = bool(cfg.fuse_sigmoid_affine)
         self._var_id_stride: int = 1
         setattr(self, "_HZ_MAX_INPUT_DIM", cfg.max_input_dim)
         self._sparse_next_frame_id: int = 0
@@ -216,14 +221,45 @@ class HybridzTF(RegistryTF):
 
     def side_state_signature(self, layer_id: int):
         lid = int(layer_id)
+        target = self._sigmoid_affine_targets.get(lid, lid)
         return (
             self._hz_sig(self._hz_cache.get(lid)),
             self._sparse_hz_sig(self._sparse_hz_cache.get(lid)),
             self._sparse_drop_reasons.get(lid),
+            self._hz_sig(self._sigmoid_affine_inputs.get(target)),
         )
 
     _HZ_MAX_INPUT_DIM = 1024
     _SPARSE_MAX_AFFINE_CELLS = 8_000_000
+
+    @staticmethod
+    def _find_sigmoid_affine_targets(net: Net) -> Dict[int, int]:
+        shape_only = {
+            LayerKind.FLATTEN.value,
+            LayerKind.RESHAPE.value,
+        }
+        targets: Dict[int, int] = {}
+        for layer in net.layers:
+            if layer.kind.upper() != LayerKind.SIGMOID.value:
+                continue
+            current = layer.id
+            chain = [current]
+            while True:
+                successors = net.succs.get(current, [])
+                if len(successors) != 1:
+                    break
+                successor = successors[0]
+                if net.preds.get(successor, []) != [current]:
+                    break
+                kind = net.by_id[successor].kind.upper()
+                if kind == LayerKind.DENSE.value:
+                    targets.update((node, successor) for node in chain)
+                    break
+                if kind not in shape_only:
+                    break
+                current = successor
+                chain.append(current)
+        return targets
 
     def _col_ids_from_vars(self, bounds: Bounds, var_ids) -> Optional[torch.Tensor]:
         if not var_ids:
@@ -385,11 +421,17 @@ class HybridzTF(RegistryTF):
             self._hz_cache.clear()
             self._sparse_hz_cache.clear()
             self._sparse_drop_reasons.clear()
+            self._sigmoid_affine_inputs.clear()
             self._sparse_frame_widths.clear()
             self._sparse_relu_slots.clear()
             self._cache_net_id = net_id
             self._var_id_stride = self._net_var_id_stride(net)
             self._sparse_next_frame_id = 0
+            self._sigmoid_affine_targets = (
+                self._find_sigmoid_affine_targets(net)
+                if self._fuse_sigmoid_affine
+                else {}
+            )
 
         self._set_context(net, before, after)
         self._seed_sparse_cache(L, input_bounds)

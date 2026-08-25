@@ -533,6 +533,22 @@ def sparse_hz_apply_layer(L, hz: SparseHZono, input_bounds: Bounds, result: Fact
 
 def tf_dense(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
+    sigmoid_in = tf._sigmoid_affine_inputs.get(L.id)
+    if sigmoid_in is not None:
+        W = L.params["weight"].to(sigmoid_in.c)
+        bias = L.params.get("bias")
+        bias = (
+            sigmoid_in.c.new_zeros(W.shape[0])
+            if bias is None
+            else bias.to(sigmoid_in.c).flatten()
+        )
+        hz = hz_apply_sigmoid(sigmoid_in, tf._sigmoid_K, affine=(W, bias))
+        fact = interval.tf_dense(L, bounds)
+        if _hz_exceeds_limit(tf, L, hz):
+            tf._hz_cache.pop(L.id, None)
+            return fact
+        tf._hz_cache[L.id] = hz
+        return _hz_fact(fact, hz)
     if hz_in is not None:
         W = L.params["weight"].to(hz_in.c)
         in_dim = W.shape[1]
@@ -617,6 +633,15 @@ def tf_tanh(L, bounds, tf):
 def tf_sigmoid(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     fact = interval.tf_sigmoid(L, bounds)
+    target = tf._sigmoid_affine_targets.get(L.id)
+    if target is not None:
+        tf._sigmoid_affine_inputs.pop(target, None)
+        if hz_in is not None:
+            W = tf._net.by_id[target].params["weight"]
+            if hz_in.c.shape[0] == W.shape[1]:
+                tf._sigmoid_affine_inputs[target] = hz_in
+                tf._hz_cache.pop(L.id, None)
+                return fact
     if hz_in is not None:
         hz_out = hz_apply_sigmoid(hz_in, K=tf._sigmoid_K)
         if _hz_exceeds_limit(tf, L, hz_out):
@@ -1309,6 +1334,114 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
     return _hz_apply_relu_family(hz, alpha_arg)
 
 
+def _project_s_curve_affine(
+    hz, affine, new_c, lb_w, ub_w, wide_idx, owner,
+    center_x, center_y, g1_x, g1_y, g2_x, g2_y,
+):
+    W, bias = affine
+    W, bias = W.to(hz.c), bias.to(hz.c).flatten()
+    device = hz.c.device
+    ng, nb, nc = hz.Gc.shape[1], hz.Gb.shape[1], hz.Ac.shape[0]
+    m, r = int(wide_idx.numel()), int(owner.numel())
+
+    x_min = center_x - g1_x.abs() - g2_x.abs()
+    x_max = center_x + g1_x.abs() + g2_x.abs()
+    y_min_seg = center_y - g1_y.abs() - g2_y.abs()
+    y_max_seg = center_y + g1_y.abs() + g2_y.abs()
+    y_min = hz.c.new_full((m,), float("inf"))
+    y_max = hz.c.new_full((m,), float("-inf"))
+    y_min.scatter_reduce_(0, owner, y_min_seg, reduce="amin", include_self=True)
+    y_max.scatter_reduce_(0, owner, y_max_seg, reduce="amax", include_self=True)
+    y_mid, y_rad = (y_min + y_max) / 2.0, (y_max - y_min) / 2.0
+    new_c[wide_idx] = y_mid.unsqueeze(1)
+
+    det = g1_x * g2_y - g2_x * g1_y
+    safe_det = torch.where(det.abs() < 1e-14, torch.ones_like(det), det)
+    nx = torch.stack([g2_y, -g2_y, -g1_y, g1_y], dim=1) / safe_det[:, None]
+    ny = torch.stack([-g2_x, g2_x, g1_x, -g1_x], dim=1) / safe_det[:, None]
+    rhs = 1.0 + nx * center_x[:, None] + ny * center_y[:, None]
+    degenerate = det.abs() < 1e-14
+    if degenerate.any():
+        nx[degenerate] = hz.c.new_tensor([1.0, -1.0, 0.0, 0.0])
+        ny[degenerate] = hz.c.new_tensor([0.0, 0.0, 1.0, -1.0])
+        rhs[degenerate] = torch.stack(
+            [x_max, -x_min, y_max_seg, -y_min_seg], dim=1
+        )[degenerate]
+    rhs += 64.0 * torch.finfo(hz.c.dtype).eps * (1.0 + rhs.abs())
+
+    facet_owner = owner.repeat_interleave(4)
+    nx, ny, rhs = nx.flatten(), ny.flatten(), rhs.flatten()
+    x_lo, x_hi = lb_w[facet_owner], ub_w[facet_owner]
+    y_lo, y_hi = y_min[facet_owner], y_max[facet_owner]
+    max_lhs = (
+        torch.where(nx >= 0, nx * x_hi, nx * x_lo)
+        + torch.where(ny >= 0, ny * y_hi, ny * y_lo)
+    )
+    big_m = (max_lhs - rhs).clamp_min(0.0)
+    big_m += 64.0 * torch.finfo(hz.c.dtype).eps * (1.0 + max_lhs.abs())
+
+    ng_total, nb_total = ng + m, nb + r
+    rows = m + 4 * r
+    Ac = hz.c.new_zeros(rows, ng_total)
+    Ab = hz.c.new_zeros(rows, nb_total)
+    b = hz.c.new_zeros(rows, 1)
+    segment_cols = nb + torch.arange(r, device=device)
+    Ab[owner, segment_cols] = 1.0
+    b[:m, 0] = torch.bincount(owner, minlength=m).to(hz.c) - 2.0
+
+    ineq = m + torch.arange(4 * r, device=device)
+    input_rows = wide_idx[facet_owner]
+    Ac[ineq, :ng] = nx[:, None] * hz.Gc[input_rows]
+    Ac[ineq, ng + facet_owner] = ny * y_rad[facet_owner]
+    if nb:
+        Ab[ineq, :nb] = nx[:, None] * hz.Gb[input_rows]
+    Ab[ineq, segment_cols.repeat_interleave(4)] = -big_m / 2.0
+    b[ineq, 0] = (
+        rhs + big_m / 2.0
+        - nx * hz.c[input_rows, 0] - ny * y_mid[facet_owner]
+    )
+
+    old_Ac = torch.cat([hz.Ac, hz.c.new_zeros(nc, m)], dim=1)
+    old_Ab = torch.cat([hz.Ab, hz.c.new_zeros(nc, r)], dim=1)
+    old_mask = (
+        hz.eq_mask.to(device)
+        if hz.eq_mask is not None
+        else torch.ones(nc, dtype=torch.bool, device=device)
+    )
+    col_ids = bcol_ids = None
+    if hz.col_ids is not None and hz.col_ids.numel() == ng:
+        base_binary_ids = (
+            torch.zeros(0, dtype=torch.long, device=device)
+            if hz.bcol_ids is None and nb == 0 else hz.bcol_ids
+        )
+        if base_binary_ids is not None and base_binary_ids.numel() == nb:
+            col_ids = torch.cat([hz.col_ids.to(device), hz_fresh_col_ids(m, device)])
+            bcol_ids = torch.cat(
+                [base_binary_ids.to(device), hz_fresh_col_ids(r, device)]
+            )
+
+    out_Gc = hz.c.new_zeros(W.shape[0], ng_total)
+    out_Gc[:, ng:] = W[:, wide_idx] * y_rad
+    out = HZono(
+        c=W @ new_c + bias.view(-1, 1),
+        Gc=out_Gc,
+        Gb=hz.c.new_zeros(W.shape[0], nb_total),
+        Ac=torch.cat([old_Ac, Ac], dim=0),
+        Ab=torch.cat([old_Ab, Ab], dim=0),
+        b=torch.cat([hz.b, b], dim=0),
+        eq_mask=torch.cat([
+            old_mask,
+            torch.ones(m, dtype=torch.bool, device=device),
+            torch.zeros(4 * r, dtype=torch.bool, device=device),
+        ]),
+        col_ids=col_ids,
+        bcol_ids=bcol_ids,
+    )
+    if hasattr(hz, "full_col_ids"):
+        out.full_col_ids = hz.full_col_ids
+    return out
+
+
 def hz_apply_piecewise(
     hz: HZono,
     func,
@@ -1316,6 +1449,7 @@ def hz_apply_piecewise(
     K: int = 2,
     *,
     inflection: float = 0.0,
+    affine=None,
 ) -> HZono:
     """Sound inflection-split S-curve enclosure for monotone activations.
 
@@ -1349,7 +1483,7 @@ def hz_apply_piecewise(
     new_Gb_base[narrow] = 0.0
 
     if m == 0:
-        return HZono(
+        out = HZono(
             c=new_c,
             Gc=new_Gc_base,
             Gb=new_Gb_base,
@@ -1360,6 +1494,10 @@ def hz_apply_piecewise(
             col_ids=None if hz.col_ids is None else hz.col_ids.clone(),
             bcol_ids=None if hz.bcol_ids is None else hz.bcol_ids.clone(),
         )
+        if affine is not None:
+            W, bias = affine
+            out = hz_add_const(hz_multiply(out, W.to(out.c)), bias.to(out.c))
+        return out
 
     lb_w, ub_w = lb[wide_idx], ub[wide_idx]
     p = torch.clamp(torch.full_like(lb_w, float(inflection)), min=lb_w, max=ub_w)
@@ -1420,6 +1558,12 @@ def hz_apply_piecewise(
     g1_y = g1_y * scale_factor
     g2_x = g2_x * scale_factor
     g2_y = g2_y * scale_factor
+
+    if affine is not None:
+        return _project_s_curve_affine(
+            hz, affine, new_c, lb_w, ub_w, wide_idx, owner,
+            centers_x, centers_y, g1_x, g1_y, g2_x, g2_y,
+        )
 
     center_y_sum = torch.bincount(owner, weights=centers_y, minlength=m).to(dtype)
     center_x_sum = torch.bincount(owner, weights=centers_x, minlength=m).to(dtype)
@@ -1524,13 +1668,14 @@ def hz_apply_piecewise(
     return out
 
 
-def hz_apply_sigmoid(hz: HZono, K: int = 2) -> HZono:
+def hz_apply_sigmoid(hz: HZono, K: int = 2, *, affine=None) -> HZono:
     return hz_apply_piecewise(
         hz,
         torch.sigmoid,
         lambda x: torch.sigmoid(x) * (1 - torch.sigmoid(x)),
         K,
         inflection=0.0,
+        affine=affine,
     )
 
 

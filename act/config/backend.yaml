@@ -99,6 +99,10 @@ backend:
     tolerance: 0.0000001
     # HybridZ generator/input dimension fallback limit (used by the HybridZ TF).
     max_input_dim: 1024
+    # Segments per side of the sigmoid inflection point.
+    sigmoid_segments: 2
+    # Project eligible Sigmoid -> Dense chains without materializing Sigmoid HZ rows.
+    fuse_sigmoid_affine: false
 
   # ─────────────────────────────────────────────────────────────────────────
   # Dual 
