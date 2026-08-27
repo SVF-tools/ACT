@@ -104,6 +104,11 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --tf-modes hybridz --solvers torchlp
 
+      - name: HybridZ fused Sigmoid-affine projection (float64)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_sigmoid.json --device cpu --dtype float64 --tf-mode hybridz --solver torchlp --hz-fuse-sigmoid-affine
+
       # Solver 3: DualSolver (Wong-Kolter dual backward, no LP cascade)
       - name: Solver = dual (Wong-Kolter dual backward, float64)
         run: |
