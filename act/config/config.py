@@ -360,7 +360,7 @@ class HybridZConfig:
     tolerance: float = 1e-7
     max_input_dim: int = 1024
     sigmoid_segments: int = 2
-    fuse_sigmoid_affine: bool = True
+    fuse_sigmoid_affine: bool = False
 
 
 @dataclass

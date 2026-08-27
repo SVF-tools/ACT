@@ -102,7 +102,7 @@ backend:
     # Segments per side of the sigmoid inflection point.
     sigmoid_segments: 2
     # Project eligible Sigmoid -> Dense chains without materializing Sigmoid HZ rows.
-    fuse_sigmoid_affine: true
+    fuse_sigmoid_affine: false
 
   # ─────────────────────────────────────────────────────────────────────────
   # Dual 

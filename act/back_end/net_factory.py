@@ -2397,13 +2397,11 @@ def _lt_spec_tanh() -> Dict[str, Any]:
 
 
 def _lt_spec_sigmoid() -> Dict[str, Any]:
-    # SIGMOID: input [-3, 3] hits the saturation region; the following DENSE
-    # also exercises HybridZ's optional fused Sigmoid-affine projection.
+    # SIGMOID: input [-3, 3] hits the saturation region, exercising
+    # tf_sigmoid's PWL relaxation in tf_mlp.py.
     return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
         {"kind": LayerKind.SIGMOID.value, "params": {}},
-        {"kind": LayerKind.DENSE.value,
-         "params": {"in_features": 4, "out_features": 3, "use_bias": True}},
-        _lt_assert_le([1.0, 1.0, 1.0], 100.0),
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
     ]}
 
 

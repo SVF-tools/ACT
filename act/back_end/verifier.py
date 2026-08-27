@@ -859,6 +859,105 @@ def _make_dense_net_box_test(  # pragma: no cover
     return Net(layers=layers, preds=preds, succs=succs)
 
 
+def _test_hybridz_fused_sigmoid_affine_soundness() -> None:  # pragma: no cover
+    from act.back_end.analyze import analyze, initialize_tf_mode
+    from act.back_end.core import Fact, ConSet, Layer, Net
+    from act.back_end.transfer_functions import get_transfer_function
+    from act.config.config import HybridZConfig
+    from act.front_end.specs import OutputSpec
+    from act.util.device_manager import get_default_dtype
+
+    dtype = get_default_dtype()
+    n_in = n_out = 2
+    in_vars = [0, 1]
+    sigmoid_vars = [2, 3]
+    out_vars = [4, 5]
+    lb = torch.full((1, n_in), -2.0, dtype=dtype)
+    ub = torch.full((1, n_in), 2.0, dtype=dtype)
+    weight = torch.tensor([[1.25, -0.75], [-0.5, 1.5]], dtype=dtype)
+    bias = torch.tensor([0.1, -0.2], dtype=dtype)
+    encoded = OutputSpec(
+        kind="LINEAR_LE",
+        c=torch.ones(n_out, dtype=dtype),
+        d=torch.tensor(10.0, dtype=dtype),
+    ).encode_linear(B=1, n_out=n_out, device=lb.device, dtype=dtype)
+
+    layers = [
+        Layer(
+            id=0,
+            kind=LayerKind.INPUT.value,
+            params={"shape": (1, n_in), "dtype": str(dtype)},
+            in_vars=[],
+            out_vars=in_vars,
+        ),
+        Layer(
+            id=1,
+            kind=LayerKind.INPUT_SPEC.value,
+            params={"kind": "BOX", "lb": lb, "ub": ub},
+            in_vars=in_vars,
+            out_vars=in_vars,
+        ),
+        Layer(
+            id=2,
+            kind=LayerKind.SIGMOID.value,
+            params={},
+            in_vars=in_vars,
+            out_vars=sigmoid_vars,
+        ),
+        Layer(
+            id=3,
+            kind=LayerKind.DENSE.value,
+            params={
+                "weight": weight,
+                "weight_pos": weight.clamp(min=0),
+                "weight_neg": weight.clamp(max=0),
+                "bias": bias,
+                "in_features": n_in,
+                "out_features": n_out,
+                "input_shape": (n_in,),
+            },
+            in_vars=sigmoid_vars,
+            out_vars=out_vars,
+        ),
+        Layer(
+            id=4,
+            kind=LayerKind.ASSERT.value,
+            params=encoded,
+            in_vars=out_vars,
+            out_vars=out_vars,
+        ),
+    ]
+    net = Net(
+        layers=layers,
+        preds={0: [], 1: [0], 2: [1], 3: [2], 4: [3]},
+        succs={0: [1], 1: [2], 2: [3], 3: [4], 4: []},
+    )
+
+    try:
+        initialize_tf_mode(
+            "hybridz",
+            HybridZConfig(fuse_sigmoid_affine=True, sigmoid_segments=2),
+        )
+        entry_fact = Fact(bounds=Bounds(lb, ub), cons=ConSet())
+        _, after, _ = analyze(net, entry_id=0, entry_fact=entry_fact)
+        active_tf = get_transfer_function()
+        assert active_tf._sigmoid_affine_targets.get(2) == 3
+        assert 3 in active_tf._sigmoid_affine_inputs
+
+        axis = torch.linspace(-2.0, 2.0, 41, dtype=dtype)
+        samples = torch.cartesian_prod(axis, axis)
+        concrete = torch.sigmoid(samples) @ weight.T + bias
+        out_bounds = after[3].bounds
+        assert (concrete >= out_bounds.lb.reshape(1, -1) - 1e-10).all(), (
+            "fused Sigmoid-affine lower bound excludes a concrete output"
+        )
+        assert (concrete <= out_bounds.ub.reshape(1, -1) + 1e-10).all(), (
+            "fused Sigmoid-affine upper bound excludes a concrete output"
+        )
+    finally:
+        initialize_tf_mode("interval")
+
+
 def _make_attn_dual_planar_net(  # pragma: no cover
     B: int, L: int, D: int, H: int,
     center: torch.Tensor, eps: float,
@@ -2105,6 +2204,7 @@ def _test_verify_once_b8_mixed_outcomes() -> None:  # pragma: no cover
 _TESTS = [  # pragma: no cover
     _test_verify_once_b3_all_certified,
     _test_verify_once_b8_mixed_outcomes,
+    _test_hybridz_fused_sigmoid_affine_soundness,
     _test_att_scores_dual_planar_analyze_soundness,
     _test_att_scores_dual_planar_verify_once_certified,
     _test_att_scores_dual_planar_lp_export_solve,
