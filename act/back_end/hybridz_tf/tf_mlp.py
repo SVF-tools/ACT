@@ -21,6 +21,7 @@ except ImportError:
     np = None
     sp = None
 from act.back_end.core import Bounds, Fact
+from act.back_end.transfer_functions import is_hybridz_solver_active
 from act.back_end.solver.solver_hz import (
     HZono,
     SparseHZono,
@@ -46,6 +47,7 @@ from act.back_end.solver.solver_hz import (
     sparse_hz_lift_bounds,
     sparse_hz_linear,
     sparse_hz_matmul_relaxation,
+    sparse_hz_obbt_bounds,
     sparse_hz_pad_frame,
     sparse_hz_reduce_sum_rows,
     sparse_hz_reframe_point,
@@ -514,6 +516,11 @@ def sparse_hz_apply_relu_exact(
 def _sparse_apply_relu(L, hz: SparseHZono, input_bounds: Bounds, tf):
     lb, ub = _sparse_relu_bounds(hz, input_bounds)
     unstable_idx = np.flatnonzero((lb < 0.0) & (ub > 0.0)).astype(np.int64)
+    if unstable_idx.size and is_hybridz_solver_active():
+        lb, ub = sparse_hz_obbt_bounds(
+            hz, lb, ub, unstable_idx, time_limit=10.0
+        )
+        unstable_idx = np.flatnonzero((lb < 0.0) & (ub > 0.0)).astype(np.int64)
     reservation = tf._sparse_relu_slots_for(hz, L.id, unstable_idx)
     if reservation is None:
         return None, "sparse_relu_size_limit"

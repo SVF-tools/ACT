@@ -29,6 +29,11 @@ except ImportError:
     sp = None
     _HAS_SCIPY = False
 
+try:
+    import highspy
+except ImportError:
+    highspy = None
+
 
 # ============================================================================
 # 1. HZono dataclass
@@ -2100,6 +2105,8 @@ class _HZMILP:
     integrality: "np.ndarray"
     n_cont: int
     n_bin: int
+    cont_source: "np.ndarray"
+    bin_source: "np.ndarray"
 
     @property
     def n_var(self) -> int:
@@ -2113,8 +2120,54 @@ class _MILPResult:
     nodes: int = 0
 
 
+@dataclass(frozen=True)
+class _MIPObjectiveResult:
+    upper_bound: Optional[float]
+    x: Optional["np.ndarray"]
+    nodes: int = 0
+
+
 def _row_sum(mat) -> "np.ndarray":
     return np.asarray(mat.sum(axis=1), dtype=np.float64).reshape(-1)
+
+
+def _coalesce_antiparallel_rows(A, row_lb, row_ub):
+    A = A.tocsr()
+    A.sum_duplicates()
+    A.eliminate_zeros()
+    A.sort_indices()
+    row_lb = np.asarray(row_lb, dtype=np.float64).copy()
+    row_ub = np.asarray(row_ub, dtype=np.float64).copy()
+    representatives = {}
+    keep = []
+    lower = []
+    upper = []
+    for row in range(A.shape[0]):
+        start, stop = A.indptr[row], A.indptr[row + 1]
+        indices = A.indices[start:stop]
+        values = A.data[start:stop]
+        key = (indices.tobytes(), values.tobytes())
+        negated = (indices.tobytes(), (-values).tobytes())
+        if key in representatives:
+            target = representatives[key]
+            lower[target] = max(lower[target], row_lb[row])
+            upper[target] = min(upper[target], row_ub[row])
+        elif negated in representatives:
+            target = representatives[negated]
+            lower[target] = max(lower[target], -row_ub[row])
+            upper[target] = min(upper[target], -row_lb[row])
+        else:
+            representatives[key] = len(keep)
+            keep.append(row)
+            lower.append(row_lb[row])
+            upper.append(row_ub[row])
+    if len(keep) == A.shape[0]:
+        return A, row_lb, row_ub
+    return (
+        A[np.asarray(keep, dtype=np.int64)],
+        np.asarray(lower, dtype=np.float64),
+        np.asarray(upper, dtype=np.float64),
+    )
 
 
 def _lower_hz_milp(hz: "HZono | SparseHZono") -> _HZMILP:
@@ -2142,6 +2195,21 @@ def _lower_hz_milp(hz: "HZono | SparseHZono") -> _HZMILP:
     else:
         raise TypeError(f"unsupported HZ representation: {type(hz).__name__}")
 
+    used_cont = np.asarray(Gc.getnnz(axis=0)).reshape(-1) != 0
+    used_bin = np.asarray(Gb.getnnz(axis=0)).reshape(-1) != 0
+    if eq_Ac.shape[0]:
+        used_cont |= np.asarray(eq_Ac.getnnz(axis=0)).reshape(-1) != 0
+        used_bin |= np.asarray(eq_Ab.getnnz(axis=0)).reshape(-1) != 0
+    if le_Ac.shape[0]:
+        used_cont |= np.asarray(le_Ac.getnnz(axis=0)).reshape(-1) != 0
+        used_bin |= np.asarray(le_Ab.getnnz(axis=0)).reshape(-1) != 0
+    cont_source = np.flatnonzero(used_cont).astype(np.int64, copy=False)
+    bin_source = np.flatnonzero(used_bin).astype(np.int64, copy=False)
+    Gc, Gb = Gc[:, cont_source], Gb[:, bin_source]
+    eq_Ac, eq_Ab = eq_Ac[:, cont_source], eq_Ab[:, bin_source]
+    le_Ac, le_Ab = le_Ac[:, cont_source], le_Ab[:, bin_source]
+    n_cont, n_bin = cont_source.size, bin_source.size
+
     value_center = np.asarray(c, dtype=np.float64).reshape(-1) - _row_sum(Gb)
     value_matrix = sp.hstack([Gc, 2.0 * Gb], format="csr")
     blocks, lowers, uppers = [], [], []
@@ -2158,6 +2226,7 @@ def _lower_hz_milp(hz: "HZono | SparseHZono") -> _HZMILP:
     A = sp.vstack(blocks, format="csr") if blocks else sparse_empty(0, n_cont + n_bin)
     row_lb = np.concatenate(lowers) if lowers else np.zeros(0, dtype=np.float64)
     row_ub = np.concatenate(uppers) if uppers else np.zeros(0, dtype=np.float64)
+    A, row_lb, row_ub = _coalesce_antiparallel_rows(A, row_lb, row_ub)
     return _HZMILP(
         value_center=value_center,
         value_matrix=value_matrix,
@@ -2175,6 +2244,8 @@ def _lower_hz_milp(hz: "HZono | SparseHZono") -> _HZMILP:
         ]),
         n_cont=n_cont,
         n_bin=n_bin,
+        cont_source=cont_source,
+        bin_source=bin_source,
     )
 
 
@@ -2265,6 +2336,217 @@ def _solve_hz_feasibility(
     return _MILPResult("unknown", None, nodes)
 
 
+def _add_highs_model(solver, model: _HZMILP) -> None:
+    solver.addVars(model.n_var, model.var_lb, model.var_ub)
+    if model.A.shape[0]:
+        A = model.A.tocsr()
+        solver.addRows(
+            A.shape[0],
+            model.row_lb,
+            model.row_ub,
+            A.nnz,
+            A.indptr.astype(np.int32, copy=False),
+            A.indices.astype(np.int32, copy=False),
+            A.data,
+        )
+
+
+def _set_highs_integrality(solver, model: _HZMILP) -> None:
+    if model.n_bin:
+        binary = np.arange(model.n_cont, model.n_var, dtype=np.int32)
+        types = np.full(model.n_bin, highspy.HighsVarType.kInteger, dtype=object)
+        solver.changeColsIntegrality(model.n_bin, binary, types)
+
+
+class _HighsLPRelaxation:
+    def __init__(self, model: _HZMILP):
+        if highspy is None:
+            raise RuntimeError("highspy is unavailable")
+        self.model = model
+        self.solver = highspy.Highs()
+        self.solver.setOptionValue("output_flag", False)
+        self.solver.setOptionValue("solver", "simplex")
+        self.solver.setOptionValue("presolve", "on")
+        self.solver.setOptionValue("simplex_strategy", 1)
+        self.solver.setOptionValue("threads", 1)
+        self.solver.setOptionValue("primal_feasibility_tolerance", 1e-8)
+        self.solver.setOptionValue("dual_feasibility_tolerance", 1e-8)
+        self.solver.setOptionValue("mip_feasibility_tolerance", 1e-8)
+        A = model.A.tocsr()
+        lp = highspy.HighsLp()
+        lp.num_col_ = model.n_var
+        lp.num_row_ = A.shape[0]
+        lp.col_cost_ = np.zeros(model.n_var, dtype=np.float64)
+        lp.col_lower_ = model.var_lb
+        lp.col_upper_ = model.var_ub
+        lp.row_lower_ = model.row_lb
+        lp.row_upper_ = model.row_ub
+        lp.a_matrix_.format_ = highspy.MatrixFormat.kRowwise
+        lp.a_matrix_.start_ = A.indptr.astype(np.int32, copy=False)
+        lp.a_matrix_.index_ = A.indices.astype(np.int32, copy=False)
+        lp.a_matrix_.value_ = A.data
+        self.solver.passModel(lp)
+        self.solver.changeObjectiveSense(highspy.ObjSense.kMaximize)
+        self.indices = np.arange(model.n_var, dtype=np.int32)
+        self.costs = np.zeros(model.n_var, dtype=np.float64)
+
+    def maximize(self, coeff, offset: float, deadline: float) -> Optional[float]:
+        coeff = coeff.tocsr()
+        if coeff.nnz == 0:
+            return float(offset)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return None
+        self.costs.fill(0.0)
+        self.costs[coeff.indices] = coeff.data
+        self.solver.changeColsCost(self.model.n_var, self.indices, self.costs)
+        self.solver.setOptionValue("time_limit", remaining)
+        self.solver.run()
+        if self.solver.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+            return None
+        value = float(offset + self.solver.getObjectiveValue())
+        return value + 1e-7 * (1.0 + abs(value))
+
+    def maximize_mip(
+        self,
+        coeff,
+        offset: float,
+        deadline: float,
+        *,
+        cutoff: float,
+        feasibility_tol: float,
+    ) -> _MIPObjectiveResult:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return _MIPObjectiveResult(None, None)
+        coeff = coeff.tocsr()
+        costs = np.zeros(self.model.n_var, dtype=np.float64)
+        costs[coeff.indices] = -coeff.data
+        solver = highspy.Highs()
+        solver.setOptionValue("output_flag", False)
+        solver.setOptionValue("threads", 1)
+        solver.setOptionValue("presolve", "on")
+        solver.setOptionValue("mip_rel_gap", 0.0)
+        solver.setOptionValue("mip_heuristic_effort", 0.0)
+        solver.setOptionValue("mip_lp_solver", "ipm")
+        _add_highs_model(solver, self.model)
+        solver.changeColsCost(self.model.n_var, self.indices, costs)
+        _set_highs_integrality(solver, self.model)
+        guard = 2e-7 * (1.0 + abs(cutoff))
+        solver.changeObjectiveSense(highspy.ObjSense.kMinimize)
+        solver.setOptionValue("objective_bound", offset - cutoff + guard)
+        solver.setOptionValue(
+            "objective_target",
+            offset - cutoff - 2.0 * feasibility_tol,
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return _MIPObjectiveResult(None, None)
+        solver.setOptionValue("time_limit", remaining)
+        solver.run()
+        status = solver.getModelStatus()
+        info = solver.getInfo()
+        nodes = max(0, int(getattr(info, "mip_node_count", 0) or 0))
+        safe_statuses = {
+            highspy.HighsModelStatus.kInfeasible,
+            highspy.HighsModelStatus.kObjectiveBound,
+        }
+        if status in safe_statuses:
+            return _MIPObjectiveResult(
+                np.nextafter(cutoff, -np.inf),
+                None,
+                nodes,
+            )
+        bound_statuses = {
+            highspy.HighsModelStatus.kOptimal,
+            highspy.HighsModelStatus.kTimeLimit,
+            highspy.HighsModelStatus.kObjectiveTarget,
+        }
+        dual = (
+            float(getattr(info, "mip_dual_bound", np.inf))
+            if status in bound_statuses
+            else np.inf
+        )
+        upper = None
+        if np.isfinite(dual):
+            value = float(offset - dual)
+            upper = value + 1e-7 * (1.0 + abs(value))
+        solution = solver.getSolution()
+        x = None
+        if bool(solution.value_valid):
+            candidate = np.asarray(solution.col_value, dtype=np.float64)
+            if _valid_milp_point(
+                self.model,
+                candidate,
+                self.model.A,
+                self.model.row_lb,
+                self.model.row_ub,
+                feasibility_tol,
+            ):
+                x = candidate
+        return _MIPObjectiveResult(upper, x, nodes)
+
+
+def sparse_hz_obbt_bounds(
+    hz: SparseHZono,
+    lb,
+    ub,
+    rows,
+    *,
+    time_limit: float,
+):
+    lb = np.asarray(lb, dtype=np.float64).reshape(-1).copy()
+    ub = np.asarray(ub, dtype=np.float64).reshape(-1).copy()
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if highspy is None or rows.size == 0 or time_limit <= 0.0:
+        return lb, ub
+    model = _lower_hz_milp(hz)
+    if model.value_center.size != lb.size or ub.size != lb.size:
+        raise ValueError("sparse OBBT bounds do not match HZ outputs")
+    if model.n_var == 0:
+        return np.maximum(lb, model.value_center), np.minimum(ub, model.value_center)
+
+    solver = highspy.Highs()
+    solver.setOptionValue("output_flag", False)
+    solver.setOptionValue("solver", "simplex")
+    solver.setOptionValue("presolve", "off")
+    solver.setOptionValue("threads", 1)
+    _add_highs_model(solver, model)
+
+    indices = np.arange(model.n_var, dtype=np.int32)
+    costs = np.zeros(model.n_var, dtype=np.float64)
+    deadline = time.monotonic() + float(time_limit)
+    priority = rows[np.argsort(np.minimum(-lb[rows], ub[rows]))]
+    primary = {
+        int(row): (-1.0 if ub[row] <= -lb[row] else 1.0)
+        for row in priority
+    }
+    for opposite in (False, True):
+        for row in priority:
+            if lb[row] >= 0.0 or ub[row] <= 0.0:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return lb, ub
+            coeff = model.value_matrix.getrow(int(row))
+            costs.fill(0.0)
+            costs[coeff.indices] = coeff.data
+            sense = primary[int(row)] * (-1.0 if opposite else 1.0)
+            solver.setOptionValue("time_limit", remaining)
+            solver.changeColsCost(model.n_var, indices, sense * costs)
+            solver.run()
+            if solver.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+                return lb, ub
+            objective = float(solver.getInfo().objective_function_value)
+            value = model.value_center[row] + sense * objective
+            guard = 1e-7 * (1.0 + abs(value))
+            if sense > 0.0:
+                lb[row] = max(lb[row], value - guard)
+            else:
+                ub[row] = min(ub[row], value + guard)
+    return lb, ub
+
+
 class HZSolver(Solver):
     """Open-source Hybrid Zonotope bounds and verdict solver."""
 
@@ -2300,11 +2582,13 @@ class HZSolver(Solver):
     ) -> Optional[torch.Tensor]:
         if input_hz is None or input_hz.n_out != int(np.prod(input_shape)):
             return None
-        if input_hz.n_cont > model.n_cont or input_hz.n_bin > model.n_bin:
-            return None
-        xi_c = x[:model.n_cont][:input_hz.n_cont]
-        z = x[model.n_cont:model.n_cont + model.n_bin][:input_hz.n_bin]
-        xi_b = 2.0 * z - 1.0
+        xi_c = np.zeros(input_hz.n_cont, dtype=np.float64)
+        input_cont = model.cont_source < input_hz.n_cont
+        xi_c[model.cont_source[input_cont]] = x[:model.n_cont][input_cont]
+        xi_b = -np.ones(input_hz.n_bin, dtype=np.float64)
+        input_bin = model.bin_source < input_hz.n_bin
+        z = x[model.n_cont:]
+        xi_b[model.bin_source[input_bin]] = 2.0 * z[input_bin] - 1.0
         value = input_hz.c.copy()
         if input_hz.n_cont:
             value += np.asarray(input_hz.Gc @ xi_c).reshape(-1)
@@ -2348,11 +2632,18 @@ class HZSolver(Solver):
         M = int(encoded["M"])
         is_unsafe_linear = encoded["kind"] == OutKind.UNSAFE_LINEAR
         started = time.monotonic()
-        deadline = started + float(
-            self.time_limit if timelimit is None else timelimit
-        )
+        budget = float(self.time_limit if timelimit is None else timelimit)
+        deadline = started + budget
+        lp_deadline = min(deadline, started + max(1.0, 0.2 * budget))
+        feasibility_tol = max(self.tolerance, 1e-7)
         solves = 0
         nodes = 0
+        warm_lp = None
+        if not is_unsafe_linear and highspy is not None:
+            try:
+                warm_lp = _HighsLPRelaxation(model)
+            except Exception as exc:
+                logger.debug("HybridZ warm LP setup failed: %s", exc)
 
         def solve(extra_A=None, extra_lb=None, extra_ub=None) -> _MILPResult:
             nonlocal solves, nodes
@@ -2362,16 +2653,33 @@ class HZSolver(Solver):
                 extra_A=extra_A,
                 extra_lb=extra_lb,
                 extra_ub=extra_ub,
-                feasibility_tol=max(self.tolerance, 1e-7),
+                feasibility_tol=feasibility_tol,
             )
             solves += 1
             nodes += result.nodes
             return result
 
-        base = solve()
-        if base.status != "feasible":
-            reason = "empty_hz" if base.status == "infeasible" else "base_unknown"
-            return self._unknown_results(B, reason)
+        def maximize_lp(coeff, offset: float) -> Optional[float]:
+            nonlocal solves
+            if warm_lp is None:
+                return None
+            solves += 1
+            return warm_lp.maximize(coeff, offset, lp_deadline)
+
+        def maximize_mip(
+            coeff, offset: float, cutoff: float
+        ) -> _MIPObjectiveResult:
+            nonlocal solves, nodes
+            result = warm_lp.maximize_mip(
+                coeff,
+                offset,
+                deadline,
+                cutoff=cutoff,
+                feasibility_tol=feasibility_tol,
+            )
+            solves += 1
+            nodes += result.nodes
+            return result
 
         exact_witness = (
             isinstance(output_hz, SparseHZono)
@@ -2391,6 +2699,18 @@ class HZSolver(Solver):
                 "representation": representation,
                 "reason": reason,
             }
+
+        def falsified(lane: int, witness, reason: str) -> Optional[VerifyResult]:
+            counterexample = self._recover_input(
+                model, witness, input_hz, input_shape, lane
+            )
+            if counterexample is None:
+                return None
+            return VerifyResult(
+                VerifyStatus.FALSIFIED,
+                counterexample=counterexample,
+                metadata=metadata(lane, reason),
+            )
 
         for lane in range(B):
             start, stop = lane * n_out, (lane + 1) * n_out
@@ -2426,71 +2746,113 @@ class HZSolver(Solver):
                             if np.all(values <= t_lane - self.tolerance):
                                 witness = contracted.x
                     if witness is not None:
-                        counterexample = self._recover_input(
-                            model, witness, input_hz, input_shape, lane
+                        lane_result = falsified(
+                            lane, witness, "exact_unsafe_witness"
                         )
-                        if counterexample is not None:
-                            lane_result = VerifyResult(
-                                VerifyStatus.FALSIFIED,
-                                counterexample=counterexample,
-                                metadata=metadata(lane, "exact_unsafe_witness"),
-                            )
                 if lane_result is None:
                     lane_result = VerifyResult(
                         VerifyStatus.UNKNOWN,
                         metadata=metadata(lane, "unsafe_region_undecided"),
                     )
             else:
-                undecided = False
+                hard_rows = []
+                continuous_upper = sparse_abs_row_sum(
+                    coeff[:, :model.n_cont]
+                )
+                binary_upper = (
+                    np.asarray(
+                        coeff[:, model.n_cont:].maximum(0.0).sum(axis=1)
+                    ).reshape(-1)
+                    if model.n_bin else np.zeros(M, dtype=np.float64)
+                )
+                box_upper = const + continuous_upper + binary_upper
                 for row in range(M):
+                    cutoff = float(t_lane[row] - self.tolerance)
+                    if box_upper[row] < cutoff:
+                        continue
+                    relaxed = (
+                        None
+                        if model.n_bin >= 512
+                        else maximize_lp(coeff[row], float(const[row]))
+                    )
+                    if relaxed is not None and relaxed < cutoff:
+                        continue
+                    hard_rows.append((
+                        row,
+                        float(box_upper[row]) if relaxed is None else relaxed,
+                    ))
+                    if time.monotonic() >= deadline:
+                        break
+
+                undecided = (
+                    len(hard_rows) > 0
+                    or len(hard_rows) < M and time.monotonic() >= deadline
+                )
+                hard_rows.sort(key=lambda item: item[1], reverse=True)
+                for row, _ in hard_rows:
+                    cutoff = float(t_lane[row] - self.tolerance)
+                    if warm_lp is not None:
+                        optimized = maximize_mip(
+                            coeff[row], float(const[row]), cutoff
+                        )
+                        if (
+                            optimized.upper_bound is not None
+                            and optimized.upper_bound < cutoff
+                        ):
+                            undecided = False
+                            continue
+                        witness = optimized.x
+                        if witness is not None and exact_witness:
+                            value = const[row] + float(
+                                (coeff[row] @ witness).item()
+                            )
+                            if value >= t_lane[row] + self.tolerance:
+                                lane_result = falsified(
+                                    lane, witness, "exact_violation_witness"
+                                )
+                        if lane_result is not None:
+                            break
+                        undecided = True
+                        break
                     expanded = solve(
                         coeff[row],
-                        np.array([t_lane[row] - self.tolerance - const[row]]),
+                        np.array([cutoff - const[row]]),
                         np.array([np.inf]),
                     )
                     if expanded.status == "infeasible":
+                        undecided = False
                         continue
-                    if not exact_witness:
-                        undecided = True
-                        break
                     witness = None
                     if expanded.status == "feasible":
                         value = const[row] + float((coeff[row] @ expanded.x).item())
-                        if value >= t_lane[row] + self.tolerance:
-                            witness = expanded.x
-                        else:
-                            contracted = solve(
-                                coeff[row],
-                                np.array([t_lane[row] + self.tolerance - const[row]]),
-                                np.array([np.inf]),
-                            )
-                            if contracted.status == "feasible":
-                                value = const[row] + float(
-                                    (coeff[row] @ contracted.x).item()
+                        if exact_witness:
+                            if value >= t_lane[row] + self.tolerance:
+                                witness = expanded.x
+                            else:
+                                contracted = solve(
+                                    coeff[row],
+                                    np.array([
+                                        t_lane[row] + self.tolerance - const[row]
+                                    ]),
+                                    np.array([np.inf]),
                                 )
-                                if value >= t_lane[row] + self.tolerance:
+                                if contracted.status == "feasible":
                                     witness = contracted.x
                     if witness is not None:
-                        counterexample = self._recover_input(
-                            model, witness, input_hz, input_shape, lane
+                        lane_result = falsified(
+                            lane, witness, "exact_violation_witness"
                         )
-                        if counterexample is not None:
-                            lane_result = VerifyResult(
-                                VerifyStatus.FALSIFIED,
-                                counterexample=counterexample,
-                                metadata=metadata(lane, "exact_violation_witness"),
-                            )
+                        if lane_result is not None:
                             break
                     undecided = True
-                    if time.monotonic() >= deadline:
-                        break
+                    break
                 if lane_result is None:
                     lane_result = VerifyResult(
                         VerifyStatus.UNKNOWN if undecided else VerifyStatus.CERTIFIED,
                         metadata=metadata(
                             lane,
-                            "violation_region_undecided" if undecided
-                            else "expanded_violations_infeasible",
+                            "objective_bound_undecided" if undecided
+                            else "objective_bounds_safe",
                         ),
                     )
             results.append(lane_result)

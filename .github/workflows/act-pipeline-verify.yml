@@ -49,7 +49,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install coverage onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" tensorflow pandas numpy scipy highspy pyyaml tqdm psutil transformers scikit-learn
 
       - name: Fetch VNNLIB benchmarks (authenticated sparse checkout, avoids raw.githubusercontent rate-limit)
         uses: actions/checkout@v4
@@ -111,10 +111,10 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify vnnlib --category collins_rul_cnn_2022 --max-instances 5 --solvers dual --validate-soundness --device cpu --dtype float64
 
-      - name: Verify vit_2023 (interval / hybridz / dual) with two-level soundness validation
+      - name: Verify vit_2023 (interval / HybridZ TF + solver / dual) with two-level soundness validation
         run: |
           cd ${{ github.workspace }}
-          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers hybridz" "--solvers dual"; do
             coverage run -p -m act.pipeline --verify vnnlib --category vit_2023 --max-instances 1 $combo --validate-soundness --device cpu --dtype float64
           done
 
