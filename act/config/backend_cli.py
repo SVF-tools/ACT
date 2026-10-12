@@ -201,13 +201,12 @@ def _make_solver(
         return GurobiSolver(config=gurobi_config)
     if solver_name == "torchlp":
         return TorchLPSolver(config=torchlp_config)
-    # "auto": try Gurobi, fall back to TorchLP
-    try:
-        from act.back_end.solver.solver_gurobi import GurobiSolver
+    # "auto": Gurobi when gurobipy is importable, otherwise TorchLP
+    from act.back_end.solver.solver_gurobi import GurobiSolver, is_gurobi_available
 
+    if is_gurobi_available():
         return GurobiSolver(config=gurobi_config)
-    except Exception:
-        return TorchLPSolver(config=torchlp_config)
+    return TorchLPSolver(config=torchlp_config)
 
 
 def explicit_bab_fields(args: argparse.Namespace) -> set[str]:

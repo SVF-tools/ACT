@@ -904,31 +904,21 @@ class FSBBranching(BaBSRBranching):
 
         N = batch.batch_size
         baseline = batch.parent_margins
-        try:
-            result = self._evaluate_hypotheses(net, bounds_dict, hypothesis_list)
-            stacked_margins = result.margins.to(device=batch.lb.device, dtype=batch.lb.dtype)
-            if stacked_margins.dim() == 1:
-                stacked_margins = stacked_margins.reshape(1, -1)
-            if stacked_margins.dim() > 2:
-                stacked_margins = stacked_margins.reshape(stacked_margins.shape[0], N, -1).mean(dim=-1)
-            if stacked_margins.shape[0] != len(hypothesis_list):
-                raise ValueError("KFSB solver returned wrong candidate dimension")
-            if stacked_margins.shape[1] != N:
-                stacked_margins = stacked_margins.reshape(len(hypothesis_list), N, -1).mean(dim=-1)
-            improvements = (
-                stacked_margins - baseline.to(stacked_margins.device).unsqueeze(0)
-                if baseline is not None
-                else stacked_margins
-            )
-        except (TypeError, NotImplementedError, ValueError):
-            # Legacy solvers without batched hypotheses use serial evaluation.
-            improvements = self._evaluate_hypotheses_serial(
-                net,
-                bounds_dict,
-                hypothesis_list,
-                baseline,
-                N,
-            )
+        result = self._evaluate_hypotheses(net, bounds_dict, hypothesis_list)
+        stacked_margins = result.margins.to(device=batch.lb.device, dtype=batch.lb.dtype)
+        if stacked_margins.dim() == 1:
+            stacked_margins = stacked_margins.reshape(1, -1)
+        if stacked_margins.dim() > 2:
+            stacked_margins = stacked_margins.reshape(stacked_margins.shape[0], N, -1).mean(dim=-1)
+        if stacked_margins.shape[0] != len(hypothesis_list):
+            raise ValueError("KFSB solver returned wrong candidate dimension")
+        if stacked_margins.shape[1] != N:
+            stacked_margins = stacked_margins.reshape(len(hypothesis_list), N, -1).mean(dim=-1)
+        improvements = (
+            stacked_margins - baseline.to(stacked_margins.device).unsqueeze(0)
+            if baseline is not None
+            else stacked_margins
+        )
 
         if bool(torch.isneginf(improvements).all().item()):
             return bsr
@@ -973,50 +963,6 @@ class FSBBranching(BaBSRBranching):
             optimize=False,
         )
 
-    def _evaluate_hypotheses_serial(
-        self,
-        net: Net,
-        bounds_dict: Optional[Dict[int, Bounds]],
-        hypothesis_list: List[Dict[int, torch.Tensor]],
-        baseline: Optional[torch.Tensor],
-        N: int,
-    ) -> torch.Tensor:
-        improvements = torch.full(
-            (len(hypothesis_list), N),
-            float("-inf"),
-            device=next(iter(hypothesis_list[0].values())).device,
-            dtype=next(iter(hypothesis_list[0].values())).dtype,
-        )
-        for c_idx, hypo in enumerate(hypothesis_list):
-            result = None
-            try:
-                result = self._evaluate_hypothesis(net, bounds_dict, hypo)
-            except (TypeError, NotImplementedError):
-                # Legacy solver/mock does not support this hypothesis representation.
-                result = None
-            if result is None:
-                continue
-            margins = result.margins.reshape(N, -1).mean(dim=-1).to(improvements)
-            improvements[c_idx] = margins - baseline.to(margins.device) if baseline is not None else margins
-        return improvements
-
-    def _evaluate_hypothesis(
-        self,
-        net: Net,
-        bounds_dict: Optional[Dict[int, Bounds]],
-        split_signs: Dict[int, torch.Tensor],
-    ) -> Any:
-        if bounds_dict is None:
-            raise ValueError("FSB hypothesis evaluation requires bounds_dict")
-        c = self._zero_objective(net, bounds_dict)
-        return self.dual_solver.compute_certified_bound(
-            net,
-            bounds_dict,
-            c,
-            M=1,
-            split_signs=split_signs,
-            optimize=False,
-        )
 
     def _zero_objective(
         self,

@@ -549,16 +549,10 @@ class ACTFuzzer:
         total_time = time.time() - self.start_time
 
         # Neurons that were never activated across all iterations
-        never_activated_neurons: List[Tuple[str, int]] = []
-        never_activated_count = 0
-        try:
-            uncovered = self.coverage_tracker.get_uncovered_neurons()
-            never_activated_count = len(uncovered)
-            # Deterministic small sample for logs/report
-            never_activated_neurons = sorted(list(uncovered))[:20]
-        except Exception:
-            never_activated_count = 0
-            never_activated_neurons = []
+        uncovered = self.coverage_tracker.get_uncovered_neurons()
+        never_activated_count = len(uncovered)
+        # Deterministic small sample for logs/report
+        never_activated_neurons: List[Tuple[str, int]] = sorted(list(uncovered))[:20]
 
         report = FuzzingReport(
             total_iterations=self.iterations,

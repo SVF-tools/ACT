@@ -313,12 +313,14 @@ For Common Operations (list, search, download, info):
                 print(f"  • {name}")
         except ValueError as e:
             print(f"Error: {e}")
+            raise
     
     elif args.dataset:
         try:
             print_dataset_detail(args.dataset)
         except ValueError as e:
             print(f"Error: {e}")
+            raise
     
     elif args.summary:
         print_mapping_summary()
@@ -335,10 +337,7 @@ For Common Operations (list, search, download, info):
             split=args.split
         )
         
-        if result['status'] == 'error':
-            print(f"\n❌ Error: {result['message']}")
-            if 'traceback' in result:
-                print(f"\nDetails:\n{result['traceback']}")
+        assert result['status'] == 'success', f"Download failed: {result['message']}"
         # Success message already printed by download function
     
     elif args.list_downloads:
@@ -432,12 +431,10 @@ For Common Operations (list, search, download, info):
             print(f"✗ Error: {e}")
             print(f"\nThe dataset-model pair has not been downloaded yet.")
             print(f"Use: python -m act.front_end.torchvision_loader.cli --download {dataset_name} {model_name}")
+            raise
         except ValueError as e:
             print(f"✗ Error: {e}")
-        except Exception as e:
-            print(f"✗ Unexpected error: {e}")
-            import traceback
-            print(f"\nDetails:\n{traceback.format_exc()}")
+            raise
     
     elif args.models_for:
         # Show all recommended models for a dataset (case-insensitive)
@@ -497,6 +494,7 @@ For Common Operations (list, search, download, info):
         except ValueError as e:
             print(f"Error: {e}")
             print(f"Use --list to see all available datasets")
+            raise
     
     elif args.datasets_for:
         # Show all datasets that can run inference with a model (case-insensitive)
@@ -603,18 +601,17 @@ For Common Operations (list, search, download, info):
                     print(f"  Dataset samples: {result['num_samples']}")
             
             print(f"{rule()}")
+            assert result['status'] == 'success', f"Inference failed: {result.get('error')}"
             
         except FileNotFoundError as e:
             print(f"\n✗ Error: Dataset-model pair not found locally")
             print(f"   {e}")
             print(f"\nDownload first with:")
             print(f"   python -m act.front_end.torchvision_loader.cli --download {dataset_name} {model_name}")
+            raise
         except ValueError as e:
             print(f"\n✗ Error: {e}")
-        except Exception as e:
-            print(f"\n✗ Unexpected error: {e}")
-            import traceback
-            print(f"\nDetails:\n{traceback.format_exc()}")
+            raise
     
     elif args.validate:
         user_dataset, user_model = args.validate
@@ -643,6 +640,7 @@ For Common Operations (list, search, download, info):
             print(f"{rule(100)}")
         except ValueError as e:
             print(f"Error: {e}")
+            raise
     
     elif args.show_preprocessing:
         try:
@@ -677,6 +675,7 @@ For Common Operations (list, search, download, info):
             print(f"{rule(100)}")
         except ValueError as e:
             print(f"Error: {e}")
+            raise
     
     else:
         # Default: show quick examples

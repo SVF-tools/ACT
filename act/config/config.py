@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from importlib import import_module
 import math
 from pathlib import Path
@@ -365,18 +365,6 @@ class BaBConfig:
         merged.update({k: v for k, v in overrides.items() if k in valid_keys})
 
         return cls(**merged)
-
-    def to_yaml(self, path: Union[str, Path]) -> Path:
-        """Write BaB settings to a standalone YAML file (top-level ``bab`` key)."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, "w") as f:
-            yaml.dump(
-                {"bab": asdict(self)}, f, default_flow_style=False, sort_keys=False
-            )
-
-        return path
 
 
 def _validate_bab_presets(
@@ -789,38 +777,6 @@ class BackendConfig:
     def bab_preset_values(self, name: str) -> dict[str, Any]:
         """Return a validated named preset from the canonical backend YAML."""
         return load_bab_preset(name)
-
-    def to_yaml(self, path: Union[str, Path]) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        d = asdict(self)
-        bab_d = d.pop("bab")
-        d.pop("generation")
-        hz_d = d.pop("hybridz")
-        gurobi_d = d.pop("gurobi")
-        torchlp_d = d.pop("torchlp")
-        dual_d = d.pop("dual")
-        bab_enabled = d.pop("bab_enabled")
-        bab_d["enabled"] = bab_enabled
-
-        with open(path, "w") as f:
-            yaml.dump(
-                {
-                    "backend": {
-                        **d,
-                        "bab": bab_d,
-                        "hybridz": hz_d,
-                        "gurobi": gurobi_d,
-                        "torchlp": torchlp_d,
-                        "dual": dual_d,
-                    }
-                },
-                f,
-                default_flow_style=False,
-                sort_keys=False,
-            )
-        return path
 
 
 if __name__ == "__main__":

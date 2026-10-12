@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple
 import logging
 import torch
 import torch.nn as nn
@@ -518,38 +518,3 @@ def validate_onnx_file(onnx_path: Path) -> bool:
     return True
 
 
-def convert_and_save_pytorch(
-    onnx_path: Path,
-    output_path: Optional[Path] = None,
-    simplify: bool = True
-) -> Path:
-    """
-    Convert ONNX model to PyTorch and save as .pt file.
-    
-    Args:
-        onnx_path: Path to .onnx file
-        output_path: Path for .pt file (defaults to same dir as ONNX)
-        simplify: Whether to simplify ONNX before conversion
-        
-    Returns:
-        Path to saved .pt file
-        
-    Raises:
-        ONNXConversionError: If conversion or saving fails
-    """
-    try:
-        # Convert to PyTorch
-        pytorch_model = convert_onnx_to_pytorch(onnx_path, simplify=simplify)
-        
-        # Determine output path
-        if output_path is None:
-            output_path = onnx_path.with_suffix('.pt')
-        
-        # Save model
-        torch.save(pytorch_model.state_dict(), output_path)
-        logger.info(f"Saved PyTorch model to {output_path}")
-        
-        return output_path
-        
-    except Exception as e:
-        raise ONNXConversionError(f"Failed to convert and save: {str(e)}")

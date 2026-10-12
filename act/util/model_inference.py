@@ -91,7 +91,9 @@ def model_inference(models: Dict[Union[str, Tuple], nn.Module]) -> Dict[Union[st
         test_label = input_layer.label
         
         # Move input to same device as model
-        model_device = next(model.parameters()).device
+        # Parameter-free models (e.g. pure-constant ONNX nets) keep the input's device.
+        first_param = next(model.parameters(), None)
+        model_device = first_param.device if first_param is not None else test_input.device
         test_input = test_input.to(model_device)
         
         # Parse combo_id: handle tuple keys (dataset, model, in_kind, out_kind)
@@ -112,9 +114,12 @@ def model_inference(models: Dict[Union[str, Tuple], nn.Module]) -> Dict[Union[st
         success, output, error_msg = infer_single_model(combo_id, model, test_input)
         
         if success:
-            # Validate prediction against ground truth label tensor (N,), output is (N, num_classes)
-            pred_classes = output.argmax(dim=1)  # (N,)
-            is_correct = (pred_classes == test_label).all().item()
+            # Validate prediction against ground truth label tensor (N,), output is (N, num_classes).
+            # Unlabelled or non-classification outputs (e.g. VNNLIB safety nets) have no accuracy.
+            is_correct = False
+            if test_label is not None and test_label.numel() > 0 and output.dim() >= 2:
+                pred_classes = output.argmax(dim=1)  # (N,)
+                is_correct = (pred_classes == test_label).all().item()
             
             success_count += 1
             if is_correct:

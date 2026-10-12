@@ -60,27 +60,8 @@ class Layer:
         
         return lb, ub
     
-    def get_all_var_bounds(self, fact: 'Fact', is_output: bool = True) -> Dict[int, Tuple[float, float]]:
-        """Get dict of {var_id: (lb, ub)} for all variables. Use is_output=True for out_vars, False for in_vars."""
-        var_list = self.out_vars if is_output else self.in_vars
-        
-        bounds_dict = {}
-        for var_id in var_list:
-            bounds_dict[var_id] = self.get_bounds_for_var(fact, var_id, is_output)
-        
-        return bounds_dict
     
-    def get_input_shape(self) -> Optional[Tuple[int, ...]]:
-        """Get input shape from params, or None if not stored."""
-        if self.kind == "INPUT":
-            return self.params.get("shape")
-        return self.params.get("input_shape")
     
-    def get_output_shape(self) -> Optional[Tuple[int, ...]]:
-        """Get output shape from params, or None if not stored."""
-        if self.kind == "INPUT":
-            return self.params.get("shape")
-        return self.params.get("output_shape")
     
     def get_tensor(self, key: str, default: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """Get tensor parameter. Returns default if missing or not a tensor."""
@@ -107,13 +88,7 @@ class Layer:
         """Check if parameter is a tensor."""
         return isinstance(self.params.get(key), torch.Tensor)
     
-    def get_num_input_vars(self) -> int:
-        """Get number of input variables (flattened dimension)."""
-        return len(self.in_vars)
     
-    def get_num_output_vars(self) -> int:
-        """Get number of output variables (flattened dimension)."""
-        return len(self.out_vars)
 
 @dataclass
 class Net:
@@ -132,10 +107,6 @@ class Net:
         validate_wrapper_graph(self.layers)
 
     # helpers
-    def last_validation(self) -> Optional[Layer]:
-        for L in reversed(self.layers):
-            if L.is_validation(): return L
-        return None
 
     def assert_last_is_validation(self) -> None:
         if not self.layers or not self.layers[-1].is_validation():
@@ -158,12 +129,6 @@ class Net:
         return [self.get_predecessor_bounds(layer_id, after, before, i) 
                 for i in range(len(self.preds[layer_id]))]
     
-    def get_layer_shape(self, layer_id: int, facts: Dict[int, 'Fact'], 
-                        is_output: bool = True) -> Tuple[int, ...]:
-        """Get shape from bounds tensor in facts dict. Use is_output=True for output shape, False for input."""
-        if layer_id not in facts:
-            raise KeyError(f"Layer {layer_id} not found in facts dictionary")
-        return facts[layer_id].bounds.lb.shape
         
         
 def topological_sort(net: Net, reverse: bool = False) -> List[int]:
@@ -251,23 +216,6 @@ class ConSet:
                           "lb": B.lb.detach().reshape(-1).clone(),
                           "ub": B.ub.detach().reshape(-1).clone()}))
         
-    def add_op(self, tag: str, var_ids: List[int], **meta):
-        """
-        Generic operator constraint container.
-        - tag: e.g. "dense:12", "relu:5"
-        - var_ids: ordered exactly as exporter expects
-        - meta: payload used by cons_exportor.py
-        """
-        op = tag.split(":", 1)[0]
-        if op and not self._is_op_supported_by_exporter(op):
-            raise ValueError(
-                f"Unknown op tag '{op}' (tag='{tag}'). "
-                "Update act/back_end/layer_schema.py SUPPORTED_EXPORT_OPS "
-                "and exporter handling if intentional."
-            )
-        m = {"tag": tag}
-        m.update(meta)
-        self.replace(Con("INEQ", tuple(var_ids), m))
     
     @staticmethod
     def _is_op_supported_by_exporter(op: str) -> bool:

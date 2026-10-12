@@ -176,15 +176,12 @@ def parse_vnnlib_to_tensors(
         # Constraints inside (or ...) branches must not be intersected here —
         # that would produce empty boxes for disjunctive-input properties
         # (e.g. ACAS Xu prop_5..10).
-        try:
-            forms = _parse_all_forms(content)
-            simple_bodies = [
-                f[1] for f in forms
-                if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"
-                and _is_simple_x_bound(f[1])
-            ]
-        except Exception:
-            simple_bodies = []
+        forms = _parse_all_forms(content)
+        simple_bodies = [
+            f[1] for f in forms
+            if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"
+            and _is_simple_x_bound(f[1])
+        ]
         input_bounds = _extract_input_bounds(simple_bodies, num_inputs)
         
         # Create input tensor from bounds center
@@ -674,16 +671,12 @@ def _extract_input_bounds(
             continue
         x_tok = left if x_is_left else right
         lit_tok = right if x_is_left else left
-        try:
-            val = float(lit_tok)
-        except (TypeError, ValueError):
-            continue
+        val = float(lit_tok)  # _is_simple_x_bound admitted only numeric literals
         x_match = _X_RE.fullmatch(x_tok)
         if x_match is None:
             continue
         idx = int(x_match.group(1))
-        if idx >= num_inputs:
-            continue
+        assert idx < num_inputs, f"X_{idx} is bounded but the property declares {num_inputs} inputs"
         # (<= X val)  -> X <= val   (upper)
         # (>= X val)  -> X >= val   (lower)
         # (<= val X)  -> val <= X   -> X >= val (lower)

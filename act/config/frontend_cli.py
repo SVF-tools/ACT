@@ -221,6 +221,7 @@ def print_unified_info(name: str, explicit_creator: Optional[str] = None):
     except ValueError as e:
         print(f"Error: {e}")
         print(f"\nTip: Use --search to find available names or --creator to override detection")
+        raise
 
 
 def handle_unified_download(name: str, explicit_creator: Optional[str] = None):
@@ -243,23 +244,16 @@ def handle_unified_download(name: str, explicit_creator: Optional[str] = None):
             info = tv_mapping.get_dataset_info(normalized_name)
             models = info.get('models', [])
             
-            if not models:
-                print(f"⚠️  No models available for {normalized_name}")
-                return
+            assert models, f"No models available for {normalized_name}"
             
             print(f"Downloading dataset '{normalized_name}' with {len(models)} models...\n")
             
             success_count = 0
             for model in models:
-                try:
-                    result = tv_loader.download_dataset_model_pair(normalized_name, model)
-                    if result['status'] == 'success':
-                        print(f"✓ {normalized_name} + {model}")
-                        success_count += 1
-                    else:
-                        print(f"✗ {normalized_name} + {model} - {result['message']}")
-                except Exception as e:
-                    print(f"✗ {normalized_name} + {model} - Error: {e}")
+                result = tv_loader.download_dataset_model_pair(normalized_name, model)
+                assert result['status'] == 'success', f"{normalized_name} + {model}: {result['message']}"
+                print(f"✓ {normalized_name} + {model}")
+                success_count += 1
             
             print(f"\n{rule(100)}")
             print(f"Downloaded {success_count}/{len(models)} model pairs")
@@ -275,36 +269,29 @@ def handle_unified_download(name: str, explicit_creator: Optional[str] = None):
             print(f"  • VNNLIB property files")
             print(f"  • instances.csv mapping\n")
             
-            try:
-                result = vnnlib_loader.download_vnnlib_category(normalized_name)
-                
-                if result['status'] == 'success':
-                    print(f"\n{rule(100)}")
-                    print(f"✓ Successfully downloaded category: {normalized_name}")
-                    print(f"  Location: {result['category_path']}")
-                    print(f"  Instances: {result['num_instances']}")
-                    print(f"{rule(100)}\n")
-                else:
-                    print(f"\n{rule(100)}")
-                    print(f"✗ Download failed: {result['message']}")
-                    print(f"\nNote: VNNLIB benchmarks must be downloaded manually from VNN-COMP.")
-                    print(f"Expected location: data/vnnlib/{normalized_name}/")
-                    print(f"\nManual download steps:")
-                    print(f"  1. Visit: https://github.com/ChristopherBrix/vnncomp_benchmarks")
-                    print(f"  2. Download the '{normalized_name}' benchmark")
-                    print(f"  3. Extract to: data/vnnlib/{normalized_name}/")
-                    print(f"  4. Ensure structure includes:")
-                    print(f"     - onnx/         (ONNX model files)")
-                    print(f"     - vnnlib/       (VNNLIB property files)")
-                    print(f"     - instances.csv (benchmark instances)")
-                    print(f"{rule(100)}\n")
-                    
-            except Exception as e:
+            result = vnnlib_loader.download_vnnlib_category(normalized_name)
+            
+            if result['status'] != 'success':
                 print(f"\n{rule(100)}")
-                print(f"✗ Download error: {e}")
+                print(f"✗ Download failed: {result['message']}")
                 print(f"\nNote: VNNLIB benchmarks must be downloaded manually from VNN-COMP.")
                 print(f"Expected location: data/vnnlib/{normalized_name}/")
+                print(f"\nManual download steps:")
+                print(f"  1. Visit: https://github.com/ChristopherBrix/vnncomp_benchmarks")
+                print(f"  2. Download the '{normalized_name}' benchmark")
+                print(f"  3. Extract to: data/vnnlib/{normalized_name}/")
+                print(f"  4. Ensure structure includes:")
+                print(f"     - onnx/         (ONNX model files)")
+                print(f"     - vnnlib/       (VNNLIB property files)")
+                print(f"     - instances.csv (benchmark instances)")
                 print(f"{rule(100)}\n")
+            assert result['status'] == 'success', f"Download failed: {result['message']}"
+            
+            print(f"\n{rule(100)}")
+            print(f"✓ Successfully downloaded category: {normalized_name}")
+            print(f"  Location: {result['category_path']}")
+            print(f"  Instances: {result['num_instances']}")
+            print(f"{rule(100)}\n")
         elif creator_name == 'bert':
             print("BERT datasets are file-based.")
             print(f"Expected raw files under data/{normalized_name}/")
@@ -312,6 +299,7 @@ def handle_unified_download(name: str, explicit_creator: Optional[str] = None):
         
     except ValueError as e:
         print(f"Error: {e}")
+        raise
 
 
 def print_list_downloads(creator: Optional[str] = None):
@@ -408,7 +396,7 @@ def print_creator_info(name: str) -> None:
     except ValueError as e:
         print(f"Error: {e}")
         print(f"Available creators: {list_creators()}")
-        return
+        raise
 
     print(f"\n{rule(100)}")
     print(f"CREATOR: {name.upper()}")
@@ -754,28 +742,25 @@ Examples:
         print(f"MODEL SYNTHESIS - {creator_name.upper()}")
         print(f"{rule(100)}\n")
         
-        try:
-            from act.front_end.model_synthesis import model_synthesis
-            from act.util.model_inference import model_inference
-            
-            wrapped_models = model_synthesis(
-                creator=creator_name,
-                spec_overrides=_build_spec_overrides(args),
-                text_verification_overrides=_build_text_verification_overrides(args),
-            )
-            print(f"\n✓ Successfully synthesized {len(wrapped_models)} models")
-            
-            # Automatically run inference after synthesis
-            print(f"\n{rule(100)}")
-            print(f"MODEL INFERENCE - {creator_name.upper()}")
-            print(f"{rule(100)}\n")
-            
-            # model_inference extracts input from InputLayer 
-            successful_models = model_inference(cast(Any, wrapped_models))
-            print(f"\n✓ Successfully ran inference on {len(successful_models)}/{len(wrapped_models)} models")
-            print(f"  Models are ready for verification")
-        except Exception as e:
-            print(f"\n✗ Synthesis/Inference failed: {e}")
+        from act.front_end.model_synthesis import model_synthesis
+        from act.util.model_inference import model_inference
+        
+        wrapped_models = model_synthesis(
+            creator=creator_name,
+            spec_overrides=_build_spec_overrides(args),
+            text_verification_overrides=_build_text_verification_overrides(args),
+        )
+        print(f"\n✓ Successfully synthesized {len(wrapped_models)} models")
+        
+        # Automatically run inference after synthesis
+        print(f"\n{rule(100)}")
+        print(f"MODEL INFERENCE - {creator_name.upper()}")
+        print(f"{rule(100)}\n")
+        
+        # model_inference extracts input from InputLayer 
+        successful_models = model_inference(cast(Any, wrapped_models))
+        print(f"\n✓ Successfully ran inference on {len(successful_models)}/{len(wrapped_models)} models")
+        print(f"  Models are ready for verification")
     
     elif args.inference:
         creator_name = args.creator if args.creator else 'torchvision'
@@ -783,86 +768,80 @@ Examples:
         print(f"MODEL INFERENCE - {creator_name.upper()}")
         print(f"{rule(100)}\n")
         
-        try:
-            # Get downloaded pairs for the creator
-            downloaded_pairs = []
-            if creator_name == 'torchvision':
-                downloaded_pairs = tv_loader.list_downloaded_pairs()
-            elif creator_name == 'vnnlib':
-                from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
-                downloaded_pairs = vnnlib_loader.list_downloaded_pairs()
+        # Get downloaded pairs for the creator
+        downloaded_pairs = []
+        if creator_name == 'torchvision':
+            downloaded_pairs = tv_loader.list_downloaded_pairs()
+        elif creator_name == 'vnnlib':
+            from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
+            downloaded_pairs = vnnlib_loader.list_downloaded_pairs()
+        
+        if not downloaded_pairs:
+            print(f"⚠️  No downloaded models found for creator '{creator_name}'")
+            print(f"   Use --download to download datasets/categories first")
+            print(f"   Example: python -m act.front_end --download MNIST --creator {creator_name}")
+        assert downloaded_pairs, f"No downloaded models found for creator '{creator_name}'"
+        print(f"Found {len(downloaded_pairs)} downloaded pair(s) for {creator_name}")
+        print(f"Running inference on downloaded models...\n")
+        
+        results = []
+        
+        # Run inference on each downloaded pair
+        if creator_name == 'torchvision':
+            for pair_info in downloaded_pairs:
+                dataset_name = pair_info['dataset']
+                model_name = pair_info['model']
+                
+                # Test the pair
+                result = tv_loader.model_inference_with_dataset(
+                    dataset_name=dataset_name,
+                    model_name=model_name,
+                    split='test',
+                    verbose=False
+                )
+                results.append(result)
+                
+                # Print result
+                if result['status'] == 'success':
+                    print(f"✓ {dataset_name:20s} + {model_name:20s} - Output: {result['output_shape']}")
+                else:
+                    print(f"✗ {dataset_name:20s} + {model_name:20s} - Error: {result.get('error', 'Unknown')[:50]}")
+        
+        elif creator_name == 'vnnlib':
+            from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
             
-            if not downloaded_pairs:
-                print(f"⚠️  No downloaded models found for creator '{creator_name}'")
-                print(f"   Use --download to download datasets/categories first")
-                print(f"   Example: python -m act.front_end --download MNIST --creator {creator_name}")
-            else:
-                print(f"Found {len(downloaded_pairs)} downloaded pair(s) for {creator_name}")
-                print(f"Running inference on downloaded models...\n")
+            for pair_info in downloaded_pairs:
+                category = pair_info['category']
+                onnx_model = pair_info['onnx_model']
+                vnnlib_spec = pair_info['vnnlib_spec']
                 
-                results = []
+                # Test the pair
+                result = vnnlib_loader.model_inference_with_vnnlib(
+                    category=category,
+                    onnx_model=onnx_model,
+                    vnnlib_spec=vnnlib_spec,
+                    verbose=False
+                )
+                results.append(result)
                 
-                # Run inference on each downloaded pair
-                if creator_name == 'torchvision':
-                    for pair_info in downloaded_pairs:
-                        dataset_name = pair_info['dataset']
-                        model_name = pair_info['model']
-                        
-                        # Test the pair
-                        result = tv_loader.model_inference_with_dataset(
-                            dataset_name=dataset_name,
-                            model_name=model_name,
-                            split='test',
-                            verbose=False
-                        )
-                        results.append(result)
-                        
-                        # Print result
-                        if result['status'] == 'success':
-                            print(f"✓ {dataset_name:20s} + {model_name:20s} - Output: {result['output_shape']}")
-                        else:
-                            print(f"✗ {dataset_name:20s} + {model_name:20s} - Error: {result.get('error', 'Unknown')[:50]}")
-                
-                elif creator_name == 'vnnlib':
-                    from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
-                    
-                    for pair_info in downloaded_pairs:
-                        category = pair_info['category']
-                        onnx_model = pair_info['onnx_model']
-                        vnnlib_spec = pair_info['vnnlib_spec']
-                        
-                        # Test the pair
-                        result = vnnlib_loader.model_inference_with_vnnlib(
-                            category=category,
-                            onnx_model=onnx_model,
-                            vnnlib_spec=vnnlib_spec,
-                            verbose=False
-                        )
-                        results.append(result)
-                        
-                        # Print result
-                        if result['status'] == 'success':
-                            print(f"✓ {category:20s} + {result['model']:30s} - Output: {result['output_shape']}")
-                        else:
-                            print(f"✗ {category:20s} + {result['model']:30s} - Error: {result.get('error', 'Unknown')[:50]}")
-                
-                # Summary
-                successful = sum(1 for r in results if r['status'] == 'success')
-                failed = len(results) - successful
-                
-                print(f"\n{rule(100)}")
-                print(f"INFERENCE SUMMARY")
-                print(f"{rule(100)}")
-                print(f"✓ Successful: {successful}/{len(results)}")
-                if failed > 0:
-                    print(f"✗ Failed: {failed}/{len(results)}")
-                print(f"{rule(100)}\n")
-                
-        except Exception as e:
-            import traceback
-            print(f"\n✗ Inference failed: {e}")
-            print(f"\nTraceback:")
-            traceback.print_exc()
+                # Print result
+                if result['status'] == 'success':
+                    print(f"✓ {category:20s} + {result['model']:30s} - Output: {result['output_shape']}")
+                else:
+                    print(f"✗ {category:20s} + {result['model']:30s} - Error: {result.get('error', 'Unknown')[:50]}")
+        
+        # Summary
+        successful = sum(1 for r in results if r['status'] == 'success')
+        failed = len(results) - successful
+        
+        print(f"\n{rule(100)}")
+        print(f"INFERENCE SUMMARY")
+        print(f"{rule(100)}")
+        print(f"✓ Successful: {successful}/{len(results)}")
+        if failed > 0:
+            print(f"✗ Failed: {failed}/{len(results)}")
+        print(f"{rule(100)}\n")
+        assert failed == 0, f"{failed}/{len(results)} inference run(s) failed"
     
     else:
         parser.print_help()

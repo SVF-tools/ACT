@@ -362,7 +362,7 @@ def tokenize(sentence: str) -> list[str]:
         import nltk  # type: ignore[import-untyped]
 
         return nltk.word_tokenize(sentence)
-    except Exception as exc:
+    except (ImportError, LookupError) as exc:  # nltk or its punkt data not installed
         logger.debug("Falling back to regex tokenization: %s", exc)
         return _TOKEN_RE.findall(sentence)
 

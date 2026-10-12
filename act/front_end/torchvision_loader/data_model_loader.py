@@ -131,19 +131,14 @@ def _download_dataset(
         # Archive datasets ship train+test in one archive: download
         # once, then both splits are available regardless of `split`.
         print(f"  • Downloading archive from {dataset_info['download']['url']} ...")
-        try:
-            for split_name in ('test', 'train'):
-                ds = _resolve_external_dataset(
-                    dataset_info, raw_dir,
-                    train=(split_name == 'train'),
-                    download=True,
-                )
-                downloaded_splits.append(split_name)
-                print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
-        except Exception as e:
-            error = f"External archive download failed: {e}"
-            errors.append(error)
-            print("    ⚠ " + error)
+        for split_name in ('test', 'train'):
+            ds = _resolve_external_dataset(
+                dataset_info, raw_dir,
+                train=(split_name == 'train'),
+                download=True,
+            )
+            downloaded_splits.append(split_name)
+            print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
     else:
         import torchvision.datasets
         dataset_class = getattr(torchvision.datasets, dataset_name, None)
@@ -159,19 +154,14 @@ def _download_dataset(
             if split not in (split_name, 'both'):
                 continue
             print(f"  • Downloading {split_name} split...")
-            try:
-                # Split-selection kwarg differs per dataset (train= / split= / image_set= / version= / background= / none), so unpack the per-dataset set declared in split_kwarg.
-                ds = dataset_class(
-                    root=str(raw_dir),
-                    **dataset_info["split_kwarg"][split_name],
-                    download=True
-                )
-                downloaded_splits.append(split_name)
-                print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
-            except Exception as e:
-                error = f"{split_name.capitalize()} split failed: {e}"
-                errors.append(error)
-                print("    ⚠ " + error)
+            # Split-selection kwarg differs per dataset (train= / split= / image_set= / version= / background= / none), so unpack the per-dataset set declared in split_kwarg.
+            ds = dataset_class(
+                root=str(raw_dir),
+                **dataset_info["split_kwarg"][split_name],
+                download=True
+            )
+            downloaded_splits.append(split_name)
+            print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
     
     return downloaded_splits, errors
 
@@ -211,98 +201,93 @@ def download_dataset_model_pair(
         >>> print(result['dataset_path'])
         '/path/to/ACT/data/torchvision/MNIST/raw/'
     """
-    import traceback
-    
     # Use path from config if not specified
     if root_dir is None:
         root_dir = get_torchvision_data_root()
     
-    try:
-        # Normalize names (case-insensitive)
-        dataset_name = find_dataset_name(dataset_name)
-        model_name = find_model_name(model_name)
-        
-        # Validate compatibility
-        validation = validate_dataset_model_compatibility(dataset_name, model_name)
-        if not validation['compatible']:
+    # Normalize names (case-insensitive)
+    dataset_name = find_dataset_name(dataset_name)
+    model_name = find_model_name(model_name)
+    
+    # Validate compatibility
+    validation = validate_dataset_model_compatibility(dataset_name, model_name)
+    if not validation['compatible']:
+        return {
+            'status': 'error',
+            'message': f"Incompatible pair: {', '.join(validation['issues'])}"
+        }
+    
+    # Get dataset info
+    dataset_info = get_dataset_info(dataset_name)
+    
+    # Create directory structure
+    dataset_dir = Path(root_dir) / dataset_name
+    raw_dir = dataset_dir / "raw"
+    models_dir = dataset_dir / "models"
+    
+    # Check if dataset already exists (for incremental download)
+    dataset_exists = dataset_dir.exists() and raw_dir.exists()
+    model_file_path = models_dir / f"{model_name}.py"
+    model_already_exists = model_file_path.exists()
+    
+    if dataset_exists:
+        if model_already_exists:
+            print(f"\n⚠️  Model '{model_name}' already exists for dataset '{dataset_name}'")
+            print(f"   Skipping download (pair already complete)")
             return {
-                'status': 'error',
-                'message': f"Incompatible pair: {', '.join(validation['issues'])}"
+                'status': 'success',
+                'message': f"Model {model_name} already exists for {dataset_name}",
+                'path': str(dataset_dir)
             }
-        
-        # Get dataset info
-        dataset_info = get_dataset_info(dataset_name)
-        
-        # Create directory structure
-        dataset_dir = Path(root_dir) / dataset_name
-        raw_dir = dataset_dir / "raw"
-        models_dir = dataset_dir / "models"
-        
-        # Check if dataset already exists (for incremental download)
-        dataset_exists = dataset_dir.exists() and raw_dir.exists()
-        model_file_path = models_dir / f"{model_name}.py"
-        model_already_exists = model_file_path.exists()
-        
-        if dataset_exists:
-            if model_already_exists:
-                print(f"\n⚠️  Model '{model_name}' already exists for dataset '{dataset_name}'")
-                print(f"   Skipping download (pair already complete)")
-                return {
-                    'status': 'success',
-                    'message': f"Model {model_name} already exists for {dataset_name}",
-                    'path': str(dataset_dir)
-                }
+        else:
+            print(f"\n✓ Dataset '{dataset_name}' already downloaded - adding model '{model_name}'")
+            print(f"  Location: {raw_dir}")
+            
+            # Load existing metadata to check splits
+            info_path = dataset_dir / "info.json"
+            if info_path.exists():
+                with open(info_path, 'r') as f:
+                    existing_metadata = json.load(f)
+                downloaded_splits = existing_metadata.get('splits_downloaded', [])
+                print(f"  Existing splits: {', '.join(downloaded_splits)}")
             else:
-                print(f"\n✓ Dataset '{dataset_name}' already downloaded - adding model '{model_name}'")
-                print(f"  Location: {raw_dir}")
-                
-                # Load existing metadata to check splits
-                info_path = dataset_dir / "info.json"
-                if info_path.exists():
-                    with open(info_path, 'r') as f:
-                        existing_metadata = json.load(f)
-                    downloaded_splits = existing_metadata.get('splits_downloaded', [])
-                    print(f"  Existing splits: {', '.join(downloaded_splits)}")
-                else:
-                    downloaded_splits = []
-                
-                # Create models directory if it doesn't exist
-                models_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            # Fresh download - create directories
-            raw_dir.mkdir(parents=True, exist_ok=True)
+                downloaded_splits = []
+            
+            # Create models directory if it doesn't exist
             models_dir.mkdir(parents=True, exist_ok=True)
-            downloaded_splits = []
-        
-        print(f"\n{rule()}")
-        print(f"{'ADDING MODEL' if dataset_exists else 'DOWNLOADING'}: {dataset_name} + {model_name}")
-        print(f"{rule()}")
-        print(f"Target: {dataset_dir}")
-        if not dataset_exists:
-            print(f"Split: {split}")
-        
-        # Download dataset (only if not already present)
-        if not dataset_exists:
-            print(f"\n[1/3] Downloading dataset...")
+    else:
+        # Fresh download - create directories
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_splits = []
+    
+    print(f"\n{rule()}")
+    print(f"{'ADDING MODEL' if dataset_exists else 'DOWNLOADING'}: {dataset_name} + {model_name}")
+    print(f"{rule()}")
+    print(f"Target: {dataset_dir}")
+    if not dataset_exists:
+        print(f"Split: {split}")
+    
+    # Download dataset (only if not already present)
+    if not dataset_exists:
+        print(f"\n[1/3] Downloading dataset...")
 
-            downloaded_splits, errors = _download_dataset(root_dir, dataset_name, dataset_info, split)
+        downloaded_splits, errors = _download_dataset(root_dir, dataset_name, dataset_info, split)
 
-            if not downloaded_splits:
-                return {
-                    'status': 'error',
-                    'message': f"Failed to download any splits for {dataset_name}, with errors: {"\n".join(errors)}"
-                }
-        else:
-            print(f"\n[1/3] Dataset already present, skipping download...")
-        
-        # Save model architecture
-        print(f"\n[2/3] Saving model architecture...")
-        model_path = models_dir / f"{model_name}.py"
-        
-        import torchvision.models
-        if hasattr(torchvision.models, model_name):
-            # Standard TorchVision model
-            model_code = f"""
+        assert downloaded_splits and not errors, (
+            f"Failed to download {dataset_name}: {'; '.join(errors)}"
+        )
+    else:
+        print(f"\n[1/3] Dataset already present, skipping download...")
+    
+    # Save model architecture
+    print(f"\n[2/3] Saving model architecture...")
+    model_path = models_dir / f"{model_name}.py"
+    
+    import torchvision.models
+    if hasattr(torchvision.models, model_name):
+        # Standard TorchVision model
+        model_code = f"""
 # Standard TorchVision Model: {model_name}
 # Can be loaded with: torchvision.models.{model_name}()
 
@@ -321,106 +306,92 @@ model = models.{model_name}(weights="DEFAULT")
 print(f"Model: {model_name}")
 print(f"Parameters: {{sum(p.numel() for p in model.parameters()):,}}")
 """
+    else:
+        # Custom model - get definition
+        model_code = _get_custom_model_definition(model_name, dataset_info['num_classes'])
+    
+    with open(model_path, 'w') as f:
+        f.write(model_code)
+    print(f"  ✓ Model architecture saved: {model_path}")
+    
+    # Save/update metadata
+    print(f"\n[3/3] Saving metadata...")
+    info_path = dataset_dir / "info.json"
+    
+    # Load existing metadata if it exists
+    if info_path.exists():
+        with open(info_path, 'r') as f:
+            existing_metadata = json.load(f)
+        
+        # Check if this is old format (single model) or new format (list of models)
+        if 'models' not in existing_metadata:
+            # Old format - convert to new format
+            old_model = existing_metadata.get('model')
+            models_list = [old_model] if old_model else []
         else:
-            # Custom model - get definition
-            model_code = _get_custom_model_definition(model_name, dataset_info['num_classes'])
+            models_list = existing_metadata.get('models', [])
         
-        with open(model_path, 'w') as f:
-            f.write(model_code)
-        print(f"  ✓ Model architecture saved: {model_path}")
+        # Add new model if not already in list
+        if model_name not in models_list:
+            models_list.append(model_name)
         
-        # Save/update metadata
-        print(f"\n[3/3] Saving metadata...")
-        info_path = dataset_dir / "info.json"
-        
-        # Load existing metadata if it exists
-        if info_path.exists():
-            try:
-                with open(info_path, 'r') as f:
-                    existing_metadata = json.load(f)
-                
-                # Check if this is old format (single model) or new format (list of models)
-                if 'models' not in existing_metadata:
-                    # Old format - convert to new format
-                    old_model = existing_metadata.get('model')
-                    models_list = [old_model] if old_model else []
-                else:
-                    models_list = existing_metadata.get('models', [])
-                
-                # Add new model if not already in list
-                if model_name not in models_list:
-                    models_list.append(model_name)
-                
-                # Preserve existing splits if incremental
-                if dataset_exists:
-                    downloaded_splits = existing_metadata.get('splits_downloaded', downloaded_splits)
-            except Exception as e:
-                print(f"  ⚠ Could not read existing metadata: {e}")
-                models_list = [model_name]
-        else:
-            models_list = [model_name]
-        
-        # Create updated metadata with list of models
-        metadata = {
-            'dataset': dataset_name,
-            'models': models_list,  # Changed from single 'model' to list 'models'
-            'category': dataset_info['category'],
-            'input_size': dataset_info['input_size'],
-            'num_classes': dataset_info['num_classes'],
-            'splits_downloaded': downloaded_splits,
-            'preprocessing_required': validation['preprocessing_required'],
-            'preprocessing_steps': validation['preprocessing_steps'],
-            'notes': dataset_info['notes'],
-            'paths': {
-                'raw_data': str(raw_dir),
-                'models_directory': str(models_dir),
-                'metadata': str(info_path)
-            }
+        # Preserve existing splits if incremental
+        if dataset_exists:
+            downloaded_splits = existing_metadata.get('splits_downloaded', downloaded_splits)
+    else:
+        models_list = [model_name]
+    
+    # Create updated metadata with list of models
+    metadata = {
+        'dataset': dataset_name,
+        'models': models_list,  # Changed from single 'model' to list 'models'
+        'category': dataset_info['category'],
+        'input_size': dataset_info['input_size'],
+        'num_classes': dataset_info['num_classes'],
+        'splits_downloaded': downloaded_splits,
+        'preprocessing_required': validation['preprocessing_required'],
+        'preprocessing_steps': validation['preprocessing_steps'],
+        'notes': dataset_info['notes'],
+        'paths': {
+            'raw_data': str(raw_dir),
+            'models_directory': str(models_dir),
+            'metadata': str(info_path)
         }
-        
-        with open(info_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        print(f"  ✓ Metadata saved: {info_path}")
-        print(f"  ✓ Models registered: {', '.join(models_list)}")
-        
-        # Calculate directory size
-        total_size_bytes = _get_directory_size(dataset_dir)
-        total_size_formatted = _format_size(total_size_bytes)
-        
-        # Print summary
-        print(f"\n{rule()}")
-        print(f"✓ DOWNLOAD COMPLETE")
-        print(f"{rule()}")
-        print(f"Dataset: {raw_dir}")
-        print(f"Model: {model_path}")
-        print(f"Info: {info_path}")
-        print(f"Size: {total_size_formatted} ({total_size_bytes:,} bytes)")
-        
-        if validation['preprocessing_required']:
-            print(f"\n⚠ Preprocessing Required:")
-            for step in validation['preprocessing_steps']:
-                print(f"  • {step}")
-        
-        return {
-            'status': 'success',
-            'dataset_path': str(raw_dir),
-            'model_path': str(model_path),
-            'info_path': str(info_path),
-            'message': 'Download completed successfully',
-            'metadata': metadata,
-            'size_bytes': total_size_bytes,
-            'size_formatted': total_size_formatted
-        }
-        
-    except AssertionError:
-        # Re-raise AssertionError from validation without catching
-        raise
-    except Exception as e:
-        return {
-            'status': 'error',
-            'message': f"Download failed: {str(e)}",
-            'traceback': traceback.format_exc()
-        }
+    }
+    
+    with open(info_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"  ✓ Metadata saved: {info_path}")
+    print(f"  ✓ Models registered: {', '.join(models_list)}")
+    
+    # Calculate directory size
+    total_size_bytes = _get_directory_size(dataset_dir)
+    total_size_formatted = _format_size(total_size_bytes)
+    
+    # Print summary
+    print(f"\n{rule()}")
+    print(f"✓ DOWNLOAD COMPLETE")
+    print(f"{rule()}")
+    print(f"Dataset: {raw_dir}")
+    print(f"Model: {model_path}")
+    print(f"Info: {info_path}")
+    print(f"Size: {total_size_formatted} ({total_size_bytes:,} bytes)")
+    
+    if validation['preprocessing_required']:
+        print(f"\n⚠ Preprocessing Required:")
+        for step in validation['preprocessing_steps']:
+            print(f"  • {step}")
+    
+    return {
+        'status': 'success',
+        'dataset_path': str(raw_dir),
+        'model_path': str(model_path),
+        'info_path': str(info_path),
+        'message': 'Download completed successfully',
+        'metadata': metadata,
+        'size_bytes': total_size_bytes,
+        'size_formatted': total_size_formatted
+    }
 
 
 def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
@@ -455,46 +426,42 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
         if not info_path.exists():
             continue
         
-        try:
-            with open(info_path, 'r') as f:
-                metadata = json.load(f)
-            
-            # Calculate directory size (once per dataset)
-            size_bytes = _get_directory_size(dataset_dir)
-            size_formatted = _format_size(size_bytes)
-            
-            # info.json may store either a list under 'models' or a single
-            # 'model' string; normalise both into models_list.
-            if 'models' in metadata:
-                models_list = metadata['models']
-            else:
-                model = metadata.get('model')
-                models_list = [model] if model else []
-            
-            # Create one entry per model
-            for model_name in models_list:
-                pair_metadata = {
-                    'dataset': metadata['dataset'],
-                    'model': model_name,
-                    'category': metadata.get('category', 'unknown'),
-                    'input_size': metadata.get('input_size', []),
-                    'num_classes': metadata.get('num_classes', 0),
-                    'splits_downloaded': metadata.get('splits_downloaded', []),
-                    'preprocessing_required': metadata.get('preprocessing_required', True),
-                    'preprocessing_steps': metadata.get('preprocessing_steps', []),
-                    'notes': metadata.get('notes', ''),
-                    'paths': {
-                        'raw_data': metadata['paths'].get('raw_data', ''),
-                        'model_architecture': str(dataset_dir / "models" / f"{model_name}.py"),
-                        'metadata': str(info_path)
-                    },
-                    'size_bytes': size_bytes,
-                    'size_formatted': size_formatted
-                }
-                downloaded.append(pair_metadata)
-                
-        except Exception as e:
-            print(f"Warning: Could not read {info_path}: {e}")
+        with open(info_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Calculate directory size (once per dataset)
+        size_bytes = _get_directory_size(dataset_dir)
+        size_formatted = _format_size(size_bytes)
+        
+        # info.json may store either a list under 'models' or a single
+        # 'model' string; normalise both into models_list.
+        if 'models' in metadata:
+            models_list = metadata['models']
+        else:
+            model = metadata.get('model')
+            models_list = [model] if model else []
+        
+        # Create one entry per model
+        for model_name in models_list:
+            pair_metadata = {
+                'dataset': metadata['dataset'],
+                'model': model_name,
+                'category': metadata.get('category', 'unknown'),
+                'input_size': metadata.get('input_size', []),
+                'num_classes': metadata.get('num_classes', 0),
+                'splits_downloaded': metadata.get('splits_downloaded', []),
+                'preprocessing_required': metadata.get('preprocessing_required', True),
+                'preprocessing_steps': metadata.get('preprocessing_steps', []),
+                'notes': metadata.get('notes', ''),
+                'paths': {
+                    'raw_data': metadata['paths'].get('raw_data', ''),
+                    'model_architecture': str(dataset_dir / "models" / f"{model_name}.py"),
+                    'metadata': str(info_path)
+                },
+                'size_bytes': size_bytes,
+                'size_formatted': size_formatted
+            }
+            downloaded.append(pair_metadata)
     
     return downloaded
 
@@ -761,114 +728,88 @@ def model_inference_with_dataset(
     
     combo_id = f"m:{model_name}|x:{dataset_name}|split:{split}"
     
-    try:
-        # Load the pair
-        if verbose:
-            print(f"Testing: {dataset_name} + {model_name} ({split} split)")
-        
-        result = load_dataset_model_pair(
-            dataset_name=dataset_name,
-            model_name=model_name,
-            split=split,
-            batch_size=1,
-            shuffle=False,
-            auto_download=True,
-            root_dir=root_dir
-        )
-        
-        model = result['model']
-        dataloader = result['dataloader']
-        num_samples = result['num_samples']
-        
-        # Get first sample to test
-        input_tensor = None
-        try:
-            for batch in dataloader:
-                if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-                    # Standard (image, label) tuple
-                    input_tensor, labels = batch[0], batch[1]
-                elif isinstance(batch, (tuple, list)) and len(batch) == 1:
-                    input_tensor = batch[0]
-                else:
-                    input_tensor = batch
-                break  # Only need first batch
-        except Exception as e:
-            error_msg = f'Batch loading error: {str(e)[:50]}'
-            if verbose:
-                print(f"  ✗ FAILED - {error_msg}")
-            return {
-                'dataset': dataset_name,
-                'model': model_name,
-                'split': split,
-                'status': 'failed',
-                'error': error_msg,
-                'num_samples': num_samples
-            }
-        
-        if input_tensor is None:
-            error_msg = 'Empty dataloader'
-            if verbose:
-                print(f"  ✗ FAILED - {error_msg}")
-            return {
-                'dataset': dataset_name,
-                'model': model_name,
-                'split': split,
-                'status': 'failed',
-                'error': error_msg,
-                'num_samples': num_samples
-            }
-        
-        # Verify we have a tensor
-        if not isinstance(input_tensor, torch.Tensor):
-            error_msg = f'Input type {type(input_tensor).__name__}, expected torch.Tensor'
-            if verbose:
-                print(f"  ✗ FAILED - {error_msg}")
-            return {
-                'dataset': dataset_name,
-                'model': model_name,
-                'split': split,
-                'status': 'failed',
-                'error': error_msg,
-                'num_samples': num_samples
-            }
-        
-        # Run inference
-        success, output, error_msg = infer_single_model(combo_id, model, input_tensor)
-        
-        if success:
-            output_shape = tuple(output.shape) if output is not None else None
-            if verbose:
-                print(f"  ✓ SUCCESS - Output shape: {output_shape}")
-            return {
-                'dataset': dataset_name,
-                'model': model_name,
-                'split': split,
-                'status': 'success',
-                'output_shape': output_shape,
-                'num_samples': num_samples
-            }
+    # Load the pair
+    if verbose:
+        print(f"Testing: {dataset_name} + {model_name} ({split} split)")
+    
+    result = load_dataset_model_pair(
+        dataset_name=dataset_name,
+        model_name=model_name,
+        split=split,
+        batch_size=1,
+        shuffle=False,
+        auto_download=True,
+        root_dir=root_dir
+    )
+    
+    model = result['model']
+    dataloader = result['dataloader']
+    num_samples = result['num_samples']
+    
+    # Get first sample to test
+    input_tensor = None
+    for batch in dataloader:
+        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+            # Standard (image, label) tuple
+            input_tensor, labels = batch[0], batch[1]
+        elif isinstance(batch, (tuple, list)) and len(batch) == 1:
+            input_tensor = batch[0]
         else:
-            if verbose:
-                print(f"  ✗ FAILED - {error_msg}")
-            return {
-                'dataset': dataset_name,
-                'model': model_name,
-                'split': split,
-                'status': 'failed',
-                'error': error_msg,
-                'num_samples': num_samples
-            }
-            
-    except Exception as e:
-        error_msg = str(e)[:100]
+            input_tensor = batch
+        break  # Only need first batch
+    
+    if input_tensor is None:
+        error_msg = 'Empty dataloader'
         if verbose:
-            print(f"  ✗ ERROR - {error_msg}")
+            print(f"  ✗ FAILED - {error_msg}")
         return {
             'dataset': dataset_name,
             'model': model_name,
             'split': split,
-            'status': 'error',
-            'error': error_msg
+            'status': 'failed',
+            'error': error_msg,
+            'num_samples': num_samples
+        }
+    
+    # Verify we have a tensor
+    if not isinstance(input_tensor, torch.Tensor):
+        error_msg = f'Input type {type(input_tensor).__name__}, expected torch.Tensor'
+        if verbose:
+            print(f"  ✗ FAILED - {error_msg}")
+        return {
+            'dataset': dataset_name,
+            'model': model_name,
+            'split': split,
+            'status': 'failed',
+            'error': error_msg,
+            'num_samples': num_samples
+        }
+    
+    # Run inference
+    success, output, error_msg = infer_single_model(combo_id, model, input_tensor)
+    
+    if success:
+        output_shape = tuple(output.shape) if output is not None else None
+        if verbose:
+            print(f"  ✓ SUCCESS - Output shape: {output_shape}")
+        return {
+            'dataset': dataset_name,
+            'model': model_name,
+            'split': split,
+            'status': 'success',
+            'output_shape': output_shape,
+            'num_samples': num_samples
+        }
+    else:
+        if verbose:
+            print(f"  ✗ FAILED - {error_msg}")
+        return {
+            'dataset': dataset_name,
+            'model': model_name,
+            'split': split,
+            'status': 'failed',
+            'error': error_msg,
+            'num_samples': num_samples
         }
 
 
@@ -957,6 +898,7 @@ def main():
             print(f"   • {pair_key}: {reason}")
     
     print(rule())
+    assert failed_pairs == 0, f"{failed_pairs}/{total_pairs} dataset-model pair(s) failed inference"
 
 
 if __name__ == "__main__":

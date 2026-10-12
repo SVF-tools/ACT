@@ -102,6 +102,7 @@ def print_category_detail(category_name: str):
         
     except ValueError as e:
         print(f"Error: {e}")
+        raise
 
 
 def print_summary_statistics():
@@ -206,6 +207,7 @@ def main():
         except ValueError as e:
             print(f"Error: {e}")
             print(f"\nAvailable types: {', '.join(get_all_types())}")
+            raise
     
     elif args.info:
         print_category_detail(args.info)
@@ -261,24 +263,25 @@ def main():
                 force_redownload=args.force
             )
             
-            if result['status'] == 'success':
-                print(f"\n{rule(100)}")
-                print(f"✓ DOWNLOAD SUCCESSFUL")
-                print(f"{rule(100)}")
-                print(f"Category: {actual_name}")
-                print(f"Path: {result['category_path']}")
-                print(f"Instances: {result['num_instances']}")
-                if 'num_onnx_models' in result:
-                    print(f"ONNX models: {result['num_onnx_models']}")
-                if 'num_vnnlib_specs' in result:
-                    print(f"VNNLIB specs: {result['num_vnnlib_specs']}")
-                print(f"{rule(100)}\n")
-            else:
+            if result['status'] != 'success':
                 print(f"\n{rule(100)}")
                 print(f"⚠️  DOWNLOAD FAILED")
                 print(f"{rule(100)}")
                 print(f"Error: {result.get('message', 'Unknown error')}")
                 print(f"{rule(100)}\n")
+            assert result['status'] == 'success', f"Download failed: {result.get('message')}"
+            
+            print(f"\n{rule(100)}")
+            print(f"✓ DOWNLOAD SUCCESSFUL")
+            print(f"{rule(100)}")
+            print(f"Category: {actual_name}")
+            print(f"Path: {result['category_path']}")
+            print(f"Instances: {result['num_instances']}")
+            if 'num_onnx_models' in result:
+                print(f"ONNX models: {result['num_onnx_models']}")
+            if 'num_vnnlib_specs' in result:
+                print(f"VNNLIB specs: {result['num_vnnlib_specs']}")
+            print(f"{rule(100)}\n")
                 
         except ValueError as e:
             print(f"\n{rule(100)}")
@@ -287,51 +290,42 @@ def main():
             print(f"Error: {e}")
             print(f"\nUse --list to see available categories")
             print(f"{rule(100)}\n")
-        except Exception as e:
-            print(f"\n{rule(100)}")
-            print(f"⚠️  DOWNLOAD ERROR")
-            print(f"{rule(100)}")
-            print(f"Error: {e}")
-            print(f"{rule(100)}\n")
+            raise
     
     elif args.list_downloads:
         # List downloaded categories
-        try:
-            downloaded = list_downloaded_pairs()
+        downloaded = list_downloaded_pairs()
+        
+        if not downloaded:
+            print(f"\nNo downloaded VNNLIB categories found.")
+            print(f"Use --download <category> to download a benchmark.")
+            return
+        
+        # Group by category
+        by_category = {}
+        for pair in downloaded:
+            cat = pair['category']
+            if cat not in by_category:
+                by_category[cat] = []
+            by_category[cat].append(pair)
+        
+        print(f"\n{rule(100)}")
+        print(f"DOWNLOADED VNNLIB CATEGORIES ({len(by_category)})")
+        print(f"{rule(100)}")
+        
+        for category in sorted(by_category.keys()):
+            instances = by_category[category]
+            info = CATEGORY_MAPPING.get(category, {})
             
-            if not downloaded:
-                print(f"\nNo downloaded VNNLIB categories found.")
-                print(f"Use --download <category> to download a benchmark.")
-                return
-            
-            # Group by category
-            by_category = {}
-            for pair in downloaded:
-                cat = pair['category']
-                if cat not in by_category:
-                    by_category[cat] = []
-                by_category[cat].append(pair)
-            
-            print(f"\n{rule(100)}")
-            print(f"DOWNLOADED VNNLIB CATEGORIES ({len(by_category)})")
-            print(f"{rule(100)}")
-            
-            for category in sorted(by_category.keys()):
-                instances = by_category[category]
-                info = CATEGORY_MAPPING.get(category, {})
-                
-                print(f"\n{category} ({len(instances)} instances)")
-                if info:
-                    print(f"  Type: {info.get('type', 'N/A')}")
-                    print(f"  Description: {info.get('description', 'N/A')}")
-                print(f"  Path: {instances[0]['category_path']}")
-            
-            print(f"\n{rule(100)}")
-            print(f"Total instances: {len(downloaded)}")
-            print(f"{rule(100)}\n")
-            
-        except Exception as e:
-            print(f"Error listing downloads: {e}")
+            print(f"\n{category} ({len(instances)} instances)")
+            if info:
+                print(f"  Type: {info.get('type', 'N/A')}")
+                print(f"  Description: {info.get('description', 'N/A')}")
+            print(f"  Path: {instances[0]['category_path']}")
+        
+        print(f"\n{rule(100)}")
+        print(f"Total instances: {len(downloaded)}")
+        print(f"{rule(100)}\n")
     
     else:
         parser.print_help()

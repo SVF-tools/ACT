@@ -173,10 +173,6 @@ def set_solver_mode(mode: Optional[str]) -> None:
     _current_solver_mode = mode
 
 
-def get_solver_mode() -> Optional[str]:
-    return _current_solver_mode
-
-
 def is_dual_solver_active() -> bool:
     return _current_solver_mode == "dual"
 

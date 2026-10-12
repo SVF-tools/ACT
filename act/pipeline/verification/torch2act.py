@@ -902,11 +902,8 @@ class _LayerGraphBuilder:
                 arg_vals.append(v)
             else:
                 arg_vals.append(a)
-        try:
-            with torch.no_grad():
-                return sub(*arg_vals)
-        except Exception:
-            return None
+        with torch.no_grad():
+            return sub(*arg_vals)
 
     def _ensure_constant_vars(self, node_name: str) -> bool:
         """Emit a CONSTANT layer for an ONNX initializer (consumed by Concat /

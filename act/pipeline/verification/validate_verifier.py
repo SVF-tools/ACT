@@ -319,24 +319,17 @@ class VerificationValidator:
                 (v for v in high.values() if torch.is_tensor(v)), None
             )
         )
-        try:
-            spec = OutputSpec(kind=kind, **high)
-            new_params = spec.encode_linear(
-                B=target_B,
-                n_out=n_out,
-                device=ref.device if ref is not None else torch.device(self.device),
-                dtype=(
-                    ref.dtype
-                    if ref is not None and ref.dtype.is_floating_point
-                    else self.dtype
-                ),
-            )
-        except Exception as e:
-            logger.warning(
-                f"_batchify_assert_layer({kind}) at B={target_B}: "
-                f"re-encode failed: {e}"
-            )
-            return
+        spec = OutputSpec(kind=kind, **high)
+        new_params = spec.encode_linear(
+            B=target_B,
+            n_out=n_out,
+            device=ref.device if ref is not None else torch.device(self.device),
+            dtype=(
+                ref.dtype
+                if ref is not None and ref.dtype.is_floating_point
+                else self.dtype
+            ),
+        )
 
         L.params.clear()
         L.params.update(new_params)

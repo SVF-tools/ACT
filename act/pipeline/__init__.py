@@ -22,7 +22,6 @@ Key Components:
     - ModelFactory: Create PyTorch models from YAML configurations
     - TorchToACT: Convert PyTorch models to ACT representation
     - VerifierValidator: Validate verifier correctness with concrete tests
-    - PerformanceProfiler: Profile execution time and memory usage
 
 All verification utilities are located in the verification/ submodule.
 
@@ -42,40 +41,8 @@ Example:
 from act.pipeline.verification.model_factory import ModelFactory
 from act.pipeline.verification.torch2act import TorchToACT
 
-# Import utilities
-try:
-    from act.pipeline.verification.utils import (
-        PerformanceProfiler,
-        ParallelExecutor,
-        print_memory_usage,
-        clear_torch_cache,
-        setup_logging,
-        ProgressTracker,
-    )
-    UTILS_AVAILABLE = True
-except ImportError:
-    UTILS_AVAILABLE = False
-    PerformanceProfiler = None
-    ParallelExecutor = None
-    print_memory_usage = None
-    clear_torch_cache = None
-    setup_logging = None
-    ProgressTracker = None
-
-
 __all__ = [
     # Core model factory and conversion
     'ModelFactory',
     'TorchToACT',
-    
-    # Utilities
-    'PerformanceProfiler',
-    'ParallelExecutor',
-    'print_memory_usage',
-    'clear_torch_cache',
-    'setup_logging',
-    'ProgressTracker',
-    
-    # Availability flags
-    'UTILS_AVAILABLE',
 ]

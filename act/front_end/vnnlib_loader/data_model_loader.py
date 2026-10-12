@@ -181,121 +181,112 @@ def download_vnnlib_category(
             'message': f"Failed to download instances.csv from all sources. Tried {len(VNNCOMP_REPO_URLS)} repositories."
         }
     
-    try:
-        # Parse instances.csv to get ONNX and VNNLIB files
-        instances: List[Dict[str, Any]] = []
-        onnx_files: set[str] = set()
-        vnnlib_files: set[str] = set()
-        with open(instances_file, 'r') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-            if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
-                rows = rows[1:]
-            
-            for row in rows:
-                if len(row) >= 3:
-                    onnx_field, vnnlib_field, timeout = row[0], row[1], row[2]
-                    onnx_entries = _parse_onnx_field(onnx_field)
-                    vnnlib_file = _normalize_rel_path(vnnlib_field)
-                    for _, onnx_file in onnx_entries:
-                        onnx_files.add(onnx_file)
-                    vnnlib_files.add(vnnlib_file)
-                    instances.append({
-                        'onnx': onnx_entries,
-                        'vnnlib': vnnlib_file,
-                        'timeout': timeout
-                    })
+    # Parse instances.csv to get ONNX and VNNLIB files
+    instances: List[Dict[str, Any]] = []
+    onnx_files: set[str] = set()
+    vnnlib_files: set[str] = set()
+    with open(instances_file, 'r') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+        if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
+            rows = rows[1:]
         
-        logger.info(f"Found {len(instances)} instances in category '{category}'")
+        for row in rows:
+            if len(row) >= 3:
+                onnx_field, vnnlib_field, timeout = row[0], row[1], row[2]
+                onnx_entries = _parse_onnx_field(onnx_field)
+                vnnlib_file = _normalize_rel_path(vnnlib_field)
+                for _, onnx_file in onnx_entries:
+                    onnx_files.add(onnx_file)
+                vnnlib_files.add(vnnlib_file)
+                instances.append({
+                    'onnx': onnx_entries,
+                    'vnnlib': vnnlib_file,
+                    'timeout': timeout
+                })
+    
+    logger.info(f"Found {len(instances)} instances in category '{category}'")
+    
+    # Download ONNX and VNNLIB files using the successful base URL
+    downloaded_onnx: set[str] = set()
+    downloaded_vnnlib: set[str] = set()
+    all_files: List[Tuple[str, set[str]]] = [(rel_path, downloaded_onnx) for rel_path in sorted(onnx_files)]
+    all_files.extend((rel_path, downloaded_vnnlib) for rel_path in sorted(vnnlib_files))
+    
+    for idx, (rel_path, downloaded_set) in enumerate(all_files, 1):
+        target_path = category_dir / rel_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Download ONNX and VNNLIB files using the successful base URL
-        downloaded_onnx: set[str] = set()
-        downloaded_vnnlib: set[str] = set()
-        all_files: List[Tuple[str, set[str]]] = [(rel_path, downloaded_onnx) for rel_path in sorted(onnx_files)]
-        all_files.extend((rel_path, downloaded_vnnlib) for rel_path in sorted(vnnlib_files))
+        # Try compressed first, then uncompressed.
+        tried_urls = []
+        success = False
         
-        for idx, (rel_path, downloaded_set) in enumerate(all_files, 1):
-            target_path = category_dir / rel_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
+        for extension in ['.gz', '']:
+            file_url = f"{successful_base_url}/{repo_prefix}/{rel_path}{extension}"
+            tried_urls.append(file_url)
             
-            # Try compressed first, then uncompressed.
-            tried_urls = []
-            success = False
-            
-            for extension in ['.gz', '']:
-                file_url = f"{successful_base_url}/{repo_prefix}/{rel_path}{extension}"
-                tried_urls.append(file_url)
+            try:
+                logger.debug(f"[{idx}/{len(all_files)}] Trying {rel_path}{extension}")
                 
-                try:
-                    logger.debug(f"[{idx}/{len(all_files)}] Trying {rel_path}{extension}")
+                if extension == '.gz':
+                    # Download compressed file
+                    gz_path = target_path.parent / f"{target_path.name}.gz"
+                    urllib.request.urlretrieve(file_url, gz_path)
                     
-                    if extension == '.gz':
-                        # Download compressed file
-                        gz_path = target_path.parent / f"{target_path.name}.gz"
-                        urllib.request.urlretrieve(file_url, gz_path)
-                        
-                        # Decompress
-                        with gzip.open(gz_path, 'rb') as f_in:
-                            with open(target_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                        
-                        # Remove .gz file
-                        gz_path.unlink()
-                        logger.debug(f"  ✓ Decompressed {rel_path}")
-                    else:
-                        # Download uncompressed file
-                        urllib.request.urlretrieve(file_url, target_path)
+                    # Decompress
+                    with gzip.open(gz_path, 'rb') as f_in:
+                        with open(target_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
                     
-                    downloaded_set.add(rel_path)
-                    success = True
-                    break
-                except Exception as e:
-                    logger.debug(f"  Failed with {extension}: {e}")
-                    continue
-            
-            if not success:
-                logger.warning(f"Failed to download {rel_path} from any URL")
+                    # Remove .gz file
+                    gz_path.unlink()
+                    logger.debug(f"  ✓ Decompressed {rel_path}")
+                else:
+                    # Download uncompressed file
+                    urllib.request.urlretrieve(file_url, target_path)
+                
+                downloaded_set.add(rel_path)
+                success = True
+                break
+            except Exception as e:
+                logger.debug(f"  Failed with {extension}: {e}")
+                continue
         
-        # Create metadata
-        metadata = {
-            'category': category,
-            'repo_name': repo_name,
-            'version': version,
-            'num_instances': len(instances),
-            'num_onnx_models': len(downloaded_onnx),
-            'num_vnnlib_specs': len(downloaded_vnnlib),
-            'source': successful_base_url,
-            'paths': {
-                'onnx': str(onnx_dir),
-                'vnnlib': str(vnnlib_dir),
-                'instances': str(instances_file)
-            }
+        assert success, f"Failed to download {rel_path} from any of {tried_urls}"
+    
+    # Create metadata
+    metadata = {
+        'category': category,
+        'repo_name': repo_name,
+        'version': version,
+        'num_instances': len(instances),
+        'num_onnx_models': len(downloaded_onnx),
+        'num_vnnlib_specs': len(downloaded_vnnlib),
+        'source': successful_base_url,
+        'paths': {
+            'onnx': str(onnx_dir),
+            'vnnlib': str(vnnlib_dir),
+            'instances': str(instances_file)
         }
-        
-        # Save metadata
-        metadata_path = category_dir / "info.json"
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        logger.info(
-            f"Successfully downloaded category '{category}': "
-            f"{len(instances)} instances, {len(downloaded_onnx)} ONNX models, "
-            f"{len(downloaded_vnnlib)} VNNLIB specs"
-        )
-        
-        return {
-            'status': 'success',
-            'message': f"Downloaded {len(instances)} instances",
-            'category_path': str(category_dir),
-            'num_instances': len(instances)
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to download category '{category}': {e}")
-        return {
-            'status': 'error',
-            'message': str(e)
-        }
+    }
+    
+    # Save metadata
+    metadata_path = category_dir / "info.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(
+        f"Successfully downloaded category '{category}': "
+        f"{len(instances)} instances, {len(downloaded_onnx)} ONNX models, "
+        f"{len(downloaded_vnnlib)} VNNLIB specs"
+    )
+    
+    return {
+        'status': 'success',
+        'message': f"Downloaded {len(instances)} instances",
+        'category_path': str(category_dir),
+        'num_instances': len(instances)
+    }
 
 
 def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -338,44 +329,40 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[Dict[str, Any]
         if not instances_file.exists():
             continue
         
-        try:
-            with open(instances_file, 'r') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-                if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
-                    rows = rows[1:]
-                
-                for row in rows:
-                    if len(row) >= 3:
-                        onnx_field, vnnlib_file, timeout = row[0], row[1], row[2]
-                        onnx_entries = _parse_onnx_field(onnx_field)
-                        vnnlib_rel = _normalize_rel_path(vnnlib_file)
+        with open(instances_file, 'r') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
+                rows = rows[1:]
+            
+            for row in rows:
+                if len(row) >= 3:
+                    onnx_field, vnnlib_file, timeout = row[0], row[1], row[2]
+                    onnx_entries = _parse_onnx_field(onnx_field)
+                    vnnlib_rel = _normalize_rel_path(vnnlib_file)
+                    
+                    onnx_paths = [category_dir / onnx_rel for _, onnx_rel in onnx_entries]
+                    vnnlib_path = category_dir / vnnlib_rel
+                    
+                    # Only include if all referenced files exist
+                    if all(onnx_path.exists() for onnx_path in onnx_paths) and vnnlib_path.exists():
+                        first_onnx_rel = onnx_entries[0][1]
+                        paths: Dict[str, Any] = {
+                            'onnx': str(onnx_paths[0]),
+                            'vnnlib': str(vnnlib_path)
+                        }
+                        if len(onnx_entries) > 1:
+                            paths['onnx_models'] = [str(onnx_path) for onnx_path in onnx_paths]
                         
-                        onnx_paths = [category_dir / onnx_rel for _, onnx_rel in onnx_entries]
-                        vnnlib_path = category_dir / vnnlib_rel
-                        
-                        # Only include if all referenced files exist
-                        if all(onnx_path.exists() for onnx_path in onnx_paths) and vnnlib_path.exists():
-                            first_onnx_rel = onnx_entries[0][1]
-                            paths: Dict[str, Any] = {
-                                'onnx': str(onnx_paths[0]),
-                                'vnnlib': str(vnnlib_path)
-                            }
-                            if len(onnx_entries) > 1:
-                                paths['onnx_models'] = [str(onnx_path) for onnx_path in onnx_paths]
-                            
-                            all_instances.append({
-                                'category': category_dir.name,
-                                'onnx_model': first_onnx_rel,
-                                'onnx_models': onnx_entries,
-                                'vnnlib_spec': vnnlib_rel,
-                                'timeout': float(timeout) if timeout else None,
-                                'is_dual_model': len(onnx_entries) > 1,
-                                'paths': paths
-                            })
-        
-        except Exception as e:
-            logger.warning(f"Failed to read instances from {category_dir.name}: {e}")
+                        all_instances.append({
+                            'category': category_dir.name,
+                            'onnx_model': first_onnx_rel,
+                            'onnx_models': onnx_entries,
+                            'vnnlib_spec': vnnlib_rel,
+                            'timeout': float(timeout) if timeout else None,
+                            'is_dual_model': len(onnx_entries) > 1,
+                            'paths': paths
+                        })
     
     return all_instances
 
@@ -670,62 +657,49 @@ def model_inference_with_vnnlib(
     model_name = Path(onnx_model).stem
     combo_id = f"{category}+{model_name}"
     
-    try:
-        # Load the pair
+    # Load the pair
+    if verbose:
+        logger.info(f"Testing: {category} + {model_name}")
+    
+    result = load_vnnlib_pair(
+        category=category,
+        onnx_model=onnx_model,
+        vnnlib_spec=vnnlib_spec,
+        root_dir=root_dir,
+        auto_download=True
+    )
+    
+    model = result['model']
+    labeled_tensor = result['labeled_tensor']
+    input_tensor = labeled_tensor.tensor  # Already has batch dimension
+    
+    # Run inference
+    success, output, error_msg = infer_single_model(
+        combo_id, 
+        model, 
+        input_tensor  # Already (1, C, H, W)
+    )
+    
+    if success:
+        if output is None:
+            raise RuntimeError("Inference succeeded without an output tensor")
         if verbose:
-            logger.info(f"Testing: {category} + {model_name}")
-        
-        result = load_vnnlib_pair(
-            category=category,
-            onnx_model=onnx_model,
-            vnnlib_spec=vnnlib_spec,
-            root_dir=root_dir,
-            auto_download=True
-        )
-        
-        model = result['model']
-        labeled_tensor = result['labeled_tensor']
-        input_tensor = labeled_tensor.tensor  # Already has batch dimension
-        
-        # Run inference
-        success, output, error_msg = infer_single_model(
-            combo_id, 
-            model, 
-            input_tensor  # Already (1, C, H, W)
-        )
-        
-        if success:
-            if output is None:
-                raise RuntimeError("Inference succeeded without an output tensor")
-            if verbose:
-                logger.info(f"  ✓ SUCCESS - Output shape: {output.shape}")
-            return {
-                'category': category,
-                'model': model_name,
-                'spec': vnnlib_spec,
-                'status': 'success',
-                'output_shape': tuple(output.shape)
-            }
-        else:
-            if verbose:
-                logger.warning(f"  ✗ FAILED - {error_msg}")
-            return {
-                'category': category,
-                'model': model_name,
-                'spec': vnnlib_spec,
-                'status': 'failed',
-                'error': error_msg
-            }
-            
-    except Exception as e:
-        error_msg = str(e)[:100]
-        if verbose:
-            logger.error(f"  ✗ ERROR - {error_msg}")
+            logger.info(f"  ✓ SUCCESS - Output shape: {output.shape}")
         return {
             'category': category,
             'model': model_name,
             'spec': vnnlib_spec,
-            'status': 'error',
+            'status': 'success',
+            'output_shape': tuple(output.shape)
+        }
+    else:
+        if verbose:
+            logger.warning(f"  ✗ FAILED - {error_msg}")
+        return {
+            'category': category,
+            'model': model_name,
+            'spec': vnnlib_spec,
+            'status': 'failed',
             'error': error_msg
         }
 
