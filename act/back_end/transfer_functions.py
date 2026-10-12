@@ -130,15 +130,12 @@ def ensure_active_tf(default_mode: str = "interval") -> TransferFunction:
     """Return the active TF, self-healing to ``default_mode`` if unset.
 
     Consolidates the self-heal pattern shared by analyze.py / cli.py /
-    verifier.py. Catches only ``RuntimeError`` (the documented
-    "not initialised" case); any other exception from a broken TF subclass
-    bubbles up so the bug surfaces rather than silently demoting to interval.
+    verifier.py. Only the "not initialised" state is healed; nothing is
+    caught, so a broken TF subclass surfaces rather than demoting to interval.
     """
-    try:
-        return get_transfer_function()
-    except RuntimeError:
+    if _current_tf is None:
         set_transfer_function_mode(default_mode)
-        return get_transfer_function()
+    return get_transfer_function()
 
 
 def set_transfer_function_mode(mode: str = "interval", tf_config: Any = None) -> None:

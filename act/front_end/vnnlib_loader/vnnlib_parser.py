@@ -318,23 +318,19 @@ def extract_label_from_vnnlib(vnnlib_path: Path) -> Optional[int]:
         >>> print(label)
         14
     """
-    try:
-        with open(vnnlib_path, 'r') as f:
-            # Read first few lines (label is typically in first comment)
-            for _ in range(5):
-                line = f.readline()
-                if not line:
-                    break
-                
-                # Match patterns like: ; CIFAR100 property with label: 14.
-                match = re.search(r'label:\s*(\d+)', line, re.IGNORECASE)
-                if match:
-                    return int(match.group(1))
-        
-        return None
-    except Exception as e:
-        logger.debug(f"Failed to extract label from {vnnlib_path}: {e}")
-        return None
+    with open(vnnlib_path, 'r') as f:
+        # Read first few lines (label is typically in first comment)
+        for _ in range(5):
+            line = f.readline()
+            if not line:
+                break
+            
+            # Match patterns like: ; CIFAR100 property with label: 14.
+            match = re.search(r'label:\s*(\d+)', line, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+    
+    return None
 
 
 # -------------------------------------------------------------------------

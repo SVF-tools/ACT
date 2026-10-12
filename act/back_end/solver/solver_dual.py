@@ -843,14 +843,12 @@ class DualSolver(Solver):
         from act.back_end.dual_tf.tf_transformer import (
             attention_rule_alpha, _attention_input_boxes,
         )
-        boxes = None
-        try:
-            boxes = _attention_input_boxes(layer, bounds_dict)
-        except KeyError:
+        kind = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+        src_keys = ("q_src", "k_src") if kind == "ATT_SCORES" else ("w_src", "v_src")
+        if any(int(layer.params[key]) not in bounds_dict for key in src_keys):
             # Missing predecessor bounds disable learned attention slopes.
-            boxes = None
-        if boxes is None:
             return None
+        boxes = _attention_input_boxes(layer, bounds_dict)
         x_l, x_u, y_l, y_u, _scale, _mask = boxes
         x_l = x_l.to(device=device, dtype=dtype)
         x_u = x_u.to(device=device, dtype=dtype)
@@ -1159,42 +1157,33 @@ class DualSolver(Solver):
                 vals[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
                 continue
             preds = net.preds.get(lid, [])
-            refreshed = None
-            try:
-                if k == LayerKind.CONV2D.value:
-                    plb, pub = vals[preds[0]]
-                    lb, ub = _fwd_conv2d_interval(layer, plb, pub)
-                    lb, ub = lb.flatten(start_dim=1), ub.flatten(start_dim=1)
-                elif k == LayerKind.DENSE.value:
-                    w = layer.params["weight"]
-                    bias = layer.params.get("bias")
-                    if not isinstance(w, torch.Tensor):
-                        return None
-                    plb, pub = vals[preds[0]]
-                    c = (plb + pub) * 0.5
-                    r = (pub - plb) * 0.5
-                    m = c @ w.T
-                    rho = r @ w.abs().T
-                    lb = m - rho
-                    ub = m + rho
-                    if isinstance(bias, torch.Tensor):
-                        lb, ub = lb + bias, ub + bias
-                elif k == LayerKind.ADD.value:
-                    (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
-                    lb, ub = alb + blb, aub + bub
-                elif k in (LayerKind.FLATTEN.value, LayerKind.RESHAPE.value):
-                    lb, ub = vals[preds[0]]
-                elif k == LayerKind.RELU.value:
-                    lb, ub = vals[preds[0]]
-                else:
+            if k == LayerKind.CONV2D.value:
+                plb, pub = vals[preds[0]]
+                lb, ub = _fwd_conv2d_interval(layer, plb, pub)
+                lb, ub = lb.flatten(start_dim=1), ub.flatten(start_dim=1)
+            elif k == LayerKind.DENSE.value:
+                w = layer.params["weight"]
+                bias = layer.params.get("bias")
+                if not isinstance(w, torch.Tensor):
                     return None
-                refreshed = (lb, ub)
-            except (KeyError, IndexError, ValueError):
-                # Missing/incompatible interval metadata disables this optional refresh.
-                refreshed = None
-            if refreshed is None:
+                plb, pub = vals[preds[0]]
+                c = (plb + pub) * 0.5
+                r = (pub - plb) * 0.5
+                m = c @ w.T
+                rho = r @ w.abs().T
+                lb = m - rho
+                ub = m + rho
+                if isinstance(bias, torch.Tensor):
+                    lb, ub = lb + bias, ub + bias
+            elif k == LayerKind.ADD.value:
+                (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
+                lb, ub = alb + blb, aub + bub
+            elif k in (LayerKind.FLATTEN.value, LayerKind.RESHAPE.value):
+                lb, ub = vals[preds[0]]
+            elif k == LayerKind.RELU.value:
+                lb, ub = vals[preds[0]]
+            else:
                 return None
-            lb, ub = refreshed
 
             b = out.get(lid)
             if b is not None:

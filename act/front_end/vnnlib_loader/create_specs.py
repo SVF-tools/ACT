@@ -160,6 +160,7 @@ class VNNLibSpecCreator(BaseSpecCreator):
         # different run.
         _onnx_cache: Dict[Tuple[str, str, Optional[str]], Dict[str, Any]] = {}
         
+        failures: List[str] = []
         for instance_info in all_instances:
             category = instance_info['category']
             onnx_model = instance_info['onnx_model']
@@ -194,16 +195,21 @@ class VNNLibSpecCreator(BaseSpecCreator):
                     validate_shapes=validate_shapes
                 )
                 
-                if result is not None:
-                    results.append(result)
+                results.append(result)
                 
             except UnsupportedSpecError:
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — collect every failure, raise below
                 logger.error(
                     f"Failed to create specs for {category}/{instance_id}: {e}"
                 )
+                failures.append(f"{category}/{instance_id}: {e}")
         
+        if failures:
+            raise RuntimeError(
+                f"Spec creation failed for {len(failures)}/{len(all_instances)} VNNLIB instance(s):\n  "
+                + "\n  ".join(failures)
+            )
         logger.info(f"Successfully created specs for {len(results)} instances")
         return results
     
@@ -213,13 +219,12 @@ class VNNLibSpecCreator(BaseSpecCreator):
         instance_id: str,
         instance_data: Dict[str, Any],
         validate_shapes: bool
-    ) -> Optional[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
+    ) -> Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]:
         """
         Create specs for a single VNNLIB instance.
         
         Returns:
             Tuple of (category, instance_id, pytorch_model, labeled_tensors, spec_pairs)
-            or None if failed
         """
         logger.info(f"Generating specs for {category}/{instance_id}")
         
@@ -230,22 +235,16 @@ class VNNLibSpecCreator(BaseSpecCreator):
         # Parse VNNLIB to create specs
         # Pass input_shape to ensure specs match tensor shape (not flattened)
         # Pass true_label to promote RANGE to TOP1_ROBUST for classification
-        try:
-            queries = parse_vnnlib_queries(
-                vnnlib_path,
-                labeled_tensor=labeled_tensor,
-            )
-            if not queries:
-                raise RuntimeError("parse_vnnlib_queries returned no queries")
-            logger.info(
-                f"Parsed VNNLIB specs: {len(queries)} queries, "
-                f"first kind=({queries[0][0].kind}, {queries[0][1].kind})"
-            )
-        except UnsupportedSpecError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to parse VNNLIB specs: {e}")
-            return None
+        queries = parse_vnnlib_queries(
+            vnnlib_path,
+            labeled_tensor=labeled_tensor,
+        )
+        if not queries:
+            raise RuntimeError(f"parse_vnnlib_queries returned no queries for {vnnlib_path}")
+        logger.info(
+            f"Parsed VNNLIB specs: {len(queries)} queries, "
+            f"first kind=({queries[0][0].kind}, {queries[0][1].kind})"
+        )
         
         spec_pairs = list(queries)
         
@@ -258,8 +257,9 @@ class VNNLibSpecCreator(BaseSpecCreator):
             )
             
             if not validated_pairs:
-                logger.warning(f"Spec validation failed for {category}/{instance_id}")
-                return None
+                raise RuntimeError(
+                    f"No spec pair of {category}/{instance_id} matches the model's I/O shapes"
+                )
             
             spec_pairs = validated_pairs
         
@@ -320,6 +320,4 @@ def create_specs_from_paths(onnx_path, vnnlib_path, category: str = "custom"):
     }
     sr = VNNLibSpecCreator()._create_specs_for_single_instance(
         category, f"{onnx_p.stem}__{vnnlib_p.stem}", instance_data, validate_shapes=True)
-    if sr is None:
-        raise SystemExit(f"Spec creation failed (unsupported/invalid spec) for {vnnlib_p.name}")
     return sr

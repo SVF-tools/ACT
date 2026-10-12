@@ -67,10 +67,7 @@ def _discover_net_names(nets_dir: Path, manifest_path: Optional[Path]) -> List[s
                 break
 
     if manifest_path is not None and manifest_path.exists():
-        try:
-            names.extend(str(n) for n in _load_manifest(manifest_path))
-        except Exception as e:
-            logger.warning(f"Failed to read manifest {manifest_path}: {e}")
+        names.extend(str(n) for n in _load_manifest(manifest_path))
 
     names.extend(p.stem for p in sorted(nets_dir.glob('*.json')))
 
@@ -123,26 +120,25 @@ class ModelFactory:
         - Enables O(1) lookup via get_act_net()
         - Costs ~10-20MB memory for typical test suites
         """
+        # Callers that only need VNNLIB/TorchVision models construct the factory
+        # before nets are generated; consumers that need nets check list_networks().
         if not self.nets_dir.exists():
-            logger.warning(f"Nets dir not found: {self.nets_dir}")
+            logger.debug(f"Nets dir not found: {self.nets_dir}")
             return
         
         for name in self.net_names:
             net_path = self.nets_dir / f"{name}.json"
             
             if not net_path.exists():
-                logger.warning(f"ACT Net file not found: {net_path}. Skipping '{name}'.")
-                continue
+                raise FileNotFoundError(
+                    f"ACT Net '{name}' is listed in the manifest but {net_path} does not exist"
+                )
             
-            try:
-                with open(net_path, 'r') as f:
-                    net_dict = json.load(f)
-                act_net = NetSerializer.deserialize_net(net_dict)
-                self.nets[name] = act_net
-                logger.debug(f"Pre-loaded ACT Net '{name}' from {net_path}")
-            except Exception as e:
-                logger.error(f"Failed to load ACT Net '{name}' from {net_path}: {e}")
-                continue
+            with open(net_path, 'r') as f:
+                net_dict = json.load(f)
+            act_net = NetSerializer.deserialize_net(net_dict)
+            self.nets[name] = act_net
+            logger.debug(f"Pre-loaded ACT Net '{name}' from {net_path}")
         
         logger.info(f"Pre-loaded {len(self.nets)} ACT Nets from {self.nets_dir}")
     
@@ -342,11 +338,17 @@ def main():
     print("PyTorch Model Factory - Spec-Free Verification Testing")
     print(rule())
     
-    all_passed = True
+    failures: List[str] = []
     total_tests = 0
     passed_tests = 0
     
-    for name in factory.list_networks():
+    network_names = factory.list_networks()
+    if not network_names:
+        raise RuntimeError(
+            f"No ACT Nets found in {factory.nets_dir}; run `python -m act.back_end --generate` first"
+        )
+    
+    for name in network_names:
         print(f"\n{rule()}")
         print(f"Network: {name}")
         print(rule())
@@ -395,13 +397,15 @@ def main():
                         
                         # Track test success
                         total_tests += 1
+                        # Constraint outcomes are properties of the (random-weight)
+                        # network on this input, not conversion errors.
                         if input_satisfied and output_satisfied:
                             passed_tests += 1
-                            print(f"  ✅ Test PASSED (both constraints satisfied)")
+                            print(f"  ✅ Both constraints satisfied")
                         elif not input_satisfied:
-                            print(f"  ⚠️  Test UNCERTAIN (input constraint violated)")
+                            print(f"  ℹ️  Input outside spec region (property not applicable)")
                         else:
-                            print(f"  ❌ Test FAILED (output constraint violated)")
+                            print(f"  ℹ️  Output property violated on this input (counterexample)")
                     
                     else:
                         # Legacy nn.Module (no verification)
@@ -415,34 +419,30 @@ def main():
                     print(f"  ❌ Test case '{test_case}' failed: {e}")
                     import traceback
                     traceback.print_exc()
-                    all_passed = False
+                    failures.append(f"{name}/{test_case}: {e}")
             
         except Exception as e:
             print(f"\n❌ Failed to create/test model '{name}': {e}")
             import traceback
             traceback.print_exc()
-            all_passed = False
+            failures.append(f"{name}: {e}")
     
     # Print summary
     print("\n" + rule())
     print(f"📊 Verification Test Summary:")
     print(f"   Total tests: {total_tests}")
-    print(f"   ✅ Passed: {passed_tests}")
-    print(f"   ⚠️  Uncertain/Failed: {total_tests - passed_tests}")
-    if total_tests > 0:
-        success_rate = (passed_tests / total_tests) * 100
-        print(f"   Success rate: {success_rate:.1f}%")
+    print(f"   ✅ Both constraints satisfied: {passed_tests}")
+    print(f"   ℹ️  Input outside spec / property violated: {total_tests - passed_tests}")
+    if total_tests == 0:
+        raise RuntimeError("No ACT→PyTorch test cases were executed")
     print(rule())
     
-    if all_passed:
-        print("✅ All models created and tested successfully")
-    else:
-        print("⚠️  Some models had issues - see details above")
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} ACT→PyTorch model/test-case error(s):\n  " + "\n  ".join(failures)
+        )
+    print("✅ All models created and tested successfully")
     print(rule())
-
-    if not all_passed:
-        import sys
-        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -536,8 +536,9 @@ def witness_relu_preactivations(
             x,
             forward_lin_max_perturbed=dual_config.forward_lin_max_perturbed,
         )
-    except (ValueError, RuntimeError, KeyError, IndexError):
-        # Unsupported layers and incompatible witness shapes use BaBSR scoring.
+    except ValueError:
+        # compute_forward_bounds raises ValueError for layer kinds it cannot
+        # propagate; those nets use BaBSR scoring.
         bounds_dict = None
     if bounds_dict is None:
         return None

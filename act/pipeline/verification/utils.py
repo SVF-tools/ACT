@@ -70,6 +70,26 @@ def _assert_dag(preds: Dict[int, List[int]], succs: Dict[int, List[int]], n_laye
         raise ValueError(f"Layer graph contains a cycle! Nodes: {cycle_nodes}")
 
 
+def _assert_dataflow(layers: List[Any], preds: Dict[int, List[int]]) -> None:
+    """Assert every layer reads its in_vars from its predecessors' out_vars.
+
+    A violation means an edge bypasses a layer (e.g. BatchNorm's SCALE), so
+    abstract interpretation would propagate the bounds of the wrong tensor.
+    """
+    by_id = {layer.id: layer for layer in layers}
+    for layer in layers:
+        layer_preds = preds.get(layer.id, [])
+        if not layer.in_vars or not layer_preds:
+            continue
+        produced = set().union(*(by_id[p].out_vars for p in layer_preds))
+        missing = set(layer.in_vars) - produced
+        assert not missing, (
+            f"Layer {layer.id} ({layer.kind}) reads {len(missing)}/{len(layer.in_vars)} "
+            f"input vars not produced by its predecessors "
+            f"{[(p, by_id[p].kind) for p in layer_preds]}"
+        )
+
+
 def _normalize_axes(axes: Any, rank: int) -> List[int]:
     """Sort + dedupe + normalise possibly-negative axes against ``rank``."""
     return sorted({(a + rank) if a < 0 else a for a in (int(x) for x in axes)})

@@ -804,9 +804,5 @@ def get_category_info(category: str, root_dir: Optional[str] = None) -> Optional
     if not info_path.exists():
         return None
     
-    try:
-        with open(info_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Failed to read category info: {e}")
-        return None
+    with open(info_path, 'r') as f:
+        return json.load(f)

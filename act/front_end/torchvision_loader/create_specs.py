@@ -135,6 +135,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         logger.info(f"Processing {len(all_pairs)} dataset-model pairs")
         
         results = []
+        failures: List[str] = []
         
         for pair_info in all_pairs:
             dataset_name = pair_info['dataset']
@@ -166,8 +167,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     validate_shapes=validate_shapes
                 )
                 
-                if result is not None:
-                    results.append(result)
+                results.append(result)
                 
                 # Memory optimization: Free dataset/dataloader after extracting input_tensors
                 # pair_data contains the dataset (476 MB for MNIST) which is no longer needed
@@ -175,11 +175,17 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                 del pair_data, dataloader
                 gc.collect()
                 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — collect every failure, raise below
                 logger.error(
                     f"Failed to create specs for {dataset_name} + {model_name}: {e}"
                 )
+                failures.append(f"{dataset_name} + {model_name}: {e}")
         
+        if failures:
+            raise RuntimeError(
+                f"Spec creation failed for {len(failures)}/{len(all_pairs)} dataset-model pair(s):\n  "
+                + "\n  ".join(failures)
+            )
         logger.info(f"Successfully created specs for {len(results)} pairs")
         return results
     
@@ -192,7 +198,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         num_samples: int,
         start_index: int,
         validate_shapes: bool
-    ) -> Optional[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
+    ) -> Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]:
         """
         Create specs for a single dataset-model pair.
         
@@ -218,8 +224,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
             labeled_tensors.append(LabeledInputTensor(tensor=tensor, label=label))
         
         if not labeled_tensors:
-            logger.warning(f"No samples collected for {data_source}")
-            return None
+            raise RuntimeError(f"No samples collected for {data_source} + {model_name}")
         
         logger.info(f"Collected {len(labeled_tensors)} samples")
         
@@ -261,8 +266,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
             spec_pairs = validated_pairs
         
         if not spec_pairs:
-            logger.warning(f"No valid specs generated for {data_source} + {model_name}")
-            return None
+            raise RuntimeError(f"No valid specs generated for {data_source} + {model_name}")
         
         return (data_source, model_name, pytorch_model, labeled_tensors, spec_pairs)
     

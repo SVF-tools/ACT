@@ -206,9 +206,6 @@ class ACTStats:
         except ImportError:
             print(f"⚠️ [{stage_name}] psutil not available, cannot monitor memory")
             return 0.0
-        except Exception as e:
-            print(f"⚠️ [{stage_name}] Error monitoring memory: {e}")
-            return 0.0
     
     @classmethod
     def get_memory_usage_mb(cls) -> float:

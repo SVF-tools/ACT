@@ -69,7 +69,7 @@ from act.back_end.layer_schema import ACT_TO_TORCH, LayerKind
 from act.back_end.layer_util import create_layer
 from act.back_end.utils import avgpool2d_output_hw
 from act.pipeline.verification.utils import (
-    _prod, _normalize_tuple, _assert_dag, _broadcast_const_to_size,
+    _prod, _normalize_tuple, _assert_dag, _assert_dataflow, _broadcast_const_to_size,
     _normalize_axes, _reduce_output_shape, _compute_slice_output_shape,
     ONNX_HANDLERS,
 )
@@ -77,8 +77,6 @@ from act.pipeline.verification.utils import (
 # Imports needed for main() test harness
 from act.util.model_inference import model_inference
 from act.front_end.model_synthesis import model_synthesis
-from act.back_end.solver.solver_torchlp import TorchLPSolver
-from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.util.options import PerformanceOptions
 from act.util.format_utils import rule
 
@@ -147,6 +145,12 @@ class _LayerGraphBuilder:
         # the split node (mapped to the LAST chunk), so graph-edge resolution
         # would mis-wire them. _build_preds_succs honours this override.
         self._fx_pred_override: Dict[int, List[int]] = {}
+
+        # Head layer of each node converted into a chain of layers (BatchNorm
+        # -> SCALE + BIAS). node_to_layer_id maps a node to its LAST layer so
+        # successors read its output; incoming FX edges must enter the head,
+        # otherwise the layers in between are bypassed. See _record_chain_head.
+        self._node_first_layer_id: Dict[str, int] = {}
 
         # Compile-time constants (e.g. OnnxShape values) that must NOT enter
         # the runtime IR. Resolved by ``_resolve_constant_tensor`` BEFORE any
@@ -972,6 +976,7 @@ class _LayerGraphBuilder:
         if self.fx_graph is None:
             return
         for node in self.fx_graph.nodes:
+            first_layer_id = len(self.layers)
             if node.op == 'placeholder':
                 pass  # Already pre-registered in _pre_register_nodes
             elif node.op == 'call_module':
@@ -984,6 +989,27 @@ class _LayerGraphBuilder:
                 self._handle_get_attr(node)
             elif node.op == 'output':
                 self._handle_output(node)
+            self._record_chain_head(node.name, first_layer_id)
+    
+    def _record_chain_head(self, node_name: str, first_layer_id: int) -> None:
+        """Route a node's incoming FX edges to the head of the chain it emitted.
+
+        Only a contiguous chain of data layers ending at the node's registered
+        layer qualifies (BatchNorm SCALE -> BIAS, const - x, DequantizeLinear).
+        Other expansions keep the default wiring, e.g. sibling SLICEs of a
+        split (pinned via _fx_pred_override) or a CONSTANT emitted before its
+        consumer.
+        """
+        last = self.node_to_layer_id.get(node_name)
+        if last is None or last <= first_layer_id:
+            return
+        chain = range(first_layer_id, last + 1)
+        if not all(self.layers[lid].in_vars for lid in chain):
+            return
+        for prev, cur in zip(chain, chain[1:]):
+            if not set(self.layers[cur].in_vars) <= set(self.layers[prev].out_vars):
+                return
+        self._node_first_layer_id[node_name] = first_layer_id
     
     def _handle_call_module(self, node: fx.Node) -> None:
         """Handle call_module node."""
@@ -1007,6 +1033,10 @@ class _LayerGraphBuilder:
     
     def _handle_call_function(self, node: fx.Node) -> None:
         """Handle call_function node."""
+        if node.target is nn.functional.adaptive_avg_pool2d:
+            self._process_adaptive_avg_pool2d_function(node)
+            return
+        
         target_name = str(node.target).lower()
         
         handlers = {
@@ -1088,14 +1118,17 @@ class _LayerGraphBuilder:
         """Build preds and succs dictionaries, validating DAG property.
         
         Uses a hybrid approach:
-        1. Build edges from FX graph for mapped nodes
-        2. For unmapped intermediate layers (e.g., SCALE from BatchNorm), 
-           connect them sequentially based on layer creation order
+        1. Build edges from FX graph for mapped nodes; a node converted into
+           a chain of layers is entered at the chain head
+        2. Connect the remaining layers of a multi-layer conversion (e.g. BIAS
+           after BatchNorm's SCALE) sequentially by layer creation order
         """
         n_layers = len(self.layers)
         
-        # Identify which layers are mapped to FX nodes
+        # Identify which layers are mapped to FX nodes. The head of a chain
+        # conversion receives that node's incoming FX edges.
         mapped_layer_ids = set(lid for lid in self.node_to_layer_id.values() if lid >= 0)
+        mapped_layer_ids.update(self._node_first_layer_id.values())
         
         preds: Dict[int, List[int]] = {i: [] for i in range(n_layers)}
         succs: Dict[int, List[int]] = {i: [] for i in range(n_layers)}
@@ -1108,6 +1141,7 @@ class _LayerGraphBuilder:
             layer_id = self.node_to_layer_id.get(node_name)
             if layer_id is None or layer_id < 0:
                 continue
+            layer_id = self._node_first_layer_id.get(node_name, layer_id)
             
             for pred_name in pred_names:
                 pred_layer_id = self.node_to_layer_id.get(pred_name)
@@ -1122,8 +1156,8 @@ class _LayerGraphBuilder:
                 if pred_layer_id != layer_id and pred_layer_id not in preds[layer_id]:
                     preds[layer_id].append(pred_layer_id)
         
-        # Second, connect unmapped layers (SCALE, BIAS from BatchNorm, etc.) sequentially
-        # These layers are internal to a multi-layer conversion and should connect to i-1.
+        # Second, connect layers internal to a multi-layer conversion (e.g. BIAS
+        # after BatchNorm's SCALE) sequentially: they connect to i-1.
         # Source layers (``in_vars == []``, e.g. CONSTANT emitted by
         # ``_ensure_constant_vars``) are intentionally exempt -- they have no
         # data dependency on anything upstream, so wiring them to ``i-1`` would
@@ -1187,6 +1221,9 @@ class _LayerGraphBuilder:
             return
         if kind == LayerKind.RELU.value:
             self._convert_activation(mod, LayerKind.RELU)
+            return
+        if kind == LayerKind.RELU6.value:
+            self._convert_activation(mod, LayerKind.RELU6)
             return
         if kind == LayerKind.CONV2D.value and isinstance(mod, nn.Conv2d):
             self._convert_conv2d(mod)
@@ -1904,6 +1941,14 @@ class _LayerGraphBuilder:
                 self.shape = x_shape
                 self._register_node(node.name, layer_id)
     
+    def _process_adaptive_avg_pool2d_function(self, node: fx.Node) -> None:
+        """Process F.adaptive_avg_pool2d() via the nn.AdaptiveAvgPool2d converter."""
+        if not self._get_predecessor_state(node):
+            return
+        output_size = node.args[1] if len(node.args) > 1 else node.kwargs["output_size"]
+        self._convert_adaptive_avgpool2d(nn.AdaptiveAvgPool2d(output_size))
+        self._register_node(node.name)
+    
     def _process_mean_operation(self, node: fx.Node) -> None:
         """Process torch.mean()."""
         if not self._get_predecessor_state(node):
@@ -2076,6 +2121,7 @@ class TorchToACT:
         
         # Build and validate network
         preds, succs = self._build_layer_graph()
+        _assert_dataflow(self.layers, preds)
         net = Net(layers=self.layers, preds=preds, succs=succs)
         
         from act.back_end.layer_util import validate_graph
@@ -2223,7 +2269,7 @@ class TorchToACT:
 # -----------------------------------------------------------------------------
 
 def main():
-    """Main entry point for PyTorch→ACT conversion and verification testing."""
+    """Main entry point for PyTorch→ACT conversion testing."""
     # Initialize debug file (GUARDED)
     if PerformanceOptions.debug_tf:
         debug_file = PerformanceOptions.debug_output_file
@@ -2245,61 +2291,22 @@ def main():
     print(f"  {len(successful_models)} models passed inference tests")
     
     if not successful_models:
-        print("  No successful models to verify!")
-        exit(1)
+        raise RuntimeError("No synthesized model passed inference; nothing to convert")
     
-    # Step 3: Convert and verify all successful models (memory-efficient)
-    print(f"\n Step 3: Converting and verifying all {len(successful_models)} successful models...")
-    print(f"  Processing one at a time to avoid memory issues...")
-    
-    # Import verification functions
-    from act.back_end.verifier import verify_once
+    # Step 3: Convert every successful model (one at a time to bound memory).
+    print(f"\n Step 3: Converting all {len(successful_models)} successful models...")
     
     import gc
     import torch as torch_module
     
-    conversion_results = {}
-    verification_results = {}
-    conversion_success_count = 0
-    verification_success_count = 0
-    
-    # Step 4: Initialize solvers (moved earlier to reuse for all models)
-    print("\n Step 4: Initializing solvers...")
-    gurobi_solver = None
-    torch_solver = None
-    
-    try:
-        gurobi_solver = GurobiSolver()
-        print("  Gurobi solver available")
-    except Exception as e:
-        print(f"  Gurobi initialization failed: {e}")
-
-    try:
-        torch_solver = TorchLPSolver()
-        print(f"  TorchLP solver available (device: {torch_solver._device})")
-    except Exception as e:
-        print(f"  TorchLP initialization failed: {e}")
-    
-    solvers_to_test = []
-    if gurobi_solver:
-        solvers_to_test.append(("Gurobi", gurobi_solver))
-    if torch_solver:
-        solvers_to_test.append(("TorchLP", torch_solver))
-    
-    if not solvers_to_test:
-        print("  No solvers available!")
-        print("  Will only test conversions without verification")
-    
-    print(f"\n Step 5: Processing all models...")
+    failed_conversions = {}
     
     for idx, (model_id, wrapped_model) in enumerate(successful_models.items(), 1):
         print(f"\n  [{idx}/{len(successful_models)}] Processing '{model_id}'...")
         
-        # === CONVERSION ===
         try:
             net = TorchToACT(wrapped_model).run()
             
-            # Verify the conversion produced a valid net
             if not net.layers:
                 raise ValueError("Net should have layers")
             if net.layers[0].kind != LayerKind.INPUT.value:
@@ -2309,74 +2316,30 @@ def main():
             
             layer_types = " -> ".join([layer.kind for layer in net.layers])
             print(f"    Conversion: {len(net.layers)} layers ({layer_types})")
-            
-            conversion_results[model_id] = "SUCCESS"
-            conversion_success_count += 1
-            
-        except Exception as e:
-            conversion_results[model_id] = f"FAILED: {str(e)[:100]}..."
+            del net
+        except Exception as e:  # noqa: BLE001 — collect every failure, raise below
+            failed_conversions[model_id] = e
             print(f"    Conversion FAILED: {e}")
-            continue  # Skip verification if conversion failed
         
-        # === VERIFICATION (only if solvers available) ===
-        if solvers_to_test:
-            model_verification = {}
-            
-            for solver_name, solver in solvers_to_test:
-                try:
-                    # TEMPORARILY COMMENTED OUT: Testing if verify_once causes memory issue
-                    # res = verify_once(net, solver=solver, timelimit=30.0)
-                    # status = res.status
-                    status = "SKIPPED"  # Placeholder to test memory usage
-                    model_verification[solver_name] = status
-                    print(f"    Verification ({solver_name}): {status} (verify_once commented out)")
-                    
-                    if status == "UNSAT" or status == "SAT":
-                        verification_success_count += 1
-                        
-                except Exception as e:
-                    model_verification[solver_name] = f"ERROR: {str(e)[:50]}"
-                    print(f"    Verification ({solver_name}): ERROR - {str(e)[:50]}")
-            
-            verification_results[model_id] = model_verification
-        
-        # === MEMORY CLEANUP ===
-        # Free memory from this net immediately (no need to store)
-        del net
-        
-        # Clean up memory periodically
         if idx % 10 == 0:
             gc.collect()
             if torch_module.cuda.is_available():
                 torch_module.cuda.empty_cache()
     
-    # === FINAL SUMMARY ===
     total_count = len(successful_models)
     print(f"\nFinal Results:")
-    print(f"  Conversions: {conversion_success_count}/{total_count} ({conversion_success_count/total_count*100:.1f}%)")
+    print(f"  Conversions: {total_count - len(failed_conversions)}/{total_count}")
     
-    if solvers_to_test and verification_results:
-        # Count successful verifications (UNSAT or SAT results)
-        total_verifications = sum(len(v) for v in verification_results.values())
-        successful_verifications = sum(
-            1 for results in verification_results.values() 
-            for status in results.values() 
-            if isinstance(status, str) and status in ["UNSAT", "SAT"]
-        )
-        print(f"  Verifications: {successful_verifications}/{total_verifications} successful")
-    
-    # Print failed conversions if any
-    failed_conversions = {k: v for k, v in conversion_results.items() if v != "SUCCESS"}
-    if failed_conversions:
-        print(f"\n  Failed conversions: {len(failed_conversions)}")
-        for model_id, error in list(failed_conversions.items())[:5]:  # Show first 5
-            print(f"    - {model_id}: {error}")
-    
-    # Print debug file location (GUARDED)
     if PerformanceOptions.debug_tf:
         print(f"\nDebug log written to: {PerformanceOptions.debug_output_file}")
     
-    print("\nTorch->ACT conversion and verification completed!")
+    if failed_conversions:
+        details = "\n  ".join(f"{model_id}: {err}" for model_id, err in failed_conversions.items())
+        raise RuntimeError(
+            f"{len(failed_conversions)}/{total_count} Torch→ACT conversion(s) failed:\n  {details}"
+        )
+    
+    print("\nTorch->ACT conversion completed!")
 
 
 if __name__ == "__main__":
