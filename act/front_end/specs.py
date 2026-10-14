@@ -15,6 +15,7 @@
 from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, ClassVar, Dict, List, Optional
 import torch
 
@@ -265,7 +266,7 @@ class InputSpec:
         )
 
 
-class OutKind:
+class OutKind(str, Enum):
     LINEAR_LE   = "LINEAR_LE"
     TOP1_ROBUST = "TOP1_ROBUST"
     MARGIN_ROBUST = "MARGIN_ROBUST"
@@ -278,11 +279,11 @@ class OutputSpec:
         "y_true", "margin", "c", "d", "lb", "ub", "C", "thresholds"
     )
     # Kinds whose unsafe set is closed, so severity == 0 already violates.
-    CLOSED_KINDS: ClassVar[frozenset[str]] = frozenset(
+    CLOSED_KINDS: ClassVar[frozenset[OutKind]] = frozenset(
         {OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.UNSAFE_LINEAR}
     )
 
-    kind: str
+    kind: OutKind
     c: Optional[torch.Tensor] = None
     d: Optional[torch.Tensor] = None
     y_true: Optional[torch.Tensor] = None
