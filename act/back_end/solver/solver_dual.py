@@ -19,7 +19,12 @@ from act.back_end.core import Bounds, Layer, Net, get_topo_order
 from act.back_end.layer_schema import LayerKind
 from act.back_end.dual_tf.tf_forward import _intersect_boxes
 from act.config.config import DualConfig
-from act.back_end.solver.solver_base import Solver, SolverCaps
+from act.back_end.solver.solver_base import (
+    BatchLPSolution,
+    SolveStatus,
+    Solver,
+    SolverCaps,
+)
 from act.front_end.specs import OutputSpec, OutKind
 from act.util.device_manager import get_default_device, get_default_dtype
 from act.util.stats import SpecBatchResult
@@ -37,6 +42,25 @@ class DualResult:
     alpha_state: Optional[Dict[int, torch.Tensor]] = None
     eta_state: Optional[Dict[int, torch.Tensor]] = None
     nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+
+
+@dataclass(frozen=True)
+class DualBatchResult:
+    """Decoded result of :meth:`DualSolver.solve_spec_batch` for one K-lane batch."""
+
+    solution: BatchLPSolution
+    margins: torch.Tensor
+    lower_bounds: torch.Tensor
+    bounds_dict: Optional[Dict[int, Bounds]] = None
+    nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+    alpha_state: Optional[Dict[int, torch.Tensor]] = None
+    eta_state: Optional[Dict[int, torch.Tensor]] = None
+    witness_input: Optional[torch.Tensor] = None
+    row_slack: Optional[torch.Tensor] = None
+    c_rows: Optional[torch.Tensor] = None
+    thresholds: Optional[torch.Tensor] = None
+    m_specs: int = 0
+    reference_bounds: Optional[Dict[int, Bounds]] = None
 
 
 def expand_bounds_dict(bounds_dict: Dict[int, Bounds], M: int) -> Dict[int, Bounds]:
@@ -171,6 +195,224 @@ class DualSolver(Solver):
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=True, supports_csp=False, supports_dual=True)
 
+    def solve_spec_batch(
+        self,
+        net: Net,
+        bounds_dict: Dict[int, Bounds],
+        out_spec: OutputSpec,
+        *,
+        optimize: bool,
+        dual_config: DualConfig,
+        input_shape: tuple[int, ...],
+        keep_rows: Optional[torch.Tensor] = None,
+        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        eta: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
+        optimize_alpha: bool = True,
+        refresh_forward: bool = True,
+        return_nu: bool = False,
+        reuse_bounds_for_branching: bool = False,
+    ) -> DualBatchResult:
+        """Solve and decode one prepared K-lane output-spec batch.
+
+        Bound construction and refinement are caller policy. This method owns
+        output-row encoding, dual optimization, lane status/witness decoding,
+        and the optional converged-state nu pass used by neuron branching.
+        """
+        sample_bounds = next(iter(bounds_dict.values()))
+        device = sample_bounds.lb.device
+        dtype = sample_bounds.lb.dtype
+        if sample_bounds.lb.dim() < 2:
+            raise ValueError(
+                "DualSolver.solve_spec_batch: bounds_dict entries must be batched "
+                f"[K, *shape]; got dim={sample_bounds.lb.dim()}"
+            )
+        k_actual = int(sample_bounds.lb.shape[0])
+
+        assert_layers = [
+            layer
+            for layer in net.layers
+            if (layer.kind.upper() if isinstance(layer.kind, str) else layer.kind)
+            == LayerKind.ASSERT.value
+        ]
+        if not assert_layers:
+            raise ValueError("DualSolver.solve_spec_batch: net has no ASSERT layer")
+        assert_layer = assert_layers[0]
+        assert_preds = net.preds.get(assert_layer.id, [])
+        if len(assert_preds) != 1:
+            raise ValueError(
+                f"ASSERT layer {assert_layer.id} must have exactly 1 predecessor, "
+                f"got {len(assert_preds)}"
+            )
+        output_bounds = bounds_dict[assert_preds[0]]
+        n_out = int(output_bounds.lb.flatten(start_dim=1).shape[-1])
+        encoded_spec = out_spec.encode_linear(
+            B=k_actual, n_out=n_out, device=device, dtype=dtype
+        )
+        m_specs = int(encoded_spec["M"])
+
+        if out_spec.kind == OutKind.UNSAFE_LINEAR:
+            c_rows = cast(torch.Tensor, encoded_spec["C"]).contiguous()
+            thresholds = cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+        else:
+            c_rows = -cast(torch.Tensor, encoded_spec["C"]).contiguous()
+            thresholds = -cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+            if keep_rows is not None:
+                idx = keep_rows.to(device=device, dtype=torch.long)
+                c_rows = (
+                    c_rows.view(k_actual, m_specs, n_out)
+                    .index_select(1, idx)
+                    .reshape(k_actual * int(idx.numel()), n_out)
+                    .contiguous()
+                )
+                thresholds = thresholds.index_select(1, idx).contiguous()
+                m_specs = int(idx.numel())
+        active_mask = torch.ones(
+            k_actual, m_specs, dtype=torch.bool, device=device
+        )
+
+        compute_certified_bound = cast(Any, self.compute_certified_bound)
+        if optimize:
+            dual_result = compute_certified_bound(
+                net,
+                bounds_dict,
+                c_rows,
+                M=m_specs,
+                optimize=True,
+                optimize_alpha=optimize_alpha,
+                refresh_forward=refresh_forward,
+                forward_lin_max_perturbed=dual_config.forward_lin_max_perturbed,
+                n_iters=dual_config.n_iters,
+                lr_alpha=dual_config.lr_alpha,
+                lr_beta=dual_config.lr_beta,
+                lr_decay=dual_config.lr_decay,
+                eta=eta,
+                incremental_alphas=incremental_alphas,
+                incremental_etas=incremental_etas,
+                split_signs=split_signs,
+                return_optimized=True,
+                return_sce=True,
+                per_class_alpha=dual_config.per_class_alpha,
+                **({"return_nu_per_layer": True} if return_nu else {}),
+            )
+        else:
+            dual_result = compute_certified_bound(
+                net,
+                bounds_dict,
+                c_rows,
+                M=m_specs,
+                return_sce=True,
+                **({"return_nu_per_layer": True} if return_nu else {}),
+            )
+
+        margins = dual_result.margins.view(k_actual, m_specs)
+        sce = cast(Optional[torch.Tensor], dual_result.sce)
+        slack = margins - thresholds
+        if out_spec.kind == OutKind.UNSAFE_LINEAR:
+            certified = ((slack > 0) & active_mask).any(dim=-1)
+            candidate_rows = torch.zeros(
+                k_actual, dtype=torch.long, device=device
+            )
+        else:
+            violations = (slack < 0) & active_mask
+            certified = ~violations.any(dim=-1)
+            candidate_rows = torch.where(
+                violations.any(dim=1),
+                violations.to(torch.int64).argmax(dim=1),
+                torch.zeros(k_actual, dtype=torch.long, device=device),
+            )
+
+        statuses = tuple(
+            SolveStatus.UNSAT if bool(is_certified.item()) else SolveStatus.SAT
+            for is_certified in certified
+        )
+        nvars = (
+            max((max(layer.out_vars) for layer in net.layers if layer.out_vars), default=-1)
+            + 1
+        )
+        x_candidate = torch.zeros(k_actual, nvars, device=device, dtype=dtype)
+        input_layers = [
+            layer
+            for layer in net.layers
+            if (layer.kind.upper() if isinstance(layer.kind, str) else layer.kind)
+            == LayerKind.INPUT.value
+        ]
+        if len(input_layers) != 1:
+            raise ValueError(
+                f"Expected exactly one INPUT layer, found {len(input_layers)}."
+            )
+        input_ids_list = list(input_layers[0].out_vars)
+        input_ids = torch.tensor(input_ids_list, device=device, dtype=torch.long)
+        if sce is not None:
+            sce_flat = sce.flatten(start_dim=1).to(device=device)
+            row_offsets = (
+                torch.arange(k_actual, device=device) * m_specs
+                + candidate_rows.to(device=device)
+            )
+            chosen_sce = sce_flat.index_select(0, row_offsets)
+            x_candidate[:, input_ids] = chosen_sce.to(device=device, dtype=dtype)
+        else:
+            statuses = tuple(
+                SolveStatus.UNSAT if status == SolveStatus.UNSAT else SolveStatus.UNKNOWN
+                for status in statuses
+            )
+        solution = BatchLPSolution(
+            statuses=statuses,
+            x=x_candidate,
+            max_viol=-slack.min(dim=1).values.detach(),
+        )
+
+        branch_bounds: Optional[Dict[int, Bounds]] = None
+        branch_nu: Optional[Dict[int, torch.Tensor]] = None
+        if return_nu and reuse_bounds_for_branching:
+            branch_bounds = bounds_dict
+            branch_nu = dual_result.nu_per_layer
+            if branch_nu is None:
+                nu_pass = self.compute_certified_bound(
+                    net,
+                    bounds_dict,
+                    c_rows,
+                    M=m_specs,
+                    alpha=dual_result.alpha_state,
+                    eta=dual_result.eta_state if split_signs is not None else None,
+                    split_signs=split_signs,
+                    return_nu_per_layer=True,
+                )
+                branch_nu = nu_pass.nu_per_layer
+        elif return_nu:
+            branch_bounds, branch_nu = self.recompute_bounds_and_nu(
+                net,
+                bounds_dict,
+                c_rows,
+                m_specs,
+                alpha_state=dual_result.alpha_state,
+                eta_state=dual_result.eta_state if split_signs is not None else None,
+                split_signs=split_signs,
+                per_class_alpha=dual_config.per_class_alpha,
+            )
+
+        witness_input = (
+            x_candidate[:, input_ids].reshape(k_actual, *input_shape).detach()
+            if sce is not None
+            else None
+        )
+        lower_bounds = -solution.max_viol
+        return DualBatchResult(
+            solution=solution,
+            margins=margins,
+            lower_bounds=lower_bounds,
+            bounds_dict=branch_bounds,
+            nu_per_layer=branch_nu,
+            alpha_state=dual_result.alpha_state,
+            eta_state=dual_result.eta_state,
+            witness_input=witness_input,
+            row_slack=slack.detach(),
+            c_rows=c_rows.detach(),
+            thresholds=thresholds.detach(),
+            m_specs=m_specs,
+            reference_bounds=bounds_dict,
+        )
 
     def compute_certified_bound(
         self, net: Net, bounds_dict: Dict[int, Bounds],
@@ -554,8 +796,7 @@ class DualSolver(Solver):
         if k != LayerKind.RELU.value:
             return None
         b = bounds_dict.get(layer.id)
-        if b is None:
-            return None
+        assert b is not None, f"_init_alpha: no bounds for RELU layer {layer.id}"
         if incremental_alphas is not None and layer.id in incremental_alphas:
             alpha_init = (
                 incremental_alphas[layer.id]
@@ -892,6 +1133,85 @@ class DualSolver(Solver):
 
         return best_bounds.detach(), best_sce, best_alpha_state, best_eta_state
 
+    def _interval_refresh_bounds(
+        self,
+        net: Net,
+        base: Dict[int, Bounds],
+        split_signs: Dict[int, torch.Tensor],
+    ) -> Optional[Dict[int, Bounds]]:
+        """Re-propagate split phases with interval arithmetic and intersect base."""
+        from act.back_end.dual_tf.tf_forward import _fwd_conv2d_interval
+
+        out = dict(base)
+        vals: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer in net.layers:
+            k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            lid = layer.id
+            if k == LayerKind.ASSERT.value:
+                continue
+            if k in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
+                b = out.get(lid)
+                assert b is not None, f"_interval_refresh_bounds: no bounds for {k} layer {lid}"
+                vals[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
+                continue
+            preds = net.preds.get(lid, [])
+            if k == LayerKind.CONV2D.value:
+                plb, pub = vals[preds[0]]
+                lb, ub = _fwd_conv2d_interval(layer, plb, pub)
+                lb, ub = lb.flatten(start_dim=1), ub.flatten(start_dim=1)
+            elif k == LayerKind.DENSE.value:
+                w = layer.params["weight"]
+                bias = layer.params.get("bias")
+                assert isinstance(w, torch.Tensor), (
+                    f"_interval_refresh_bounds: DENSE layer {lid} weight is {type(w).__name__}"
+                )
+                plb, pub = vals[preds[0]]
+                c = (plb + pub) * 0.5
+                r = (pub - plb) * 0.5
+                m = c @ w.T
+                rho = r @ w.abs().T
+                lb = m - rho
+                ub = m + rho
+                if isinstance(bias, torch.Tensor):
+                    lb, ub = lb + bias, ub + bias
+            elif k == LayerKind.ADD.value:
+                (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
+                lb, ub = alb + blb, aub + bub
+            elif k in (LayerKind.FLATTEN.value, LayerKind.RESHAPE.value):
+                lb, ub = vals[preds[0]]
+            elif k == LayerKind.RELU.value:
+                lb, ub = vals[preds[0]]
+            else:
+                return None
+
+            b = out.get(lid)
+            if b is not None:
+                lb = torch.maximum(lb, b.lb.flatten(start_dim=1))
+                ub = torch.minimum(ub, b.ub.flatten(start_dim=1))
+                ub = torch.maximum(ub, lb)
+            if k == LayerKind.RELU.value:
+                s = split_signs.get(lid)
+                if s is not None:
+                    sl = s[:, 0, :] if s.dim() == 3 else s
+                    n = min(lb.shape[-1], sl.shape[-1])
+                    sn = sl[..., :n].to(lb.device)
+                    lb, ub = lb.clone(), ub.clone()
+                    lb[..., :n] = torch.where(
+                        sn > 0, lb[..., :n].clamp(min=0.0), lb[..., :n]
+                    )
+                    ub[..., :n] = torch.where(
+                        sn < 0, ub[..., :n].clamp(max=0.0), ub[..., :n]
+                    )
+                    ub[..., :n] = torch.maximum(ub[..., :n], lb[..., :n])
+            if b is not None:
+                out[lid] = Bounds(
+                    lb.view_as(b.lb).clone(), ub.view_as(b.ub).clone()
+                )
+            if k == LayerKind.RELU.value:
+                vals[lid] = (lb.clamp(min=0.0), ub.clamp(min=0.0))
+            else:
+                vals[lid] = (lb, ub)
+        return out
 
     def _harden_split_bounds(
         self,
@@ -1193,11 +1513,11 @@ class DualSolver(Solver):
 
         device, dtype = c.device, c.dtype
         input_lid = self._find_input_layer_id(net)
-        if input_lid is None:
-            return bounds_dict, None
+        assert input_lid is not None, "recompute_bounds_and_nu: net has no INPUT layer"
         input_bounds = bounds_dict.get(input_lid)
-        if input_bounds is None:
-            return bounds_dict, None
+        assert input_bounds is not None, (
+            f"recompute_bounds_and_nu: no bounds for INPUT layer {input_lid}"
+        )
         input_lb = input_bounds.lb.to(device=device, dtype=dtype)
         input_ub = input_bounds.ub.to(device=device, dtype=dtype)
 

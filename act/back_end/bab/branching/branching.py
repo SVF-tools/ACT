@@ -14,11 +14,8 @@
 #     1. Input splitting  — bisect (or N-ary section) the input domain along a dim.
 #     2. Neuron splitting  — fix an unstable ReLU's activation phase (on/off).
 #
-#   Joint multi-neuron splitting (``_multi_split_from_decision``): split each lane's
-#   top-k BaBSR-scored neurons together into all 2^k sign combinations (one "skip"
-#   instead of k greedy single splits); gains are super-additive.
-#     * "Mining Verdict Boundaries for Neural Network Verification",
-#       Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui, FM 2026.
+#   Joint multi-neuron splitting (2^k sign combinations of each lane's top-k
+#   BaBSR neurons, FM 2026) lives in ``act.back_end.bab.branching.multi_split``.
 #
 #   Strategies (subclasses of ``BranchingStrategy``):
 #     * ``RandomBranching`` — uniform-random over eligible dims (width-weighted for
@@ -35,7 +32,7 @@
 #       Decomposition", De Palma et al., 2021.
 #
 #   Result types: ``BranchingScores`` (per-dim / per-neuron scores) and
-#   ``SplitDecision`` (``input_axis`` / ``cut_dim`` + ``fanout`` for input splits;
+#   ``SplitDecision`` (``input_axis`` + ``fanout`` for input splits;
 #   ``layer_id`` / ``neuron_idx`` for neuron splits). Factory:
 #   ``_build_branching_strategy``.
 #
@@ -47,13 +44,24 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from act.back_end.bab.node import SubproblemBatch
+from act.config.config import DualConfig
+from act.back_end.bab.node import (
+    SubproblemBatch,
+    _layer_neuron_count,
+    split_input,
+    split_input_nary,
+    split_neurons,
+)
 from act.back_end.core import Bounds, Layer, Net
+from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+from act.back_end.layer_schema import LayerKind
 from act.front_end.specs import InKind
+from act.util.device_manager import get_default_device, get_default_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +74,91 @@ class BranchingScores:
     flat: Optional[torch.Tensor] = None
     per_layer: Optional[Dict[int, torch.Tensor]] = None
     intercept_per_layer: Optional[Dict[int, torch.Tensor]] = None
+    input_fallback: Optional[torch.Tensor] = None
+    """Width-masked input-axis scores kept alongside neuron scores, so a lane
+    with no splittable neuron falls back to a *wide* input dimension instead of
+    a hard-coded dim 0 (zero width on any sparse-perturbation benchmark)."""
 
 
 @dataclass
 class SplitDecision:
     kind: str
     input_axis: Optional[torch.Tensor | int] = None
-    cut_dim: Optional[torch.Tensor] = None
     fanout: int = 2
     layer_id: Optional[torch.Tensor] = None
     neuron_idx: Optional[torch.Tensor] = None
+
+    def input_axes(self, batch: SubproblemBatch) -> torch.Tensor:
+        if self.input_axis is None:
+            raise ValueError("input-axis decision missing input_axis")
+        input_axis = torch.as_tensor(
+            self.input_axis, device=batch.lb.device, dtype=torch.long
+        ).reshape(-1)
+        if input_axis.numel() == 1:
+            input_axis = input_axis.expand(batch.batch_size)
+        if input_axis.numel() != batch.batch_size:
+            raise ValueError(
+                f"input-axis decision has {input_axis.numel()} lanes for batch size "
+                f"{batch.batch_size}"
+            )
+        return input_axis.contiguous()
+
+    def apply(
+        self,
+        batch: SubproblemBatch,
+        net: Net,
+    ) -> tuple[SubproblemBatch, torch.Tensor]:
+        fanout = max(2, int(self.fanout))
+        if self.kind == "input_axis":
+            dims = self.input_axes(batch)
+            if fanout == 2:
+                return split_input(batch, dims)
+            return split_input_nary(batch, dims, fanout)
+
+        if self.kind == "neuron":
+            if self.layer_id is None or self.neuron_idx is None:
+                raise ValueError("neuron decision missing layer_id or neuron_idx")
+
+            layer_id_tensor = self.layer_id.reshape(-1)
+            neuron_idx_tensor = self.neuron_idx.reshape(-1)
+            if layer_id_tensor.numel() == 0 or neuron_idx_tensor.numel() == 0:
+                raise ValueError("neuron decision tensors must be non-empty")
+
+            representative_layer_id = int(layer_id_tensor[0].item())
+            if representative_layer_id < 0:
+                raise ValueError(
+                    f"neuron decision has negative layer_id {representative_layer_id}; "
+                    "input-axis splits must be emitted as "
+                    "SplitDecision(kind='input_axis')"
+                )
+
+            n_lanes = batch.batch_size
+            layer_ids = (
+                layer_id_tensor.expand(n_lanes)
+                if layer_id_tensor.numel() == 1
+                else layer_id_tensor
+            )
+            neuron_indices = (
+                neuron_idx_tensor.expand(n_lanes)
+                if neuron_idx_tensor.numel() == 1
+                else neuron_idx_tensor
+            )
+            if layer_ids.numel() != n_lanes or neuron_indices.numel() != n_lanes:
+                raise ValueError(
+                    f"neuron decision has {layer_ids.numel()}/{neuron_indices.numel()} "
+                    f"entries for batch size {n_lanes}"
+                )
+
+            return split_neurons(
+                batch,
+                net,
+                layer_ids.unsqueeze(1),
+                neuron_indices.unsqueeze(1),
+                1,
+                first_sign=+1.0,
+            )
+
+        raise ValueError(f"Unknown SplitDecision.kind: {self.kind!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +171,9 @@ class BranchingStrategy(ABC):
 
     Lifecycle (called by the BaB engine per iteration)::
 
-        scores     = strategy.compute_scores(batch, net, unstable_mask)
-        split_dims = strategy.select(scores)
-        left, right = split_subproblems(batch, split_dims)
+        scores   = strategy.compute_scores(batch, net, unstable_mask)
+        decision = strategy.select(scores)
+        children, parent_index = decision.apply(batch, net)
 
     Subclass contract
     ~~~~~~~~~~~~~~~~~
@@ -139,7 +222,27 @@ class BranchingStrategy(ABC):
             if scores.flat is None:
                 raise ValueError("Base BranchingStrategy requires flat scores")
             scores = scores.flat
-        return scores.argmax(dim=-1)
+        return _argmax_splittable(scores)
+
+
+def _argmax_splittable(scores: torch.Tensor) -> torch.Tensor:
+    """Row-wise ``argmax`` that refuses a masked-out (``-inf``) winner.
+
+    Input-axis scorers mask zero-width dimensions to ``-inf``. A lane whose best
+    score is still ``-inf`` has nothing to split: bisecting a zero-width
+    dimension yields two children identical to the parent, so the frontier keeps
+    re-expanding them and BaB livelocks. Failing loudly is the sound option —
+    silently emitting no children would let ``bab.py`` drain the pool and report
+    CERTIFIED.
+    """
+    best = scores.argmax(dim=-1)
+    best_score = scores.gather(-1, best.unsqueeze(-1)).squeeze(-1)
+    if not bool(torch.isfinite(best_score).all().item()):
+        raise ValueError(
+            "no splittable input dimension: every candidate dimension is "
+            "zero-width or masked out in at least one lane"
+        )
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -181,10 +284,11 @@ class RandomBranching(BranchingStrategy):
             embedding_mask = _perturbed_embedding_input_mask(net, batch)
             widths = batch.widths()  # (N, D)
             if embedding_mask is None:
-                scores = torch.rand(N, D, device=device) * (widths > 0).float()
+                scores = torch.rand(N, D, device=device)
             else:
                 mask = embedding_mask.unsqueeze(0).expand(N, -1)
                 scores = widths.masked_fill(~mask, float("-inf"))
+            scores = scores.masked_fill(widths <= 0, float("-inf"))
 
         return scores
 
@@ -205,11 +309,12 @@ class InputBranching(BranchingStrategy):
         unstable_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         widths = batch.widths()
+        scores = widths.masked_fill(widths <= 0, float("-inf"))
         embedding_mask = _perturbed_embedding_input_mask(net, batch)
         if embedding_mask is not None:
             mask = embedding_mask.unsqueeze(0).expand_as(widths)
-            return widths.masked_fill(~mask, float("-inf"))
-        return widths
+            return scores.masked_fill(~mask, float("-inf"))
+        return scores
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +405,7 @@ class BaBSRBranching(BranchingStrategy):
             flat=None,
             per_layer=per_layer,
             intercept_per_layer=intercept_per_layer,
+            input_fallback=self._baseline_scores(batch, None, net),
         )
 
     def _baseline_scores(
@@ -324,7 +430,8 @@ class BaBSRBranching(BranchingStrategy):
                 mask = mask.unsqueeze(0).expand(batch.batch_size, -1)
             scores = scores * mask
 
-        return scores
+        # Masked last: -inf * 0 from the unstable mask would be NaN.
+        return scores.masked_fill(widths <= 0, float("-inf"))
 
     def _already_split_mask(
         self,
@@ -341,14 +448,25 @@ class BaBSRBranching(BranchingStrategy):
         signs = batch.split_signs[lid]
         return (signs != 0).any(dim=1)
 
+    @staticmethod
+    def _input_axis_fallback(scores: BranchingScores) -> SplitDecision:
+        if scores.input_fallback is None:
+            raise ValueError(
+                "no splittable input dimension: neuron branching fell back to an "
+                "input-axis split but no width scores were recorded"
+            )
+        return SplitDecision(
+            kind="input_axis", input_axis=_argmax_splittable(scores.input_fallback)
+        )
+
     def select(self, scores: torch.Tensor | BranchingScores) -> torch.Tensor | SplitDecision:
         if isinstance(scores, torch.Tensor):
-            return scores.argmax(dim=-1)
+            return _argmax_splittable(scores)
         if scores.flat is not None:
-            return SplitDecision(kind="input_axis", input_axis=scores.flat.argmax(dim=-1))
+            return SplitDecision(kind="input_axis", input_axis=_argmax_splittable(scores.flat))
         per_layer = scores.per_layer
         if not per_layer:
-            return SplitDecision(kind="input_axis", input_axis=0)
+            return self._input_axis_fallback(scores)
 
         N = next(iter(per_layer.values())).shape[0]
         device = next(iter(per_layer.values())).device
@@ -390,12 +508,51 @@ class BaBSRBranching(BranchingStrategy):
                     continue
 
             self.icp_score_counter = 0
-            return SplitDecision(kind="input_axis", input_axis=0)
+            return self._input_axis_fallback(scores)
 
         return SplitDecision(kind="neuron", layer_id=decisions_layer, neuron_idx=decisions_neuron)
 
 
 _WITNESS_GAP_TOL = 1e-6
+
+
+def witness_relu_preactivations(
+    net: Net,
+    witness_input: torch.Tensor,
+    input_shape: tuple[int, ...],
+    dual_config: DualConfig,
+) -> Optional[Dict[int, torch.Tensor]]:
+    """Return concrete per-ReLU pre-activations at a dual witness."""
+    if witness_input.numel() == 0:
+        return None
+    x = witness_input
+    if input_shape and x.dim() == 2 and x.shape[1] == int(math.prod(input_shape)):
+        x = x.reshape(x.shape[0], *input_shape)
+    bounds_dict = None
+    try:
+        bounds_dict = compute_forward_bounds(
+            net,
+            x,
+            x,
+            forward_lin_max_perturbed=dual_config.forward_lin_max_perturbed,
+        )
+    except ValueError:
+        # compute_forward_bounds raises ValueError for layer kinds it cannot
+        # propagate; those nets use BaBSR scoring.
+        bounds_dict = None
+    if bounds_dict is None:
+        return None
+    preactivations = {
+        layer_id: bounds.lb.flatten(start_dim=1)
+        for layer_id, bounds in bounds_dict.items()
+        if _layer_kind_upper(net.by_id[layer_id]) == LayerKind.RELU.value
+    }
+    return preactivations or None
+
+
+def _layer_kind_upper(layer: Layer) -> str:
+    kind = layer.kind
+    return kind.value if isinstance(kind, LayerKind) else kind.upper()
 
 
 class WitnessResidualBranching(BaBSRBranching):
@@ -489,7 +646,12 @@ class WitnessResidualBranching(BaBSRBranching):
             self._record_babsr_disagreement(
                 batch, net, unstable_mask, bounds_dict, nu_per_layer, per_layer
             )
-        return BranchingScores(flat=None, per_layer=per_layer, intercept_per_layer=None)
+        return BranchingScores(
+            flat=None,
+            per_layer=per_layer,
+            intercept_per_layer=None,
+            input_fallback=self._baseline_scores(batch, None, net),
+        )
 
     def _record_babsr_disagreement(
         self,
@@ -548,6 +710,61 @@ class WitnessResidualBranching(BaBSRBranching):
         return pairs, torch.isfinite(best_val)
 
 
+def _assert_witness_residual_decision_unstable(
+    decision: SplitDecision,
+    bounds_dict: Optional[Dict[int, Bounds]],
+) -> None:
+    """Check that every non-fallback witness decision splits an unstable ReLU."""
+    if decision.kind != "neuron":
+        return
+    layer_ids = decision.layer_id
+    neuron_indices = decision.neuron_idx
+    violation: Optional[str] = None
+    if layer_ids is None or neuron_indices is None:
+        violation = (
+            f"neuron decision missing tensors (has_layers={layer_ids is not None}, "
+            f"has_neurons={neuron_indices is not None})"
+        )
+    elif bounds_dict is None:
+        violation = (
+            f"missing bounds (lanes={layer_ids.numel()}, "
+            f"decisions={neuron_indices.numel()})"
+        )
+    else:
+        layer_ids = layer_ids.reshape(-1)
+        neuron_indices = neuron_indices.reshape(-1)
+        for lane, (layer_raw, neuron_raw) in enumerate(
+            zip(layer_ids.tolist(), neuron_indices.tolist())
+        ):
+            layer_id = int(layer_raw)
+            neuron = int(neuron_raw)
+            bounds = bounds_dict.get(layer_id)
+            if bounds is None:
+                violation = (
+                    f"decision has no layer bounds (lane={lane}, layer={layer_id}, "
+                    f"neuron={neuron}, available_layers={len(bounds_dict)})"
+                )
+                break
+            lb = bounds.lb.flatten(start_dim=1)
+            ub = bounds.ub.flatten(start_dim=1)
+            if lane >= lb.shape[0] or neuron >= lb.shape[1] or neuron < 0:
+                violation = (
+                    f"decision index out of range (lane={lane}, layer={layer_id}, "
+                    f"neuron={neuron}, bound_lanes={lb.shape[0]}, "
+                    f"bound_neurons={lb.shape[1]})"
+                )
+                break
+            lower = float(lb[lane, neuron].item())
+            upper = float(ub[lane, neuron].item())
+            if not lower < 0.0 < upper:
+                violation = (
+                    f"non-fallback decision selected stable neuron (lane={lane}, "
+                    f"layer={layer_id}, neuron={neuron}, lb={lower:g}, ub={upper:g})"
+                )
+                break
+    assert violation is None, f"WITNESS RESIDUAL invariant violated: {violation}"
+
+
 def _preact_bias_of(net: Net, lid: int) -> torch.Tensor:
     layer = net.by_id[lid]
     n_neurons = len(layer.out_vars)
@@ -560,8 +777,8 @@ def _preact_bias_of(net: Net, lid: int) -> torch.Tensor:
         for value in pred.params.values():
             if isinstance(value, torch.Tensor):
                 return torch.zeros(n_neurons, dtype=value.dtype, device=value.device)
-    dtype = torch.float32
-    device = torch.device("cpu")
+    dtype = get_default_dtype()
+    device = get_default_device()
     for value in layer.params.values():
         if isinstance(value, torch.Tensor):
             dtype = value.dtype
@@ -582,7 +799,10 @@ def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) 
     if net is None:
         return None
     for layer in net.layers:
-        if layer.kind != "INPUT_SPEC" or layer.params.get("kind") != InKind.LP_EMBEDDING:
+        if (
+            layer.kind != LayerKind.INPUT_SPEC.value
+            or layer.params.get("kind") != InKind.LP_EMBEDDING
+        ):
             continue
         center = layer.params.get("center")
         if not isinstance(center, torch.Tensor) or center.dim() < 2:
@@ -611,21 +831,6 @@ def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) 
             flat = flat[:batch.input_dim]
         setattr(batch, "_perturbed_embedding_mask", flat)
         return flat
-    return None
-
-
-def attention_nu_exposure_candidates(
-    bounds_dict: Optional[Dict[int, Bounds]],
-    nu_per_layer: Optional[Dict[int, torch.Tensor]],
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Deferred hook for future attention-neuron splitting.
-
-    Attention BaBSR needs a stable exposure of catalytic attention ν and
-    pre-activation intervals.  Phase P4 intentionally ships input splitting
-    only, so this hook documents the integration point and returns no
-    candidates until that exposure contract exists.
-    """
-    del bounds_dict, nu_per_layer
     return None
 
 
@@ -699,30 +904,21 @@ class FSBBranching(BaBSRBranching):
 
         N = batch.batch_size
         baseline = batch.parent_margins
-        try:
-            result = self._evaluate_hypotheses(net, bounds_dict, hypothesis_list)
-            stacked_margins = result.margins.to(device=batch.lb.device, dtype=batch.lb.dtype)
-            if stacked_margins.dim() == 1:
-                stacked_margins = stacked_margins.reshape(1, -1)
-            if stacked_margins.dim() > 2:
-                stacked_margins = stacked_margins.reshape(stacked_margins.shape[0], N, -1).mean(dim=-1)
-            if stacked_margins.shape[0] != len(hypothesis_list):
-                raise ValueError("KFSB solver returned wrong candidate dimension")
-            if stacked_margins.shape[1] != N:
-                stacked_margins = stacked_margins.reshape(len(hypothesis_list), N, -1).mean(dim=-1)
-            improvements = (
-                stacked_margins - baseline.to(stacked_margins.device).unsqueeze(0)
-                if baseline is not None
-                else stacked_margins
-            )
-        except Exception:
-            improvements = self._evaluate_hypotheses_serial(
-                net,
-                bounds_dict,
-                hypothesis_list,
-                baseline,
-                N,
-            )
+        result = self._evaluate_hypotheses(net, bounds_dict, hypothesis_list)
+        stacked_margins = result.margins.to(device=batch.lb.device, dtype=batch.lb.dtype)
+        if stacked_margins.dim() == 1:
+            stacked_margins = stacked_margins.reshape(1, -1)
+        if stacked_margins.dim() > 2:
+            stacked_margins = stacked_margins.reshape(stacked_margins.shape[0], N, -1).mean(dim=-1)
+        if stacked_margins.shape[0] != len(hypothesis_list):
+            raise ValueError("KFSB solver returned wrong candidate dimension")
+        if stacked_margins.shape[1] != N:
+            stacked_margins = stacked_margins.reshape(len(hypothesis_list), N, -1).mean(dim=-1)
+        improvements = (
+            stacked_margins - baseline.to(stacked_margins.device).unsqueeze(0)
+            if baseline is not None
+            else stacked_margins
+        )
 
         if bool(torch.isneginf(improvements).all().item()):
             return bsr
@@ -742,7 +938,12 @@ class FSBBranching(BaBSRBranching):
                 final_per_layer[lid] = torch.full_like(source, float("-inf"))
             final_per_layer[lid][lane, neuron_idx] = improvements[ci, lane]
 
-        return BranchingScores(flat=None, per_layer=final_per_layer, intercept_per_layer=bsr.intercept_per_layer)
+        return BranchingScores(
+            flat=None,
+            per_layer=final_per_layer,
+            intercept_per_layer=bsr.intercept_per_layer,
+            input_fallback=bsr.input_fallback,
+        )
 
     def _evaluate_hypotheses(
         self,
@@ -762,54 +963,15 @@ class FSBBranching(BaBSRBranching):
             optimize=False,
         )
 
-    def _evaluate_hypotheses_serial(
-        self,
-        net: Net,
-        bounds_dict: Optional[Dict[int, Bounds]],
-        hypothesis_list: List[Dict[int, torch.Tensor]],
-        baseline: Optional[torch.Tensor],
-        N: int,
-    ) -> torch.Tensor:
-        improvements = torch.full(
-            (len(hypothesis_list), N),
-            float("-inf"),
-            device=next(iter(hypothesis_list[0].values())).device,
-            dtype=next(iter(hypothesis_list[0].values())).dtype,
-        )
-        for c_idx, hypo in enumerate(hypothesis_list):
-            try:
-                result = self._evaluate_hypothesis(net, bounds_dict, hypo)
-                margins = result.margins.reshape(N, -1).mean(dim=-1).to(improvements)
-                improvements[c_idx] = margins - baseline.to(margins.device) if baseline is not None else margins
-            except Exception:
-                # Recoverable: an individual hypothetical split may be incompatible with a legacy solver/mock.
-                continue
-        return improvements
-
-    def _evaluate_hypothesis(
-        self,
-        net: Net,
-        bounds_dict: Optional[Dict[int, Bounds]],
-        split_signs: Dict[int, torch.Tensor],
-    ) -> Any:
-        if bounds_dict is None:
-            raise ValueError("FSB hypothesis evaluation requires bounds_dict")
-        c = self._zero_objective(net, bounds_dict)
-        return self.dual_solver.compute_certified_bound(
-            net,
-            bounds_dict,
-            c,
-            M=1,
-            split_signs=split_signs,
-            optimize=False,
-        )
 
     def _zero_objective(
         self,
         net: Net,
         bounds_dict: Dict[int, Bounds],
     ) -> torch.Tensor:
-        assert_layers = [layer for layer in net.layers if layer.kind == "ASSERT"]
+        assert_layers = [
+            layer for layer in net.layers if layer.kind == LayerKind.ASSERT.value
+        ]
         if assert_layers:
             assert_layer = assert_layers[-1]
             preds = net.preds.get(assert_layer.id, [])
@@ -827,6 +989,7 @@ class FSBBranching(BaBSRBranching):
         neuron_idx_per_lane: torch.Tensor,
         net: Net,
     ) -> Dict[int, torch.Tensor]:
+        # This is a one-sided +1 scoring hypothesis, not a partition into children.
         hypo: Dict[int, torch.Tensor] = {}
         if batch.split_signs is not None:
             for key, value in batch.split_signs.items():
@@ -875,343 +1038,3 @@ def _build_branching_strategy(
             raise ValueError("FSB branching requires a dual_solver instance (inject via factory).")
         return FSBBranching(dual_solver=dual_solver, branching_candidates=branching_candidates)
     raise ValueError(f"Unknown branching method: {method!r}")
-
-
-# ---------------------------------------------------------------------------
-# Joint multi-neuron splitting (verdict-boundary)
-#
-#   "Mining Verdict Boundaries for Neural Network Verification"
-#   Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui
-#   FM 2026
-# ---------------------------------------------------------------------------
-
-
-def _collect_neuron_candidates(
-    branch_batch: SubproblemBatch,
-    bounds_dict: Dict[int, Bounds],
-    nu_per_layer: Dict[int, torch.Tensor],
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Per-lane BaBSR scores (area x |nu|) over all splittable neurons.
-
-    Returns ``(scores, layer_ids, neuron_ids)``, each ``[K, C]`` over the
-    concatenated candidate axis; stable or already-split neurons score -inf.
-    """
-    kb = branch_batch.batch_size
-    device = branch_batch.lb.device
-    cand_layers: List[torch.Tensor] = []
-    cand_neurons: List[torch.Tensor] = []
-    cand_scores: List[torch.Tensor] = []
-    for lid, nut in nu_per_layer.items():
-        b = bounds_dict.get(lid)
-        if b is None:
-            continue
-        lb = b.lb.flatten(start_dim=1)
-        ub = b.ub.flatten(start_dim=1)
-        if lb.shape[0] != kb:
-            continue
-        n = min(lb.shape[-1], nut.shape[-1])
-        amb = (lb[:, :n] < 0) & (ub[:, :n] > 0)
-        already = branch_batch.split_signs.get(lid) if branch_batch.split_signs else None
-        if already is not None:
-            amb &= already[:, 0, :n].to(device) == 0
-        area = (-lb[:, :n] * ub[:, :n] / (ub[:, :n] - lb[:, :n]).clamp(min=1e-12)).clamp(min=0)
-        nv = nut.reshape(kb, -1, nut.shape[-1])[:, :, :n].abs().sum(dim=1)
-        sc = torch.where(amb, area * nv, torch.full_like(area, float("-inf")))
-        cand_scores.append(sc)
-        cand_layers.append(torch.full((kb, n), lid, device=device, dtype=torch.long))
-        cand_neurons.append(
-            torch.arange(n, device=device, dtype=torch.long).expand(kb, n)
-        )
-    if not cand_scores:
-        return None
-    return (
-        torch.cat(cand_scores, dim=1),
-        torch.cat(cand_layers, dim=1),
-        torch.cat(cand_neurons, dim=1),
-    )
-
-
-def enumerate_unstable_candidates(
-    branch_batch: SubproblemBatch,
-    bounds_dict: Optional[Dict[int, Bounds]],
-    nu_per_layer: Optional[Dict[int, torch.Tensor]],
-    *,
-    limit: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    if bounds_dict is None or nu_per_layer is None:
-        return []
-    cand = _collect_neuron_candidates(branch_batch, bounds_dict, nu_per_layer)
-    if cand is None:
-        return []
-    scores, layers, neurons = cand
-    finite_mask = torch.isfinite(scores)
-    total = int(finite_mask.sum().item())
-    if total == 0 or (limit is not None and total > int(limit)):
-        return []
-    out: List[Dict[str, Any]] = []
-    for lane in range(scores.shape[0]):
-        flat_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        for col in torch.where(finite_mask[lane])[0].tolist():
-            lid = int(layers[lane, col].item())
-            nidx = int(neurons[lane, col].item())
-            b = bounds_dict.get(lid)
-            if b is not None and lid not in flat_cache:
-                flat_cache[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
-            lb = float(flat_cache[lid][0][lane, nidx].item()) if lid in flat_cache else 0.0
-            ub = float(flat_cache[lid][1][lane, nidx].item()) if lid in flat_cache else 0.0
-            denom = ub - lb
-            area = float(max(0.0, (-lb * ub) / denom)) if denom > 1e-12 else 0.0
-            score = float(scores[lane, col].item())
-            out.append({
-                "lane": lane, "layer_id": lid, "neuron_idx": nidx,
-                "score": score, "lb": lb, "ub": ub,
-                "nu": (score / area) if area > 1e-12 else None, "area": area,
-            })
-    return out
-
-
-def _layer_neuron_count(layer: Layer) -> int:
-    """Width of a layer's output block.
-
-    Derived from the variable-id span rather than ``len(out_vars)`` so that the
-    sign tensors stay aligned with the solver's flat variable indexing even if a
-    layer ever declares a non-contiguous ``out_vars`` list.
-    """
-    span = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
-    assert span == len(layer.out_vars), (
-        f"layer {layer.id} has non-contiguous out_vars: span {span} != "
-        f"{len(layer.out_vars)} declared variables"
-    )
-    return span
-
-
-def _index_subproblem_batch(
-    batch: SubproblemBatch, lanes: torch.Tensor
-) -> SubproblemBatch:
-    """Restrict every field of ``batch`` to the given lane indices."""
-
-    def _pick(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        return None if t is None else t.index_select(0, lanes.to(t.device))
-
-    def _pick_dict(
-        state: Optional[Dict[int, torch.Tensor]]
-    ) -> Optional[Dict[int, torch.Tensor]]:
-        if state is None:
-            return None
-        return {l: t.index_select(0, lanes.to(t.device)) for l, t in state.items()}
-
-    return SubproblemBatch(
-        lb=batch.lb.index_select(0, lanes.to(batch.lb.device)),
-        ub=batch.ub.index_select(0, lanes.to(batch.ub.device)),
-        depths=batch.depths.index_select(0, lanes.to(batch.depths.device)),
-        incremental_alpha=_pick_dict(batch.incremental_alpha),
-        incremental_eta=_pick_dict(batch.incremental_eta),
-        split_signs=_pick_dict(batch.split_signs),
-        parent_margins=_pick(batch.parent_margins),
-        lower_bound=_pick(batch.lower_bound),
-        node_id=_pick(batch.node_id),
-        parent_id=_pick(batch.parent_id),
-    )
-
-
-def _concat_subproblem_batches(
-    a: SubproblemBatch, b: SubproblemBatch
-) -> SubproblemBatch:
-    """Stack two child batches that were split at different depths.
-
-    The per-layer state dicts may disagree on their key sets: a layer touched
-    only by one group's selection exists there and not in the other. A missing
-    key means "no neuron of this layer is constrained", which is exactly what an
-    all-zero sign block encodes, so padding with zeros preserves each side's
-    feasible region rather than widening or narrowing it.
-    """
-
-    def _cat(x: Optional[torch.Tensor], y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if x is None or y is None:
-            return None
-        return torch.cat([x, y.to(device=x.device, dtype=x.dtype)], dim=0)
-
-    def _cat_dict(
-        x: Optional[Dict[int, torch.Tensor]],
-        y: Optional[Dict[int, torch.Tensor]],
-        n_x: int,
-        n_y: int,
-    ) -> Optional[Dict[int, torch.Tensor]]:
-        if not x and not y:
-            return None
-        x = x or {}
-        y = y or {}
-        out: Dict[int, torch.Tensor] = {}
-        for lid in sorted(set(x) | set(y)):
-            present = x.get(lid)
-            if present is None:
-                present = y[lid]
-            trailing = present.shape[1:]
-            left = x.get(lid)
-            if left is None:
-                left = torch.zeros(
-                    (n_x, *trailing), dtype=present.dtype, device=present.device
-                )
-            right = y.get(lid)
-            if right is None:
-                right = torch.zeros(
-                    (n_y, *trailing), dtype=present.dtype, device=present.device
-                )
-            out[lid] = torch.cat([left, right.to(device=left.device)], dim=0)
-        return out
-
-    n_a, n_b = a.batch_size, b.batch_size
-    return SubproblemBatch(
-        lb=torch.cat([a.lb, b.lb.to(a.lb.device)], dim=0),
-        ub=torch.cat([a.ub, b.ub.to(a.ub.device)], dim=0),
-        depths=torch.cat([a.depths, b.depths.to(a.depths.device)], dim=0),
-        incremental_alpha=_cat_dict(a.incremental_alpha, b.incremental_alpha, n_a, n_b),
-        incremental_eta=_cat_dict(a.incremental_eta, b.incremental_eta, n_a, n_b),
-        split_signs=_cat_dict(a.split_signs, b.split_signs, n_a, n_b),
-        parent_margins=_cat(a.parent_margins, b.parent_margins),
-        lower_bound=_cat(a.lower_bound, b.lower_bound),
-        node_id=_cat(a.node_id, b.node_id),
-        parent_id=_cat(a.parent_id, b.parent_id),
-    )
-
-
-def _multi_split_from_groups(
-    batch: SubproblemBatch,
-    net: Net,
-    top_layers: torch.Tensor,
-    top_neurons: torch.Tensor,
-    k_eff: int,
-) -> Tuple[SubproblemBatch, torch.Tensor]:
-    # Soundness: the 2^k_eff sign-combination children exactly partition each
-    # lane's region for ANY (top_layers, top_neurons) — BaBSR- or LLM-chosen.
-    n_lanes = batch.batch_size
-    n_children = 2 ** k_eff
-    device = batch.lb.device
-    parent_index = torch.arange(n_lanes, device=device).repeat(n_children)
-
-    def _gather(state: Optional[Dict[int, torch.Tensor]]) -> Optional[Dict[int, torch.Tensor]]:
-        if state is None:
-            return None
-        return {
-            l: t.index_select(0, parent_index.to(t.device)) for l, t in state.items()
-        }
-
-    m_specs = 1
-    if batch.incremental_alpha:
-        m_specs = int(next(iter(batch.incremental_alpha.values())).shape[1])
-    elif batch.split_signs:
-        m_specs = int(next(iter(batch.split_signs.values())).shape[1])
-
-    signs = _gather(batch.split_signs) or {}
-    for lid_val in torch.unique(top_layers).tolist():
-        lid_int = int(lid_val)
-        layer = net.by_id[lid_int]
-        n_neurons = _layer_neuron_count(layer)
-        if lid_int not in signs:
-            signs[lid_int] = torch.zeros(
-                n_children * n_lanes, m_specs, n_neurons,
-                device=device, dtype=batch.lb.dtype,
-            )
-        else:
-            signs[lid_int] = signs[lid_int].clone()
-        for bit in range(k_eff):
-            lane_sel = torch.where(top_layers[:, bit] == lid_val)[0]
-            if lane_sel.numel() == 0:
-                continue
-            neuron_sel = top_neurons[lane_sel, bit].to(device=device, dtype=torch.long)
-            for j in range(n_children):
-                sign_val = 1.0 if (j >> bit) & 1 else -1.0
-                rows = j * n_lanes + lane_sel
-                # Two index tensors separated by a `:` slice broadcast against
-                # EACH OTHER to shape [len(rows), m_specs] — positional pairing
-                # rows[i] <-> neuron_sel[i], not an outer product. Do not rewrite
-                # as signs[lid_int][rows][:, :, neuron_sel] = ...: that indexes a
-                # copy, so the assignment silently no-ops.
-                signs[lid_int][rows, :, neuron_sel] = sign_val
-
-    children = SubproblemBatch(
-        lb=batch.lb.index_select(0, parent_index),
-        ub=batch.ub.index_select(0, parent_index),
-        depths=batch.depths.index_select(0, parent_index) + k_eff,
-        incremental_alpha=_gather(batch.incremental_alpha),
-        incremental_eta=_gather(batch.incremental_eta),
-        split_signs=signs,
-        parent_margins=(
-            batch.parent_margins.index_select(0, parent_index)
-            if batch.parent_margins is not None
-            else None
-        ),
-        lower_bound=(
-            batch.lower_bound.index_select(0, parent_index)
-            if batch.lower_bound is not None
-            else None
-        ),
-    )
-    return children, parent_index
-
-
-def _multi_split_from_decision(
-    batch: SubproblemBatch,
-    net: Net,
-    bounds_dict: Optional[Dict[int, Bounds]],
-    nu_per_layer: Optional[Dict[int, torch.Tensor]],
-    k_levels: int,
-) -> Optional[Tuple[SubproblemBatch, torch.Tensor]]:
-    """Joint top-k neuron split: each lane emits all 2^k sign combinations.
-
-    Verdict-boundary multi-neuron splitting — "Mining Verdict Boundaries for
-    Neural Network Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang,
-    Yulei Sui, FM 2026. Candidates are scored by the BaBSR heuristic
-    (``_collect_neuron_candidates``).
-
-    The 2^k children exactly partition each lane's region (every selected
-    neuron is constrained to >=0 or <=0 in both directions across the
-    combination set), so replacing the lane by its children is sound. Joint
-    splits are super-additive in bound gain versus greedy single splits.
-
-    Lanes are grouped by how many finite candidates they actually have, so a
-    single candidate-starved lane no longer collapses ``k_eff`` for the whole
-    wave: lanes with >=2 candidates take the joint split, lanes with exactly one
-    take a plain 2-child split, and the two groups are concatenated. Returns
-    None only when some lane has no splittable neuron at all, since neuron
-    branching cannot cover such a lane and the caller must fall back to the
-    decision path (which can still split an input axis).
-    """
-    if bounds_dict is None or nu_per_layer is None:
-        return None
-    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer)
-    if cand is None:
-        return None
-    all_scores, all_layers, all_neurons = cand
-    finite_per_lane = torch.isfinite(all_scores).sum(dim=1)
-    if int(finite_per_lane.min().item()) < 1:
-        return None
-    k_lane = finite_per_lane.clamp(max=k_levels)
-    joint_mask = k_lane >= 2
-    if not bool(joint_mask.any().item()):
-        return None
-
-    def _group(lanes: torch.Tensor, k: int) -> Tuple[SubproblemBatch, torch.Tensor]:
-        sub = _index_subproblem_batch(batch, lanes)
-        scores = all_scores.index_select(0, lanes)
-        top = torch.topk(scores, k=k, dim=1).indices
-        children, local_parent = _multi_split_from_groups(
-            sub,
-            net,
-            all_layers.index_select(0, lanes).gather(1, top),
-            all_neurons.index_select(0, lanes).gather(1, top),
-            k,
-        )
-        return children, lanes.to(local_parent.device).index_select(0, local_parent)
-
-    k_eff = min(k_levels, int(finite_per_lane[joint_mask].min().item()))
-    lanes_joint = torch.where(joint_mask)[0]
-    lanes_single = torch.where(~joint_mask)[0]
-    joint_children, joint_parent = _group(lanes_joint, k_eff)
-    if lanes_single.numel() == 0:
-        return joint_children, joint_parent
-    single_children, single_parent = _group(lanes_single, 1)
-    return (
-        _concat_subproblem_batches(joint_children, single_children),
-        torch.cat([joint_parent, single_parent]),
-    )

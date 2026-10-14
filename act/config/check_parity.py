@@ -4,14 +4,12 @@ Run in CI (``.github/workflows/act.config.yml``) or locally
 (``python -m act.config.check_parity``). Exits non-zero on any drift, so an
 option added to one surface can never be silently missed by the others.
 
-The config.py dataclasses are the single source of truth. Two documented
-asymmetries are allowed:
+The config.py dataclasses are the single source of truth. One documented
+asymmetry is allowed:
 
 * pipeline ``verification.bab`` is a SPARSE override of ``backend.yaml``
   (its YAML lists only non-default keys), so there the YAML keys must be a
   subset of the CLI surface rather than equal to it.
-* fields declared ``metadata={"in_yaml": False}`` (BackendConfig's text-verify
-  scalars mirrored into ``bab.*``) are CLI/dataclass-only and absent from YAML.
 """
 from __future__ import annotations
 
@@ -52,7 +50,7 @@ class ParityReport:
 
 
 def check_backend(report: ParityReport) -> None:
-    from act.config.config import _BACKEND_YAML, _NETGEN_YAML, BaBConfig, BackendConfig, DualConfig
+    from act.config.config import _BACKEND_YAML, _NETGEN_YAML, BaBConfig
     from act.config.backend_cli import (
         _BACKEND_OVERRIDE_SPEC,
         _BACKEND_SUBCONFIG_PREFIX,
@@ -65,7 +63,8 @@ def check_backend(report: ParityReport) -> None:
     cli_options = {key for key, *_ in _BACKEND_OVERRIDE_SPEC}
 
     yaml_keys: set[str] = set()
-    backend_yaml = _load_yaml(_BACKEND_YAML).get("backend", {})
+    backend_document = _load_yaml(_BACKEND_YAML)
+    backend_yaml = backend_document.get("backend", {})
     for key, value in backend_yaml.items():
         prefix = _BACKEND_SUBCONFIG_PREFIX.get(key)
         if prefix is None:
@@ -82,25 +81,6 @@ def check_backend(report: ParityReport) -> None:
         for key in _load_yaml(_NETGEN_YAML):
             yaml_keys.add(f"gen_{key}")
 
-    # A backend option may be CLI-only (settable but absent from the YAML) only if
-    # its dataclass field is declared metadata={"in_yaml": False}. No hand-coded
-    # list here -- the field declares it, and a normal new field defaults to
-    # requiring a YAML entry.
-    cli_only_allowed = {
-        f.name for f in fields(BackendConfig) if not f.metadata.get("in_yaml", True)
-    }
-    bab_cli_only_allowed = {
-        f"bab_{f.name}"
-        for f in fields(BaBConfig)
-        if not f.metadata.get("in_yaml", True)
-    }
-    dual_cli_only_allowed = {
-        f"dual_{f.name}"
-        for f in fields(DualConfig)
-        if not f.metadata.get("in_yaml", True)
-    }
-    cli_only_allowed |= bab_cli_only_allowed | dual_cli_only_allowed
-
     print("[backend]")
     report.require("CLI options are backed by a dataclass field",
                    cli_options <= dataclass_fields, _fmt(cli_options - dataclass_fields))
@@ -108,11 +88,32 @@ def check_backend(report: ParityReport) -> None:
                    dataclass_fields <= cli_options, _fmt(dataclass_fields - cli_options))
     report.require("YAML keys are backed by a dataclass field",
                    yaml_keys <= dataclass_fields, _fmt(yaml_keys - dataclass_fields))
-    report.require("YAML keys are all CLI-settable",
-                   yaml_keys <= cli_options, _fmt(yaml_keys - cli_options))
-    report.require("CLI options absent from YAML are in_yaml=False fields",
-                   (cli_options - yaml_keys) <= cli_only_allowed,
-                   _fmt((cli_options - yaml_keys) - cli_only_allowed))
+    report.require("CLI and YAML are 1-to-1",
+                   cli_options == yaml_keys,
+                   f"cli-only={_fmt(cli_options - yaml_keys)} yaml-only={_fmt(yaml_keys - cli_options)}")
+
+    print("[backend.bab_presets]")
+    bab_yaml_keys = set((backend_yaml.get("bab") or {}).keys()) - {"enabled"}
+    for preset_name, preset in (backend_document.get("bab_presets") or {}).items():
+        preset_keys = set(preset or {})
+        report.require(
+            f"preset '{preset_name}' only uses backend.bab keys",
+            preset_keys <= bab_yaml_keys,
+            _fmt(preset_keys - bab_yaml_keys),
+        )
+        try:
+            BaBConfig(**(preset or {}))
+        except (TypeError, ValueError) as exc:
+            report.require(
+                f"preset '{preset_name}' constructs a valid BaBConfig",
+                False,
+                str(exc),
+            )
+        else:
+            report.require(
+                f"preset '{preset_name}' constructs a valid BaBConfig",
+                True,
+            )
 
 
 def check_pipeline(report: ParityReport) -> None:

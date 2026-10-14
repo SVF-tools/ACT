@@ -69,6 +69,7 @@ import torch
 
 from act.back_end.bab.node import SubproblemBatch
 from act.back_end.solver.solver_base import SolveStatus
+from act.util.device_manager import get_default_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +385,7 @@ class TopKBounding(BoundingStrategy):
         self._split_signs: Optional[Dict[int, torch.Tensor]] = None
 
     def push(self, batch: SubproblemBatch) -> None:
+        size_before = len(self)
         n_new = batch.batch_size
         device, dtype = batch.lb.device, batch.lb.dtype
         lower = (
@@ -409,6 +411,7 @@ class TopKBounding(BoundingStrategy):
             self._incremental_alpha = _clone_optional_dict(batch.incremental_alpha)
             self._incremental_eta = _clone_optional_dict(batch.incremental_eta)
             self._split_signs = _clone_optional_dict(batch.split_signs)
+            self._assert_push_transition(size_before, n_new)
             return
 
         assert prev_ub is not None and prev_depths is not None
@@ -430,6 +433,7 @@ class TopKBounding(BoundingStrategy):
         if self._parent_id is not None:
             assert batch.parent_id is not None
             self._parent_id = torch.cat([self._parent_id, batch.parent_id.to(self._parent_id.device)], dim=0)
+        self._assert_push_transition(size_before, n_new)
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
         lb = self._lb
@@ -455,7 +459,39 @@ class TopKBounding(BoundingStrategy):
             self._clear()
         else:
             self._restrict(remaining)
+        self._assert_pop_transition(total, result.batch_size)
         return result
+
+    def _assert_push_transition(self, size_before: int, added: int) -> None:
+        size_after = len(self)
+        assert size_after == size_before + added, (
+            "TOP-K BOUNDING invariant violated: push changed pool by wrong size "
+            f"(before={size_before}, batch_size={added}, after={size_after}, "
+            f"expected_after={size_before + added})"
+        )
+
+    def _assert_pop_transition(self, size_before: int, popped: int) -> None:
+        size_after = len(self)
+        cap_ok = self.k <= 0 or popped <= self.k
+        bookkeeping_ok = size_before - popped == size_after
+        assert cap_ok and bookkeeping_ok, (
+            "TOP-K BOUNDING invariant violated: pop cap or pool bookkeeping failed "
+            f"(before={size_before}, popped={popped}, after={size_after}, "
+            f"k={self.k}, expected_after={size_before - popped})"
+        )
+
+    def view_all(self) -> SubproblemBatch:
+        """Return a lossless, non-destructive view of the full frontier."""
+        if self._lb is None:
+            raise IndexError("view of empty pool")
+        indices = torch.arange(self._lb.shape[0], device=self._lb.device)
+        return self._build(indices)
+
+    def replace_all(self, batch: SubproblemBatch) -> None:
+        """Replace the full frontier without scoring or advancing schedules."""
+        self._clear()
+        if batch.batch_size > 0:
+            self.push(batch)
 
     def _priority_scores(self) -> torch.Tensor:
         depths_t, lb = self._depths, self._lower_bound
@@ -579,6 +615,7 @@ class DiverseTopKBounding(TopKBounding):
             self._clear()
         else:
             self._restrict(remaining)
+        self._assert_pop_transition(total, result.batch_size)
         return result
 
     def _dedup_select(self, order: torch.Tensor, n: int) -> torch.Tensor:
@@ -688,7 +725,9 @@ class DiverseTopKBounding(TopKBounding):
             value = split_signs[layer_id]
             if value.shape[0] == 0:
                 continue
-            pieces.append(value.detach().reshape(value.shape[0], -1).to(dtype=torch.float32))
+            pieces.append(
+                value.detach().reshape(value.shape[0], -1).to(dtype=get_default_dtype())
+            )
         if not pieces:
             return None
         features = torch.cat(pieces, dim=1)
@@ -699,7 +738,11 @@ class DiverseTopKBounding(TopKBounding):
     def _box_center_features(self) -> Optional[torch.Tensor]:
         if self._lb is None or self._ub is None:
             return None
-        centers = ((self._lb + self._ub) / 2.0).detach().to(dtype=torch.float32)
+        centers = (
+            ((self._lb + self._ub) / 2.0)
+            .detach()
+            .to(dtype=get_default_dtype())
+        )
         if centers.ndim > 2:
             centers = centers.reshape(centers.shape[0], -1)
         if centers.shape[1] == 0:
@@ -708,6 +751,47 @@ class DiverseTopKBounding(TopKBounding):
 
 
 ROOT_PARENT = -1
+
+
+def _mcts_visit_accounting_valid(
+    parent: Dict[int, int], visits: Dict[int, int], n_tot: int
+) -> bool:
+    if n_tot < 0 or any(count < 0 for count in visits.values()):
+        return False
+    child_visit_sums: Dict[int, int] = {}
+    for node, count in visits.items():
+        parent_id = parent.get(node, ROOT_PARENT)
+        if parent_id != ROOT_PARENT:
+            child_visit_sums[parent_id] = child_visit_sums.get(parent_id, 0) + count
+    if any(visits.get(node, 0) < total for node, total in child_visit_sums.items()):
+        return False
+    root_visits = sum(
+        count
+        for node, count in visits.items()
+        if parent.get(node, ROOT_PARENT) == ROOT_PARENT
+    )
+    return root_visits == n_tot
+
+
+def _mcts_visit_diagnostics(
+    parent: Dict[int, int], visits: Dict[int, int]
+) -> tuple[int, int, int]:
+    child_visit_sums: Dict[int, int] = {}
+    for node, count in visits.items():
+        parent_id = parent.get(node, ROOT_PARENT)
+        if parent_id != ROOT_PARENT:
+            child_visit_sums[parent_id] = child_visit_sums.get(parent_id, 0) + count
+    root_visits = sum(
+        count
+        for node, count in visits.items()
+        if parent.get(node, ROOT_PARENT) == ROOT_PARENT
+    )
+    min_visit = min(visits.values(), default=0)
+    max_child_excess = max(
+        (total - visits.get(node, 0) for node, total in child_visit_sums.items()),
+        default=0,
+    )
+    return root_visits, min_visit, max_child_excess
 
 
 class MCTSBounding(BoundingStrategy):
@@ -896,8 +980,8 @@ class MCTSBounding(BoundingStrategy):
         ``SAT`` status here always denotes a spurious, still-unresolved lane.
         """
         ids = node_ids.detach().cpu()
-        lb = lower_bounds.detach().to(device="cpu", dtype=torch.float64)
-        depth = depths.detach().to(device="cpu", dtype=torch.float64)
+        lb = lower_bounds.detach().cpu().to(dtype=get_default_dtype())
+        depth = depths.detach().cpu().to(dtype=get_default_dtype())
         blended = self.lambda_ * depth / max(n_unstable, 1) + (
             1.0 - self.lambda_
         ) * self._rank01(ids, lb)
@@ -918,6 +1002,13 @@ class MCTSBounding(BoundingStrategy):
             while valued != ROOT_PARENT and self.Q.get(valued, -math.inf) < reward:
                 self.Q[valued] = reward
                 valued = self.parent[valued]
+        assert _mcts_visit_accounting_valid(self.parent, self.N, self.n_tot), (
+            "MCTS invariant violated: visit-tree accounting is inconsistent "
+            f"(n_tot={self.n_tot}, root_visits="
+            f"{_mcts_visit_diagnostics(self.parent, self.N)[0]}, min_visit="
+            f"{_mcts_visit_diagnostics(self.parent, self.N)[1]}, "
+            f"max_child_excess={_mcts_visit_diagnostics(self.parent, self.N)[2]})"
+        )
 
     def frontier_parent_visit_histogram(self) -> Dict[int, int]:
         parent_ids = self._parent_id

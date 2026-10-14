@@ -72,7 +72,7 @@ jobs:
       - name: VNNLIB — download benchmarks
         run: |
           cd ${{ github.workspace }}
-          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 relusplitter_2026 isomorphic_acasxu_2026 smart_turn_multimodal_2026; do
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 relusplitter_2026 isomorphic_acasxu_2026; do
             coverage run -p -m act.front_end --download $cat
           done
 
@@ -97,17 +97,6 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify vnnlib --category relusplitter_2026 --max-instances 2 --merge-split-relus \
             --solvers dual --device cpu --dtype float64
-
-      # ===================================================================
-      # ONNX QuantizeLinear/DequantizeLinear ingestion: smart_turn is the only
-      # benchmark with QDQ nodes, exercising the onnx_converter Q/DQ converters
-      # + initializer folding.
-      # ===================================================================
-      - name: VNNLIB E2E — smart_turn_multimodal_2026 (ONNX Q/DQ ingestion)
-        run: |
-          cd ${{ github.workspace }}
-          timeout 30 coverage run -p -m act.pipeline --verify vnnlib --category smart_turn_multimodal_2026 \
-            --max-instances 1 --solvers dual --device cpu --dtype float64 --ignore-errors || true
 
       # ===================================================================
       # Isomorphic dual-network specs (2026): _isomorphic_multinet_rewrite,
@@ -143,8 +132,8 @@ jobs:
             --device cpu --dtype float64
 
       # ===================================================================
-      # Gain branching + joint multi-neuron splitting: _multi_split_from_decision
-      # / _multi_split_from_groups and the gain-tier bab loop (2^k child cubes).
+      # NEURON SPLIT and MULTI-SPLIT invariants are asserted in node.py and bab.py.
+      # Exit status 0 means every lane received a verdict; stdout is not validation.
       # ===================================================================
       - name: BaB gain branching + multi-split
         run: |
@@ -153,71 +142,46 @@ jobs:
             --solver dual --bab --bab-branching gain --bab-multi-split-levels 3 \
             --bab-max-depth 4 --bab-max-subproblems 40 --device cpu --dtype float64
 
-      # Joint multi-neuron splitting is orthogonal to the branching method: the
-      # k neurons come from the BaBSR heuristic either way, so this must work
-      # under --bab-branching babsr. The greps make the job non-vacuous — the
-      # telemetry counters are emitted only when the joint path actually runs,
-      # and k_requested proves the explicit flag survives the --solver dual
-      # preset instead of being silently forced to 4.
+      # Joint-split depth, counters, and child cubes are asserted in bab.py and node.py.
+      # Exit status 0 means every lane received a verdict; stdout is not validation.
       - name: BaB joint multi-split — decoupled from gain (babsr + dual_alpha_eta)
         run: |
           cd ${{ github.workspace }}
-          out=$(coverage run -p -m act.back_end --verify \
+          coverage run -p -m act.back_end --verify \
             --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
             --solver dual --bab --bab-branching babsr --bab-solver-tier dual_alpha_eta \
             --bab-multi-split-levels 3 --bab-max-batch-size 256 \
             --bab-max-depth 6 --bab-max-subproblems 60 \
-            --device cpu --dtype float64 --verbose 2>&1)
-          echo "$out"
-          grep -qE "multi_split_k_requested: 3"    <<<"$out"
-          grep -qE "multi_split_wave_count: [1-9]" <<<"$out"
-          grep -qE "multi_split_k_used: [2-9]"     <<<"$out"
+            --device cpu --dtype float64 --verbose
 
-      # --bab-multi-split-levels 1 is load-bearing: when joint splitting fires it
-      # replaces the brancher entirely, so compute_scores is never called and this
-      # step would silently exercise nothing. wave_count: 0 asserts that.
+      # Witness decision and neuron-split invariants are asserted in branching.py and node.py.
+      # Exit status 0 means every lane received a verdict; stdout is not validation.
       - name: BaB branching — witness residual (dual_alpha_eta)
         run: |
           cd ${{ github.workspace }}
-          out=$(coverage run -p -m act.back_end --verify \
+          coverage run -p -m act.back_end --verify \
             --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
             --solver dual --bab --bab-branching witness_residual \
             --bab-solver-tier dual_alpha_eta --bab-multi-split-levels 1 \
             --bab-max-batch-size 64 --bab-max-depth 5 --bab-max-subproblems 30 \
-            --device cpu --dtype float64 --verbose 2>&1)
-          echo "$out"
-          grep -qE "multi_split_wave_count: 0"              <<<"$out"
-          grep -qE "witness_residual_fallback_count: 0"     <<<"$out"
-          grep -qE "^  nodes: [1-9]"                        <<<"$out"
+            --device cpu --dtype float64 --verbose
 
-      # top-k is a real parameter on the four TopKBounding-family strategies and
-      # a hard error on the other two. Both halves are asserted.
+      # Top-k cap and pool-size invariants are asserted in branching/bounding.py.
+      # Exit status 0 means every lane received a verdict.
       - name: BaB bounding — top-k parameter
         run: |
           cd ${{ github.workspace }}
           for v in depth_bound_blend greedy annealed diverse_split_signs; do
-            out=$(coverage run -p -m act.back_end --verify \
+            coverage run -p -m act.back_end --verify \
               --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
               --bab --bab-bounding $v --bab-top-k 2 \
               --solver torchlp --device cpu --dtype float64 \
-              --timeout 30 --bab-max-depth 4 --bab-max-subproblems 40 --verbose 2>&1)
-            echo "$out"
-            grep -qE "^  nodes: [1-9]"              <<<"$out"
-            grep -qE "bounding_top_k_effective: 2"  <<<"$out"
-          done
-          for v in random mcts; do
-            if coverage run -p -m act.back_end --verify \
-              --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
-              --bab --bab-bounding $v --bab-top-k 2 \
-              --solver torchlp --device cpu --dtype float64 \
-              --timeout 20 --bab-max-depth 2 --bab-max-subproblems 5 >/dev/null 2>&1; then
-              echo "expected --bab-top-k to be rejected for $v"; exit 1
-            fi
+              --timeout 30 --bab-max-depth 4 --bab-max-subproblems 40 --verbose
           done
 
       # ===================================================================
       # SST/Yelp text-method selection: select_bert_method + BackendConfig
-      # text-method resolution (planar -> baf/alpha_mode/solver_tier).
+      # text-method resolution (planar -> solver_tier).
       # ===================================================================
       - name: Text-method config resolution (planar)
         run: |
@@ -349,10 +313,8 @@ jobs:
               --timeout 30 --bab-max-depth 8 --bab-max-subproblems 300
           done
 
-      # Greedy / annealed / diverse_split_signs / MCTS pool-selection strategies end-to-end through
-      # the back-end CLI. mlp_plain_3x8 survives LP presolve and enters BaB; the
-      # greps reject a vacuous run (nodes_minted is emitted only by the BaB wave
-      # loop). stderr is folded in because the mcts wave summary is a log record.
+      # Pool transitions and MCTS visit-tree invariants are asserted in branching/bounding.py.
+      # Exit status 0 means every lane received a verdict; stdout is not validation.
       - name: BaB bounding — greedy / SA / diverse / MCTS (ACT net)
         run: |
           cd ${{ github.workspace }}
@@ -361,16 +323,10 @@ jobs:
             "--bab-bounding annealed --bab-sa-cooling-rate 0.95" \
             "--bab-bounding diverse_split_signs" \
             "--bab-bounding mcts --bab-solver-tier dual_alpha --bab-mcts-exploration 1.4 --bab-mcts-lambda 0.5 --bab-mcts-virtual-loss 1.0"; do
-            out=$(coverage run -p -m act.back_end --verify \
+            coverage run -p -m act.back_end --verify \
               --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" --bab $opts \
               --solver torchlp --device cpu --dtype float64 \
-              --timeout 30 --bab-max-depth 3 --bab-max-subproblems 10 --verbose 2>&1)
-            echo "$out"
-            grep -qE "^  nodes: [1-9]" <<<"$out"
-            grep -q "nodes_minted:" <<<"$out"
-            case "$opts" in
-              *mcts*) grep -qE "mcts: nodes=[1-9].*n_tot=[1-9].*histogram=\{" <<<"$out" ;;
-            esac
+              --timeout 30 --bab-max-depth 3 --bab-max-subproblems 10 --verbose
           done
 
       - name: BaB split + bounding — N-ary split + SA order (VNNLIB)
@@ -391,7 +347,22 @@ jobs:
             --bab-bounding depth_bound_blend --bab-provenance \
             --bab-max-depth 3 --bab-max-nodes 10 --device cpu --dtype float64
 
-      # ── Coverage ───────────────────────────────────────────────────────
+      # Correctness invariants are asserted in act/back_end/bab/climb.py; a
+      # violation raises "CLIMB invariant violated: ..." at the failing line.
+      # Exit status 0 means every lane received a verdict. The generated net's
+      # weights change whenever nets are regenerated; 250 subproblems keep core
+      # learning and propagation exercised across regenerations (17-75 cores).
+      - name: BaB CLIMB — certificate replay and propagation
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify \
+            --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
+            --solver dual --bab --bab-preset climb --bab-max-batch-size 16 \
+            --bab-max-depth 14 --bab-max-subproblems 250 --timeout 600 --verbose
+
+      # These pool nets exercise symbolic MaxPool forward and cached one-hot dual
+      # backward. Exit status 0 means every lane received a verdict (CERTIFIED /
+      # FALSIFIED / UNKNOWN / TIMEOUT); source assertions catch invariant violations.
       - name: Dual MaxPool — symbolic forward and one-hot backward
         run: |
           cd ${{ github.workspace }}
@@ -401,6 +372,7 @@ jobs:
               --bab-branching babsr --bab-multi-split-levels 1 --verbose
           done
 
+      # ── Coverage ───────────────────────────────────────────────────────
       - name: Combine coverage data
         if: always()
         run: |

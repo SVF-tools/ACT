@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # This runner lives in <repo>/vnncomp/; the repo root (which holds the `act`
@@ -50,7 +51,8 @@ def run_vnncomp_instance(args) -> None:
     t0 = time.time()
     initialize_device(args.device, args.dtype)
 
-    from act.back_end.bab.bab import clear_violation_check_module_cache, verify_bab_batched
+    from act.back_end.bab.bab import verify_bab_batched
+    from act.back_end.bab.violation import clear_violation_check_module_cache
     from act.config.config import build_vnncomp_bab_config
     from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.front_end.model_synthesis import merge_split_relus
@@ -65,12 +67,7 @@ def run_vnncomp_instance(args) -> None:
     def remaining() -> float:
         return args.timeout - (time.time() - t0) - args.margin
 
-    try:
-        sr = create_specs_from_paths(args.onnx, args.vnnlib)
-    except SystemExit as exc:
-        print(f"[load failed] {exc}", file=sys.stderr)
-        write_vnncomp_result(args.output, "unknown")
-        return
+    sr = create_specs_from_paths(args.onnx, args.vnnlib)
 
     raw_model = sr[2]
     param = next(raw_model.parameters(), None)
@@ -103,24 +100,27 @@ def run_vnncomp_instance(args) -> None:
     # exactly (per-model budgets collapse to remaining()).
     wrapped_models = list(synthesize_models_from_specs([sr]).values())
     n_models = len(wrapped_models)
+    if n_models == 0:
+        raise RuntimeError(
+            f"No wrapped models were synthesized for ONNX {args.onnx!r} and VNNLIB {args.vnnlib!r}"
+        )
 
     if args.fuzzing_seconds > 0 and remaining() > 1.0:
         per_model_fuzz = min(args.fuzzing_seconds, remaining() / n_models)
         for wm in wrapped_models:
             if remaining() <= 1.0:
                 break
-            try:
-                ce, _ = pgd_preattack(wm, sr[3], min(per_model_fuzz, remaining()), args.fuzzing_scale)
-            except Exception as exc:
-                ce = None
-                print(f"[attack skipped] {exc}", file=sys.stderr)
+            ce, _ = pgd_preattack(
+                wm, sr[3], min(per_model_fuzz, remaining()), args.fuzzing_scale
+            )
             if ce is not None:
                 x = ce.input if hasattr(ce, "input") else ce
                 if io_decls is None:
-                    write_vnncomp_result(args.output, "unknown")
-                else:
-                    write_vnncomp_result(args.output, "sat", x=x, y=raw_forward(x),
-                                         in_decl=io_decls[0], out_decl=io_decls[1])
+                    raise RuntimeError(
+                        f"Cannot write a counterexample because {args.vnnlib!r} has no VNNLIB 2.0 I/O declarations"
+                    )
+                write_vnncomp_result(args.output, "sat", x=x, y=raw_forward(x),
+                                     in_decl=io_decls[0], out_decl=io_decls[1])
                 return
 
     if remaining() <= 1.0:
@@ -149,7 +149,7 @@ def run_vnncomp_instance(args) -> None:
                 # certification permanently impossible for the run.
                 cfg.branching_method = "width"
                 cfg.multi_split_levels = 1
-                cfg.reuse_root_bounds = False
+                cfg.root_bounds_reuse = "none"
                 cfg.intermediate_refine = "none"
                 cfg.frontier_cap = 0
             clear_violation_check_module_cache()
@@ -182,30 +182,26 @@ def run_vnncomp_instance(args) -> None:
     # the clock -> 'timeout'.
     statuses = []
     falsified_ce = None
-    try:
-        unfinished = n_models
-        for wm in wrapped_models:
-            if remaining() <= 1.0:
-                break
-            deadline = time.time() + remaining() / max(1, unfinished)
-            res = _verify_wrapped(wm, deadline)
-            unfinished -= 1
-            statuses.append(res.status)
-            if res.status == VerifyStatus.FALSIFIED and res.counterexample is not None:
-                falsified_ce = res.counterexample
-                break
-    except Exception as exc:
-        print(f"[verify error] {exc}", file=sys.stderr)
-        write_vnncomp_result(args.output, "unknown")
-        return
+    unfinished = n_models
+    for wm in wrapped_models:
+        if remaining() <= 1.0:
+            break
+        deadline = time.time() + remaining() / max(1, unfinished)
+        res = _verify_wrapped(wm, deadline)
+        unfinished -= 1
+        statuses.append(res.status)
+        if res.status == VerifyStatus.FALSIFIED and res.counterexample is not None:
+            falsified_ce = res.counterexample
+            break
 
     if falsified_ce is not None:
         if io_decls is None:
-            write_vnncomp_result(args.output, "unknown")
-        else:
-            write_vnncomp_result(args.output, "sat", x=falsified_ce,
-                                 y=raw_forward(falsified_ce),
-                                 in_decl=io_decls[0], out_decl=io_decls[1])
+            raise RuntimeError(
+                f"Cannot write a counterexample because {args.vnnlib!r} has no VNNLIB 2.0 I/O declarations"
+            )
+        write_vnncomp_result(args.output, "sat", x=falsified_ce,
+                             y=raw_forward(falsified_ce),
+                             in_decl=io_decls[0], out_decl=io_decls[1])
     elif len(statuses) == n_models and all(s == VerifyStatus.CERTIFIED for s in statuses):
         write_vnncomp_result(args.output, "unsat")
     elif any(s not in (VerifyStatus.CERTIFIED, VerifyStatus.TIMEOUT) for s in statuses):
@@ -214,7 +210,7 @@ def run_vnncomp_instance(args) -> None:
         write_vnncomp_result(args.output, "timeout")
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description="ACT VNN-COMP 2026 single-instance runner")
     ap.add_argument("onnx")
     ap.add_argument("vnnlib")
@@ -242,8 +238,16 @@ def main() -> None:
                          "input-domain splitting with full per-node bound recomputation "
                          "(the ACAS Xu regime); 0 disables the profile")
     args = ap.parse_args()
-    run_vnncomp_instance(args)
+    try:
+        run_vnncomp_instance(args)
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        from act.front_end.vnnlib_loader.vnnlib_parser import write_vnncomp_result
+
+        write_vnncomp_result(args.output, "unknown")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

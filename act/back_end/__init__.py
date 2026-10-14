@@ -124,9 +124,7 @@ __all__ = [
     "BackendConfig",
     "GenerationConfig",
     # BaB
-    "BabNode",
     "SubproblemBatch",
-    "split_subproblems",
     "BaBConfig",
     "verify_bab",
     "BranchingStrategy",

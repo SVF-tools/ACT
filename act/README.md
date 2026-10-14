@@ -67,8 +67,12 @@ act/
 │   ├── layer_util.py               # Layer validation and creation utilities
 │   ├── bab/                        # Branch-and-bound refinement package
 │   │   ├── bab.py                  # BaB engine: verify_bab(), verify_bab_batched()
-│   │   ├── node.py                 # BaB tree node representation
+│   │   ├── climb.py                # CLIMB certificate replay, core learning, propagation
+│   │   ├── violation.py            # Concrete counterexample checks for BaB candidates
+│   │   ├── node.py                 # Subproblem batches and all child construction
 │   │   └── branching/              # Branching and bounding strategies
+│   │       ├── branching.py        # Split decisions and branching heuristics
+│   │       └── multi_split.py      # Multi-neuron selection and gain testing
 │   ├── utils.py                    # Backend utilities (affine_bounds, validate_constraints)
 │   ├── analyze.py                  # Network analysis and bounds propagation
 │   ├── cons_exportor.py            # Constraint export to solvers
@@ -77,7 +81,7 @@ act/
 │   │   ├── solver_base.py          # Base solver interface
 │   │   ├── solver_gurobi.py        # Gurobi MILP solver integration
 │   │   ├── solver_torchlp.py       # PyTorch-based LP solver
-│   │   ├── solver_dual.py          # Dual certified bounds solver
+│   │   ├── solver_dual.py          # Dual certified bounds solver with solve_spec_batch()
 │   │   └── solver_hz.py            # HybridZ-based solver
 │   ├── interval_tf/                # Interval-based transfer functions
 │   │   ├── interval_tf.py          # Interval TF implementation
