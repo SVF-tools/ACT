@@ -254,7 +254,7 @@ def parse_vnnlib_queries(
       - Inequalities involving only X are folded into the input BOX.
       - Inequalities involving Y become rows of an UNSAFE_LINEAR OutputSpec.
       - When ``labeled_tensor.label`` is provided and queries match the
-        classification pattern (Y_j - Y_true <= 0 for all j != true), the
+        classification pattern (one row Y_true - Y_j <= 0 for each j != true), the
         result collapses to a single TOP1_ROBUST OutputSpec.
 
     Raises:
@@ -1052,13 +1052,15 @@ def _try_promote_to_top1(
     Structural requirements:
       - All queries share identical input BOX bounds.
       - Every query has exactly ONE output inequality of the form
-        ``Y_other - Y_true <= 0`` (coefficients +1 / -1, RHS = 0).
+        ``Y_true - Y_other <= 0`` (coefficients +1 on the true class, -1 on
+        the other class, RHS = 0), i.e. unsafe iff Y_other >= Y_true.
       - The set of ``other`` indices covers every class except ``true_label``.
 
     Orientation (CRITICAL): VNNLIB uses BOTH ``(>= Y_j Y_true)`` and
-    ``(<= Y_true Y_j)``; after canonicalisation both yield the same <= form
-    but with opposite coefficient placement. Missing either orientation
-    regresses CIFAR-100 to ~99 queries/image. Both branches accepted below.
+    ``(<= Y_true Y_j)``; ``_parse_inequality`` canonicalises both to the row
+    ``Y_true - Y_j <= 0``, which is accepted. A row with the true class at -1
+    (``Y_j - Y_true <= 0``) encodes "Y_true is minimal" (an argmin property)
+    and is NOT a top-1 robustness property, so it stays UNSAFE_LINEAR.
     """
     if not queries:
         return None
@@ -1100,12 +1102,9 @@ def _try_promote_to_top1(
         val_neg = [v for _, v in nz if v < 0][0]
         if abs(val_pos - 1.0) > 1e-6 or abs(val_neg + 1.0) > 1e-6:
             return None
-        if pos[0] == t_idx:
-            covered.add(neg[0])
-        elif neg[0] == t_idx:
-            covered.add(pos[0])
-        else:
+        if pos[0] != t_idx:
             return None
+        covered.add(neg[0])
     if covered != expected:
         return None
     y_true = _coerce_label_to_tensor(true_label)

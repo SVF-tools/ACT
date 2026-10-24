@@ -507,13 +507,9 @@ def load_vnnlib_pair(
     vnnlib_path = category_dir / vnnlib_rel
     onnx_path_g = category_dir / _normalize_rel_path(onnx_model_g) if onnx_model_g else None
     
-    # Auto-download if not found
-    if (
-        not category_dir.exists()
-        or not onnx_path.exists()
-        or not vnnlib_path.exists()
-        or (onnx_path_g is not None and not onnx_path_g.exists())
-    ):
+    # Auto-download only when the category directory itself is missing; a missing
+    # file inside an existing category is reported by the per-file checks below.
+    if not category_dir.exists():
         if auto_download:
             logger.info(f"Category '{category}' not found locally. Downloading...")
             
