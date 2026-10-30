@@ -48,39 +48,36 @@ def run_vnncomp_instance(args) -> None:
               "check the NVIDIA driver (nvidia-smi must work).",
               file=sys.stderr, flush=True)
 
-    t0 = time.time()
+    t0 = time.monotonic()
     initialize_device(args.device, args.dtype)
 
     from act.back_end.bab.bab import verify_bab_batched
     from act.back_end.bab.violation import clear_violation_check_module_cache
     from act.config.config import build_vnncomp_bab_config
     from act.back_end.solver.solver_torchlp import TorchLPSolver
-    from act.front_end.model_synthesis import merge_split_relus
-    from act.front_end.model_synthesis import synthesize_models_from_specs
-    from act.front_end.vnnlib_loader.create_specs import create_specs_from_paths
+    from act.front_end.vnnlib_loader.vnncomp_instance import load_vnncomp_instance
     from act.front_end.vnnlib_loader.vnnlib_parser import (
         extract_vnnlib_2_io_decls, write_vnncomp_result)
     from act.pipeline.fuzzing.actfuzzer import pgd_preattack
-    from act.pipeline.verification.torch2act import TorchToACT
+    from act.pipeline.verification.instance import DisjunctResults, convert_model
     from act.util.stats import VerifyStatus
 
     def remaining() -> float:
-        return args.timeout - (time.time() - t0) - args.margin
+        return args.timeout - (time.monotonic() - t0) - args.margin
 
-    sr = create_specs_from_paths(args.onnx, args.vnnlib)
-
-    raw_model = sr[2]
+    instance = load_vnncomp_instance(args.onnx, args.vnnlib, merge_relus=True)
+    raw_model = instance.raw_model
     param = next(raw_model.parameters(), None)
     io_decls = extract_vnnlib_2_io_decls(args.vnnlib)
 
-    input_dim = int(sr[3][0].tensor.numel()) if sr[3] else 0
+    input_dim = int(instance.inputs[0].tensor.numel()) if instance.inputs else 0
     low_dim = 0 < input_dim <= args.input_split_dims
     if low_dim:
         print(f"[profile] input_dim={input_dim} <= {args.input_split_dims}: "
               f"input-split BaB with per-node bound recompute", file=sys.stderr, flush=True)
 
     def raw_forward(x):
-        ref = sr[3][0].tensor if sr[3] else None
+        ref = instance.inputs[0].tensor if instance.inputs else None
         if ref is not None and x.numel() == ref.numel() and x.shape != ref.shape:
             x = x.reshape(ref.shape)
         if param is not None:
@@ -88,22 +85,15 @@ def run_vnncomp_instance(args) -> None:
         with torch.no_grad():
             return raw_model(x)
 
-    verify_model, n_merged = merge_split_relus(raw_model)
-    if n_merged:
-        print(f"[merge] fused {n_merged} split-ReLU neurons", file=sys.stderr, flush=True)
-        sr = tuple(verify_model if i == 2 else v for i, v in enumerate(sr))
-
-    # A VNNLIB 2.0 top-1 OR that did NOT pattern-merge (front-end Layer 1) yields
-    # N disjunct models here; the instance is unsat only if EVERY disjunct is
-    # infeasible and sat if ANY single disjunct is reachable. Verifying just the
-    # first would be unsound. N == 1 reproduces the original single-model path
-    # exactly (per-model budgets collapse to remaining()).
-    wrapped_models = list(synthesize_models_from_specs([sr]).values())
-    n_models = len(wrapped_models)
-    if n_models == 0:
-        raise RuntimeError(
-            f"No wrapped models were synthesized for ONNX {args.onnx!r} and VNNLIB {args.vnnlib!r}"
+    if instance.merged_relus:
+        print(
+            f"[merge] fused {instance.merged_relus} split-ReLU neurons",
+            file=sys.stderr,
+            flush=True,
         )
+
+    wrapped_models = list(instance.models)
+    n_models = len(wrapped_models)
 
     if args.fuzzing_seconds > 0 and remaining() > 1.0:
         per_model_fuzz = min(args.fuzzing_seconds, remaining() / n_models)
@@ -111,7 +101,7 @@ def run_vnncomp_instance(args) -> None:
             if remaining() <= 1.0:
                 break
             ce, _ = pgd_preattack(
-                wm, sr[3], min(per_model_fuzz, remaining()), args.fuzzing_scale
+                wm, instance.inputs, min(per_model_fuzz, remaining()), args.fuzzing_scale
             )
             if ce is not None:
                 x = ce.input if hasattr(ce, "input") else ce
@@ -132,10 +122,10 @@ def run_vnncomp_instance(args) -> None:
         (wall-clock). When n_models == 1, deadline is set just past the global
         margin deadline so budget_left() == remaining() and this path is
         byte-identical to the original single-model logic."""
-        net = TorchToACT(wrapped).run()
+        net = convert_model(wrapped)
 
         def budget_left():
-            return min(remaining(), deadline - time.time())
+            return min(remaining(), deadline - time.monotonic())
 
         def _verify(tier, budget):
             cfg, dual_cfg = build_vnncomp_bab_config(args.config, llm_backend=args.llm_backend, llm_model=args.llm_model,
@@ -176,25 +166,20 @@ def run_vnncomp_instance(args) -> None:
             res = _verify(args.solver_tier, budget_left())
         return res
 
-    # Aggregate across disjuncts. Soundness (N > 1): 'unsat' requires EVERY
-    # disjunct CERTIFIED; one FALSIFIED disjunct with a CE gives 'sat'; a
-    # genuinely inconclusive verdict gives 'unknown'; otherwise the shortfall is
-    # the clock -> 'timeout'.
-    statuses = []
-    falsified_ce = None
-    unfinished = n_models
-    for wm in wrapped_models:
+    aggregate = DisjunctResults(n_models)
+    deadline = time.monotonic() + remaining()
+    for index, budget in aggregate.pending(deadline):
+        assert budget is not None
         if remaining() <= 1.0:
             break
-        deadline = time.time() + remaining() / max(1, unfinished)
-        res = _verify_wrapped(wm, deadline)
-        unfinished -= 1
-        statuses.append(res.status)
-        if res.status == VerifyStatus.FALSIFIED and res.counterexample is not None:
-            falsified_ce = res.counterexample
+        res = _verify_wrapped(wrapped_models[index], time.monotonic() + budget)
+        aggregate.record((res,))
+        if aggregate.counterexample is not None:
             break
 
-    if falsified_ce is not None:
+    if aggregate.verdict == "sat":
+        falsified_ce = aggregate.counterexample
+        assert falsified_ce is not None
         if io_decls is None:
             raise RuntimeError(
                 f"Cannot write a counterexample because {args.vnnlib!r} has no VNNLIB 2.0 I/O declarations"
@@ -202,12 +187,8 @@ def run_vnncomp_instance(args) -> None:
         write_vnncomp_result(args.output, "sat", x=falsified_ce,
                              y=raw_forward(falsified_ce),
                              in_decl=io_decls[0], out_decl=io_decls[1])
-    elif len(statuses) == n_models and all(s == VerifyStatus.CERTIFIED for s in statuses):
-        write_vnncomp_result(args.output, "unsat")
-    elif any(s not in (VerifyStatus.CERTIFIED, VerifyStatus.TIMEOUT) for s in statuses):
-        write_vnncomp_result(args.output, "unknown")
     else:
-        write_vnncomp_result(args.output, "timeout")
+        write_vnncomp_result(args.output, aggregate.verdict)
 
 
 def main() -> int:
@@ -238,6 +219,10 @@ def main() -> int:
                          "input-domain splitting with full per-node bound recomputation "
                          "(the ACAS Xu regime); 0 disables the profile")
     args = ap.parse_args()
+    if args.timeout <= 0:
+        ap.error("timeout must be greater than zero")
+    if args.margin < 0:
+        ap.error("--margin must be non-negative")
     try:
         run_vnncomp_instance(args)
     except BaseException:

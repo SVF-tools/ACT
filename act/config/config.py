@@ -33,9 +33,11 @@ NO_REFINEMENT_MODE: Final[str] = "none"
 #   ---------------|------------------------------|----------------------------
 #   none           | no (children re-propagate)   | n/a
 #   plain          | yes, untouched               | no
-#   split_refresh  | yes                          | _interval_refresh_bounds +
+#   split_refresh  | yes                          | bound_refresh.refresh_bounds +
 #                  |                              | per_subproblem_refine
-VALID_ROOT_BOUNDS_REUSE: Final[tuple[str, ...]] = ("none", "plain", "split_refresh")
+VALID_ROOT_BOUNDS_REUSE: Final[tuple[str, ...]] = (
+    "none", "plain", "split_refresh", "split_refresh_linear",
+)
 # BaB subproblem-pool selection strategies (``--bab-bounding``).
 #
 #   value                | pool class          | order function                       | --bab-top-k | reference
@@ -138,6 +140,10 @@ class BaBConfig:
     max_depth: int = 20
     max_nodes: int = 2000
     frontier_cap: int = 0
+    frontier_mem_safety: float = 0.0
+    """CUDA managed-memory fraction; zero preserves the existing unplanned path."""
+    frontier_offload: bool = True
+    """Allow host frontier storage when the CUDA memory planner is enabled."""
     top_k: int = 0
     """Cap on how many pooled subproblems a single BaB wave may pop, independently
     of the batch size. 0 = unbounded. Honoured by the TopKBounding family
@@ -163,16 +169,41 @@ class BaBConfig:
     """Solver tier for BaB bound computation.
     Valid: 'lp', 'dual', 'dual_alpha', 'dual_alpha_eta'."""
 
+    terminal_lp_enabled: bool = False
+    """Solve candidate-less lanes with independently checked terminal LP evidence."""
+    climb_terminal_cores: bool = True
+    """Publish root-box terminal LP cores; theta-budget subsets need their own LP proof."""
+    milp_escalation: bool = False
+    """Try a bounded exact ReLU MILP after unresolved root tiers, before BaB."""
+    milp_max_variables: int = 2000
+    """Maximum variables, including ReLU binaries, in the optional MILP."""
+    milp_max_constraints: int = 2000
+    """Maximum linear constraints in the optional MILP."""
+    milp_timeout: float = 60.0
+    """MILP seconds, additionally capped by the shared remaining deadline."""
+
     climb_enabled: bool = False
     """Enable query-local CLIMB certificate replay and core propagation."""
+    climb_coarsening_enabled: bool = True
+    """Apply literal-budget coarsening before admitting replay-certified cores."""
+    climb_propagation_enabled: bool = True
+    """Apply learned cores to pending and active subproblems; false also disables merging."""
+    climb_merge_enabled: bool = False
+    """Merge complementary root-domain rows to a fixed point on an unseen core, then rebound."""
+    climb_complement_bounding: bool = False
+    """Bound each new core's deepest-decision complement once on the root domain."""
+    climb_steer: bool = False
+    """Bias finite BranchingScores by core frequency without changing conditions."""
+    climb_presplit_propagation_enabled: bool = True
+    """Run propagation and merge before splitting; false defers both to the next pre-bound step."""
     climb_theta: float = 0.0
-    """Fraction of replay slack available to the vector deletion budget."""
+    """Fraction of slack available to the vector deletion budget; exact zero costs need none."""
     climb_delta_abs: float = 1e-9
     """Absolute deletion-budget margin: delta = climb_delta_abs + climb_delta_rel * |slack|."""
     climb_delta_rel: float = 1e-7
     """Relative deletion-budget margin: delta = climb_delta_abs + climb_delta_rel * |slack|."""
     climb_recheck_k: int = 0
-    """Maximum lanes given one extra direct replay after budget coarsening."""
+    """Maximum dual lanes given one extra direct replay after budget coarsening."""
     climb_max_cores: int = 1024
     """Maximum retained cores after subsumption and deterministic eviction."""
     climb_propagate_core_chunk: int = 4096
@@ -202,10 +233,12 @@ class BaBConfig:
 
     intermediate_refine_ratio: float = 10.0
     """Width-blowup threshold multiplier for intermediate_refine='auto'."""
+    intermediate_refine_max_tensor_mib: float = 0.0
+    """Extra refinement tensor budget in MiB; zero leaves existing chunks unchanged."""
 
     root_bounds_reuse: str = "none"
     """Reuse of the root box's forward bounds by descendants (dual tiers).
-    Valid: 'none', 'plain', 'split_refresh'.
+    Valid: 'none', 'plain', 'split_refresh', 'split_refresh_linear'.
 
     Sound by monotonicity: a child box is contained in the root box, so the
     root's per-layer bounds remain valid over-approximations. Children only
@@ -219,7 +252,13 @@ class BaBConfig:
     'plain' stops there, while 'split_refresh' additionally hardens the dict
     with the split-derived interval refresh plus per_subproblem_refine. So
     'plain' is the split-independent reference: it skips only the
-    split-derived tightening, not the per-lane input override."""
+    split-derived tightening, not the per-lane input override.
+    'split_refresh_linear' additionally uses affine/ReLU-chain halfspaces;
+    unsupported graphs retain the conservative interval refresh."""
+
+    climb_lin_support_refinement: bool = True
+    """Keep only sufficient winning halfspace supports in linear refresh.
+    False retains all same-frame halfspace dependencies conservatively."""
 
     per_subproblem_refine: str = NO_REFINEMENT_MODE
     """Per-subproblem sparse backward refinement of intermediate bounds in the
@@ -237,6 +276,14 @@ class BaBConfig:
     per_subproblem_refine_rows_cap: int = 64
     """Max refined neurons per layer per batch (top-cap by interval width);
     bounds the K x 2*cap backward cost."""
+
+    presolve_time_fraction: float = 0.0
+    """Root work window as a fraction of the BaB timeout, measured from BaB
+    entry. 0.0 means the root may use the remaining total timeout."""
+
+    child_n_iters: int = 0
+    """Alpha/eta iterations for optimized all-child batches. 0 uses
+    ``DualConfig.n_iters`` on every batch."""
 
     auto_batch_safety: float = 0.55
     """Fraction of GPU memory the auto batch sizer (max_batch_size='auto') may
@@ -306,6 +353,17 @@ class BaBConfig:
             )
         if self.top_k < 0:
             raise ConfigError(f"top_k must be non-negative, got {self.top_k}")
+        if not math.isfinite(self.frontier_mem_safety) or not 0.0 <= self.frontier_mem_safety <= 1.0:
+            raise ConfigError("frontier_mem_safety must be finite and in [0, 1]")
+        if (not math.isfinite(self.intermediate_refine_max_tensor_mib)
+                or self.intermediate_refine_max_tensor_mib < 0.0):
+            raise ConfigError("intermediate_refine_max_tensor_mib must be finite and non-negative")
+        for name in ("milp_max_variables", "milp_max_constraints"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(f"{name} must be a positive integer")
+        if not math.isfinite(self.milp_timeout) or self.milp_timeout <= 0.0:
+            raise ConfigError("milp_timeout must be finite and positive")
         if not math.isfinite(self.climb_theta) or not 0.0 <= self.climb_theta <= 1.0:
             raise ConfigError("climb_theta must be finite and in [0, 1]")
         if not math.isfinite(self.climb_delta_abs) or self.climb_delta_abs < 0.0:
@@ -318,6 +376,18 @@ class BaBConfig:
             raise ConfigError("climb_max_cores must be positive")
         if self.climb_propagate_core_chunk < 1:
             raise ConfigError("climb_propagate_core_chunk must be positive")
+        if (
+            not math.isfinite(self.presolve_time_fraction)
+            or not 0.0 <= self.presolve_time_fraction <= 1.0
+        ):
+            raise ConfigError(
+                "presolve_time_fraction must be finite and in [0, 1], got "
+                f"{self.presolve_time_fraction}"
+            )
+        if self.child_n_iters < 0:
+            raise ConfigError(
+                f"child_n_iters must be non-negative, got {self.child_n_iters}"
+            )
         if self.top_k > 0 and self.bounding in TOP_K_INCOMPATIBLE_BOUNDINGS:
             raise ConfigError(
                 f"top_k={self.top_k} is not supported by bounding={self.bounding!r}; "
@@ -494,6 +564,18 @@ class DualConfig:
     lr_decay: float = 0.98
     """Multiplicative learning-rate decay applied each Adam iteration."""
 
+    stagnation_patience: int = 0
+    """Stop after this many non-improving iterations; zero disables stopping."""
+
+    stagnation_tol: float = 1e-5
+    """Minimum bound improvement that resets the stagnation counter."""
+
+    stop_when_verified: bool = False
+    """Stop once every lane is certified; disabled by default."""
+
+    max_time: float = 0.0
+    """Optimization time limit in seconds; zero disables the limit."""
+
     per_class_alpha: bool = True
     """Allocate separate α tensors per output class rather than sharing one α."""
 
@@ -505,6 +587,10 @@ class DualConfig:
     keeps an explicit linear bound; above it, interval-only."""
 
     def __post_init__(self) -> None:
+        for name in ("stagnation_patience", "stagnation_tol", "max_time"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ConfigError(f"{name} must be finite and non-negative, got {value}")
         if self.forward_lin_max_perturbed < 0:
             raise ConfigError(
                 "forward_lin_max_perturbed must be non-negative, got "
@@ -570,11 +656,12 @@ class BackendConfig:
     see commit af797ff / C6).
     """
 
-    bab_max_batch_size: int = 8
+    bab_max_batch_size: Union[int, str] = 8
     """Maximum K for BaB sub-problem batching (tier 3).
 
     BaB dispatches up to K sub-problems per solve_batch call.  Set to 1 to
     disable batching inside BaB (equivalent to the legacy sequential loop).
+    "auto" chooses K from the existing adaptive batch policy.
     Must be 1 when solver='gurobi' (same N=1 restriction as lp_enabled).
     """
 
@@ -600,6 +687,12 @@ class BackendConfig:
             raise ConfigError(
                 f"Invalid solver {self.solver!r}; expected one of {_VALID_SOLVERS}"
             )
+        if self.bab_max_batch_size != "auto" and (
+            isinstance(self.bab_max_batch_size, bool)
+            or not isinstance(self.bab_max_batch_size, int)
+            or self.bab_max_batch_size < 1
+        ):
+            raise ConfigError("bab_max_batch_size must be a positive integer or 'auto'")
         if self.device not in _VALID_DEVICES:
             raise ConfigError(
                 f"Invalid device {self.device!r}; expected one of {_VALID_DEVICES}"
@@ -631,10 +724,10 @@ class BackendConfig:
                     "varying constraint matrices; see commit af797ff).  "
                     "Either set lp_enabled=False or switch to solver='torchlp'."
                 )
-            if self.bab_max_batch_size > 1:
+            if self.bab_max_batch_size != 1:
                 raise ConfigError(
                     f"BackendConfig: solver='gurobi' is incompatible with "
-                    f"bab_max_batch_size={self.bab_max_batch_size} > 1.  "
+                    f"bab_max_batch_size={self.bab_max_batch_size!r}; expected 1.  "
                     f"GurobiSolver.solve_batch raises for N>1.  "
                     f"Either set bab_max_batch_size=1 or switch to solver='torchlp'."
                 )

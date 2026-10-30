@@ -14,6 +14,7 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
@@ -33,6 +34,54 @@ class SolverCaps:
         self.supports_csp = supports_csp
         self.supports_hz = supports_hz
         self.supports_dual = supports_dual
+
+class BoundResult(ABC):
+    """Result of one certified-bound call.
+
+    Concrete solvers retain their optimization state on their result types;
+    branching depends only on the certified row bounds and optional witnesses.
+    """
+
+    @abstractmethod
+    def row_lower_bounds(self) -> "torch.Tensor":
+        """Return the certified lower bound for each packed specification row."""
+
+    @abstractmethod
+    def row_witness_inputs(self) -> Optional["torch.Tensor"]:
+        """Return a witness input per packed row when the solver produced one."""
+
+
+class BatchBoundResult(ABC):
+    """Decoded result of one K-lane output-spec batch.
+
+    The interface is consumed by Branch-and-Bound. Solver-specific warm-start
+    state remains on the concrete result type.
+    """
+
+    @abstractmethod
+    def lane_solution(self) -> "BatchLPSolution":
+        """Return the per-lane feasibility solution."""
+
+    @abstractmethod
+    def lane_lower_bounds(self) -> "torch.Tensor":
+        """Return the certified lower bound of the worst row per lane."""
+
+    @abstractmethod
+    def spec_row_slack(self) -> Optional["torch.Tensor"]:
+        """Return per-lane specification-row slack when it is available."""
+
+    @abstractmethod
+    def lane_witness_inputs(self) -> Optional["torch.Tensor"]:
+        """Return a candidate input per lane when it is available."""
+
+    @abstractmethod
+    def intermediate_bounds(self) -> Optional[Dict[int, "Bounds"]]:
+        """Return intermediate bounds used by branching when available."""
+
+    @abstractmethod
+    def neuron_sensitivities(self) -> Optional[Dict[int, "torch.Tensor"]]:
+        """Return per-neuron branching sensitivities when available."""
+
 
 class Solver:
     """Abstract solver interface used by the exporter and verification pipeline.
@@ -82,7 +131,7 @@ class Solver:
         M: int = 1,
         return_sce: bool = False,
         enable_grad: bool = False,
-    ) -> object:
+    ) -> BoundResult:
         """Sound certified lower bound ``L <= min_x c @ f(x)`` for x in the
         input region described by ``bounds_dict``, computed via backward
         propagation through ``net``'s graph.
@@ -97,15 +146,14 @@ class Solver:
             M: number of spec rows packed into ``c``'s leading axis per
                 sample. DualSolver-specific (lazy M-broadcast);
                 LP/MILP solvers ignore this. Defaults to 1.
-            return_sce: if True, also return a per-sample input witness
-                (sub/super-gradient extremum). Defaults to False.
+            return_sce: if True, expose an input witness per packed row via
+                ``BoundResult.row_witness_inputs()``. Defaults to False.
             enable_grad: if True, allow gradient flow through the bound
                 computation (for adversarial / robust-training loops).
 
         Returns:
-            ``Tensor[B*M]`` lower bound per (sample, spec) row, or
-            ``(Tensor[B*M], Optional[Tensor[B*M, *input_shape]])`` when
-            ``return_sce=True``.
+            A :class:`BoundResult` with one certified lower bound per packed
+            (sample, specification) row.
 
         Subclasses with ``capabilities().supports_dual == True`` must
         override this; LP/MILP-only solvers inherit the NotImplementedError.

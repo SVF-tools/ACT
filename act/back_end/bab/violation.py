@@ -22,7 +22,7 @@ from typing import List, cast
 import torch
 
 from act.back_end.core import Layer, Net
-from act.front_end.specs import InKind, OutKind, normalize_position_mask
+from act.front_end.specs import InKind, OutKind
 from act.util.model_inference import infer_single_model
 
 
@@ -279,6 +279,9 @@ def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) 
     result = torch.ones(x_batch.shape[0], device=x_batch.device, dtype=torch.bool)
     tol = 1e-7
     for layer in spec_layers:
+        if layer.input_geometry is not None:
+            result &= layer.input_geometry.contains(x_batch, tol=tol)
+            continue
         kind = layer.params.get("kind")
         if kind not in (InKind.BOX, InKind.LINF_BALL, InKind.LP_EMBEDDING):
             continue
@@ -288,62 +291,4 @@ def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) 
             lb_t = lb.to(device=x_batch.device, dtype=x_batch.dtype)
             ub_t = ub.to(device=x_batch.device, dtype=x_batch.dtype)
             result &= ((x_batch >= lb_t - tol) & (x_batch <= ub_t + tol)).flatten(start_dim=1).all(dim=1)
-        if kind != InKind.LP_EMBEDDING:
-            continue
-        center = layer.params.get("center")
-        eps = layer.params.get("eps")
-        p_norm = layer.params.get("p_norm")
-        if not isinstance(center, torch.Tensor) or eps is None or p_norm is None:
-            result &= torch.zeros_like(result)
-            continue
-        center_t = center.to(device=x_batch.device, dtype=x_batch.dtype)
-        if isinstance(eps, torch.Tensor):
-            eps_t = eps.to(device=x_batch.device, dtype=x_batch.dtype)
-        elif isinstance(eps, (int, float, bool)):
-            eps_t = center_t.new_tensor(float(eps))
-        else:
-            result &= torch.zeros_like(result)
-            continue
-        if isinstance(p_norm, torch.Tensor):
-            p_value = float(p_norm.reshape(-1)[0].item())
-        elif isinstance(p_norm, (int, float, bool)):
-            p_value = float(p_norm)
-        else:
-            result &= torch.zeros_like(result)
-            continue
-        positions_raw = layer.params.get("perturbed_positions")
-        positions = (
-            positions_raw
-            if positions_raw is None or isinstance(positions_raw, (torch.Tensor, list, tuple))
-            else None
-        )
-        mask = normalize_position_mask(
-            positions,
-            int(center_t.shape[-2]),
-            batch_shape=tuple(center_t.shape[:-2]),
-            device=x_batch.device,
-        )
-        if mask.shape[0] == 1 and x_batch.shape[0] != 1:
-            mask_b = mask.expand(x_batch.shape[0], *mask.shape[1:])
-            center_b = center_t.expand_as(x_batch)
-        else:
-            mask_b = mask
-            center_b = center_t.expand_as(x_batch)
-        delta = x_batch - center_b
-        clean = (~mask_b).unsqueeze(-1).expand_as(delta)
-        if bool(clean.any().item()):
-            clean_ok = torch.where(clean, delta.abs(), torch.zeros_like(delta)).flatten(start_dim=1).amax(dim=1) <= tol
-            result &= clean_ok
-        perturbed_delta = delta[mask_b.unsqueeze(-1).expand_as(delta)].reshape(x_batch.shape[0], -1, center_t.shape[-1])
-        if perturbed_delta.numel() == 0:
-            continue
-        if p_value == float("inf"):
-            norms = perturbed_delta.abs().amax(dim=-1)
-        elif p_value == 1.0:
-            norms = perturbed_delta.abs().sum(dim=-1)
-        elif p_value == 2.0:
-            norms = torch.linalg.vector_norm(perturbed_delta, ord=2, dim=-1)
-        else:
-            norms = torch.linalg.vector_norm(perturbed_delta, ord=p_value, dim=-1)
-        result &= (norms <= eps_t.reshape(-1)[0] + tol).all(dim=1)
     return result

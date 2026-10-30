@@ -17,7 +17,9 @@ from typing import List, Optional, Tuple, cast
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
 from act.back_end.utils import pwl_meta, scale_interval, four_corner_envelope
 from act.back_end.interval_tf.tf_mlp import tf_concat
-from act.back_end.interval_tf.tf_attention import LinearBounds, att_scores_dual_planar
+from act.back_end.interval_tf.tf_attention import (
+    LinearBounds, att_scores_dual_planar, _GELU_MIN_X, _GELU_MIN_Y,
+)
 
 # tf_embedding is provided by act.back_end.interval_tf.tf_rnn (signature
 # (L, Bin) -> Fact). The previous transformer-local definition had a wrong
@@ -46,49 +48,77 @@ def tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     P = cast(torch.Tensor, L.params["pos_vec"]); B=Bounds(Bin.lb+P, Bin.ub+P); C=ConSet()
     C.replace(Con("EQ", tuple(L.out_vars+L.in_vars), {"tag":f"posenc:{L.id}"})); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
-def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
+def _layernorm_box(L: Layer, Bin: Bounds) -> Bounds:
+    """Bound normalization independently over each trailing gamma-sized row."""
     if Bin.lb.dim() < 2:
         raise ValueError(f"LAYERNORM expects batched bounds [B, *], got shape {tuple(Bin.lb.shape)}")
     variant = L.params.get("variant", L.params.get("layer_norm", "standard"))
-    norm_dims = tuple(range(1, Bin.lb.dim()))
-    mu_lb = torch.mean(Bin.lb, dim=norm_dims, keepdim=True)
-    mu_ub = torch.mean(Bin.ub, dim=norm_dims, keepdim=True)
-    cx_lb, cx_ub = Bin.lb - mu_ub, Bin.ub - mu_lb
-    if variant == "no_var":
-        # The no-variance form omits the std division, so the centered
-        # interval already is the normalized output (tighter, no relaxation).
-        sh_lb, sh_ub = cx_lb, cx_ub
+    if variant == "no":
+        output = Bin.copy()
     else:
-        radius = 0.5 * (Bin.ub - Bin.lb)
-        v_lo = torch.zeros_like(mu_lb)
-        v_hi = torch.mean((2 * radius) ** 2, dim=norm_dims, keepdim=True)
-        eps=float(cast(float, L.params.get("eps",1e-5)))
-        eps_t = Bin.lb.new_tensor(eps)
-        inv_lb = torch.rsqrt(v_hi + eps_t)
-        inv_ub = torch.rsqrt(torch.clamp_min(v_lo, 0.0) + eps_t)
-        sh_lb, sh_ub = scale_interval(cx_lb, cx_ub, inv_lb, inv_ub)
-    gamma = cast(torch.Tensor, L.params["gamma"])
-    beta = cast(torch.Tensor, L.params["beta"])
-    if gamma.numel() != sh_lb.shape[-1] and sh_lb.shape[-1] % gamma.numel() == 0:
-        repeat = sh_lb.shape[-1] // gamma.numel()
-        gamma = gamma.repeat(repeat)
-        beta = beta.repeat(repeat)
-    lb=torch.where(gamma>=0, gamma*sh_lb+beta, gamma*sh_ub+beta)
-    ub=torch.where(gamma>=0, gamma*sh_ub+beta, gamma*sh_lb+beta)
+        gamma = cast(torch.Tensor, L.params["gamma"]).to(Bin.lb).flatten()
+        beta = cast(torch.Tensor, L.params["beta"]).to(Bin.lb).flatten()
+        width = gamma.numel()
+        if width == 0 or Bin.lb.flatten(1).shape[1] % width:
+            raise ValueError(f"LAYERNORM {L.id}: gamma width must divide the input width")
+        lower = Bin.lb.reshape(Bin.lb.shape[0], -1, width)
+        upper = Bin.ub.reshape(Bin.ub.shape[0], -1, width)
+        cx_lb = lower - upper.mean(-1, keepdim=True)
+        cx_ub = upper - lower.mean(-1, keepdim=True)
+        if variant == "no_var":
+            sh_lb, sh_ub = cx_lb, cx_ub
+        else:
+            # Variance includes differences between coordinate centers, even
+            # when the input box has zero radius.
+            square_lb = torch.where(
+                (cx_lb <= 0) & (cx_ub >= 0), torch.zeros_like(cx_lb),
+                torch.minimum(cx_lb.square(), cx_ub.square()),
+            )
+            v_lo = square_lb.mean(-1, keepdim=True)
+            v_hi = torch.maximum(cx_lb.square(), cx_ub.square()).mean(-1, keepdim=True)
+            eps = float(cast(float, L.params.get("eps", 1e-5)))
+            inv_lb, inv_ub = torch.rsqrt(v_hi + eps), torch.rsqrt(v_lo + eps)
+            sh_lb, sh_ub = scale_interval(cx_lb, cx_ub, inv_lb, inv_ub)
+        lb = torch.where(gamma >= 0, gamma * sh_lb + beta, gamma * sh_ub + beta)
+        ub = torch.where(gamma >= 0, gamma * sh_ub + beta, gamma * sh_lb + beta)
+        lb, ub = _round_nan_outward(lb.reshape_as(Bin.lb), ub.reshape_as(Bin.ub))
+        output = Bounds(lb, ub)
+    return output
+
+
+def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
+    """Attach the existing LayerNorm constraints to its shared interval image."""
+    output = _layernorm_box(L, Bin)
+    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"layernorm:{L.id}"}))
+    C.add_box(L.id,L.out_vars,output); return Fact(output,C)
+
+def _gelu_box(L: Layer, Bin: Bounds) -> Bounds:
+    """Bound the declared GELU mode, sharing its image with the dual kernels."""
+    approximate = cast(str, L.params.get("approximate", "none"))
+    if approximate == "none":
+        f_lb = torch.nn.functional.gelu(Bin.lb)
+        f_ub = torch.nn.functional.gelu(Bin.ub)
+        contains_min = (Bin.lb <= _GELU_MIN_X) & (Bin.ub >= _GELU_MIN_X)
+        lb = torch.where(contains_min, torch.full_like(f_lb, _GELU_MIN_Y),
+                         torch.minimum(f_lb, f_ub))
+        ub = torch.maximum(f_lb, f_ub)
+    elif approximate == "tanh":
+        # The tanh factor is monotone; its product with x is not.
+        def factor(x: torch.Tensor) -> torch.Tensor:
+            return 0.5 * (1 + torch.tanh((2 / torch.pi) ** 0.5 * (x + 0.044715 * x**3)))
+        lb, ub = scale_interval(Bin.lb, Bin.ub, factor(Bin.lb), factor(Bin.ub))
+        point = Bin.lb == Bin.ub
+        value = torch.nn.functional.gelu(Bin.lb, approximate="tanh")
+        lb, ub = torch.where(point, value, lb), torch.where(point, value, ub)
+    else:
+        raise ValueError(f"GELU {L.id}: unsupported approximate={approximate!r}")
     lb, ub = _round_nan_outward(lb, ub)
-    B=Bounds(lb,ub); C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"layernorm:{L.id}"}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return Bounds(lb, ub)
+
 
 def tf_gelu(L: Layer, Bin: Bounds) -> Fact:
-    GELU_MIN_X = -0.7517916
-    GELU_MIN_Y = -0.17004
-    f = lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
-    f_lb, f_ub = f(Bin.lb), f(Bin.ub)
-    contains_min = (Bin.lb <= GELU_MIN_X) & (Bin.ub >= GELU_MIN_X)
-    lb = torch.where(contains_min, torch.full_like(f_lb, GELU_MIN_Y), torch.minimum(f_lb, f_ub))
-    ub = torch.maximum(f_lb, f_ub)
-    lb, ub = _round_nan_outward(lb, ub)
-    B = Bounds(lb, ub); C = ConSet()
+    """Attach GELU constraints to the shared, mode-correct interval image."""
+    B = _gelu_box(L, Bin); C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"gelu:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,3)}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
@@ -135,8 +165,13 @@ def _tf_att_scores_dual_planar(L: Layer) -> Fact:
 
 
 def softmax_rowsize(L: Layer, bounds: Bounds) -> Optional[int]:
+    if "rowsize" in L.params:
+        row = L.get_int("rowsize")
+        if row < 1 or bounds.lb.flatten(1).shape[1] % row:
+            raise ValueError(f"SOFTMAX {L.id}: rowsize must divide the feature width")
+        return row
     input_shape = L.params.get("input_shape")
-    axis = int(L.params.get("axis", -1))
+    axis = L.get_int("axis", -1)
     if input_shape is None:
         return int(bounds.lb.shape[-1])
     shape = tuple(int(d) for d in cast(Tuple[int, ...], input_shape))

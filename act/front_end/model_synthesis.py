@@ -57,6 +57,16 @@ def infer_layout_from_tensor(x: torch.Tensor) -> str:
     return "FLAT"
 
 
+def _is_fixed_model_input(labeled: LabeledInputTensor, spec: InputSpec) -> bool:
+    """Identify one fixed model tensor carried inside one spec lane."""
+    seed = spec.lb if isinstance(spec.lb, torch.Tensor) else spec.center
+    return (
+        isinstance(seed, torch.Tensor)
+        and labeled.tensor.ndim >= 2 and labeled.tensor.shape[0] != 1
+        and tuple(seed.shape[1:]) == tuple(labeled.tensor.shape)
+    )
+
+
 def _merge_specs_to_batch(
     lts: List[LabeledInputTensor],
     in_specs: List[InputSpec],
@@ -104,6 +114,13 @@ def _merge_specs_to_batch(
     Returns:
         (batched_labeled_tensor, batched_input_spec, batched_output_spec)
     """
+    if len(lts) != 1 and any(
+        _is_fixed_model_input(labeled, spec) for labeled, spec in zip(lts, in_specs)
+    ):
+        raise ValueError(
+            "Fixed-shape model input cannot be merged into independent verifier lanes"
+        )
+
     # Assert all tensors have the same shape (guaranteed by grouping in gkey)
     if len(lts) > 1:
         first_shape = lts[0].tensor.shape
@@ -335,7 +352,7 @@ def synthesize_models_and_seeds_from_specs(
     groups: Dict[Tuple, List] = defaultdict(list)
     models: Dict[int, Tuple[nn.Module, str]] = {}  # id(model) -> (model, model's representative_name)
     
-    for data_source, model_name, pytorch_model, labeled_tensors, spec_pairs in spec_results:
+    for result_index, (data_source, model_name, pytorch_model, labeled_tensors, spec_pairs) in enumerate(spec_results):
         if not labeled_tensors or not spec_pairs:
             continue
         
@@ -364,6 +381,8 @@ def synthesize_models_and_seeds_from_specs(
                     d_sig,
                 )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
+            if _is_fixed_model_input(lt, in_spec):
+                gkey += (result_index, idx)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     
     # -------------------------------------------------------------------------
@@ -375,7 +394,7 @@ def synthesize_models_and_seeds_from_specs(
     ] = {}
     disjunct_counter: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     for gkey, grouped_specs in groups.items():
-        data_src, mid, in_kind, out_kind, _cd_sig = gkey
+        data_src, mid, in_kind, out_kind, _cd_sig = gkey[:5]
         pytorch_model, rep_name = models[mid]
         # Use representative model_name for the display key; if a single
         # (data_src, model_name) expands into multiple UNSAFE_LINEAR disjuncts
@@ -394,7 +413,7 @@ def synthesize_models_and_seeds_from_specs(
     # -------------------------------------------------------------------------
     # Summary: Print statistics and return results
     # -------------------------------------------------------------------------
-    total_specs = sum(vm.input_layer.input_tensor.shape[0] for vm in synthesis_models.values())
+    total_specs = sum(int(vm.input_spec.spec.lb.shape[0]) for vm in synthesis_models.values())
     
     print(f"\n🎉 Synthesis Complete:")
     print(f"   Total specs: {total_specs}")
@@ -570,7 +589,187 @@ def model_synthesis(
     return wrapped_models
 
 
+def _smoke_compact_bert() -> None:
+    """Check nonconstant compact routes, indexed queries and CLI Net round trips."""
+    import hashlib
+    from importlib import import_module
+    import json
+    from pathlib import Path
+    import sys
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from transformers import BertConfig, BertForSequenceClassification
+
+    from act.back_end.serialization import load_net_from_file, save_net_to_file
+    from act.front_end.bert_loader.compact_bert import (
+        CompactBertRouteBModel, NoVarLayerNorm, embedding_sum,
+        load_compact_bert, tokenize_act_tokens,
+    )
+    from act.front_end.bert_loader.create_specs import BertSpecCreator
+    from act.util import path_config
+    from act.util.device_manager import get_current_settings, initialize_device
+    from act.util.stats import VerifyStatus
+
+    # These clients import synthesis themselves; load them only for this smoke.
+    backend_cli = import_module("act.config.backend_cli")
+    frontend_cli = import_module("act.config.frontend_cli")
+    query_index = import_module("act.front_end.bert_loader.query_index")
+    verify_once = import_module("act.back_end.verifier").verify_once
+    ACTToTorch = import_module("act.pipeline.verification.act2torch").ACTToTorch
+    TorchToACT = import_module("act.pipeline.verification.torch2act").TorchToACT
+
+    initialize_device(device="cpu", dtype="float64")
+    device, dtype = get_current_settings()
+    torch.manual_seed(42)
+    with TemporaryDirectory(prefix="act-compact-smoke-") as directory:
+        root = Path(directory)
+        with patch.object(path_config, "get_project_root", return_value=str(root)):
+            model_dir = Path(path_config.get_bert_artifact_root()) / "models" / "model_sst_1"
+            checkpoint = model_dir / "ckpt-7"
+            checkpoint.mkdir(parents=True)
+            config = BertConfig(
+                vocab_size=10, hidden_size=8, num_hidden_layers=1,
+                num_attention_heads=2, intermediate_size=16,
+                max_position_embeddings=32, type_vocab_size=2,
+                hidden_act="relu", num_labels=2,
+            )
+            source = BertForSequenceClassification(config).to(device=device, dtype=dtype)
+            source.bert.embeddings.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                device=device, dtype=dtype
+            )
+            for block in source.bert.encoder.layer:
+                block.attention.output.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                    device=device, dtype=dtype
+                )
+                block.output.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                    device=device, dtype=dtype
+                )
+            with torch.no_grad():
+                source.classifier.bias.copy_(source.classifier.bias.new_tensor([-1.0, 1.0]))
+            source.eval()
+            (model_dir / "checkpoint").write_text("7\n", encoding="utf-8")
+            (checkpoint / "config.json").write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            (checkpoint / "vocab.txt").write_text(
+                "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nplay\n##ing\n!\n",
+                encoding="utf-8",
+            )
+            weights = checkpoint / "pytorch_model.bin"
+            torch.save(source.state_dict(), weights)
+            raw_sst = Path(path_config.get_data_root()) / "sst"
+            raw_sst.mkdir()
+            (raw_sst / "test.txt").write_text(
+                "(4 (4 hello) (4 playing) (4 world) (4 hello) (4 world) (4 hello))\n",
+                encoding="utf-8",
+            )
+            checksum = hashlib.sha256(weights.read_bytes()).hexdigest()
+            relative_weights = weights.relative_to(path_config.get_data_root()).as_posix()
+            (Path(path_config.get_bert_artifact_root()) / "SHA256SUMS").write_text(
+                f"{checksum}  {relative_weights}\n", encoding="utf-8"
+            )
+            index = root / "queries.csv"
+            index.write_text(
+                "dataset,split,depth,example_id,position,p,eps,checkpoint_sha256\n"
+                f"sst,test,1,0,1,inf,0.001,{checksum}\n"
+                "sst,test,1,0,3,1,0.001,\n",
+                encoding="utf-8",
+            )
+            relative_model = model_dir.relative_to(path_config.get_data_root())
+            loaded = load_compact_bert(relative_model)
+            tokens = tokenize_act_tokens(
+                ["hello", "playing", "world", "hello", "world", "hello"], loaded.tokenizer
+            )
+            assert tokens.wordpiece_tokens == [
+                "[CLS]", "hello", "play", "##ing", "world", "hello", "world", "hello", "[SEP]",
+            ]
+            seed = embedding_sum(loaded, tokens.input_ids, tokens.token_type_ids)
+            changed = seed.clone()
+            changed[:, 0, 0] += 0.25
+            route_b = CompactBertRouteBModel(loaded.model, seed.shape[1])
+            with torch.no_grad():
+                expected = loaded.model(seed)
+                changed_expected = loaded.model(changed)
+                assert (changed_expected - expected).abs().max() > 1e-7
+                torch.testing.assert_close(
+                    source(input_ids=tokens.input_ids.unsqueeze(0)).logits, expected,
+                    rtol=1e-9, atol=1e-10,
+                )
+                for inputs in (seed, changed):
+                    torch.testing.assert_close(route_b(inputs), loaded.model(inputs), rtol=1e-9, atol=1e-10)
+
+            creator = BertSpecCreator(config_dict={"checkpoint_dir": str(relative_model)})
+            with patch("act.front_end.bert_loader.create_specs.BertVocabulary") as vocabulary:
+                for route in ("a", "b"):
+                    results = creator.create_specs_for_data_model_pairs(conversion_route=route)
+                    assert results[0][1] == "compact_bert"
+                    assert results[0][4][0][0].perturbed_positions.tolist() == [0]
+                    (wrapped,) = synthesize_models_from_specs(results).values()
+                    net = TorchToACT(wrapped).run()
+                    path = root / f"route-{route}.json"
+                    save_net_to_file(net, str(path))
+                    for candidate in (net, load_net_from_file(str(path))):
+                        restored = ACTToTorch(candidate).run().eval()
+                        for inputs in (seed, changed):
+                            torch.testing.assert_close(
+                                restored(inputs)["output"], loaded.model(inputs),
+                                rtol=1e-8, atol=1e-9,
+                            )
+                vocabulary.assert_not_called()
+
+            query = query_index.read_query(index, 0)
+            assert query_index.verify_checkpoint_sha256(query) == weights
+            with patch.object(
+                BertSpecCreator, "_single_spec_pair", wraps=BertSpecCreator._single_spec_pair
+            ) as single:
+                wrapped_query = query_index.build_query_model(query)
+                assert single.call_count == 1
+            mask = wrapped_query.input_spec.spec.perturbed_positions
+            assert mask.shape == seed.shape[:2]
+            assert mask[0].nonzero().flatten().tolist() == [1]
+            try:
+                query_index.build_query_model(query_index.read_query(index, 1))
+            except query_index.QueryIndexError:
+                pass
+            else:
+                raise AssertionError("WordPiece continuation accepted as a query position")
+            partition = query_index.yelp_partition_indices(10)
+            assert len(partition["calibration"]) == 2
+            assert sorted(partition["calibration"] + partition["evaluation"]) == list(range(10))
+            assert not set(partition["calibration"]) & set(partition["evaluation"])
+
+            with patch.object(sys, "argv", [
+                "act.front_end", "--synthesis", "--creator", "bert",
+                "--checkpoint-dir", str(relative_model),
+                "--device", "cpu", "--dtype", "float64",
+            ]):
+                assert frontend_cli.main() in (None, 0)
+            saved = root / "verified.json"
+            for source_args in (
+                ["--query-index", str(index), "--query-id", "0", "--save-net", str(saved)],
+                ["--network", str(saved)],
+            ):
+                with patch.object(sys, "argv", [
+                    "act.back_end", "--verify", *source_args, "--solver", "torchlp",
+                    "--no-bab", "--timeout", "30", "--device", "cpu", "--dtype", "float64",
+                ]):
+                    assert backend_cli.main() == 0
+            restored_net = load_net_from_file(str(saved))
+            restored_query = ACTToTorch(restored_net).run().eval()
+            for inputs in (seed, changed):
+                torch.testing.assert_close(
+                    restored_query(inputs)["output"], loaded.model(inputs), rtol=1e-8, atol=1e-9,
+                )
+            assert all(result.status == VerifyStatus.CERTIFIED for result in verify_once(restored_net))
+    print("Compact BERT A/B/ACT/reload and query CLI smoke passed")
+
+
 if __name__ == "__main__":
+    import sys
+
+    if "--compact-smoke" in sys.argv:
+        _smoke_compact_bert()
+        sys.exit(0)
+
     from act.util.model_inference import model_inference
     from act.util.device_manager import initialize_device
     

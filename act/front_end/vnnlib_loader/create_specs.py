@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Tuple, Dict, Optional, override
 import logging
+import torch
 import torch.nn as nn
 
 from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
@@ -262,6 +263,17 @@ class VNNLibSpecCreator(BaseSpecCreator):
                 )
             
             spec_pairs = validated_pairs
+
+        # A fixed ONNX leading dimension is part of one model input, not the
+        # number of independent verification queries.  Validation above used
+        # the declared model shape; add one spec lane only afterwards.
+        declared_shape = tuple(labeled_tensor.tensor.shape)
+        if len(declared_shape) >= 2 and declared_shape[0] != 1:
+            for input_spec, _output_spec in spec_pairs:
+                for key in ("lb", "ub", "center"):
+                    value = getattr(input_spec, key)
+                    if isinstance(value, torch.Tensor) and tuple(value.shape) == declared_shape:
+                        setattr(input_spec, key, value.reshape(1, *declared_shape))
         
         # Return in unified format with labeled_tensors as list
         labeled_tensors = [labeled_tensor]

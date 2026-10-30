@@ -20,6 +20,8 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 
 # Import validation functions
 from act.back_end.layer_util import validate_layer, validate_graph, validate_wrapper_graph
+from act.back_end.layer_schema import LayerKind
+from act.front_end.specs import InputGeometry, normalize_input_geometry
 
 # Type alias for union-typed parameter values
 ParamValue = Union[torch.Tensor, int, str, tuple, bool, None]
@@ -29,13 +31,22 @@ ParamValue = Union[torch.Tensor, int, str, tuple, bool, None]
 class Layer:
     id: int                                     # Unique layer identifier
     kind: str                                   # UPPER name (e.g., "DENSE", "CONV2D", "RELU")
-    params: Dict[str, ParamValue]              # Union-typed parameters: tensors, scalars, shapes, etc.
+    params: Dict[str, Any]                     # Schema-validated, including nested metadata
     in_vars: List[int]                         # Input variable indices 
     out_vars: List[int]                        # Output variable indices
-    cache: Dict[str, torch.Tensor] = field(default_factory=dict)  # Runtime cache tensors
+    cache: Dict[str, Any] = field(default_factory=dict)  # Runtime values and metadata
+    input_geometry: Optional[InputGeometry] = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         validate_layer(self)
+        self.refresh_input_geometry()
+
+    def refresh_input_geometry(self) -> None:
+        """Rebuild derived geometry after construction or explicit sample slicing."""
+        self.input_geometry = (
+            normalize_input_geometry(self.params)
+            if self.kind == LayerKind.INPUT_SPEC.value else None
+        )
 
     def is_validation(self) -> bool:
         return self.kind == "ASSERT"
@@ -76,14 +87,27 @@ class Net:
     _topo_cache: Dict[bool, List[int]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _input_geometry_id: Optional[int] = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self.by_id = {L.id: L for L in self.layers}
+        geometry_ids = [layer.id for layer in self.layers if layer.input_geometry is not None]
+        if len(geometry_ids) > 1:
+            raise ValueError("A Net supports at most one LP_EMBEDDING input specification")
+        self._input_geometry_id = geometry_ids[0] if geometry_ids else None
         # Validate the graph structure
         validate_graph(self.layers)
         validate_wrapper_graph(self.layers)
 
     # helpers
+
+    @property
+    def input_geometry(self) -> Optional[InputGeometry]:
+        """Return the canonical input domain without scanning the graph."""
+        return (
+            self.by_id[self._input_geometry_id].input_geometry
+            if self._input_geometry_id is not None else None
+        )
 
     def assert_last_is_validation(self) -> None:
         if not self.layers or not self.layers[-1].is_validation():

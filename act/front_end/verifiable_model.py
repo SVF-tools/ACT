@@ -79,7 +79,7 @@ import torch.nn as nn
 from typing import Dict, Any, Optional, List, Tuple, Union
 
 # Import ACT components
-from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+from act.front_end.specs import InputGeometry, InputSpec, OutputSpec, InKind, OutKind
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.back_end.layer_schema import LayerKind, REGISTRY
 from act.back_end.layer_util import create_layer
@@ -468,9 +468,12 @@ class InputSpecLayer(nn.Module):
         super().__init__()
         self.spec = spec or InputSpec(**kwargs)
         self.kind = self.spec.kind
+        positions = self.spec.perturbed_positions
 
         if self.kind == InKind.LP_EMBEDDING:
             self.spec.lb, self.spec.ub = self.spec.materialize_box_seed()
+            # Export the same explicit token selection checked by this wrapper.
+            positions = self.spec._embedding_position_mask()
         elif self.kind == InKind.LINF_BALL and self.spec.center is not None and self.spec.eps is not None:
             eps = self.spec.eps
             if isinstance(eps, torch.Tensor):
@@ -491,8 +494,8 @@ class InputSpecLayer(nn.Module):
         else:
             self.p_norm = None
 
-        if isinstance(self.spec.perturbed_positions, torch.Tensor):
-            self.register_buffer("perturbed_positions", self.spec.perturbed_positions)
+        if isinstance(positions, torch.Tensor):
+            self.register_buffer("perturbed_positions", positions)
         else:
             self.perturbed_positions = None
 
@@ -505,27 +508,30 @@ class InputSpecLayer(nn.Module):
                 setattr(self, name, None)
         self._validate_schema()
 
+    def _act_params(self) -> dict[str, torch.Tensor | str | int]:
+        """Use one parameter layout for schema checks and ACT emission."""
+        params: dict[str, torch.Tensor | str | int] = {"kind": self.kind}
+        for name in ("lb", "ub", "center", "A", "b", "eps"):
+            val = getattr(self, name, None)
+            if isinstance(val, torch.Tensor):
+                params[name] = val
+        if self.kind == InKind.LP_EMBEDDING:
+            for name in ("p_norm", "perturbed_positions"):
+                val = getattr(self, name, None)
+                if not isinstance(val, torch.Tensor):
+                    raise ValueError(f"LP_EMBEDDING requires normalized {name}")
+                params[name] = val
+            center = params.get("center")
+            if not isinstance(center, torch.Tensor):
+                raise ValueError("LP_EMBEDDING requires center")
+            # Preserve the embedding axis before bounds are flattened.
+            params["embed_dim"] = center.shape[-1]
+        return params
+
     def _validate_schema(self):
         """Validate parameters against INPUT_SPEC layer schema"""
         schema = REGISTRY[LayerKind.INPUT_SPEC.value]
-        params = {"kind": self.kind}
-        for name in ("lb", "ub", "center", "A", "b"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.eps is not None:
-            params["eps"] = self.eps
-        if self.kind == InKind.LP_EMBEDDING:
-            if self.p_norm is not None:
-                params["p_norm"] = self.p_norm
-            if self.perturbed_positions is not None:
-                params["perturbed_positions"] = self.perturbed_positions
-        if self.kind == InKind.LP_EMBEDDING:
-            if self.p_norm is None:
-                raise ValueError("LP_EMBEDDING requires p_norm")
-            if self.perturbed_positions is None:
-                raise ValueError("LP_EMBEDDING requires perturbed_positions")
-        
+        params = self._act_params()
         # Check schema compliance
         for key in schema["params_required"]:
             if key not in params:
@@ -548,30 +554,13 @@ class InputSpecLayer(nn.Module):
         (lb/ub/center carry the leading B dim from the wrapped tensors).
         """
         del B
-        params = {"kind": self.kind}
-        for name in ("lb", "ub", "center", "A", "b"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.eps is not None:
-            params["eps"] = self.eps
-        if self.kind == InKind.LP_EMBEDDING:
-            if self.p_norm is not None:
-                params["p_norm"] = self.p_norm
-            if self.perturbed_positions is not None:
-                params["perturbed_positions"] = self.perturbed_positions
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT_SPEC.value,
-            params=params,
+            params=self._act_params(),
             in_vars=in_vars,
             out_vars=in_vars,
         )
-        if self.kind == InKind.LP_EMBEDDING:
-            if self.p_norm is not None:
-                layer.cache["p_norm"] = self.p_norm
-            if self.perturbed_positions is not None:
-                layer.cache["perturbed_positions"] = self.perturbed_positions
         return [layer], in_vars
 
     @staticmethod
@@ -666,17 +655,22 @@ class InputSpecLayer(nn.Module):
             return (x, satisfied, explanation)
         
         elif self.kind == InKind.LP_EMBEDDING:
-            lb_buffer, ub_buffer = self.lb, self.ub
-            if not isinstance(lb_buffer, torch.Tensor) or not isinstance(
-                ub_buffer, torch.Tensor
+            center_buffer, eps_buffer, norm_buffer = self.center, self.eps, self.p_norm
+            mask_buffer = self.perturbed_positions
+            if not isinstance(center_buffer, torch.Tensor) or not isinstance(
+                eps_buffer, torch.Tensor
+            ) or not isinstance(norm_buffer, torch.Tensor) or not isinstance(
+                mask_buffer, torch.Tensor
             ):
-                return (x, True, "⚠️ INPUT LP_EMBEDDING: Missing lb/ub")
+                raise ValueError("LP_EMBEDDING requires normalized input parameters")
 
-            lb = self._gather_rows(lb_buffer, rows, batch_size, "lb")
-            ub = self._gather_rows(ub_buffer, rows, batch_size, "ub")
-            lb_ok = (x >= lb).reshape(batch_size, -1).all(dim=1)
-            ub_ok = (x <= ub).reshape(batch_size, -1).all(dim=1)
-            satisfied = lb_ok & ub_ok
+            geometry = InputGeometry(
+                self._gather_rows(center_buffer, rows, batch_size, "center"),
+                self._gather_rows(eps_buffer, rows, batch_size, "eps"),
+                self._gather_rows(mask_buffer, rows, batch_size, "perturbed_positions"),
+                float(norm_buffer.item()),
+            )
+            satisfied = geometry.contains(x)
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT LP_EMBEDDING: {n_ok}/{batch_size} satisfied"
             return (x, satisfied, explanation)

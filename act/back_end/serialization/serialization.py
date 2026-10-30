@@ -22,8 +22,11 @@ import numpy as np
 import torch
 
 from act.back_end.core import Layer, Net
+from act.front_end.spec_creator_base import LabeledInputTensor
 
 SERIALIZATION_VERSION = "2.0"
+_VALUE_TAG = "__act_type__"
+_TENSOR_KEYS = frozenset({"data", "dtype", "shape"})
 
 class ACTSerializationError(Exception):
     """Custom exception for serialization errors."""
@@ -82,63 +85,90 @@ class TensorEncoder:
 
         return tensor
 
+
+def _encode_value(value: Any) -> Any:
+    """Encode supported nested metadata while retaining the v2 tensor payload."""
+    if isinstance(value, torch.Tensor):
+        return TensorEncoder.encode_tensor(value)
+    if isinstance(value, LabeledInputTensor):
+        return {
+            _VALUE_TAG: "labeled_input",
+            "tensor": _encode_value(value.tensor),
+            "label": _encode_value(value.label),
+        }
+    if isinstance(value, tuple):
+        return {_VALUE_TAG: "tuple", "items": [_encode_value(item) for item in value]}
+    if isinstance(value, list):
+        return [_encode_value(item) for item in value]
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("ACT metadata dictionary keys must be strings")
+        encoded = {key: _encode_value(item) for key, item in value.items()}
+        if _VALUE_TAG in value or _TENSOR_KEYS.issubset(value):
+            return {_VALUE_TAG: "dict", "items": encoded}
+        return encoded
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported ACT metadata type {type(value).__name__}")
+
+
+def _decode_value(value: Any, target_device: Optional[str]) -> Any:
+    """Decode recursive metadata and legacy flat v2.0 tensor payloads."""
+    if isinstance(value, list):
+        return [_decode_value(item, target_device) for item in value]
+    if isinstance(value, dict):
+        if _VALUE_TAG in value:
+            tag = value[_VALUE_TAG]
+            if tag == "tuple" and set(value) == {_VALUE_TAG, "items"}:
+                if not isinstance(value["items"], list):
+                    raise ValueError("ACT tuple metadata items must be a list")
+                return tuple(_decode_value(item, target_device) for item in value["items"])
+            if tag == "dict" and set(value) == {_VALUE_TAG, "items"}:
+                if not isinstance(value["items"], dict):
+                    raise ValueError("ACT dictionary metadata items must be a dictionary")
+                return {
+                    key: _decode_value(item, target_device)
+                    for key, item in value["items"].items()
+                }
+            if tag == "labeled_input" and set(value) == {_VALUE_TAG, "tensor", "label"}:
+                tensor = _decode_value(value["tensor"], target_device)
+                label = _decode_value(value["label"], target_device)
+                if not isinstance(tensor, torch.Tensor) or (
+                    label is not None and not isinstance(label, torch.Tensor)
+                ):
+                    raise ValueError("ACT labeled_input requires a tensor and optional tensor label")
+                return LabeledInputTensor(tensor=tensor, label=label)
+            raise ValueError(f"Unsupported ACT metadata tag {tag!r}")
+        if _TENSOR_KEYS.issubset(value):
+            return TensorEncoder.decode_tensor(value, target_device)
+        return {key: _decode_value(item, target_device) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported JSON metadata value {type(value).__name__}")
+
+
 class LayerSerializer:
     """Handles Layer serialization/deserialization."""
     
     @staticmethod
     def serialize_layer(layer: Layer) -> Dict[str, Any]:
         """Convert Layer to JSON-serializable dictionary."""
-        # Encode tensor parameters
-        params_encoded = {}
-        for name, value in layer.params.items():
-            if isinstance(value, torch.Tensor):
-                params_encoded[name] = TensorEncoder.encode_tensor(value)
-            else:
-                # Handle non-tensor parameters (floats, ints, strings, etc.)
-                params_encoded[name] = value
-        
-        # Encode cache tensors (if any)
-        cache_encoded = {}
-        if hasattr(layer, 'cache'):
-            for name, value in layer.cache.items():
-                if isinstance(value, torch.Tensor):
-                    cache_encoded[name] = TensorEncoder.encode_tensor(value)
-                else:
-                    # Handle non-tensor cache values
-                    cache_encoded[name] = value
-        
         return {
             "id": layer.id,
             "kind": layer.kind,
-            "params": params_encoded,
+            "params": _encode_value(layer.params),
             "in_vars": layer.in_vars,
             "out_vars": layer.out_vars,
-            "cache": cache_encoded
+            "cache": _encode_value(layer.cache),
         }
     
     @staticmethod
     def deserialize_layer(layer_dict: Dict[str, Any], target_device: Optional[str] = None) -> Layer:
         """Convert JSON dictionary to Layer object."""
-        # Decode tensor parameters
-        params_decoded = {}
-        for name, value in layer_dict.get("params", {}).items():
-            if isinstance(value, dict) and "dtype" in value and "shape" in value:
-                # This is a tensor that was encoded
-                params_decoded[name] = TensorEncoder.decode_tensor(value, target_device)
-            else:
-                # This is a regular value (float, int, string, etc.)
-                params_decoded[name] = value
-        
-        # Decode cache tensors
-        cache_decoded = {}
-        for name, value in layer_dict.get("cache", {}).items():
-            if isinstance(value, dict) and "dtype" in value and "shape" in value:
-                # This is a tensor that was encoded
-                cache_decoded[name] = TensorEncoder.decode_tensor(value, target_device)
-            else:
-                # This is a regular value
-                cache_decoded[name] = value
-        
+        params_decoded = _decode_value(layer_dict.get("params", {}), target_device)
+        cache_decoded = _decode_value(layer_dict.get("cache", {}), target_device)
+        if not isinstance(params_decoded, dict) or not isinstance(cache_decoded, dict):
+            raise ValueError("ACT layer params/cache must decode to dictionaries")
         return Layer(
             id=layer_dict["id"],
             kind=layer_dict["kind"],

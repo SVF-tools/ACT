@@ -388,6 +388,9 @@ net_factory:
   # ============================================================================
   # These architectures are emitted alongside the sampled families so the
   # manifest-driven netfactory sweep exercises them without workflow changes.
+  # The fixed LAYER_TESTING_SPECS registry also emits layer_testing_lp_dense:
+  # two independent unit L2 token balls, linear maximum 10, threshold 10.25.
+  # Its enclosing-box maximum is 14; a single global-ball maximum is sqrt(50).
 
   layer_testing:
     attention:

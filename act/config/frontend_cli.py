@@ -48,6 +48,9 @@ _FRONTEND_TEXTVERIFY_OVERRIDE_KEYS: tuple[str, ...] = (
     "num_verify_iters",
     "k",
     "alpha_opt_steps",
+    "checkpoint_dir",
+    "position_mode",
+    "conversion_route",
 )
 
 
@@ -712,6 +715,27 @@ Examples:
         default=None,
         dest="alpha_opt_steps",
         help="Optimized-alpha optimization steps.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        dest="checkpoint_dir",
+        help="Compact BERT model directory containing a checkpoint.",
+    )
+    parser.add_argument(
+        "--position-mode",
+        choices=("prefix", "sweep"),
+        default=None,
+        dest="position_mode",
+        help="Select prefix or eligible WordPiece sweep positions.",
+    )
+    parser.add_argument(
+        "--conversion-route",
+        choices=("a", "b"),
+        default=None,
+        dest="conversion_route",
+        help="Use manual route a or generic FX route b.",
     )
     
     # Add standard device/dtype arguments

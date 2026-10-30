@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from act.back_end.analyze import AnalyzeCache
 
 # Front-end enums (kinds)
-from act.front_end.specs import InKind, OutKind, OutputSpec, normalize_position_mask
+from act.front_end.specs import InKind, OutKind, OutputSpec
 
 # Verification types (canonical location: act/util/stats.py)
 from act.util.stats import VerifyStatus, VerifyResult
@@ -78,6 +78,10 @@ def _slice_first_dim(value: Any, sample_idx: int, expected_b: int) -> Any:
 def slice_net_to_sample(net: Net, sample_idx: int) -> Net:
     from act.front_end.spec_creator_base import LabeledInputTensor
 
+    seed_bounds = seed_from_input_specs(gather_input_spec_layers(net))
+    B = int(seed_bounds.lb.shape[0])
+    if not 0 <= sample_idx < B:
+        raise IndexError(f"sample index {sample_idx} outside {B} verifier lanes")
     mutable_kinds = {
         LayerKind.INPUT.value,
         LayerKind.INPUT_SPEC.value,
@@ -104,9 +108,9 @@ def slice_net_to_sample(net: Net, sample_idx: int) -> Net:
     input_layer = net2.by_id[entry_id]
     shape = input_layer.params.get("shape") or []
     shape_t = tuple(shape) if isinstance(shape, (list, tuple)) else ()
-    B = int(shape_t[0]) if shape_t else 1
     if shape_t and int(shape_t[0]) == B:
         input_layer.params["shape"] = (1,) + tuple(shape_t[1:])
+    input_layer.params["batch_size"] = 1
     li = input_layer.params.get("labeled_input")
     if isinstance(li, LabeledInputTensor):
         new_tensor = _slice_first_dim(li.tensor, sample_idx, B)
@@ -116,10 +120,16 @@ def slice_net_to_sample(net: Net, sample_idx: int) -> Net:
         )
 
     for spec_layer in gather_input_spec_layers(net2):
+        geometry = spec_layer.input_geometry
+        if geometry is not None:
+            spec_layer.params["perturbed_positions"] = _slice_first_dim(
+                geometry.mask, sample_idx, B
+            )
         for key in ("center", "eps", "lb", "ub", "A", "b"):
             val = spec_layer.params.get(key)
             if val is not None:
                 spec_layer.params[key] = _slice_first_dim(val, sample_idx, B)
+        spec_layer.refresh_input_geometry()
 
     assert_layer = get_assert_layer(net2)
     m_raw = assert_layer.params.get("M", 1)
@@ -206,27 +216,13 @@ def seed_from_input_specs(spec_layers) -> Bounds:
                 e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
                 return Bounds(center - e, center + e)
 
-    # LP_EMBEDDING seeds the enclosing box; finite-p precision is recovered by
-    # the dual input contribution, which reads p_norm/perturbed_positions.
+    # The canonical root domain supplies the seed; child boxes never redefine it.
     for spec_layer in spec_layers:
         if spec_layer.params.get("kind") == InKind.LP_EMBEDDING:
             if "lb" in spec_layer.params and "ub" in spec_layer.params:
                 return Bounds(spec_layer.params["lb"].clone(), spec_layer.params["ub"].clone())
-            center = spec_layer.params.get("center")
-            eps = spec_layer.params.get("eps")
-            if center is None or eps is None:
-                raise ValueError("LP_EMBEDDING requires center/eps or lb/ub for seeding.")
-            e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
-            lb = center.clone()
-            ub = center.clone()
-            mask = normalize_position_mask(
-                spec_layer.params.get("perturbed_positions"),
-                int(center.shape[-2]),
-                batch_shape=tuple(center.shape[:-2]),
-                device=center.device,
-            )
-            expanded = mask.unsqueeze(-1).expand_as(center)
-            return Bounds(torch.where(expanded, center - e, lb), torch.where(expanded, center + e, ub))
+            assert spec_layer.input_geometry is not None
+            return Bounds(*spec_layer.input_geometry.box())
     
     # LIN_POLY only -> error
     if any(spec_layer.params.get("kind") == InKind.LIN_POLY for spec_layer in spec_layers):
@@ -276,10 +272,8 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
             if "lb" in L.params and "ub" in L.params:
                 globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
             else:
-                center = L.params["center"]
-                eps = L.params["eps"]
-                e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
-                globalC.add_box(-1, input_ids, Bounds(center - e, center + e))
+                assert L.input_geometry is not None
+                globalC.add_box(-1, input_ids, Bounds(*L.input_geometry.box()))
         elif k == InKind.LIN_POLY:
             A, b = L.params["A"], L.params["b"]
             globalC.replace(Con("INEQ", tuple(input_ids), {"tag": "in:linpoly", "A": A, "b": b}))
@@ -319,7 +313,10 @@ def setup_and_solve_batch(
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
 
-    entry_fact = Fact(bounds=input_bounds_per_b, cons=ConSet())
+    entry_fact = Fact(
+        bounds=Bounds(input_bounds_per_b.lb.flatten(1), input_bounds_per_b.ub.flatten(1)),
+        cons=ConSet(),
+    )
     add_all_input_specs(entry_fact.cons, input_ids, spec_layers)
 
     _before, after, globalC = analyze(net, entry_id, entry_fact, cache=cache)
@@ -405,18 +402,20 @@ def verify_lp_batched(
     violations = torch.zeros(batch_size, device=x_candidates.device, dtype=torch.bool)
     if bool(sat_mask.any().item()):
         violation_module = importlib.import_module("act.back_end.bab.violation")
-        sat_idx = torch.where(sat_mask)[0]
-        checked_sat = violation_module.check_violations_batched(
-            net, x_candidates.index_select(0, sat_idx), assert_layer,
+        # Keep the original lane layout through model and ASSERT evaluation;
+        # selecting SAT inputs alone loses per-sample targets and input specs.
+        checked = violation_module.check_violations_batched(
+            net, x_candidates, assert_layer,
         )
-        if checked_sat.shape != (int(sat_idx.numel()),):
+        in_region = violation_module._check_input_specs_batched(
+            x_candidates, gather_input_spec_layers(net)
+        )
+        if checked.shape != (batch_size,):
             raise ValueError(
                 f"verify_lp_batched: check_violations_batched returned "
-                f"shape={tuple(checked_sat.shape)} expected ({int(sat_idx.numel())},)"
+                f"shape={tuple(checked.shape)} expected ({batch_size},)"
             )
-        violations.scatter_(
-            0, sat_idx, checked_sat.to(device=x_candidates.device, dtype=torch.bool),
-        )
+        violations = checked.to(device=x_candidates.device, dtype=torch.bool) & in_region & sat_mask
 
     results: List[VerifyResult] = []
     x_cpu = x_candidates.detach().cpu()
@@ -612,7 +611,10 @@ def verify_once(
         return results
 
     # 2. Build entry_fact (with all INPUT_SPEC constraints) and analyze.
-    entry_fact = Fact(bounds=seed_bounds, cons=ConSet())
+    entry_fact = Fact(
+        bounds=Bounds(seed_bounds.lb.flatten(1), seed_bounds.ub.flatten(1)),
+        cons=ConSet(),
+    )
     add_all_input_specs(entry_fact.cons, input_ids, spec_layers)
     _before, after, _globalC = analyze(net, entry_id, entry_fact)
 
@@ -713,12 +715,20 @@ def verify_once(
         # on row i). Sound under-approximation: EXISTS row i such that
         # min_{y in box} (c_i @ y) > d_i. min(c_i @ y) = c_i_pos @ lb + c_i_neg @ ub.
         margin_min = (C_pos * lb_exp + C_neg * ub_exp).sum(dim=-1)
-        certified = (margin_min.view(B, M) > thresholds).any(dim=-1)
+        values = margin_min.view(B, M)
+        slack = values - thresholds
     else:
-        # LINEAR_LE / TOP1_ROBUST / MARGIN_ROBUST / RANGE: certified iff for
-        # all y in the box, ALL rows max_y (c_i @ y) < d_i.
+        # ALL-row properties use upper bounds; the shared predicate below
+        # preserves LINEAR_LE/RANGE equality and rejects closed-unsafe ties.
         margin_max = (C_pos * ub_exp + C_neg * lb_exp).sum(dim=-1)
-        certified = (margin_max.view(B, M) < thresholds).all(dim=-1)
+        values = margin_max.view(B, M)
+        slack = thresholds - values
+    from act.back_end.solver.solver_dual import unproven_spec_rows
+
+    proven = ~unproven_spec_rows(
+        slack, kind, torch.maximum(values.abs(), thresholds.abs())
+    )
+    certified = proven.any(dim=-1) if is_unsafe_linear else proven.all(dim=-1)
 
     # 5. Concrete falsification (optional).
     falsified = torch.zeros(B, dtype=torch.bool, device=device)
@@ -741,11 +751,13 @@ def verify_once(
                 (concrete_violation <= thresholds).all(dim=-1)
             )
         else:
-            # ALL-rows kinds: FALSIFIED iff ANY lane's concrete margin
-            # meets-or-exceeds threshold.
-            falsified = (~certified) & (
-                (concrete_violation >= thresholds).any(dim=-1)
+            # Closed unsafe sets include equality; LINEAR_LE/RANGE do not.
+            violation_rows = (
+                concrete_violation >= thresholds
+                if kind in OutputSpec.CLOSED_KINDS
+                else concrete_violation > thresholds
             )
+            falsified = (~certified) & violation_rows.any(dim=-1)
         if falsified.any():
             x_center_cpu = x_center.detach().cpu()
             # B1 (oracle-verified): single sync via .tolist() replaces B per-element .item() syncs.

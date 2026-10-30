@@ -63,12 +63,15 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections import Counter
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
+from copy import copy
+from dataclasses import fields, replace
+from typing import Callable, Dict, Iterator, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 
 import torch
 
-from act.back_end.bab.node import SubproblemBatch
+from act.back_end.bab.node import SubproblemBatch, tensor_storage_bytes
 from act.back_end.solver.solver_base import SolveStatus
+from act.back_end.solver.solver_dual import AlphaState
 from act.util.device_manager import get_default_dtype
 
 
@@ -135,6 +138,61 @@ class BoundingStrategy(ABC):
         """True when no subproblems remain."""
         return len(self) == 0
 
+    @abstractmethod
+    def _resident_batch(self) -> Optional[SubproblemBatch]:
+        """Expose resident references without gathering any tensor."""
+        ...
+
+    @abstractmethod
+    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+        """Publish a fully allocated replacement without further tensor allocation."""
+        ...
+
+    def resident_tensors(self) -> Iterator[torch.Tensor]:
+        """Visit the pool's actual resident tensors, never ``view_all`` copies."""
+        batch = self._resident_batch()
+        if batch is not None:
+            yield from batch.tensors()
+
+    def storage_bytes(self, device: torch.device | str | None = None) -> int:
+        """Return unique resident storage bytes on the requested device."""
+        return tensor_storage_bytes(self.resident_tensors(), device)
+
+    def to(self, device: torch.device | str) -> None:
+        """Move all resident state atomically; failed allocation leaves it intact."""
+        batch = self._resident_batch()
+        if batch is not None:
+            self._assign(batch.to(device))
+
+    def drop_warm_state(self) -> None:
+        """Make resident lanes cold without dropping any unproved domain."""
+        batch = self._resident_batch()
+        if batch is not None:
+            self._assign(batch.drop_warm_state())
+
+    def projected_push_bytes(self, batch: SubproblemBatch) -> int:
+        """Bound extra push allocations, excluding already-resident/input storage.
+
+        The union payload is bounded by the sum of each side's per-lane payload;
+        a second output-sized allowance covers zero padding and concat temporaries.
+        This is conservative for matching schemas and needs no tensor allocation.
+        """
+        if not batch.batch_size:
+            return 0
+        resident = tuple(self.resident_tensors())
+        incoming = tuple(batch.tensors())
+        target = resident[0].device if resident else batch.lb.device
+        converted = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in incoming if tensor.device != target
+        )
+        row_bytes = sum(t.numel() * t.element_size() for t in incoming) // len(batch)
+        if resident:
+            row_bytes += sum(t.numel() * t.element_size() for t in resident) // len(self)
+        # Priority pools fill two absent scalar scores, and clone/select uses indices.
+        row_bytes += 2 * batch.lb.element_size() + 8
+        return converted + 2 * (len(self) + len(batch)) * row_bytes
+
 
 # ---------------------------------------------------------------------------
 # Random baseline
@@ -147,121 +205,64 @@ class RandomBounding(BoundingStrategy):
     ``pop(k)`` selects ``k`` subproblems uniformly at random from the
     pool (without replacement).
 
-    Internal storage is fully tensor-native: three tensors ``(M, D)``,
-    ``(M, D)``, ``(M,)`` for lower bounds, upper bounds, and depths
-    respectively.
+    The pool retains complete subproblem rows, including dual warm starts
+    and split phases.
     """
 
     def __init__(self) -> None:
-        self._lb: Optional[torch.Tensor] = None  # (M, D)
-        self._ub: Optional[torch.Tensor] = None  # (M, D)
-        self._depths: Optional[torch.Tensor] = None  # (M,)
+        self._batch: Optional[SubproblemBatch] = None
 
     # -- BoundingStrategy interface -----------------------------------------
 
     def push(self, batch: SubproblemBatch) -> None:
-        if self._lb is None:
-            self._lb = batch.lb.clone()
-            self._ub = batch.ub.clone()
-            self._depths = batch.depths.clone()
-        else:
-            assert self._ub is not None and self._depths is not None
-            self._lb = torch.cat([self._lb, batch.lb], dim=0)
-            self._ub = torch.cat([self._ub, batch.ub], dim=0)
-            self._depths = torch.cat([self._depths, batch.depths], dim=0)
+        if not batch.batch_size:
+            return
+        self._batch = (
+            batch.select(torch.arange(batch.batch_size, device=batch.lb.device))
+            if self._batch is None else self._batch.concat(batch)
+        )
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
         if self.empty:
             raise IndexError("pop from empty pool")
 
         n = min(batch_size, len(self))
-        assert self._lb is not None and self._ub is not None and self._depths is not None
-        perm = torch.randperm(len(self), device=self._lb.device)
+        assert self._batch is not None
+        perm = torch.randperm(len(self), device=self._batch.lb.device)
         selected = perm[:n]
         remaining = perm[n:]
-
-        result = SubproblemBatch(
-            lb=self._lb[selected],
-            ub=self._ub[selected],
-            depths=self._depths[selected],
-        )
-
-        if len(remaining) > 0:
-            self._lb = self._lb[remaining]
-            self._ub = self._ub[remaining]
-            self._depths = self._depths[remaining]
-        else:
-            self._lb = None
-            self._ub = None
-            self._depths = None
-
+        result = self._batch.select(selected)
+        self._batch = self._batch.select(remaining) if remaining.numel() else None
         return result
 
     def evict_to(self, cap: int) -> int:
         total = len(self)
-        if total <= cap or cap <= 0:
+        if cap < 0:
+            raise ValueError("frontier cap must be non-negative")
+        if total <= cap:
             return 0
-        assert self._lb is not None and self._ub is not None and self._depths is not None
-        self._lb = self._lb[:cap]
-        self._ub = self._ub[:cap]
-        self._depths = self._depths[:cap]
+        if cap == 0:
+            self._batch = None
+            return total
+        assert self._batch is not None
+        self._batch = self._batch.select(
+            torch.arange(cap, device=self._batch.lb.device)
+        )
         return total - cap
 
     def __len__(self) -> int:
-        return 0 if self._lb is None else self._lb.shape[0]
+        return 0 if self._batch is None else self._batch.batch_size
+
+    def _resident_batch(self) -> Optional[SubproblemBatch]:
+        return self._batch
+
+    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+        self._batch = batch
 
 
 # ---------------------------------------------------------------------------
 # Top-k priority selection (quantitative total order: depth + lower bound)
 # ---------------------------------------------------------------------------
-
-
-def _clone_optional_dict(
-    d: Optional[Dict[int, torch.Tensor]],
-) -> Optional[Dict[int, torch.Tensor]]:
-    return {key: tensor.clone() for key, tensor in d.items()} if d is not None else None
-
-
-def _index_optional_dict(
-    d: Optional[Dict[int, torch.Tensor]], idx: torch.Tensor
-) -> Optional[Dict[int, torch.Tensor]]:
-    if d is None:
-        return None
-    return {key: tensor.index_select(0, idx.to(tensor.device)) for key, tensor in d.items()}
-
-
-def _merge_optional_dict(
-    existing: Optional[Dict[int, torch.Tensor]],
-    n_existing: int,
-    incoming: Optional[Dict[int, torch.Tensor]],
-    n_incoming: int,
-) -> Optional[Dict[int, torch.Tensor]]:
-    # Per-key concat with key-union; a subproblem missing a key is padded with
-    # zeros (e.g. split_signs keys differ per branch — a missing layer means "not
-    # split", i.e. all-zero signs). Keeps the pool lossless across heterogeneous
-    # incremental-state/split structures.
-    if existing is None and incoming is None:
-        return None
-    existing = existing or {}
-    incoming = incoming or {}
-    merged: Dict[int, torch.Tensor] = {}
-    for key in sorted(set(existing) | set(incoming)):
-        te = existing.get(key)
-        ti = incoming.get(key)
-        ref = te if te is not None else ti
-        assert ref is not None
-        if te is not None and ti is not None:
-            assert te.shape[1:] == ti.shape[1:], (
-                f"optional dict key {key} trailing shape mismatch: "
-                f"existing {tuple(te.shape[1:])} vs incoming {tuple(ti.shape[1:])}"
-            )
-        trailing = ref.shape[1:]
-        if te is None:
-            te = torch.zeros((n_existing, *trailing), dtype=ref.dtype, device=ref.device)
-        if ti is None:
-            ti = torch.zeros((n_incoming, *trailing), dtype=ref.dtype, device=ref.device)
-        merged[key] = torch.cat([te, ti], dim=0)
-    return merged
 
 
 class OrderFunction(Protocol):
@@ -380,59 +381,31 @@ class TopKBounding(BoundingStrategy):
         self._parent_margins: Optional[torch.Tensor] = None
         self._node_id: Optional[torch.Tensor] = None
         self._parent_id: Optional[torch.Tensor] = None
-        self._incremental_alpha: Optional[Dict[int, torch.Tensor]] = None
+        self._incremental_alpha: Optional[AlphaState] = None
         self._incremental_eta: Optional[Dict[int, torch.Tensor]] = None
         self._split_signs: Optional[Dict[int, torch.Tensor]] = None
+        self._decision_literals: Optional[torch.Tensor] = None
+        self._warm_state_present: Optional[torch.Tensor] = None
 
     def push(self, batch: SubproblemBatch) -> None:
+        if not batch.batch_size:
+            return
         size_before = len(self)
         n_new = batch.batch_size
         device, dtype = batch.lb.device, batch.lb.dtype
-        lower = (
-            batch.lower_bound
-            if batch.lower_bound is not None
-            else torch.zeros(n_new, dtype=dtype, device=device)
+        incoming = replace(
+            batch,
+            lower_bound=(batch.lower_bound if batch.lower_bound is not None
+                         else torch.zeros(n_new, dtype=dtype, device=device)),
+            parent_margins=(batch.parent_margins if batch.parent_margins is not None
+                            else torch.zeros(n_new, dtype=dtype, device=device)),
         )
-        parent = (
-            batch.parent_margins
-            if batch.parent_margins is not None
-            else torch.zeros(n_new, dtype=dtype, device=device)
+        resident = self._resident_batch()
+        staged = (
+            incoming.select(torch.arange(n_new, device=device))
+            if resident is None else resident.concat(incoming)
         )
-        prev_lb, prev_ub, prev_depths = self._lb, self._ub, self._depths
-        prev_lower, prev_parent = self._lower_bound, self._parent_margins
-        if prev_lb is None:
-            self._lb = batch.lb.clone()
-            self._ub = batch.ub.clone()
-            self._depths = batch.depths.clone()
-            self._lower_bound = lower.clone()
-            self._parent_margins = parent.clone()
-            self._node_id = batch.node_id.clone() if batch.node_id is not None else None
-            self._parent_id = batch.parent_id.clone() if batch.parent_id is not None else None
-            self._incremental_alpha = _clone_optional_dict(batch.incremental_alpha)
-            self._incremental_eta = _clone_optional_dict(batch.incremental_eta)
-            self._split_signs = _clone_optional_dict(batch.split_signs)
-            self._assert_push_transition(size_before, n_new)
-            return
-
-        assert prev_ub is not None and prev_depths is not None
-        assert prev_lower is not None and prev_parent is not None
-        assert (self._node_id is None) == (batch.node_id is None)
-        assert (self._parent_id is None) == (batch.parent_id is None)
-        n_old = prev_lb.shape[0]
-        self._incremental_alpha = _merge_optional_dict(self._incremental_alpha, n_old, batch.incremental_alpha, n_new)
-        self._incremental_eta = _merge_optional_dict(self._incremental_eta, n_old, batch.incremental_eta, n_new)
-        self._split_signs = _merge_optional_dict(self._split_signs, n_old, batch.split_signs, n_new)
-        self._lb = torch.cat([prev_lb, batch.lb], dim=0)
-        self._ub = torch.cat([prev_ub, batch.ub], dim=0)
-        self._depths = torch.cat([prev_depths, batch.depths], dim=0)
-        self._lower_bound = torch.cat([prev_lower, lower.to(prev_lower)], dim=0)
-        self._parent_margins = torch.cat([prev_parent, parent.to(prev_parent)], dim=0)
-        if self._node_id is not None:
-            assert batch.node_id is not None
-            self._node_id = torch.cat([self._node_id, batch.node_id.to(self._node_id.device)], dim=0)
-        if self._parent_id is not None:
-            assert batch.parent_id is not None
-            self._parent_id = torch.cat([self._parent_id, batch.parent_id.to(self._parent_id.device)], dim=0)
+        self._assign(staged)
         self._assert_push_transition(size_before, n_new)
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
@@ -443,22 +416,20 @@ class TopKBounding(BoundingStrategy):
         n = min(batch_size, total)
         if self.k > 0:
             n = min(n, self.k)
-        _advance_order_schedule(self.order)
         if n >= total:
             selected = torch.arange(total, device=lb.device)
             remaining: Optional[torch.Tensor] = None
         else:
-            order = torch.argsort(self._priority_scores(), descending=True)
+            order = torch.argsort(self._priority_scores(next_wave=True), descending=True)
             selected = order[:n]
             remaining = order[n:]
 
         result = self._build(selected)
+        kept = self._build(remaining) if remaining is not None and remaining.numel() else None
         if self.select_probe is not None:
             self.select_probe(result)
-        if remaining is None or remaining.numel() == 0:
-            self._clear()
-        else:
-            self._restrict(remaining)
+        self._assign(kept)
+        _advance_order_schedule(self.order)
         self._assert_pop_transition(total, result.batch_size)
         return result
 
@@ -487,65 +458,61 @@ class TopKBounding(BoundingStrategy):
         indices = torch.arange(self._lb.shape[0], device=self._lb.device)
         return self._build(indices)
 
-    def replace_all(self, batch: SubproblemBatch) -> None:
-        """Replace the full frontier without scoring or advancing schedules."""
-        self._clear()
-        if batch.batch_size > 0:
-            self.push(batch)
+    def checkpoint(self) -> Optional[SubproblemBatch]:
+        """Retain resident references without copying the frontier payload."""
+        return self._resident_batch()
 
-    def _priority_scores(self) -> torch.Tensor:
+    def restore(self, state: Optional[SubproblemBatch]) -> None:
+        """Restore a pre-commit frontier without allocating tensor storage."""
+        self._assign(state)
+
+    def replace_all(self, batch: SubproblemBatch) -> None:
+        """Replace without scoring; each lane keeps its own warm-state presence."""
+        staged = TopKBounding()
+        staged.push(batch)
+        self._assign(staged._resident_batch())
+
+    def _priority_scores(self, *, next_wave: bool = False) -> torch.Tensor:
         depths_t, lb = self._depths, self._lower_bound
         assert depths_t is not None and lb is not None
-        return self.order(depths_t, lb)
+        # Score at the same annealing step as before, but publish the tick only
+        # after every gather succeeds. OOM must not consume a schedule step.
+        order = copy(self.order) if next_wave else self.order
+        if next_wave:
+            _advance_order_schedule(order)
+        return order(depths_t, lb)
 
     def _build(self, idx: torch.Tensor) -> SubproblemBatch:
-        lb, ub, depths = self._lb, self._ub, self._depths
-        lower, parent = self._lower_bound, self._parent_margins
-        assert lb is not None and ub is not None and depths is not None
-        assert lower is not None and parent is not None
-        idx = idx.to(lb.device)
-        return SubproblemBatch(
-            lb=lb.index_select(0, idx),
-            ub=ub.index_select(0, idx),
-            depths=depths.index_select(0, idx),
-            incremental_alpha=_index_optional_dict(self._incremental_alpha, idx),
-            incremental_eta=_index_optional_dict(self._incremental_eta, idx),
-            split_signs=_index_optional_dict(self._split_signs, idx),
-            parent_margins=parent.index_select(0, idx),
-            lower_bound=lower.index_select(0, idx),
-            node_id=(
-                self._node_id.index_select(0, idx.to(self._node_id.device))
-                if self._node_id is not None
-                else None
-            ),
-            parent_id=(
-                self._parent_id.index_select(0, idx.to(self._parent_id.device))
-                if self._parent_id is not None
-                else None
-            ),
-        )
+        batch = self._resident_batch()
+        assert batch is not None
+        return batch.select(idx)
+
+    def _resident_batch(self) -> Optional[SubproblemBatch]:
+        if self._lb is None:
+            return None
+        return SubproblemBatch(**{
+            field.name: getattr(self, "_" + field.name) for field in fields(SubproblemBatch)
+        })
+
+    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+        for field in fields(SubproblemBatch):
+            setattr(self, "_" + field.name, None if batch is None else getattr(batch, field.name))
 
     def _restrict(self, idx: torch.Tensor) -> None:
-        kept = self._build(idx)
-        self._lb, self._ub, self._depths = kept.lb, kept.ub, kept.depths
-        self._lower_bound, self._parent_margins = kept.lower_bound, kept.parent_margins
-        self._node_id, self._parent_id = kept.node_id, kept.parent_id
-        self._incremental_alpha, self._incremental_eta, self._split_signs = (
-            kept.incremental_alpha,
-            kept.incremental_eta,
-            kept.split_signs,
-        )
+        self._assign(self._build(idx))
 
     def _clear(self) -> None:
-        self._lb = self._ub = self._depths = None
-        self._lower_bound = self._parent_margins = None
-        self._node_id = self._parent_id = None
-        self._incremental_alpha = self._incremental_eta = self._split_signs = None
+        self._assign(None)
 
     def evict_to(self, cap: int) -> int:
         total = len(self)
-        if total <= cap or cap <= 0:
+        if cap < 0:
+            raise ValueError("frontier cap must be non-negative")
+        if total <= cap:
             return 0
+        if cap == 0:
+            self._clear()
+            return total
         order = torch.argsort(self._priority_scores(), descending=True)
         self._restrict(order[:cap])
         return total - cap
@@ -592,12 +559,11 @@ class DiverseTopKBounding(TopKBounding):
         n = min(batch_size, total)
         if self.k > 0:
             n = min(n, self.k)
-        _advance_order_schedule(self.order)
         if n >= total:
             selected = torch.arange(total, device=lb.device)
             remaining: Optional[torch.Tensor] = None
         else:
-            order = torch.argsort(self._priority_scores(), descending=True)
+            order = torch.argsort(self._priority_scores(next_wave=True), descending=True)
             if self.diversity_mode == "none":
                 selected = order[:n]
             elif self.diversity_mode == "soft":
@@ -609,12 +575,11 @@ class DiverseTopKBounding(TopKBounding):
             remaining = order[~selected_mask.index_select(0, order)]
 
         result = self._build(selected)
+        kept = self._build(remaining) if remaining is not None and remaining.numel() else None
         if self.select_probe is not None:
             self.select_probe(result)
-        if remaining is None or remaining.numel() == 0:
-            self._clear()
-        else:
-            self._restrict(remaining)
+        self._assign(kept)
+        _advance_order_schedule(self.order)
         self._assert_pop_transition(total, result.batch_size)
         return result
 
@@ -680,7 +645,7 @@ class DiverseTopKBounding(TopKBounding):
 
         lb = self._lb
         assert lb is not None
-        priorities = self._priority_scores().index_select(0, order.to(lb.device))
+        priorities = self._priority_scores(next_wave=True).index_select(0, order.to(lb.device))
         priorities = priorities.to(device=features.device, dtype=features.dtype)
         priority_span = (priorities.max() - priorities.min()).clamp(
             min=torch.finfo(priorities.dtype).eps
@@ -794,7 +759,7 @@ def _mcts_visit_diagnostics(
     return root_visits, min_visit, max_child_excess
 
 
-class MCTSBounding(BoundingStrategy):
+class MCTSBounding(TopKBounding):
     """MCTS side tables (``N``/``Q``) over the BaB tree, maintained as a pure observer.
 
     ``order`` governs **eviction priority only**; selection is UCB1 (W2). At this
@@ -816,8 +781,7 @@ class MCTSBounding(BoundingStrategy):
         lambda_: float = 0.5,
         virtual_loss: float = 1.0,  # inert at K=1; reserved for the batched extension
     ) -> None:
-        self.order: OrderFunction = order if order is not None else DepthLowerBoundOrder()
-        self.select_probe = select_probe
+        super().__init__(order, select_probe=select_probe)
         self.exploration: float = float(exploration)
         self.lambda_: float = float(lambda_)
         self.virtual_loss: float = float(virtual_loss)
@@ -825,16 +789,6 @@ class MCTSBounding(BoundingStrategy):
         self.N: Dict[int, int] = {}
         self.Q: Dict[int, float] = {}
         self.n_tot: int = 0
-        self._lb: Optional[torch.Tensor] = None
-        self._ub: Optional[torch.Tensor] = None
-        self._depths: Optional[torch.Tensor] = None
-        self._lower_bound: Optional[torch.Tensor] = None
-        self._parent_margins: Optional[torch.Tensor] = None
-        self._node_id: Optional[torch.Tensor] = None
-        self._parent_id: Optional[torch.Tensor] = None
-        self._incremental_alpha: Optional[Dict[int, torch.Tensor]] = None
-        self._incremental_eta: Optional[Dict[int, torch.Tensor]] = None
-        self._split_signs: Optional[Dict[int, torch.Tensor]] = None
 
     def push(self, batch: SubproblemBatch) -> None:
         if batch.node_id is None or batch.parent_id is None:
@@ -842,129 +796,10 @@ class MCTSBounding(BoundingStrategy):
             raise ValueError(
                 f"MCTSBounding.push requires provenance, but batch.{missing} is None"
             )
-        n_new = batch.batch_size
-        device, dtype = batch.lb.device, batch.lb.dtype
-        lower = (
-            batch.lower_bound
-            if batch.lower_bound is not None
-            else torch.zeros(n_new, dtype=dtype, device=device)
-        )
-        parent = (
-            batch.parent_margins
-            if batch.parent_margins is not None
-            else torch.zeros(n_new, dtype=dtype, device=device)
-        )
-        prev_lb = self._lb
-        if prev_lb is None:
-            self._lb = batch.lb.clone()
-            self._ub = batch.ub.clone()
-            self._depths = batch.depths.clone()
-            self._lower_bound = lower.clone()
-            self._parent_margins = parent.clone()
-            self._node_id = batch.node_id.clone()
-            self._parent_id = batch.parent_id.clone()
-            self._incremental_alpha = _clone_optional_dict(batch.incremental_alpha)
-            self._incremental_eta = _clone_optional_dict(batch.incremental_eta)
-            self._split_signs = _clone_optional_dict(batch.split_signs)
-        else:
-            prev_ub, prev_depths = self._ub, self._depths
-            prev_lower, prev_parent = self._lower_bound, self._parent_margins
-            prev_node, prev_parent_id = self._node_id, self._parent_id
-            assert prev_ub is not None and prev_depths is not None
-            assert prev_lower is not None and prev_parent is not None
-            assert prev_node is not None and prev_parent_id is not None
-            n_old = prev_lb.shape[0]
-            self._incremental_alpha = _merge_optional_dict(self._incremental_alpha, n_old, batch.incremental_alpha, n_new)
-            self._incremental_eta = _merge_optional_dict(self._incremental_eta, n_old, batch.incremental_eta, n_new)
-            self._split_signs = _merge_optional_dict(self._split_signs, n_old, batch.split_signs, n_new)
-            self._lb = torch.cat([prev_lb, batch.lb], dim=0)
-            self._ub = torch.cat([prev_ub, batch.ub], dim=0)
-            self._depths = torch.cat([prev_depths, batch.depths], dim=0)
-            self._lower_bound = torch.cat([prev_lower, lower.to(prev_lower)], dim=0)
-            self._parent_margins = torch.cat([prev_parent, parent.to(prev_parent)], dim=0)
-            self._node_id = torch.cat([prev_node, batch.node_id.to(prev_node.device)], dim=0)
-            self._parent_id = torch.cat([prev_parent_id, batch.parent_id.to(prev_parent_id.device)], dim=0)
-
-        for nid, pid in zip(batch.node_id.tolist(), batch.parent_id.tolist()):
-            self.parent[int(nid)] = int(pid)
-
-    def pop(self, batch_size: int = 1) -> SubproblemBatch:
-        lb = self._lb
-        if lb is None:
-            raise IndexError("pop from empty pool")
-        total = lb.shape[0]
-        n = min(batch_size, total)
-        _advance_order_schedule(self.order)
-        if n >= total:
-            selected = torch.arange(total, device=lb.device)
-            remaining: Optional[torch.Tensor] = None
-        else:
-            order = torch.argsort(self._priority_scores(), descending=True)
-            selected = order[:n]
-            remaining = order[n:]
-
-        result = self._build(selected)
-        if self.select_probe is not None:
-            self.select_probe(result)
-        if remaining is None or remaining.numel() == 0:
-            self._clear()
-        else:
-            self._restrict(remaining)
-        return result
-
-    def evict_to(self, cap: int) -> int:
-        total = len(self)
-        if total <= cap or cap <= 0:
-            return 0
-        order = torch.argsort(self._priority_scores(), descending=True)
-        self._restrict(order[:cap])
-        return total - cap
-
-    def __len__(self) -> int:
-        return 0 if self._lb is None else self._lb.shape[0]
-
-    def _priority_scores(self) -> torch.Tensor:
-        depths_t, lb = self._depths, self._lower_bound
-        assert depths_t is not None and lb is not None
-        return self.order(depths_t, lb)
-
-    def _build(self, idx: torch.Tensor) -> SubproblemBatch:
-        lb, ub, depths = self._lb, self._ub, self._depths
-        lower, parent = self._lower_bound, self._parent_margins
-        node_id, parent_id = self._node_id, self._parent_id
-        assert lb is not None and ub is not None and depths is not None
-        assert lower is not None and parent is not None
-        assert node_id is not None and parent_id is not None
-        idx = idx.to(lb.device)
-        return SubproblemBatch(
-            lb=lb.index_select(0, idx),
-            ub=ub.index_select(0, idx),
-            depths=depths.index_select(0, idx),
-            incremental_alpha=_index_optional_dict(self._incremental_alpha, idx),
-            incremental_eta=_index_optional_dict(self._incremental_eta, idx),
-            split_signs=_index_optional_dict(self._split_signs, idx),
-            parent_margins=parent.index_select(0, idx),
-            lower_bound=lower.index_select(0, idx),
-            node_id=node_id.index_select(0, idx.to(node_id.device)),
-            parent_id=parent_id.index_select(0, idx.to(parent_id.device)),
-        )
-
-    def _restrict(self, idx: torch.Tensor) -> None:
-        kept = self._build(idx)
-        self._lb, self._ub, self._depths = kept.lb, kept.ub, kept.depths
-        self._lower_bound, self._parent_margins = kept.lower_bound, kept.parent_margins
-        self._node_id, self._parent_id = kept.node_id, kept.parent_id
-        self._incremental_alpha, self._incremental_eta, self._split_signs = (
-            kept.incremental_alpha,
-            kept.incremental_eta,
-            kept.split_signs,
-        )
-
-    def _clear(self) -> None:
-        self._lb = self._ub = self._depths = None
-        self._lower_bound = self._parent_margins = None
-        self._node_id = self._parent_id = None
-        self._incremental_alpha = self._incremental_eta = self._split_signs = None
+        parent = self.parent.copy()
+        parent.update(zip(batch.node_id.tolist(), batch.parent_id.tolist()))
+        super().push(batch)
+        self.parent = parent
 
     def observe(
         self,

@@ -98,6 +98,37 @@ def _cos_interval(lo: torch.Tensor, hi: torch.Tensor) -> Bounds:
 def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     # Parameter names aligned with PyTorch: weight, bias, weight_pos, weight_neg
     W = L.params["weight"]
+    if L.params.get("token_wise", False):
+        assert isinstance(W, torch.Tensor)
+        weight = W.to(device=Bin.lb.device, dtype=Bin.lb.dtype)
+        in_features = weight.shape[1]
+        if len(L.in_vars) % in_features:
+            raise ValueError(
+                f"token-wise DENSE {L.id}: {len(L.in_vars)} inputs are not divisible "
+                f"by in_features={in_features}"
+            )
+        tokens = len(L.in_vars) // in_features
+        batch = Bin.lb.shape[0]
+        bias = L.params.get("bias")
+        if bias is None:
+            bias = weight.new_zeros(weight.shape[0])
+        else:
+            assert isinstance(bias, torch.Tensor)
+            bias = bias.to(device=Bin.lb.device, dtype=Bin.lb.dtype)
+        lower = Bin.lb.reshape(batch, tokens, in_features)
+        upper = Bin.ub.reshape(batch, tokens, in_features)
+        positive, negative = weight.clamp(min=0), weight.clamp(max=0)
+        box = Bounds(
+            (lower @ positive.T + upper @ negative.T + bias).reshape(batch, -1),
+            (upper @ positive.T + lower @ negative.T + bias).reshape(batch, -1),
+        )
+        constraints = ConSet()
+        constraints.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+            "tag": f"dense:{L.id}", "W": weight, "b": bias,
+            "token_wise": True, "token_count": tokens,
+        }))
+        constraints.add_box(L.id, L.out_vars, box)
+        return Fact(box, constraints)
     W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
     W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
     b = L.params.get("bias", torch.zeros(W.shape[0]))
@@ -113,7 +144,8 @@ def tf_bias(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B); return Fact(B,C)
 
 def tf_scale(L: Layer, Bin: Bounds) -> Fact:
-    a=L.params["a"]
+    # Bounds are [B, n], but SCALE parameters can retain spatial axes.
+    a=L.params["a"].reshape(-1)
     lb=torch.where(a>=0, a*Bin.lb, a*Bin.ub); ub=torch.where(a>=0, a*Bin.ub, a*Bin.lb)
     B=Bounds(lb,ub); C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"scale:{L.id}", "a": a}))
     C.add_box(L.id, L.out_vars, B); return Fact(B,C)

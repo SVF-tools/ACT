@@ -17,7 +17,6 @@ License: AGPLv3+
 
 import argparse
 from contextlib import contextmanager
-from copy import deepcopy
 import logging
 from pathlib import Path
 from typing import Any, cast
@@ -29,7 +28,6 @@ from act.util.format_utils import rule
 from act.config.config import VALID_BOUNDINGS, VALID_SOLVER_TIERS
 
 logger = logging.getLogger(__name__)
-from act.front_end.specs import OutputSpec
 from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 from act.front_end.vnnlib_loader.vnnlib_parser import UnsupportedSpecError
 from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
@@ -691,76 +689,13 @@ def _run_vnnlib_verify(args) -> bool:
 
 @contextmanager
 def _sliced_net_view(net, sample_idx: int, batch_size: int):
-    """Yield a per-sample view of ``net`` with spec/assert/input layers sliced.
+    """Yield the canonical per-lane slice without mutating the source Net."""
+    from act.back_end.verifier import gather_input_spec_layers, seed_from_input_specs, slice_net_to_sample
 
-    On exit, original layer params/out_vars are restored. Safer than inline
-    try/finally because mutation surface is encapsulated.
-    """
-    from act.back_end.verifier import (
-        find_entry_layer_id,
-        gather_input_spec_layers,
-        get_assert_layer,
-    )
-
-    assert_layer = get_assert_layer(net)
-    spec_layers = gather_input_spec_layers(net)
-    input_layer = net.by_id[find_entry_layer_id(net)]
-    full_input_ids = list(input_layer.out_vars)
-    input_dim = len(full_input_ids) // batch_size
-    if len(full_input_ids) != input_dim * batch_size:
-        raise RuntimeError(
-            f"InputLayer.out_vars ({len(full_input_ids)}) not divisible by B={batch_size}"
-        )
-
-    orig_assert_params = deepcopy(assert_layer.params)
-    orig_spec_params = [deepcopy(spec_layer.params) for spec_layer in spec_layers]
-    orig_input_outvars = list(input_layer.out_vars)
-    try:
-        assert_kind = orig_assert_params.get("kind")
-        if not isinstance(assert_kind, str):
-            raise TypeError(
-                f"ASSERT kind must be str, got {type(assert_kind).__name__}"
-            )
-        reference = next(
-            (
-                value
-                for value in orig_assert_params.values()
-                if isinstance(value, torch.Tensor) and value.is_floating_point()
-            ),
-            None,
-        )
-        if reference is None:
-            raise RuntimeError("ASSERT params contain no floating tensor for slicing")
-        assert_layer.params.update(
-            OutputSpec(kind=assert_kind)._gather_rows(
-                rows=torch.tensor([sample_idx], device=reference.device),
-                batch_size=1,
-                device=reference.device,
-                dtype=reference.dtype,
-                shared_ndim={},
-                source=orig_assert_params,
-                source_batch_size=batch_size,
-            )
-        )
-
-        for spec_layer, sp_orig in zip(spec_layers, orig_spec_params):
-            for sp_key, sp_val in sp_orig.items():
-                if (
-                    hasattr(sp_val, "dim")
-                    and sp_val.dim() >= 1
-                    and sp_val.shape[0] == batch_size
-                ):
-                    spec_layer.params[sp_key] = sp_val[sample_idx : sample_idx + 1]
-
-        input_layer.out_vars = full_input_ids[
-            sample_idx * input_dim : (sample_idx + 1) * input_dim
-        ]
-        yield net
-    finally:
-        assert_layer.params = orig_assert_params
-        for spec_layer, sp_orig in zip(spec_layers, orig_spec_params):
-            spec_layer.params = sp_orig
-        input_layer.out_vars = orig_input_outvars
+    actual_B = int(seed_from_input_specs(gather_input_spec_layers(net)).lb.shape[0])
+    if actual_B != batch_size:
+        raise ValueError(f"Requested B={batch_size} but INPUT_SPEC has B={actual_B}")
+    yield slice_net_to_sample(net, sample_idx)
 
 
 def _run_bab_on_net(net, args, bab_first_sample_only: bool = False):

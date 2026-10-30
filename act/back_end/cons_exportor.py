@@ -313,24 +313,25 @@ def _emit_dense(
     b_t = _as_td(b, device, dtype)
     n_out, n_in = W_t.shape
     var_ids_all = list(con.var_ids)
-    y = var_ids_all[:n_out]
-    x = var_ids_all[n_out:]
-    if len(x) != n_in:
+    token_count = int(con.meta["token_count"]) if con.meta.get("token_wise", False) else 1
+    total_out, total_in = n_out * token_count, n_in * token_count
+    y = var_ids_all[:total_out]
+    x = var_ids_all[total_out:]
+    if len(x) != total_in:
         raise ValueError(
             f"dense: var_ids length mismatch: {len(x)} input vars vs "
-            f"W.shape[1]={n_in}"
+            f"expected {total_in} ({token_count} x W.shape[1]={n_in})"
         )
-    m = n_out
+    m = total_out
     col_block = torch.empty((m, 1 + n_in), device=device, dtype=torch.long)
     col_block[:, 0] = torch.tensor(y, device=device, dtype=torch.long)
-    col_block[:, 1:] = torch.tensor(
-        x, device=device, dtype=torch.long
-    ).unsqueeze(0).expand(m, -1)
+    x_rows = torch.tensor(x, device=device, dtype=torch.long).reshape(token_count, n_in)
+    col_block[:, 1:] = x_rows[:, None, :].expand(token_count, n_out, n_in).reshape(m, n_in)
     val_per_row = torch.empty((m, 1 + n_in), device=device, dtype=dtype)
     val_per_row[:, 0] = 1.0
-    val_per_row[:, 1:] = -W_t
+    val_per_row[:, 1:] = -W_t.repeat(token_count, 1)
     val_block = val_per_row.unsqueeze(0).expand(N, m, 1 + n_in).contiguous()
-    rhs_block = b_t.reshape(m).unsqueeze(0).expand(N, m).contiguous()
+    rhs_block = b_t.reshape(n_out).repeat(token_count).unsqueeze(0).expand(N, m).contiguous()
     eq.add_block(col_block, val_block, rhs_block)
 
 

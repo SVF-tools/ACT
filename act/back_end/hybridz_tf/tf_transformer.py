@@ -606,12 +606,11 @@ def tf_mha_split(L, bounds, tf):
 
 
 def tf_mha_join(L, bounds, tf):
-    fact = interval.tf_mha_join(
-        L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
-    )
+    inputs = tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
+    fact = interval.tf_mha_join(L, inputs)
     parts = [tf._hz_cache.get(pid) for pid in tf._net.preds.get(L.id, [])]
     if parts and all(part is not None for part in parts):
-        tf._hz_cache[L.id] = hz_concat(parts)
+        tf._hz_cache[L.id] = hz_concat(parts, batch_size=inputs[0].lb.shape[0])
     else:
         tf._hz_cache.pop(L.id, None)
     return fact
@@ -639,8 +638,9 @@ def sparse_hz_apply_layer(L, hz, input_bounds, result, tf):
             tf._sparse_hz_cache.get(pid)
             for pid in tf._net.preds.get(L.id, [])
         ]
+        inputs = tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         return (
-            (True, sparse_hz_concat(parts), None)
+            (True, sparse_hz_concat(parts, batch_size=inputs[0].lb.shape[0]), None)
             if parts and all(part is not None for part in parts)
             else (True, None, "missing_sparse_mha_join_input")
         )

@@ -16,10 +16,13 @@
 import math
 
 import torch
-from typing import Tuple, Callable, Dict, Any, List
+from typing import Tuple, Callable, Dict, Any, List, Final
 from act.back_end.core import Bounds
 from act.back_end.interval_tf.tf_mlp import _sin_interval, _cos_interval, _quantize_params_flat, _quantize_qdq_value
-from .tf_forward import LinearBound, Frame, _reset_forward_box
+from .tf_forward import (
+    LinearBound, Frame, _reset_forward_box, _concretize,
+    _fwd_elementwise_planes, _intersect_boxes,
+)
 
 
 # ---- Shared primitives ----
@@ -28,7 +31,8 @@ def sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(x)
 
 def dsigmoid(x: torch.Tensor) -> torch.Tensor:
-    s = torch.sigmoid(x); return s * (1 - s)
+    # Avoid cancellation in 1-sigmoid(x) on the positive saturated side.
+    return torch.sigmoid(x) * torch.sigmoid(-x)
 
 def tanh(x: torch.Tensor) -> torch.Tensor:
     return torch.tanh(x)
@@ -64,35 +68,66 @@ def _dual_constant_box_backward(nu: torch.Tensor, lower: torch.Tensor, upper: to
     return v_out.view(BM, n), contrib
 
 
+_SMOOTH_TANGENT_BISECTIONS: Final[int] = 40
+
+
 def compute_smooth_relaxation(
     l: torch.Tensor, u: torch.Tensor,
     func: Callable[[torch.Tensor], torch.Tensor],
     dfunc: Callable[[torch.Tensor], torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Linear relaxation (k_lo, b_lo, k_hi, b_hi) for S-shaped f on [l, u].
+    """Enclosing planes for increasing, convex-then-concave sigmoid/tanh/erf.
 
+    A one-sided interval uses a midpoint tangent and a chord on the appropriate
+    curvature sides. Across zero, endpoint-anchored tangents are bracketed;
+    reading the larger derivative at each bracket keeps the plane enclosing.
     Works element-wise on any broadcastable shape (including batched [B, n]).
     """
     from .tf_mlp import _repair_degenerate_interval
     u = _repair_degenerate_interval(l, u, "smooth_relaxation")
     f_l, f_u = func(l), func(u)
-    denom = (u - l).clamp(min=1e-12)
-    k_chord = (f_u - f_l) / denom
-    k_lower, k_upper = k_chord.clone(), k_chord.clone()
-    b_lower = f_l - k_lower * l
-    b_upper = f_l - k_upper * l
+    width = u - l
+    # Every positive width needs its actual secant. A singleton instead has
+    # a zero numerator and a constant chord; only that denominator is replaced.
+    k_chord = (f_u - f_l) / torch.where(width > 0, width, torch.ones_like(width))
+    b_chord = f_l - k_chord * l
+    midpoint = (l + u) * 0.5
+    k_tangent = dfunc(midpoint)
+    b_tangent = func(midpoint) - k_tangent * midpoint
+    convex, concave = u <= 0, l >= 0
+    crossing = ~(convex | concave)
+    k_lower = torch.where(convex, k_tangent, k_chord)
+    b_lower = torch.where(convex, b_tangent, b_chord)
+    k_upper = torch.where(concave, k_tangent, k_chord)
+    b_upper = torch.where(concave, b_tangent, b_chord)
 
-    mask_pos = l >= 0
-    if mask_pos.any():
-        k_tan = dfunc(l)
-        k_lower = torch.where(mask_pos, k_tan, k_lower)
-        b_lower = torch.where(mask_pos, f_l - k_tan * l, b_lower)
+    if bool(crossing.any()):
+        l_cross = torch.where(crossing, l, -1.0)
+        u_cross = torch.where(crossing, u, 1.0)
+        f_left, f_right = func(l_cross), func(u_cross)
+        # The upper plane is anchored at l; f' decreases on its positive
+        # tangency bracket, so its left endpoint supplies a safe slope.
+        lo, hi = torch.zeros_like(u_cross), u_cross
+        for _ in range(_SMOOTH_TANGENT_BISECTIONS):
+            mid = (lo + hi) * 0.5
+            residual = dfunc(mid) * (mid - l_cross) - (func(mid) - f_left)
+            lo, hi = torch.where(residual >= 0, mid, lo), torch.where(residual >= 0, hi, mid)
+        chord_upper = dfunc(u_cross) * (u_cross - l_cross) >= f_right - f_left
+        k_hi = torch.where(chord_upper, k_chord, dfunc(lo))
 
-    mask_neg = u <= 0
-    if mask_neg.any():
-        k_tan = dfunc(u)
-        k_upper = torch.where(mask_neg, k_tan, k_upper)
-        b_upper = torch.where(mask_neg, f_u - k_tan * u, b_upper)
+        # The lower plane is anchored at u; f' increases on the negative
+        # bracket, so use its right endpoint. Non-crossing entries are ignored.
+        lo, hi = l_cross, torch.zeros_like(l_cross)
+        for _ in range(_SMOOTH_TANGENT_BISECTIONS):
+            mid = (lo + hi) * 0.5
+            residual = f_right - func(mid) - dfunc(mid) * (u_cross - mid)
+            lo, hi = torch.where(residual >= 0, mid, lo), torch.where(residual >= 0, hi, mid)
+        chord_lower = f_right - f_left <= dfunc(l_cross) * (u_cross - l_cross)
+        k_lo = torch.where(chord_lower, k_chord, dfunc(hi))
+        k_lower = torch.where(crossing, k_lo, k_lower)
+        b_lower = torch.where(crossing, f_u - k_lo * u, b_lower)
+        k_upper = torch.where(crossing, k_hi, k_upper)
+        b_upper = torch.where(crossing, f_l - k_hi * l, b_upper)
 
     return k_lower, b_lower, k_upper, b_upper
 
@@ -145,6 +180,30 @@ def dual_smooth_backward(
     return v_out.view(BM, n), contrib
 
 
+def _forward_smooth_planes(
+    parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], post_activation: bool,
+    int_lb: torch.Tensor, int_ub: torch.Tensor,
+    planes: Callable[[torch.Tensor, torch.Tensor],
+                     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Compose valid scalar envelopes while retaining the caller's grad context."""
+    parent, relation = parent_boxes[0], parent_lins[0]
+    lin = None
+    if relation.A_lb is not None and relation.A_ub is not None:
+        lin = _fwd_elementwise_planes(relation, planes(parent.lb, parent.ub))
+    lb, ub = int_lb, int_ub
+    if lin is not None:
+        linear_lb, linear_ub = _concretize(lin, parent_frames[0])
+        lb, ub = _intersect_boxes(linear_lb, linear_ub, int_lb, int_ub)
+    out = Bounds(lb, ub)
+    stored = out if post_activation else Bounds(parent.lb, parent.ub)
+    if lin is not None and not post_activation:
+        return stored, out, lin, parent_frames[0]
+    lin, frame = _reset_forward_box(lb, ub, lb.device, lb.dtype)
+    return stored, out, lin, frame
+
+
 # ---- SIGMOID ----
 
 @torch.no_grad()
@@ -153,17 +212,13 @@ def forward_sigmoid(
     parent_frames: List[Frame], preds: List[int], post_activation: bool,
     device: torch.device, dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward pass for SIGMOID activation.
-
-    Body copied from tf_forward.py lines 426-430 (SIGMOID branch).
-    Returns (stored, out, lin, frame).
-    """
+    """Propagate sigmoid bounds and compose its planes on an explicit frame."""
     parent_box = parent_boxes[0]
-    pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    out = Bounds(torch.sigmoid(pre_lb), torch.sigmoid(pre_ub))
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
-    return stored, out, lin, frame
+    return _forward_smooth_planes(
+        parent_boxes, parent_lins, parent_frames, post_activation,
+        torch.sigmoid(parent_box.lb), torch.sigmoid(parent_box.ub),
+        lambda l, u: compute_smooth_relaxation(l, u, sigmoid, dsigmoid),
+    )
 
 
 def backward_sigmoid(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -189,17 +244,13 @@ def forward_tanh(
     parent_frames: List[Frame], preds: List[int], post_activation: bool,
     device: torch.device, dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward pass for TANH activation.
-
-    Body copied from tf_forward.py lines 432-436 (TANH branch).
-    Returns (stored, out, lin, frame).
-    """
+    """Propagate tanh bounds and compose its planes on an explicit frame."""
     parent_box = parent_boxes[0]
-    pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    out = Bounds(torch.tanh(pre_lb), torch.tanh(pre_ub))
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
-    return stored, out, lin, frame
+    return _forward_smooth_planes(
+        parent_boxes, parent_lins, parent_frames, post_activation,
+        torch.tanh(parent_box.lb), torch.tanh(parent_box.ub),
+        lambda l, u: compute_smooth_relaxation(l, u, tanh, dtanh),
+    )
 
 
 def backward_tanh(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -227,11 +278,11 @@ def forward_erf(
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
     """Forward pass for ERF activation, mirroring TANH."""
     parent_box = parent_boxes[0]
-    pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    out = Bounds(torch.erf(pre_lb), torch.erf(pre_ub))
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
-    return stored, out, lin, frame
+    return _forward_smooth_planes(
+        parent_boxes, parent_lins, parent_frames, post_activation,
+        torch.erf(parent_box.lb), torch.erf(parent_box.ub),
+        lambda l, u: compute_smooth_relaxation(l, u, erf, derf),
+    )
 
 
 def backward_erf(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -282,6 +333,35 @@ def dual_sqrt_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
     lo_e = torch.clamp(bounds.lb, min=0.0)
     hi_e = torch.clamp(bounds.ub, min=0.0)
     return _dual_constant_box_backward(nu, torch.sqrt(lo_e), torch.sqrt(hi_e), M)
+
+
+@torch.no_grad()
+def forward_square(
+    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Exact interval image of x squared, stored as an output box."""
+    lower, upper = parent_boxes[0].lb, parent_boxes[0].ub
+    lb = torch.where(
+        (lower <= 0) & (upper >= 0), torch.zeros_like(lower),
+        torch.minimum(lower.square(), upper.square()),
+    )
+    ub = torch.maximum(lower.square(), upper.square())
+    out = Bounds(lb, ub)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    return out, out, lin, frame
+
+
+def backward_square(
+    L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+    preds: List[int], M: int = 1, alpha=None,
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Absorb square's exact output-box support without an unsound derivative."""
+    assert len(preds) == 1, f"SQUARE expects 1 predecessor, got {len(preds)}"
+    out = bounds_dict[L.id]
+    nu_in, contribution = _dual_constant_box_backward(nu, out.lb, out.ub, M)
+    return [nu_in], contribution
 
 
 # ---- SIN ----
@@ -389,3 +469,28 @@ def dual_quantize_backward(L: Any, nu: torch.Tensor, bounds: Bounds, M: int = 1)
     z_lo = _quantize_qdq_value(lo, scale, zp, qmin, qmax).reshape_as(bounds.lb)
     z_hi = _quantize_qdq_value(hi, scale, zp, qmin, qmax).reshape_as(bounds.ub)
     return _dual_constant_box_backward(nu, torch.minimum(z_lo, z_hi), torch.maximum(z_lo, z_hi), M)
+
+
+if __name__ == "__main__":
+    from act.util.device_manager import initialize_device, get_default_device, get_default_dtype
+
+    for dtype_name in ("float32", "float64"):
+        initialize_device("cpu", dtype_name)
+        device, dtype = get_default_device(), get_default_dtype()
+        lower = torch.tensor(
+            [-3., 1., -1., -5., -.1, 0., -5e-13, 1e-13, -2e-13],
+            device=device, dtype=dtype,
+        )
+        upper = torch.tensor(
+            [-1., 3., 2., .1, 5., 0., -1e-13, 5e-13, 5e-13],
+            device=device, dtype=dtype,
+        )
+        fractions = torch.linspace(0., 1., 9, device=device, dtype=dtype)
+        points = lower[:, None] + (upper - lower)[:, None] * fractions
+        tolerance = 64 * torch.finfo(dtype).eps
+        for function, derivative in ((sigmoid, dsigmoid), (tanh, dtanh), (erf, derf)):
+            k_lo, b_lo, k_hi, b_hi = compute_smooth_relaxation(lower, upper, function, derivative)
+            concrete = function(points)
+            scale = torch.maximum(function(lower).abs(), function(upper).abs()).clamp_min(torch.finfo(dtype).tiny)
+            assert ((k_lo[:, None] * points + b_lo[:, None]) <= concrete + tolerance * scale[:, None]).all()
+            assert ((k_hi[:, None] * points + b_hi[:, None]) >= concrete - tolerance * scale[:, None]).all()

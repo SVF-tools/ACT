@@ -187,3 +187,6 @@ text_verification:
   num_verify_iters: 5    # verification iterations
   k: 1                   # top-k value
   alpha_opt_steps: 1000  # alpha optimization steps
+  checkpoint_dir: null    # --checkpoint-dir; null keeps the embedding demo
+  position_mode: prefix   # --position-mode: prefix | sweep
+  conversion_route: b     # --conversion-route: manual a | generic FX b

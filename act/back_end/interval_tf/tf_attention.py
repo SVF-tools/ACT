@@ -93,9 +93,9 @@ class LinearBounds:
         # is solved exactly by the dual norm, so concretization is tight.
         self.q = 1.0 / (1.0 - 1.0 / p) if p != 1 else float("inf")
         # eps is stored verbatim: a python float keeps the original scalar-eps
-        # path bit-identical, while a [B, perturbed_words] tensor lets each BaB
-        # child lane carry its own per-word ball radius (consumed block-wise in
-        # concretize). It is never coerced, so a scalar never becomes a tensor.
+        # path bit-identical, while a [B, perturbed_words] tensor carries the
+        # original per-sample token radii, consumed block-wise in concretize.
+        # Child boxes do not redefine them; a scalar never becomes a tensor.
         self.eps = eps
         self.perturbed_words = perturbed_words
         self.device = lw.device
@@ -152,18 +152,10 @@ class LinearBounds:
 
         ``eps`` may be a scalar (one Lp ball shared by the whole batch) or a
         ``[B, perturbed_words]`` tensor carrying one radius per (lane, word)
-        block. Each block's radius scales only that block's dual-norm tail, so
-        a BaB child lane is concretized against its own asymmetric box without
-        coupling to its siblings.
-
-        Soundness (split L2 child): the per-block ``eps`` must be the ball
-        re-enclosure radius (``rederive_embedding_block_eps``) -- the radius of
-        the smallest L2 ball that still contains the child box. Feeding the raw
-        per-coordinate half-width ``(ub - lb) / 2`` at ``q == 2`` over-claims
-        the region (``||half (x) nu||_2 > ||half (x) nu||_1``, the box min) and
-        yields an unsound bound. The ``p == inf`` path is exact per-coordinate
-        and needs no re-enclosure. Sourcing that radius is the seeding oracle's
-        job (Wave 3); this method only consumes the radius it is handed.
+        block. Each block's radius scales only that block's dual-norm tail.
+        Radii describe the original token balls, not child-box half-widths.
+        BaB intersects their support with child-box support in the forward
+        frame; this method only consumes the radius it is handed.
 
         Returns:
             ``(lower, upper)`` boxes of shape ``[B, length, dim_out]``.
@@ -517,26 +509,20 @@ class LinearBounds:
     def exp(self) -> "LinearBounds":
         """Bound ``exp(x)`` with a tangent lower and secant upper envelope.
 
-        The tangent anchor is clamped below ``l + 1`` to keep the lower bound
-        strictly positive; a linear extrapolation past a threshold avoids
-        overflow while remaining an upper bound.
+        The tangent anchor stays below ``l + 1`` to keep its lower bound
+        positive. Nonfinite exponentials remain visible to callers: a linear
+        extrapolation of a convex exponential is not an upper envelope.
         """
         l, u = self.concretize()
         # Anchor < l + 1 keeps exp(anchor)*(l-anchor)+exp(anchor) > 0.
         m = torch.min((l + u) / 2, l + 0.99)
-        thres = torch.tensor(12.0, device=self.device, dtype=l.dtype)
-
-        def exp_with_trick(x: torch.Tensor) -> torch.Tensor:
-            mask = torch.lt(x, thres).to(x.dtype)
-            return mask * torch.exp(torch.min(x, thres)) + \
-                (1 - mask) * (torch.exp(thres) * (x - thres + 1))
-
-        kl = torch.exp(torch.min(m, thres))
+        kl = torch.exp(m)
         lw = self.lw * kl.unsqueeze(2)
         lb = kl * (self.lb - m + 1)
-        ku = (exp_with_trick(u) - exp_with_trick(l)) / (u - l + _EPS)
+        width = u - l
+        ku = (torch.exp(u) - torch.exp(l)) / torch.where(width > 0, width, torch.ones_like(width))
         uw = self.uw * ku.unsqueeze(2)
-        ub = self.ub * ku - ku * l + exp_with_trick(l)
+        ub = self.ub * ku - ku * l + torch.exp(l)
         return self._like(lw, uw, lb, ub)
 
     def _softmax_sum(self) -> tuple["LinearBounds", "LinearBounds"]:
@@ -656,6 +642,7 @@ class LinearBounds:
         gamma: torch.Tensor,
         beta: torch.Tensor,
         variant: str = "standard",
+        eps: float = _EPS,
     ) -> "LinearBounds":
         """Layer normalization relaxation with an optional no-variance mode.
 
@@ -675,7 +662,7 @@ class LinearBounds:
 
         if variant == "standard":
             variance = minus_mu.sqr().matmul(w_avg)
-            normalized = minus_mu.divide(variance.add(_EPS).sqrt())
+            normalized = minus_mu.divide(variance.add(eps).sqrt())
         elif variant == "no_var":
             normalized = minus_mu
         else:

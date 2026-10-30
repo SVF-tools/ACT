@@ -118,13 +118,15 @@ code ipynb/vnnlib_fuzzer.ipynb
 ### `tensor_bab.ipynb`
 
 **Purpose**: Demonstrates K-batched ("tensor") branch-and-bound (`verify_bab_batched`) on three VNN-COMP instances: ACAS Xu (one CERTIFIED, one FALSIFIED) and a CIFAR-100 ResNet (CERTIFIED).
+Also compares CLIMB off/on on CIFAR-100 idx_8420 with the same 100 s budget.
 
 **Contents**:
 1. **Setup and helpers**: ONNX + VNNLIB to an ACT net, then BaB with a per-iteration trace.
 2. **Certified case (prop_3 / net 2_4)**: one iteration table showing K, pruning, branching, pool size and seconds.
 3. **Falsified case (prop_2 / net 1_2)**: a counterexample checked on the concrete network and against its input box.
 4. **CIFAR-100 ResNet (needs a CUDA GPU)**: ReLU-neuron splitting with the alpha-eta dual, automatic K and a 100 s budget; skipped on CPU.
-5. **Summary**: one row per run (verdict, ground truth, iterations, sub-problems, max K, seconds).
+5. **CLIMB comparison (CUDA)**: idx_8420 is UNKNOWN with CLIMB off and CERTIFIED with it on; only `climb_enabled` changes.
+6. **Summary**: one row per initial case (verdict, ground truth, iterations, sub-problems, max K, seconds).
 
 **Key Features**:
 - Plain dual bounds on up to 1024 sub-boxes per iteration, splitting the widest input dimension (ACAS Xu).

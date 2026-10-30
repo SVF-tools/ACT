@@ -1,6 +1,35 @@
 # ACT Front-End: Specification Creators & Unified CLI
 
-The ACT front-end provides two specification creators for generating verification tasks from different data sources, with a unified CLI interface featuring automatic detection.
+The ACT front-end provides specification creators for generating verification tasks from different data sources, with a unified CLI interface featuring automatic detection.
+
+## Direct instances and compact BERT queries
+
+```bash
+python -m act.back_end --verify --onnx model.onnx --vnnlib property.vnnlib \
+  --save-net verified.json --solver torchlp --device cpu --dtype float64
+python -m act.back_end --verify --query-index queries.csv --query-id 0 \
+  --save-net verified.json --solver torchlp --device cpu --dtype float64
+python -m act.front_end --synthesis --creator bert \
+  --checkpoint-dir buffet/models/model_sst_1 --position-mode sweep --conversion-route b \
+  --device cpu --dtype float64
+```
+
+The query CSV needs `dataset,split,depth,example_id,position,p,eps`; optional
+`checkpoint_sha256` must match the checkpoint and its manifest. Query IDs count
+data rows from zero. SST/Yelp raw data and the matching compact checkpoint must
+already be present under ACT's data root; `get_bert_artifact_root()` retains the
+`data/buffet` checkpoint and manifest directory. For Yelp, use
+`calibration` or `evaluation` with the fixed split of raw `test.csv` rows.
+Front-end synthesis selects the compact model when `--checkpoint-dir` is set;
+without it, the embedding demo remains the default. Relative
+checkpoint paths, including direct `load_compact_bert` calls, are resolved under ACT's data root; absolute paths
+are used as given.
+`prefix` perturbs positions starting at index zero, so compact BERT's `[CLS]`
+is included in `perturbed_words`. `sweep` and indexed queries instead select
+non-special WordPieces that are not `##` continuations; query positions index
+the complete sequence including `[CLS]`. Both routes preserve this convention.
+`--save-net` writes the Net actually verified; multiple VNNLIB disjuncts use
+`verified.d0.json`, `verified.d1.json`, and so on.
 
 ## Quick Start
 
@@ -138,8 +167,9 @@ python -m act.front_end --list-downloads       # Show what's downloaded
 |---------|-------------|--------|-------|---------------|
 | **TorchVision** | 40 PyTorch datasets | 63 models | ε-perturbations | [torchvision_loader/README.md](torchvision_loader/README.md) |
 | **VNNLIB** | 34 VNN-COMP categories | ONNX models | VNNLIB files | [vnnlib_loader/README.md](vnnlib_loader/README.md) |
+| **BERT** | SST/Yelp text | Compact checkpoint | Selected WordPiece perturbation | [Direct queries](#direct-instances-and-compact-bert-queries) |
 
-Both creators implement `BaseSpecCreator` and generate:
+All creators implement `BaseSpecCreator` and generate:
 ```python
 List[Tuple[data_source, model_name, pytorch_model, input_tensors, spec_pairs]]
 ```

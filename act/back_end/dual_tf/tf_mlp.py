@@ -28,6 +28,7 @@ from .tf_forward import (
     _fwd_dense, _fwd_relu, _fwd_bias, _fwd_scale, _fwd_bn, _fwd_lrelu,
     _concretize, _box_dense, _box_bias, _box_scale, _box_bn, _box_relu,
     _box_lrelu, _intersect_boxes, _reset_forward_box,
+    _match_lin_input_dim, _DENSE_LIN_BOUND_MAX_DIM,
 )
 
 _DEGENERATE_TOL_ABS = 1e-3
@@ -246,10 +247,70 @@ def forward_dense(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
-    new_lin = _fwd_dense(L, parent_lin)
-    int_lb, int_ub = _box_dense(L, prev_lb, prev_ub)
+    if not L.params.get("token_wise", False):
+        new_lin = _fwd_dense(L, parent_lin)
+        int_lb, int_ub = _box_dense(L, prev_lb, prev_ub)
+    else:
+        weight = L.params["weight"].to(device=device, dtype=dtype)
+        out_features, in_features = weight.shape
+        if len(L.in_vars) % in_features:
+            raise ValueError(
+                f"token-wise DENSE {L.id}: {len(L.in_vars)} inputs are not divisible "
+                f"by in_features={in_features}"
+            )
+        tokens = len(L.in_vars) // in_features
+        matched = _match_lin_input_dim(parent_lin, tokens * in_features)
+        batch = matched.b_lb.shape[0]
+        bias = L.params.get("bias")
+        bias_vec = weight.new_zeros(tokens * out_features)
+        if bias is not None:
+            bias_vec = bias.to(device=device, dtype=dtype).flatten().repeat(tokens)
+
+        lower = prev_lb.reshape(prev_lb.shape[0], tokens, in_features)
+        upper = prev_ub.reshape(prev_ub.shape[0], tokens, in_features)
+        midpoint = ((lower + upper) * 0.5) @ weight.T
+        midpoint = midpoint + bias_vec.reshape(tokens, out_features)
+        spread = ((upper - lower) * 0.5) @ weight.abs().T
+        int_lb = (midpoint - spread).reshape(prev_lb.shape[0], -1)
+        int_ub = (midpoint + spread).reshape(prev_ub.shape[0], -1)
+
+        # Apply the existing lazy-identity limit before materializing token blocks.
+        if matched.A_lb is None and tokens * in_features > _DENSE_LIN_BOUND_MAX_DIM:
+            new_lin = None
+        else:
+            b_centre = ((matched.b_lb + matched.b_ub) * 0.5).reshape(
+                batch, tokens, in_features
+            )
+            b_radius = ((matched.b_ub - matched.b_lb) * 0.5).reshape(
+                batch, tokens, in_features
+            )
+            b_mid = (b_centre @ weight.T).reshape(batch, -1) + bias_vec
+            b_spread = (b_radius @ weight.abs().T).reshape(batch, -1)
+            if matched.A_lb is None and matched.A_ub is None:
+                expanded = torch.block_diag(*([weight] * tokens))
+                a_lower = expanded.unsqueeze(0).expand(batch, -1, -1).contiguous()
+                a_upper = a_lower.clone()
+            else:
+                assert matched.A_lb is not None and matched.A_ub is not None
+                symbols = matched.A_lb.shape[-1]
+                a_centre = ((matched.A_lb + matched.A_ub) * 0.5).reshape(
+                    batch, tokens, in_features, symbols
+                )
+                a_radius = ((matched.A_ub - matched.A_lb) * 0.5).reshape(
+                    batch, tokens, in_features, symbols
+                )
+                a_mid = torch.einsum("oi,btis->btos", weight, a_centre).reshape(
+                    batch, tokens * out_features, symbols
+                )
+                a_spread = torch.einsum(
+                    "oi,btis->btos", weight.abs(), a_radius
+                ).reshape(batch, tokens * out_features, symbols)
+                a_lower, a_upper = a_mid - a_spread, a_mid + a_spread
+            new_lin = LinearBound(
+                A_lb=a_lower, b_lb=b_mid - b_spread,
+                A_ub=a_upper, b_ub=b_mid + b_spread,
+            )
     if new_lin is None:
         lb, ub = int_lb, int_ub
         out = Bounds(lb, ub)
@@ -257,7 +318,7 @@ def forward_dense(
         lin, frame = _reset_forward_box(lb, ub, device, dtype)
         return stored, out, lin, frame
     lin = new_lin
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
@@ -267,7 +328,20 @@ def forward_dense(
 def backward_dense(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
                    preds: List[int], M: int = 1, alpha=None
                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    nu_out, contrib = dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
+    if not L.params.get("token_wise", False):
+        nu_out, contrib = dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
+    else:
+        weight = L.params["weight"].to(device=nu.device, dtype=nu.dtype)
+        out_features, in_features = weight.shape
+        tokens = len(L.in_vars) // in_features
+        grouped = nu.reshape(nu.shape[0], tokens, out_features)
+        nu_out = (grouped @ weight).reshape(nu.shape[0], tokens * in_features)
+        bias = L.params.get("bias")
+        if bias is not None:
+            bias = bias.to(device=nu.device, dtype=nu.dtype).reshape(1, 1, out_features)
+            contrib = -(grouped * bias).sum(dim=(1, 2))
+        else:
+            contrib = nu.new_zeros(nu.shape[0])
     assert len(preds) == 1, f"DENSE expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
 
@@ -321,7 +395,6 @@ def forward_relu(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
     new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub)
     int_lb, int_ub = _box_relu(pre_lb, pre_ub)
@@ -332,7 +405,7 @@ def forward_relu(
         lin, frame = _reset_forward_box(lb, ub, device, dtype)
         return stored, out, lin, frame
     lin = new_lin
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
@@ -363,7 +436,6 @@ def forward_lrelu(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
     alpha = float(L.params["negative_slope"])
     lin = _fwd_lrelu(parent_lin, pre_lb, pre_ub, alpha)
@@ -373,7 +445,7 @@ def forward_lrelu(
         stored = out if post_activation else Bounds(pre_lb, pre_ub)
         lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
         return stored, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
@@ -538,10 +610,9 @@ def forward_bias(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bias(L, parent_lin)
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     int_lb, int_ub = _box_bias(L, prev_lb, prev_ub)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
@@ -585,7 +656,6 @@ def forward_scale(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_scale(L, parent_lin)
     int_lb, int_ub = _box_scale(L, prev_lb, prev_ub)
@@ -593,7 +663,7 @@ def forward_scale(
         out = Bounds(int_lb, int_ub)
         lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
         return out, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
@@ -638,7 +708,6 @@ def forward_bn(
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
-    x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bn(L, parent_lin)
     int_lb, int_ub = _box_bn(L, prev_lb, prev_ub)
@@ -646,7 +715,7 @@ def forward_bn(
         out = Bounds(int_lb, int_ub)
         lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
         return out, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, parent_frame)
     lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out

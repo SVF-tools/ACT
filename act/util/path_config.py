@@ -113,6 +113,11 @@ def get_data_root() -> str:
     return os.path.join(get_project_root(), 'data')
 
 
+def get_bert_artifact_root() -> str:
+    """Get the BERT artifact directory, retaining the on-disk buffet layout."""
+    return os.path.join(get_data_root(), 'buffet')
+
+
 def get_torchvision_data_root() -> str:
     """Get the torchvision dataset downloads directory path."""
     return os.path.join(get_project_root(), 'data', 'torchvision')

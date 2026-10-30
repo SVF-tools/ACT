@@ -25,7 +25,8 @@
 #   McCormick planes from the per-input boxes in bounds_dict, fuses the two valid
 #   planes by an optimizable slope α ∈ [0, 1] (a convex combination, hence sound
 #   for any α), and sign-splits the dual variable across the two inputs as
-#   DISTINCT tensors. The MHA split/join/mask reshape family remains a stub.
+#   DISTINCT tensors. MHA projection roles and joins are exact affine maps;
+#   MASK_ADD remains a stub.
 #
 #===---------------------------------------------------------------------===#
 
@@ -36,6 +37,8 @@ from typing import Callable
 
 import torch
 
+from act.back_end.core import Bounds, Layer
+from act.back_end.interval_tf.tf_transformer import softmax_rowsize, _layernorm_box, _gelu_box
 from act.back_end.utils import four_corner_envelope
 from act.back_end.interval_tf.tf_attention import (
     _GELU_INFLECTION,
@@ -48,21 +51,90 @@ from act.back_end.interval_tf.tf_attention import (
 
 def forward_mha(L, parent_boxes, parent_lins, parent_frames, preds,
                 post_activation, device, dtype):
-    """Multi-head split/join/mask forward bounds. (Pending)
-
-    Shared by MHA_SPLIT / MHA_JOIN / MASK_ADD via registry aliasing. The
-    scalar bilinear cores (ATT_SCORES / ATT_MIX) have real handlers; the
-    head reshape/concat/mask family is not yet threaded through the dual path.
-    """
-    raise NotImplementedError("forward for MHA split/join/mask not implemented in dual_tf")
+    """MASK_ADD forward remains unsupported."""
+    raise NotImplementedError("forward for MASK_ADD not implemented in dual_tf")
 
 
 def backward_mha(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
-    """Multi-head split/join/mask backward. (Pending)
+    """MASK_ADD backward remains unsupported."""
+    raise NotImplementedError("backward for MASK_ADD not implemented in dual_tf")
 
-    Shared by MHA_SPLIT / MHA_JOIN / MASK_ADD via registry aliasing.
-    """
-    raise NotImplementedError("backward for MHA split/join/mask not implemented in dual_tf")
+
+def _mha_projection(
+    layer: Layer, input_width: int, reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select token coordinates and compact projection rows for an MHA role."""
+    weight = layer.params["weight"]
+    assert isinstance(weight, torch.Tensor)
+    weight = weight.to(reference)
+    hidden = layer.get_int("hidden_size", weight.shape[1])
+    shape = layer.get_tuple("input_shape")
+    length = int(shape[-2]) if len(shape) >= 3 else input_width // hidden
+    if weight.shape[1] != hidden or length * hidden != input_width:
+        raise ValueError(f"MHA_SPLIT {layer.id}: input/projection shape mismatch")
+    bias = layer.params.get("bias")
+    assert bias is None or isinstance(bias, torch.Tensor)
+    bias = weight.new_zeros(weight.shape[0]) if bias is None else bias.to(reference).flatten()
+    features = torch.arange(input_width, device=reference.device)
+    role = layer.params.get("role", "all")
+    if role in ("query", "key"):
+        position = layer.get_int("position", 0)
+        if not 0 <= position < length:
+            raise ValueError(f"MHA_SPLIT {layer.id}: position {position} outside {length}")
+        features = features.reshape(length, hidden)[position]
+    elif role == "value":
+        feature = layer.get_int("feature", 0)
+        if not 0 <= feature < weight.shape[0]:
+            raise ValueError(f"MHA_SPLIT {layer.id}: feature {feature} outside projection")
+        weight, bias = weight[feature:feature + 1], bias[feature:feature + 1]
+    return features, weight, bias
+
+
+def forward_mha_split(L, parent_boxes, parent_lins, parent_frames, preds,
+                      post_activation, device, dtype):
+    """Project selected token/feature rows without expanding a block weight."""
+    from .tf_forward import LinearBound, _concretize, _fwd_rowwise_planes, _intersect_boxes, _reset_forward_box
+
+    assert len(preds) == 1, f"MHA_SPLIT expects 1 predecessor, got {len(preds)}"
+    lower, upper = parent_boxes[0].lb.flatten(1), parent_boxes[0].ub.flatten(1)
+    features, weight, bias = _mha_projection(L, lower.shape[1], lower)
+    batch, hidden = lower.shape[0], weight.shape[1]
+    lower, upper = (x.index_select(1, features).reshape(batch, -1, hidden) for x in (lower, upper))
+    middle = ((lower + upper) * .5) @ weight.T + bias
+    radius = ((upper - lower) * .5) @ weight.abs().T
+    lb, ub = (middle - radius).flatten(1), (middle + radius).flatten(1)
+    parent = parent_lins[0]
+    if parent.A_lb is not None and parent.A_ub is not None:
+        selected = LinearBound(
+            parent.A_lb.index_select(1, features), parent.b_lb.index_select(1, features),
+            parent.A_ub.index_select(1, features), parent.b_ub.index_select(1, features),
+        )
+        groups = batch * lower.shape[1]
+        coefficients = weight.unsqueeze(0).expand(groups, -1, -1)
+        intercepts = bias.unsqueeze(0).expand(groups, -1)
+        lin = _fwd_rowwise_planes(
+            selected, hidden, (coefficients, intercepts, coefficients, intercepts)
+        )
+        assert lin is not None
+        frame = parent_frames[0]
+        lin_lb, lin_ub = _concretize(lin, frame)
+        lb, ub = _intersect_boxes(lin_lb, lin_ub, lb, ub)
+    else:
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    out = Bounds(lb, ub)
+    return out, out, lin, frame
+
+
+def backward_mha_split(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
+    """Apply the exact adjoint of the selected projection and its bias."""
+    assert len(preds) == 1, f"MHA_SPLIT expects 1 predecessor, got {len(preds)}"
+    input_width = bounds_dict[preds[0]].lb.flatten(1).shape[1]
+    features, weight, bias = _mha_projection(L, input_width, nu)
+    values = nu.reshape(nu.shape[0], -1, weight.shape[0])
+    selected = (values @ weight).flatten(1)
+    result = nu.new_zeros(nu.shape[0], input_width)
+    result.index_copy_(1, features, selected)
+    return [result], (values * bias).sum(dim=(1, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -120,28 +192,32 @@ def _bilinear_diff_corners(
     on their difference: ``l_min``/``l_max`` bracket ``Σ (plane2_lo - plane1_lo)``
     and ``u_min``/``u_max`` bracket ``Σ (plane1_hi - plane2_hi)``. Each difference
     is linear in ``(x, y)`` with sign-definite coefficients, so the extrema are
-    read off the box corners. Returns ``[B, 1]`` corners (one per scalar output).
+    read off the box corners. The last axis is the contraction dimension;
+    arbitrary broadcastable leading axes identify independent scalar outputs.
     """
     # Lower-plane difference: (y_u - y_l) x + (x_u - x_l) y + (x_l y_l - x_u y_u).
     cx_l = y_u - y_l
     cy_l = x_u - x_l
     const_l = x_l * y_l - x_u * y_u
+    # Preserve K-major summation at the rule-slope threshold, where a rounding
+    # difference can select a different plane. Only the reduction terms need
+    # contiguous storage; the broadcast operand bounds remain views.
     l_min = (cx_l.clamp(min=0) * x_l + cx_l.clamp(max=0) * x_u
              + cy_l.clamp(min=0) * y_l + cy_l.clamp(max=0) * y_u
-             + const_l).sum(dim=-1, keepdim=True)
+             + const_l).contiguous().sum(dim=-1, keepdim=True)
     l_max = (cx_l.clamp(min=0) * x_u + cx_l.clamp(max=0) * x_l
              + cy_l.clamp(min=0) * y_u + cy_l.clamp(max=0) * y_l
-             + const_l).sum(dim=-1, keepdim=True)
+             + const_l).contiguous().sum(dim=-1, keepdim=True)
     # Upper-plane difference: (y_u - y_l) x + (x_l - x_u) y + (x_u y_l - x_l y_u).
     cx_u = y_u - y_l
     cy_u = x_l - x_u
     const_u = x_u * y_l - x_l * y_u
     u_min = (cx_u.clamp(min=0) * x_l + cx_u.clamp(max=0) * x_u
              + cy_u.clamp(min=0) * y_l + cy_u.clamp(max=0) * y_u
-             + const_u).sum(dim=-1, keepdim=True)
+             + const_u).contiguous().sum(dim=-1, keepdim=True)
     u_max = (cx_u.clamp(min=0) * x_u + cx_u.clamp(max=0) * x_l
              + cy_u.clamp(min=0) * y_u + cy_u.clamp(max=0) * y_l
-             + const_u).sum(dim=-1, keepdim=True)
+             + const_u).contiguous().sum(dim=-1, keepdim=True)
     return l_min, l_max, u_min, u_max
 
 
@@ -181,7 +257,8 @@ def attention_rule_alpha(
 
     Mirrors the forward :func:`rule_based_alpha` warm start but on the LOCAL
     per-input box corners, so the allocator and the ``alpha=None`` kernel path
-    agree on the same init. Each slope is ``[B, 1]`` (one per scalar output).
+    agree on the same init. Each slope is ``[..., 1]`` over the broadcast
+    output axes, including ``[B, 1]`` for a scalar attention core.
     """
     l_min, l_max, u_min, u_max = _bilinear_diff_corners(x_l, x_u, y_l, y_u)
     lower_cross = ((l_min < 0) & (l_max > 0)).to(x_l.dtype)
@@ -189,6 +266,26 @@ def attention_rule_alpha(
     omega_l = rule_based_alpha(lower_cross, l_max, l_min, k_thresh)
     omega_u = rule_based_alpha(upper_cross, u_max, u_min, k_thresh)
     return {"omega_l": omega_l, "omega_u": omega_u}
+
+
+def _bilinear_planes(x_l, x_u, y_l, y_u, alpha, k_thresh):
+    """Use one convex fusion rule for attention, MATMUL and their frames."""
+    l_min, l_max, u_min, u_max = _bilinear_diff_corners(x_l, x_u, y_l, y_u)
+    lower_pos = ((l_min > 0) & (l_max > 0)).to(x_l.dtype)
+    lower_cross = ((l_min < 0) & (l_max > 0)).to(x_l.dtype)
+    upper_pos = ((u_min > 0) & (u_max > 0)).to(x_l.dtype)
+    upper_cross = ((u_min < 0) & (u_max > 0)).to(x_l.dtype)
+    if alpha is None:
+        omega_l = rule_based_alpha(lower_cross, l_max, l_min, k_thresh)
+        omega_u = rule_based_alpha(upper_cross, u_max, u_min, k_thresh)
+    else:
+        omega_l = alpha["omega_l"].to(x_l).reshape(l_min.shape)
+        omega_u = alpha["omega_u"].to(x_l).reshape(u_min.shape)
+    return _fused_mccormick_planes(
+        x_l, x_u, y_l, y_u,
+        _fusion_weights(lower_pos, lower_cross, omega_l),
+        _fusion_weights(upper_pos, upper_cross, omega_u),
+    )
 
 
 def _dual_bilinear_backward(
@@ -220,25 +317,9 @@ def _dual_bilinear_backward(
             f"_dual_bilinear_backward: expected scalar output, got width {nu_flat.shape[-1]}"
         )
     n = x_l.shape[-1]
-    dtype = x_l.dtype
 
-    l_min, l_max, u_min, u_max = _bilinear_diff_corners(x_l, x_u, y_l, y_u)
-    lower_pos = ((l_min > 0) & (l_max > 0)).to(dtype)
-    lower_cross = ((l_min < 0) & (l_max > 0)).to(dtype)
-    upper_pos = ((u_min > 0) & (u_max > 0)).to(dtype)
-    upper_cross = ((u_min < 0) & (u_max > 0)).to(dtype)
-
-    if alpha is None:
-        omega_l = rule_based_alpha(lower_cross, l_max, l_min, k_thresh)
-        omega_u = rule_based_alpha(upper_cross, u_max, u_min, k_thresh)
-    else:
-        omega_l = alpha["omega_l"].to(device=x_l.device, dtype=dtype).reshape(B, 1)
-        omega_u = alpha["omega_u"].to(device=x_l.device, dtype=dtype).reshape(B, 1)
-
-    w_l = _fusion_weights(lower_pos, lower_cross, omega_l)
-    w_u = _fusion_weights(upper_pos, upper_cross, omega_u)
-    a_x_lo, a_y_lo, c_lo, a_x_hi, a_y_hi, c_hi = _fused_mccormick_planes(
-        x_l, x_u, y_l, y_u, w_l, w_u)
+    a_x_lo, a_y_lo, c_lo, a_x_hi, a_y_hi, c_hi = _bilinear_planes(
+        x_l, x_u, y_l, y_u, alpha, k_thresh)
 
     v = nu_flat.reshape(B, M, 1)
     pos = v >= 0
@@ -253,7 +334,7 @@ def _dual_bilinear_backward(
 
     if isinstance(mask, torch.Tensor):
         # Mask is an additive constant on the score; ν · mask is counted once.
-        contrib = contrib + v.reshape(BM) * mask.to(device=nu.device, dtype=dtype).reshape(-1)
+        contrib = contrib + (v * mask.to(nu).reshape(-1, 1, 1)).reshape(BM)
     return nu_x, nu_y, contrib
 
 
@@ -263,11 +344,11 @@ def forward_attention(L, parent_boxes, parent_lins, parent_frames, preds,
 
     ATT_SCORES bounds ``scale·Σ_d Q_d K_d (+ mask)`` and ATT_MIX bounds
     ``Σ_s W_s V_s`` by the four-corner McCormick envelope of each product term,
-    summed over the contraction axis to the scalar output. The dual frame is
-    reset over the resulting box, matching the other relaxation handlers.
+    summed over the contraction axis. Compatible explicit operand relations
+    retain their shared symbolic frame; other operands use the interval box.
     """
     from act.back_end.core import Bounds
-    from .tf_forward import _reset_forward_box
+    from .tf_forward import LinearBound, _concretize, _intersect_boxes, _reset_forward_box, _shared_explicit_frame
 
     k = L.kind.upper() if isinstance(L.kind, str) else L.kind
     x_box, y_box = parent_boxes[0], parent_boxes[1]
@@ -286,9 +367,24 @@ def forward_attention(L, parent_boxes, parent_lins, parent_frames, preds,
 
     lo, hi = four_corner_envelope(x_l, x_u, y_l, y_u, sum_axis=-1, keepdim=True, scale=scale)
     if isinstance(mask, torch.Tensor):
-        m = mask.to(device=lo.device, dtype=lo.dtype).reshape(lo.shape[0], -1)
+        m = mask.to(lo).reshape(-1, 1)
         lo = lo + m
         hi = hi + m
+    if _shared_explicit_frame(parent_lins, parent_frames, [x_l.shape[1], y_l.shape[1]]):
+        lin = _fwd_matmul_lin(
+            parent_lins[0], parent_lins[1], x_l, x_u, y_l, y_u,
+            1, 1, x_l.shape[1], 1, float(L.params.get("k_thresh", 1.0)),
+        )
+        assert lin.A_lb is not None and lin.A_ub is not None
+        offset = mask.to(lo).reshape(-1, 1) if isinstance(mask, torch.Tensor) else 0.0
+        lin = LinearBound(
+            lin.A_lb * scale, lin.b_lb * scale + offset,
+            lin.A_ub * scale, lin.b_ub * scale + offset,
+        )
+        lin_lb, lin_ub = _concretize(lin, parent_frames[0])
+        lb, ub = _intersect_boxes(lin_lb, lin_ub, lo, hi)
+        out = Bounds(lb, ub)
+        return out, out, lin, parent_frames[0]
     out = Bounds(lo, hi)
     lin, frame = _reset_forward_box(lo, hi, device, dtype)
     return out, out, lin, frame
@@ -363,62 +459,105 @@ def _matmul_mccormick_box(x_l, x_u, y_l, y_u, G, I, K, J):
     return lo.reshape(B, -1), hi.reshape(B, -1)
 
 
-def _matmul_bilinear_backward(nu, x_l, x_u, y_l, y_u, G, I, K, J, M, k_thresh=1.0):
-    """Route ν through the per-element fused McCormick planes of a batched matmul.
+def _matmul_term_boxes(x_l, x_u, y_l, y_u, G, I, K, J):
+    """Expose broadcast views [B,G,I,1,K] and [B,G,1,J,K], without expansion."""
+    B = x_l.shape[0]
+    xl = x_l.reshape(B, G, I, K).unsqueeze(3)
+    xu = x_u.reshape(B, G, I, K).unsqueeze(3)
+    yl = y_l.reshape(B, G, K, J).transpose(-1, -2).unsqueeze(2)
+    yu = y_u.reshape(B, G, K, J).transpose(-1, -2).unsqueeze(2)
+    return xl, xu, yl, yu
 
-    Returns ``(nu_x, nu_y, contrib)`` with ``nu_x`` in X's ``[B*M, G*I*K]`` var
-    layout, ``nu_y`` in Y's ``[B*M, G*K*J]`` layout (DISTINCT tensors), and the
-    once-counted McCormick constant ``contrib`` of shape ``[B*M]``.
-    """
+
+def matmul_rule_alpha(x_l, x_u, y_l, y_u, G, I, K, J, k_thresh=1.0):
+    """Allocate lane-major omega leaves [B,G*I*J], without a spec-row axis."""
+    boxes = _matmul_term_boxes(x_l, x_u, y_l, y_u, G, I, K, J)
+    tree = attention_rule_alpha(*boxes, k_thresh)
+    return {key: value.reshape(x_l.shape[0], G * I * J) for key, value in tree.items()}
+
+
+def _matmul_bilinear_backward(
+    nu, x_l, x_u, y_l, y_u, G, I, K, J, M, k_thresh=1.0, alpha=None,
+):
+    """Route each signed objective through valid per-output McCormick planes."""
     B = x_l.shape[0]
     if nu.shape[0] != B * M:
         raise ValueError(f"_matmul_bilinear_backward: nu batch {nu.shape[0]} != B*M={B*M}")
-    dtype = x_l.dtype
-    xl = x_l.reshape(B, G, I, K).unsqueeze(3).expand(B, G, I, J, K)
-    xu = x_u.reshape(B, G, I, K).unsqueeze(3).expand(B, G, I, J, K)
-    yl = y_l.reshape(B, G, K, J).permute(0, 1, 3, 2).unsqueeze(2).expand(B, G, I, J, K)
-    yu = y_u.reshape(B, G, K, J).permute(0, 1, 3, 2).unsqueeze(2).expand(B, G, I, J, K)
-    P = B * G * I * J
-    xl2, xu2 = xl.reshape(P, K), xu.reshape(P, K)
-    yl2, yu2 = yl.reshape(P, K), yu.reshape(P, K)
-    l_min, l_max, u_min, u_max = _bilinear_diff_corners(xl2, xu2, yl2, yu2)
-    lower_pos = ((l_min > 0) & (l_max > 0)).to(dtype)
-    lower_cross = ((l_min < 0) & (l_max > 0)).to(dtype)
-    upper_pos = ((u_min > 0) & (u_max > 0)).to(dtype)
-    upper_cross = ((u_min < 0) & (u_max > 0)).to(dtype)
-    omega_l = rule_based_alpha(lower_cross, l_max, l_min, k_thresh)
-    omega_u = rule_based_alpha(upper_cross, u_max, u_min, k_thresh)
-    w_l = _fusion_weights(lower_pos, lower_cross, omega_l)
-    w_u = _fusion_weights(upper_pos, upper_cross, omega_u)
-    a_x_lo, a_y_lo, c_lo, a_x_hi, a_y_hi, c_hi = _fused_mccormick_planes(
-        xl2, xu2, yl2, yu2, w_l, w_u)
+    boxes = _matmul_term_boxes(x_l, x_u, y_l, y_u, G, I, K, J)
+    a_x_lo, a_y_lo, c_lo, a_x_hi, a_y_hi, c_hi = _bilinear_planes(*boxes, alpha, k_thresh)
 
-    def _planes(t):
-        return t.reshape(B, G, I, J, K).unsqueeze(1)
-
-    a_x_lo, a_y_lo, c_lo = _planes(a_x_lo), _planes(a_y_lo), _planes(c_lo)
-    a_x_hi, a_y_hi, c_hi = _planes(a_x_hi), _planes(a_y_hi), _planes(c_hi)
-    v = nu.reshape(B, M, G, I, J).unsqueeze(-1)
+    v = nu.reshape(B, M, G, I, J)
     pos = v >= 0
-    a_x = torch.where(pos, a_x_lo, a_x_hi)
-    a_y = torch.where(pos, a_y_lo, a_y_hi)
-    c_sel = torch.where(pos, c_lo, c_hi)
-    nu_x = (v * a_x).sum(dim=4).reshape(B * M, G * I * K)
-    nu_y = (v * a_y).sum(dim=3).permute(0, 1, 2, 4, 3).reshape(B * M, G * K * J)
-    contrib = (v.squeeze(-1) * c_sel.sum(dim=-1)).reshape(B * M, -1).sum(dim=-1)
+    v_pos = torch.where(pos, v, 0.)
+    v_neg = torch.where(pos, 0., v)
+    # Contract directly over output rows/columns; never build [B,M,G,I,J,K].
+    nu_x = (
+        torch.einsum("bmgij,bgijk->bmgik", v_pos, a_x_lo)
+        + torch.einsum("bmgij,bgijk->bmgik", v_neg, a_x_hi)
+    ).reshape(B * M, G * I * K)
+    nu_y = (
+        torch.einsum("bmgij,bgijk->bmgkj", v_pos, a_y_lo)
+        + torch.einsum("bmgij,bgijk->bmgkj", v_neg, a_y_hi)
+    ).reshape(B * M, G * K * J)
+    contrib = (
+        torch.einsum("bmgij,bgij->bm", v_pos, c_lo.sum(dim=-1))
+        + torch.einsum("bmgij,bgij->bm", v_neg, c_hi.sum(dim=-1))
+    ).reshape(B * M)
     return nu_x, nu_y, contrib
+
+
+def _matmul_frame_term(a, first_a, second_a, first_b, second_b, specs):
+    """Compose signed contraction coefficients with the selected affine tracks."""
+    positive, negative = a.clamp(min=0), a.clamp(max=0)
+    A = torch.einsum(specs[0], positive, first_a) + torch.einsum(specs[0], negative, second_a)
+    b = torch.einsum(specs[1], positive, first_b) + torch.einsum(specs[1], negative, second_b)
+    return A, b
+
+
+def _fwd_matmul_lin(lin_x, lin_y, x_l, x_u, y_l, y_u, G, I, K, J, k_thresh):
+    """Compose bilinear planes over a shared explicit frame, not its box alone."""
+    from .tf_forward import LinearBound
+
+    B, symbols = x_l.shape[0], lin_x.A_lb.shape[-1]
+    boxes = _matmul_term_boxes(x_l, x_u, y_l, y_u, G, I, K, J)
+    ax_l, ay_l, c_l, ax_u, ay_u, c_u = _bilinear_planes(*boxes, None, k_thresh)
+    xl_a, xu_a = (a.reshape(B, G, I, K, symbols) for a in (lin_x.A_lb, lin_x.A_ub))
+    xl_b, xu_b = (b.reshape(B, G, I, K) for b in (lin_x.b_lb, lin_x.b_ub))
+    yl_a, yu_a = (a.reshape(B, G, K, J, symbols) for a in (lin_y.A_lb, lin_y.A_ub))
+    yl_b, yu_b = (b.reshape(B, G, K, J) for b in (lin_y.b_lb, lin_y.b_ub))
+    x_specs = ("bgijk,bgiks->bgijs", "bgijk,bgik->bgij")
+    y_specs = ("bgijk,bgkjs->bgijs", "bgijk,bgkj->bgij")
+    xlo_a, xlo_b = _matmul_frame_term(ax_l, xl_a, xu_a, xl_b, xu_b, x_specs)
+    xhi_a, xhi_b = _matmul_frame_term(ax_u, xu_a, xl_a, xu_b, xl_b, x_specs)
+    ylo_a, ylo_b = _matmul_frame_term(ay_l, yl_a, yu_a, yl_b, yu_b, y_specs)
+    yhi_a, yhi_b = _matmul_frame_term(ay_u, yu_a, yl_a, yu_b, yl_b, y_specs)
+    return LinearBound(
+        (xlo_a + ylo_a).reshape(B, G * I * J, symbols),
+        (xlo_b + ylo_b + c_l.sum(-1)).reshape(B, G * I * J),
+        (xhi_a + yhi_a).reshape(B, G * I * J, symbols),
+        (xhi_b + yhi_b + c_u.sum(-1)).reshape(B, G * I * J),
+    )
 
 
 def forward_matmul(L, parent_boxes, parent_lins, parent_frames, preds,
                    post_activation, device, dtype):
-    """Dual forward interval box for a batched bilinear MATMUL (var x var)."""
+    """Bound MATMUL and retain compatible explicit operand relations."""
     from act.back_end.core import Bounds
-    from .tf_forward import _reset_forward_box
+    from .tf_forward import _concretize, _intersect_boxes, _reset_forward_box, _shared_explicit_frame
 
     G, I, K, J = _matmul_shapes(L.params["x_shape"], L.params["y_shape"])
     x_box, y_box = parent_boxes[0], parent_boxes[1]
     lo, hi = _matmul_mccormick_box(
         x_box.lb, x_box.ub, y_box.lb, y_box.ub, G, I, K, J)
+    if _shared_explicit_frame(parent_lins, parent_frames, [G * I * K, G * K * J]):
+        lin = _fwd_matmul_lin(
+            parent_lins[0], parent_lins[1], x_box.lb, x_box.ub, y_box.lb, y_box.ub,
+            G, I, K, J, float(L.params.get("k_thresh", 1.0)),
+        )
+        lin_lb, lin_ub = _concretize(lin, parent_frames[0])
+        lb, ub = _intersect_boxes(lin_lb, lin_ub, lo, hi)
+        out = Bounds(lb, ub)
+        return out, out, lin, parent_frames[0]
     out = Bounds(lo, hi)
     lin, frame = _reset_forward_box(lo, hi, device, dtype)
     return out, out, lin, frame
@@ -433,7 +572,8 @@ def backward_matmul(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     x_box = bounds_dict[int(preds[0])]
     y_box = bounds_dict[int(preds[1])]
     nu_x, nu_y, contrib = _matmul_bilinear_backward(
-        nu, x_box.lb, x_box.ub, y_box.lb, y_box.ub, G, I, K, J, M)
+        nu, x_box.lb, x_box.ub, y_box.lb, y_box.ub, G, I, K, J, M,
+        float(L.params.get("k_thresh", 1.0)), alpha)
     return [nu_x, nu_y], contrib
 
 
@@ -490,10 +630,13 @@ def backward_mul(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     return [nu_x, nu_y], contrib
 
 
+_LocalPlanes = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 def _local_vector_planes(
     l: torch.Tensor, u: torch.Tensor,
     build: "Callable[[LinearBounds], LinearBounds]",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> _LocalPlanes:
     """Sound per-output linear planes of a vector op over a local input box.
 
     Seeds an identity :class:`LinearBounds` frame whose unit L-infinity ball maps
@@ -528,7 +671,7 @@ def _local_vector_planes(
     out = build(seed)
     lw, uw = out.lw[:, 0], out.uw[:, 0]
     lb, ub = out.lb[:, 0], out.ub[:, 0]
-    rden = radius.clamp(min=1e-12).unsqueeze(1)
+    rden = torch.where(radius > 0, radius, torch.ones_like(radius)).unsqueeze(1)
     a_lo = lw.transpose(1, 2) / rden
     a_hi = uw.transpose(1, 2) / rden
     c_lo = lb - (a_lo * center.unsqueeze(1)).sum(dim=-1)
@@ -536,9 +679,37 @@ def _local_vector_planes(
     return a_lo, c_lo, a_hi, c_hi
 
 
+def _softmax_interval_box(l: torch.Tensor, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stable exact coordinate extrema, using softmax's signed monotonicity."""
+    diagonal = torch.eye(l.shape[-1], dtype=torch.bool, device=l.device)
+    lower_differences = (u.unsqueeze(-2) - l.unsqueeze(-1)).masked_fill(diagonal, 0.)
+    upper_differences = (l.unsqueeze(-2) - u.unsqueeze(-1)).masked_fill(diagonal, 0.)
+    point = (l == u).all(-1, keepdim=True)
+    value = l.softmax(-1)
+    return (
+        torch.where(point, value, torch.exp(-torch.logsumexp(lower_differences, dim=-1))),
+        torch.where(point, value, torch.exp(-torch.logsumexp(upper_differences, dim=-1))),
+    )
+
+
+def _softmax_local_planes(l: torch.Tensor, u: torch.Tensor) -> _LocalPlanes:
+    """Replace nonfinite exponential/reciprocal planes by valid box planes."""
+    a_lo, c_lo, a_hi, c_hi = _local_vector_planes(l, u, lambda bound: bound.softmax())
+    point = (l == u).all(-1, keepdim=True)
+    bad_lo = point | ~(torch.isfinite(a_lo).all(-1) & torch.isfinite(c_lo))
+    bad_hi = point | ~(torch.isfinite(a_hi).all(-1) & torch.isfinite(c_hi))
+    if bool(bad_lo.any()) or bool(bad_hi.any()):
+        lower, upper = _softmax_interval_box(l, u)
+        a_lo = torch.where(bad_lo.unsqueeze(-1), torch.zeros_like(a_lo), a_lo)
+        c_lo = torch.where(bad_lo, lower, c_lo)
+        a_hi = torch.where(bad_hi.unsqueeze(-1), torch.zeros_like(a_hi), a_hi)
+        c_hi = torch.where(bad_hi, upper, c_hi)
+    return a_lo, c_lo, a_hi, c_hi
+
+
 def _dual_vector_backward(
     nu: torch.Tensor, l: torch.Tensor, u: torch.Tensor, row: int,
-    build: "Callable[[LinearBounds], LinearBounds]", M: int,
+    planes_fn: Callable[[torch.Tensor, torch.Tensor], _LocalPlanes], M: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route the dual variable through the transpose of local relaxation planes.
 
@@ -560,7 +731,7 @@ def _dual_vector_backward(
 
     l_g = l.flatten(start_dim=1)[:, :n].reshape(B * n_rows, row)
     u_g = u.flatten(start_dim=1)[:, :n].reshape(B * n_rows, row)
-    a_lo, c_lo, a_hi, c_hi = _local_vector_planes(l_g, u_g, build)
+    a_lo, c_lo, a_hi, c_hi = planes_fn(l_g, u_g)
     a_lo = a_lo.reshape(B, n_rows, row, row)
     a_hi = a_hi.reshape(B, n_rows, row, row)
     c_lo = c_lo.reshape(B, n_rows, row)
@@ -588,7 +759,8 @@ def _layernorm_builder(
         repeat = n // gamma.numel()
         gamma = gamma.repeat(repeat)
         beta = beta.repeat(repeat)
-    return lambda bound: bound.layer_norm(gamma, beta, variant=variant)
+    eps = float(L.params.get("eps", 1e-5))
+    return lambda bound: bound.layer_norm(gamma, beta, variant=variant, eps=eps)
 
 
 def forward_softmax(L, parent_boxes, parent_lins, parent_frames, preds,
@@ -602,17 +774,28 @@ def forward_softmax(L, parent_boxes, parent_lins, parent_frames, preds,
     pre-activation.
     """
     from act.back_end.core import Bounds
-    from .tf_forward import _reset_forward_box
+    from .tf_forward import _concretize, _fwd_rowwise_planes, _intersect_boxes, _reset_forward_box
 
     parent_box = parent_boxes[0]
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    row = int(L.params.get("rowsize", pre_lb.shape[-1]))
-    out_lb, out_ub = _vector_forward_box(
-        pre_lb, pre_ub, row, lambda bound: bound.softmax())
+    row = softmax_rowsize(L, parent_box)
+    if row is None:
+        raise NotImplementedError("Dual SOFTMAX requires contiguous last-axis rows")
+    planes, l_g, u_g = _vector_local_planes(pre_lb, pre_ub, row, _softmax_local_planes)
+    out_lb, out_ub = _vector_planes_box(planes, l_g, u_g, pre_lb.shape[0])
     out_lb = out_lb.clamp(0.0, 1.0)
     out_ub = out_ub.clamp(0.0, 1.0)
+    box_lb, box_ub = _softmax_interval_box(l_g, u_g)
+    out_lb, out_ub = _intersect_boxes(
+        out_lb, out_ub, box_lb.reshape_as(out_lb), box_ub.reshape_as(out_ub))
+    lin = _fwd_rowwise_planes(parent_lins[0], row, planes)
+    if lin is not None:
+        lin_lb, lin_ub = _concretize(lin, parent_frames[0])
+        out_lb, out_ub = _intersect_boxes(lin_lb, lin_ub, out_lb, out_ub)
     out = Bounds(out_lb, out_ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
+    if lin is not None and not post_activation:
+        return stored, out, lin, parent_frames[0]
     lin, frame = _reset_forward_box(out_lb, out_ub, device, dtype)
     return stored, out, lin, frame
 
@@ -630,9 +813,11 @@ def backward_softmax(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
         raise ValueError(f"backward_softmax: layer {L.id} missing bounds in bounds_dict")
     if len(preds) != 1:
         raise ValueError(f"SOFTMAX expects 1 predecessor, got {len(preds)}")
-    row = int(L.params.get("rowsize", bounds.lb.flatten(start_dim=1).shape[-1]))
+    row = softmax_rowsize(L, bounds)
+    if row is None:
+        raise NotImplementedError("Dual SOFTMAX requires contiguous last-axis rows")
     nu_in, contrib = _dual_vector_backward(
-        nu, bounds.lb, bounds.ub, row, lambda bound: bound.softmax(), M)
+        nu, bounds.lb, bounds.ub, row, _softmax_local_planes, M)
     return [nu_in], contrib
 
 
@@ -646,17 +831,28 @@ def forward_layernorm(L, parent_boxes, parent_lins, parent_frames, preds,
     the backward pass when bounds are kept pre-activation.
     """
     from act.back_end.core import Bounds
-    from .tf_forward import _reset_forward_box
+    from .tf_forward import _concretize, _fwd_rowwise_planes, _intersect_boxes, _reset_forward_box
 
     parent_box = parent_boxes[0]
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    n = pre_lb.shape[-1]
-    builder = _layernorm_builder(L, n, pre_lb.device, pre_lb.dtype)
+    n = pre_lb.flatten(1).shape[-1]
     gamma_n = L.params["gamma"].numel()
     row = n if gamma_n == 0 or n % gamma_n else gamma_n
-    out_lb, out_ub = _vector_forward_box(pre_lb, pre_ub, row, builder)
+    builder = _layernorm_builder(L, row, pre_lb.device, pre_lb.dtype)
+    planes, l_g, u_g = _vector_local_planes(
+        pre_lb, pre_ub, row, lambda l, u: _local_vector_planes(l, u, builder),
+    )
+    out_lb, out_ub = _vector_planes_box(planes, l_g, u_g, pre_lb.shape[0])
+    interval = _layernorm_box(L, parent_box)
+    out_lb, out_ub = _intersect_boxes(out_lb, out_ub, interval.lb, interval.ub)
+    lin = _fwd_rowwise_planes(parent_lins[0], row, planes)
+    if lin is not None:
+        lin_lb, lin_ub = _concretize(lin, parent_frames[0])
+        out_lb, out_ub = _intersect_boxes(lin_lb, lin_ub, out_lb, out_ub)
     out = Bounds(out_lb, out_ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
+    if lin is not None and not post_activation:
+        return stored, out, lin, parent_frames[0]
     lin, frame = _reset_forward_box(out_lb, out_ub, device, dtype)
     return stored, out, lin, frame
 
@@ -675,30 +871,39 @@ def backward_layernorm(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     if len(preds) != 1:
         raise ValueError(f"LAYERNORM expects 1 predecessor, got {len(preds)}")
     n = bounds.lb.flatten(start_dim=1).shape[-1]
-    builder = _layernorm_builder(L, n, bounds.lb.device, bounds.lb.dtype)
     gamma_n = L.params["gamma"].numel()
     row = n if gamma_n == 0 or n % gamma_n else gamma_n
+    builder = _layernorm_builder(L, row, bounds.lb.device, bounds.lb.dtype)
     nu_in, contrib = _dual_vector_backward(
-        nu, bounds.lb, bounds.ub, row, builder, M)
+        nu, bounds.lb, bounds.ub, row, lambda l, u: _local_vector_planes(l, u, builder), M)
     return [nu_in], contrib
 
 
-def _vector_forward_box(
+def _vector_local_planes(
     pre_lb: torch.Tensor, pre_ub: torch.Tensor, row: int,
-    build: "Callable[[LinearBounds], LinearBounds]",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Concretize the local relaxation planes to a sound per-row output box."""
+    planes_fn: Callable[[torch.Tensor, torch.Tensor], _LocalPlanes],
+) -> tuple[_LocalPlanes, torch.Tensor, torch.Tensor]:
+    """Build row-local planes once for both box and symbolic propagation."""
     B = pre_lb.shape[0]
     n = pre_lb.flatten(start_dim=1).shape[-1]
+    if row < 1 or n % row:
+        raise ValueError(f"Vector row width {row} does not divide feature width {n}")
     n_rows = n // row
     l_g = pre_lb.flatten(start_dim=1).reshape(B * n_rows, row)
     u_g = pre_ub.flatten(start_dim=1).reshape(B * n_rows, row)
-    a_lo, c_lo, a_hi, c_hi = _local_vector_planes(l_g, u_g, build)
+    return planes_fn(l_g, u_g), l_g, u_g
+
+
+def _vector_planes_box(
+    planes: _LocalPlanes, l_g: torch.Tensor, u_g: torch.Tensor, batch: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concretize local planes over the row boxes they were constructed for."""
+    a_lo, c_lo, a_hi, c_hi = planes
     out_lo = (a_lo.clamp(min=0) * l_g.unsqueeze(1)
               + a_lo.clamp(max=0) * u_g.unsqueeze(1)).sum(dim=-1) + c_lo
     out_hi = (a_hi.clamp(min=0) * u_g.unsqueeze(1)
               + a_hi.clamp(max=0) * l_g.unsqueeze(1)).sum(dim=-1) + c_hi
-    return out_lo.reshape(B, n), out_hi.reshape(B, n)
+    return out_lo.reshape(batch, -1), out_hi.reshape(batch, -1)
 
 
 # GELU soundness constants (_GELU_MIN_X/_GELU_MIN_Y/_GELU_INFLECTION) are
@@ -710,7 +915,7 @@ _INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
 
 def _gelu_value(x: torch.Tensor) -> torch.Tensor:
     """Exact erf GELU ``x * Phi(x)`` matching ``torch.nn.functional.gelu``."""
-    return 0.5 * x * (1.0 + torch.erf(x * _INV_SQRT_2))
+    return torch.nn.functional.gelu(x)
 
 
 def _gelu_deriv(x: torch.Tensor) -> torch.Tensor:
@@ -740,7 +945,8 @@ def _gelu_relaxation(
     g_l, g_u = _gelu_value(l), _gelu_value(u)
     m = (l + u) * 0.5
     g_m, dg_m = _gelu_value(m), _gelu_deriv(m)
-    secant = (g_u - g_l) / (u - l).clamp(min=1e-12)
+    width = u - l
+    secant = (g_u - g_l) / torch.where(width > 0, width, torch.ones_like(width))
 
     convex = (l >= -_GELU_INFLECTION) & (u <= _GELU_INFLECTION)
     concave = (u <= -_GELU_INFLECTION) | (l >= _GELU_INFLECTION)
@@ -765,30 +971,19 @@ def _gelu_relaxation(
 
 def forward_gelu(L, parent_boxes, parent_lins, parent_frames, preds,
                  post_activation, device, dtype):
-    """Dual forward interval box for the exact erf GELU.
-
-    GELU is non-monotone with a single interior minimum, so the box maximum is
-    always at an endpoint while the minimum is the global value ``_GELU_MIN_Y``
-    when the box encloses ``_GELU_MIN_X`` (else an endpoint). Identical min-aware
-    box to :func:`interval_tf.tf_transformer.tf_gelu`, evaluated with the erf
-    form so it is sound against ``F.gelu``. The dual frame is reset over the
-    resulting box, matching the smooth-activation handlers.
-    """
-    from act.back_end.core import Bounds
+    """Compose erf GELU planes; use the shared interval image for tanh GELU."""
+    from .tf_smooth import _forward_smooth_planes
     from .tf_forward import _reset_forward_box
 
     parent_box = parent_boxes[0]
-    pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    g_l, g_u = _gelu_value(pre_lb), _gelu_value(pre_ub)
-    contains_min = (pre_lb <= _GELU_MIN_X) & (pre_ub >= _GELU_MIN_X)
-    out_lb = torch.where(
-        contains_min, torch.full_like(g_l, _GELU_MIN_Y),
-        torch.minimum(g_l, g_u))
-    out_ub = torch.maximum(g_l, g_u)
-    out = Bounds(out_lb, out_ub)
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    lin, frame = _reset_forward_box(out_lb, out_ub, device, dtype)
-    return stored, out, lin, frame
+    out = _gelu_box(L, parent_box)
+    if L.params.get("approximate", "none") == "tanh":
+        lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
+        return out if post_activation else parent_box, out, lin, frame
+    return _forward_smooth_planes(
+        parent_boxes, parent_lins, parent_frames, post_activation,
+        out.lb, out.ub, _gelu_relaxation,
+    )
 
 
 def _dual_gelu_backward(
@@ -845,5 +1040,10 @@ def backward_gelu(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
         raise ValueError(f"backward_gelu: layer {L.id} missing bounds in bounds_dict")
     if len(preds) != 1:
         raise ValueError(f"GELU expects 1 predecessor, got {len(preds)}")
+    if L.params.get("approximate", "none") == "tanh":
+        from .tf_smooth import _dual_constant_box_backward
+        out = _gelu_box(L, bounds)
+        nu_out, contrib = _dual_constant_box_backward(nu, out.lb, out.ub, M)
+        return [nu_out], contrib
     nu_out, contrib = _dual_gelu_backward(nu, bounds, M)
     return [nu_out], contrib

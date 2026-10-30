@@ -11,38 +11,121 @@
 # justification: torch C-extension stubs are absent in CI; DualSolver and verifier share result utilities during type analysis
 
 from __future__ import annotations
+import math
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeAlias, Union, cast
 
 import torch
 from act.back_end.core import Bounds, Layer, Net, get_topo_order
 from act.back_end.layer_schema import LayerKind
-from act.back_end.dual_tf.tf_forward import _intersect_boxes
+from act.back_end.dual_tf.tf_forward import (
+    Frame, ForwardFrame, ForwardPrefixCache, _intersect_boxes, _reset_forward_box,
+    forward_frame_row_lower_bounds, input_support,
+)
 from act.config.config import DualConfig
 from act.back_end.solver.solver_base import (
+    BatchBoundResult,
     BatchLPSolution,
+    BoundResult,
     SolveStatus,
     Solver,
     SolverCaps,
 )
-from act.front_end.specs import OutputSpec, OutKind
+from act.front_end.specs import OutputSpec, OutKind, lp_norm
 from act.util.device_manager import get_default_device, get_default_dtype
 from act.util.stats import SpecBatchResult
 
+_monotonic = time.monotonic
+
 
 @dataclass(frozen=True)
-class DualResult:
+class MixedAlpha:
+    """Compact ReLU slopes for a wave containing shared and per-row lanes.
+
+    Row maps preserve logical lane order without expanding shared payloads
+    along the spec axis in the frontier. Only a numerical consumer expands.
+    """
+
+    shared: torch.Tensor
+    per_row: torch.Tensor
+    shared_rows: torch.Tensor
+    per_row_rows: torch.Tensor
+
+    def materialize(self, rows: int, *, shared: bool = False) -> torch.Tensor:
+        """Restore logical lane order at a solver or replay boundary."""
+        n = self.shared.shape[0] + self.per_row.shape[0]
+        width = self.shared.shape[-1]
+        if self.per_row.shape[1] not in (1, rows):
+            raise ValueError("mixed alpha spec rows do not match the consumer")
+        out = self.shared.new_empty((n, width) if shared else (n, rows, width))
+        shared_values = self.shared if shared else self.shared.unsqueeze(1).expand(-1, rows, -1)
+        row_values = self.per_row.mean(1) if shared else self.per_row.expand(-1, rows, -1)
+        out.index_copy_(0, self.shared_rows.to(out.device), shared_values)
+        out.index_copy_(0, self.per_row_rows.to(out.device), row_values.to(out))
+        return out
+
+
+AlphaTree: TypeAlias = Union[
+    torch.Tensor, Dict[Any, "AlphaTree"], List["AlphaTree"],
+    Tuple["AlphaTree", ...], MixedAlpha, None,
+]
+AlphaState: TypeAlias = Dict[int, AlphaTree]
+
+
+def _source_phase_strip(
+    nu: torch.Tensor, bounds: Bounds, split_signs: torch.Tensor,
+    phase_slope_signs: torch.Tensor, m_specs: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Relax a dropped ReLU literal with its source slope, without its phase.
+
+    Slope 1 (active) or 0 (inactive) is a global lower line. The matching upper
+    line ``z + max(0, -l)`` or ``max(0, u)`` holds on the candidate interval
+    ``[l, u]``, so it never assumes the deleted condition. Returns the ``nu``
+    the ordinary kernel must still relax, plus the strip's predecessor ``nu``
+    and objective contribution.
+    """
+    bm = nu.shape[0]
+    values = nu.flatten(1).view(bm // m_specs, m_specs, -1)
+    current = split_signs.reshape(bm // m_specs, -1, values.shape[-1]).expand_as(values)
+    source = phase_slope_signs.reshape(bm // m_specs, -1, values.shape[-1]).expand_as(values)
+    current, source = current.to(values.device), source.to(values.device)
+    dropped = source.ne(0) & current.eq(0)
+    active = source > 0
+    lower = bounds.lb.flatten(1).unsqueeze(1).to(values)
+    upper = bounds.ub.flatten(1).unsqueeze(1).to(values)
+    intercept = torch.where(active, (-lower).clamp(min=0), upper.clamp(min=0))
+    contribution = (values.clamp(max=0) * intercept).masked_fill(~dropped, 0)
+    predecessor = (values * active.to(values)).masked_fill(~dropped, 0)
+    return (
+        values.masked_fill(dropped, 0).view(bm, -1), predecessor.view(bm, -1),
+        contribution.sum(-1).view(bm),
+    )
+
+
+@dataclass(frozen=True)
+class DualResult(BoundResult):
     """Result of ``compute_certified_bound``. Fields depend on caller flags."""
 
     margins: torch.Tensor
     sce: Optional[Any] = None
-    alpha_state: Optional[Dict[int, torch.Tensor]] = None
+    alpha_state: Optional[AlphaState] = None
     eta_state: Optional[Dict[int, torch.Tensor]] = None
     nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+    dual_margins: Optional[torch.Tensor] = None
+    forward_margins: Optional[torch.Tensor] = None
+
+    def row_lower_bounds(self) -> torch.Tensor:
+        """Return the certified lower bounds."""
+        return self.margins
+
+    def row_witness_inputs(self) -> Optional[torch.Tensor]:
+        """Return the optional dual witness inputs."""
+        return cast(Optional[torch.Tensor], self.sce)
 
 
 @dataclass(frozen=True)
-class DualBatchResult:
+class DualBatchResult(BatchBoundResult):
     """Decoded result of :meth:`DualSolver.solve_spec_batch` for one K-lane batch."""
 
     solution: BatchLPSolution
@@ -50,7 +133,7 @@ class DualBatchResult:
     lower_bounds: torch.Tensor
     bounds_dict: Optional[Dict[int, Bounds]] = None
     nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
-    alpha_state: Optional[Dict[int, torch.Tensor]] = None
+    alpha_state: Optional[AlphaState] = None
     eta_state: Optional[Dict[int, torch.Tensor]] = None
     witness_input: Optional[torch.Tensor] = None
     row_slack: Optional[torch.Tensor] = None
@@ -58,6 +141,33 @@ class DualBatchResult:
     thresholds: Optional[torch.Tensor] = None
     m_specs: int = 0
     reference_bounds: Optional[Dict[int, Bounds]] = None
+    base_reference_bounds: Optional[Dict[int, Bounds]] = None
+    dual_row_slack: Optional[torch.Tensor] = None
+    forward_only_certified: Optional[torch.Tensor] = None
+
+    def lane_solution(self) -> BatchLPSolution:
+        """Return the decoded lane solution."""
+        return self.solution
+
+    def lane_lower_bounds(self) -> torch.Tensor:
+        """Return the decoded lower bounds."""
+        return self.lower_bounds
+
+    def spec_row_slack(self) -> Optional[torch.Tensor]:
+        """Return per-row slack when output rows were decoded."""
+        return self.row_slack
+
+    def lane_witness_inputs(self) -> Optional[torch.Tensor]:
+        """Return lane witness inputs when the relaxation produced them."""
+        return self.witness_input
+
+    def intermediate_bounds(self) -> Optional[Dict[int, Bounds]]:
+        """Return intermediate bounds requested for branching."""
+        return self.bounds_dict
+
+    def neuron_sensitivities(self) -> Optional[Dict[int, torch.Tensor]]:
+        """Return dual sensitivities requested for neuron branching."""
+        return self.nu_per_layer
 
 
 def expand_bounds_dict(bounds_dict: Dict[int, Bounds], M: int) -> Dict[int, Bounds]:
@@ -90,89 +200,257 @@ def expand_bounds_dict(bounds_dict: Dict[int, Bounds], M: int) -> Dict[int, Boun
     return out
 
 
-def _alpha_tree_leaves(tree: Any):
+def _alpha_tree_leaves(
+    tree: Union[AlphaTree, Dict[int, torch.Tensor]], *, logical: bool = False,
+) -> Iterator[torch.Tensor]:
     """Yield the tensor leaves of a dual-alpha pytree.
 
     A per-layer alpha is a pytree whose shape is interpreted by the matching
     backward kernel: RELU is a single tensor leaf; future per-kind allocators
     may nest leaves in lists/dicts. ``None`` marks a fixed-slope kind with no
     alpha. The optimizer, projection, and keep-best clone all walk these leaves
-    so they cannot drift out of agreement on the pytree shape.
+    so they cannot drift out of agreement on the pytree shape. ``logical``
+    counts one ReLU leaf for mixed storage, excluding its lane-map tensors.
     """
     if tree is None:
         return
     if isinstance(tree, torch.Tensor):
         yield tree
+    elif isinstance(tree, MixedAlpha):
+        yield tree.shared
+        if not logical:
+            yield tree.per_row
+            yield tree.shared_rows
+            yield tree.per_row_rows
     elif isinstance(tree, dict):
         for value in tree.values():
-            yield from _alpha_tree_leaves(value)
+            yield from _alpha_tree_leaves(value, logical=logical)
     elif isinstance(tree, (list, tuple)):
         for value in tree:
-            yield from _alpha_tree_leaves(value)
+            yield from _alpha_tree_leaves(value, logical=logical)
     else:
         raise TypeError(f"unsupported alpha pytree node: {type(tree)!r}")
 
 
-def _clone_alpha_tree(tree: Any) -> Any:
-    """Detach-clone every leaf of an alpha pytree, preserving its structure."""
+def _alpha_tree_map(
+    tree: AlphaTree, transform: Callable[[torch.Tensor], torch.Tensor]
+) -> AlphaTree:
+    """Transform tensor leaves without changing their per-kernel structure."""
     if tree is None:
         return None
     if isinstance(tree, torch.Tensor):
-        return tree.detach().clone()
+        return transform(tree)
+    if isinstance(tree, MixedAlpha):
+        shared, per_row = transform(tree.shared), transform(tree.per_row)
+        return MixedAlpha(shared, per_row, tree.shared_rows.to(shared.device),
+                          tree.per_row_rows.to(per_row.device))
     if isinstance(tree, dict):
-        return {key: _clone_alpha_tree(value) for key, value in tree.items()}
+        return {key: _alpha_tree_map(value, transform) for key, value in tree.items()}
     if isinstance(tree, (list, tuple)):
-        return type(tree)(_clone_alpha_tree(value) for value in tree)
+        return type(tree)(_alpha_tree_map(value, transform) for value in tree)
     raise TypeError(f"unsupported alpha pytree node: {type(tree)!r}")
 
 
-# Floor on the L2 witness denominator so a zero-coefficient block yields a
-# center witness instead of a divide-by-zero.
-_DUAL_NORM_EPS = 1e-12
+def _clone_alpha_tree(tree: AlphaTree) -> AlphaTree:
+    """Detach-clone evaluated optimizer state without retaining its graph."""
+    return _alpha_tree_map(tree, lambda leaf: leaf.detach().clone())
 
 
-def _resolve_perturbation_norm(value: Any) -> float:
-    """Normalize a spec ``p_norm`` field to a float, defaulting to ``inf``.
+def _alpha_tree_gather_lanes(tree: AlphaTree, indices: torch.Tensor) -> AlphaTree:
+    """Gather axis-zero lanes, including repeated indices, into owned storage."""
+    if isinstance(tree, MixedAlpha):
+        # A dense lane-to-payload lookup is O(K), never O(K*M*N).
+        n = tree.shared.shape[0] + tree.per_row.shape[0]
+        lookup = torch.empty(n, device=tree.shared.device, dtype=torch.long)
+        lookup[tree.shared_rows.to(lookup.device)] = torch.arange(
+            tree.shared.shape[0], device=lookup.device)
+        lookup[tree.per_row_rows.to(lookup.device)] = -1 - torch.arange(
+            tree.per_row.shape[0], device=lookup.device)
+        selected = lookup.index_select(0, indices.to(lookup.device))
+        shared_rows = torch.where(selected >= 0)[0]
+        per_row_rows = torch.where(selected < 0)[0]
+        shared = tree.shared.index_select(0, selected[shared_rows])
+        per_row = tree.per_row.index_select(0, (-1 - selected[per_row_rows]).to(tree.per_row.device))
+        if not per_row_rows.numel():
+            return shared
+        if not shared_rows.numel():
+            return per_row
+        return MixedAlpha(shared, per_row, shared_rows, per_row_rows)
+    if isinstance(tree, dict):
+        return {key: _alpha_tree_gather_lanes(value, indices) for key, value in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(_alpha_tree_gather_lanes(value, indices) for value in tree)
+    return _alpha_tree_map(tree, lambda leaf: leaf.index_select(0, indices.to(leaf.device)))
 
-    LP_EMBEDDING carries the input perturbation norm ``p``; box / L_inf specs
-    omit it. A missing field (``None``) maps to ``inf`` so the dual solver keeps
-    the exact box concretization with zero behavior change.
 
-    Args:
-        value: Raw ``p_norm`` from the input-spec layer params. Accepts ``None``,
-            a number, or a string such as ``"inf"`` / ``"2"``.
+def _alpha_tree_repeat_lanes(tree: AlphaTree, repeats: int) -> AlphaTree:
+    """Repeat each lane consecutively, matching repeat_interleave bound rows."""
+    if repeats < 1:
+        raise ValueError(f"alpha lane repeats must be positive, got {repeats}")
+    if isinstance(tree, MixedAlpha):
+        count = tree.shared.shape[0] + tree.per_row.shape[0]
+        return _alpha_tree_gather_lanes(
+            tree, torch.arange(count, device=tree.shared.device).repeat_interleave(repeats))
+    if isinstance(tree, dict):
+        return {key: _alpha_tree_repeat_lanes(value, repeats) for key, value in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(_alpha_tree_repeat_lanes(value, repeats) for value in tree)
+    return _alpha_tree_map(tree, lambda leaf: leaf.repeat_interleave(repeats, dim=0))
 
-    Returns:
-        The perturbation norm ``p`` as a float (``float('inf')`` for L_inf).
+
+def _alpha_tree_zero_lanes(tree: AlphaTree, lanes: int) -> AlphaTree:
+    """Preserve payload shapes while zero-initializing missing warm-start lanes."""
+    if isinstance(tree, MixedAlpha):
+        return tree.shared.new_zeros((lanes, tree.shared.shape[-1]))
+    if isinstance(tree, dict):
+        return {key: _alpha_tree_zero_lanes(value, lanes) for key, value in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(_alpha_tree_zero_lanes(value, lanes) for value in tree)
+    return _alpha_tree_map(tree, lambda leaf: leaf.new_zeros((lanes, *leaf.shape[1:])))
+
+
+def _alpha_tree_concat_lanes(
+    left: AlphaTree, right: AlphaTree, n_left: int, n_right: int
+) -> AlphaTree:
+    """Concatenate lane state, filling absent subtrees from the present layout."""
+    if left is None and right is None:
+        return None
+    if left is None:
+        left = _alpha_tree_zero_lanes(right, n_left)
+    if right is None:
+        right = _alpha_tree_zero_lanes(left, n_right)
+    if isinstance(left, (torch.Tensor, MixedAlpha)) and isinstance(right, (torch.Tensor, MixedAlpha)):
+        mixed = isinstance(left, MixedAlpha) or isinstance(right, MixedAlpha)
+        if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+            mixed = (
+                left.ndim != right.ndim and {left.ndim, right.ndim} == {2, 3}
+            ) or (
+                left.ndim == right.ndim == 3 and left.shape[1] != right.shape[1]
+                and 1 in (left.shape[1], right.shape[1])
+            )
+        if mixed:
+            parts = []
+            for value, count in ((left, n_left), (right, n_right)):
+                if isinstance(value, torch.Tensor) and value.ndim == 3 and value.shape[1] == 1:
+                    value = value[:, 0]
+                if isinstance(value, MixedAlpha):
+                    parts.append(value)
+                elif value.ndim == 2:
+                    parts.append(MixedAlpha(
+                        value, value.new_empty((0, 1, value.shape[-1])),
+                        torch.arange(count, device=value.device),
+                        torch.empty(0, device=value.device, dtype=torch.long)))
+                elif value.ndim == 3:
+                    parts.append(MixedAlpha(
+                        value.new_empty((0, value.shape[-1])), value,
+                        torch.empty(0, device=value.device, dtype=torch.long),
+                        torch.arange(count, device=value.device)))
+                else:
+                    raise ValueError("mixed alpha requires ReLU lane/spec layouts")
+            a, b = parts
+            m = max(a.per_row.shape[1], b.per_row.shape[1])
+            if any(part.per_row.shape[1] not in (1, m) for part in parts):
+                raise ValueError("mixed alpha spec-row counts must agree")
+            return MixedAlpha(
+                torch.cat((a.shared, b.shared.to(a.shared))),
+                torch.cat((a.per_row.expand(-1, m, -1), b.per_row.to(a.per_row).expand(-1, m, -1))),
+                torch.cat((a.shared_rows, b.shared_rows.to(a.shared_rows) + n_left)),
+                torch.cat((a.per_row_rows, b.per_row_rows.to(a.per_row_rows) + n_left)))
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        if left.shape[1:] != right.shape[1:]:
+            raise ValueError("alpha leaf trailing shapes must agree when concatenating lanes")
+        return torch.cat((left, right.to(device=left.device, dtype=left.dtype)), dim=0)
+    if isinstance(left, dict) and isinstance(right, dict):
+        keys = list(left) + [key for key in right if key not in left]
+        return {
+            key: _alpha_tree_concat_lanes(left.get(key), right.get(key), n_left, n_right)
+            for key in keys
+        }
+    if isinstance(left, (list, tuple)) and isinstance(right, type(left)):
+        if len(left) != len(right):
+            raise ValueError("alpha sequence lengths must agree when concatenating lanes")
+        values = [
+            _alpha_tree_concat_lanes(a, b, n_left, n_right)
+            for a, b in zip(left, right, strict=True)
+        ]
+        return tuple(values) if isinstance(left, tuple) else values
+    raise TypeError(f"alpha pytree structure mismatch: {type(left)!r} vs {type(right)!r}")
+
+
+def _alpha_spec_row_count(state: Optional[AlphaState]) -> int:
+    """Infer spec rows from ReLU tensors; shared/attention payloads do not fix M."""
+    counts = {
+        int(tree.shape[1]) for tree in (state or {}).values()
+        if isinstance(tree, torch.Tensor) and tree.dim() >= 3 and tree.shape[1] != 1
+    }
+    counts.update(tree.per_row.shape[1] for tree in (state or {}).values()
+                  if isinstance(tree, MixedAlpha) and tree.per_row.shape[1] != 1)
+    if len(counts) > 1:
+        raise ValueError(f"inconsistent alpha spec-row counts: {sorted(counts)}")
+    return next(iter(counts), 1)
+
+
+def _alpha_tree_select_spec_rows(
+    state: Optional[AlphaState], keep_rows: torch.Tensor
+) -> Optional[AlphaState]:
+    """Select nonshared ReLU spec rows; keep per-kind attention payloads shared."""
+    if state is None:
+        return None
+    return {
+        lid: (
+            MixedAlpha(tree.shared, tree.per_row.index_select(1, keep_rows.to(tree.per_row.device))
+                       if tree.per_row.shape[1] != 1 else tree.per_row,
+                       tree.shared_rows, tree.per_row_rows)
+            if isinstance(tree, MixedAlpha) else
+            tree.index_select(1, keep_rows.to(tree.device))
+            if isinstance(tree, torch.Tensor) and tree.dim() >= 3 and tree.shape[1] != 1
+            else _alpha_tree_map(tree, lambda leaf: leaf.clone())
+        )
+        for lid, tree in state.items()
+    }
+
+
+def unproven_spec_rows(
+    slack: torch.Tensor,
+    out_kind: str = OutKind.LINEAR_LE,
+    reference: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Reject nonfinite proofs and respect the unsafe set's boundary.
+
+    Closed unsafe sets require strictly positive slack. ``reference`` applies
+    the shared rounding band; omit it only for already adjusted replay slack.
+    LINEAR_LE/RANGE keep their legal equality, without a permissive tolerance.
     """
-    if value is None:
-        return float("inf")
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in ("inf", "+inf", "infinity", "linf", "l_inf"):
-            return float("inf")
-        return float(token)
-    return float(value)
+    if out_kind in OutputSpec.CLOSED_KINDS:
+        band = 0.0 if reference is None else certification_tolerance(reference)
+        return ~(torch.isfinite(slack) & (slack > band))
+    return (slack < 0) | ~torch.isfinite(slack)
 
 
-def _dual_norm_exponent(p: float) -> float:
-    """Return the Hölder dual exponent ``q`` with ``1/p + 1/q = 1``.
+def certification_tolerance(reference: torch.Tensor) -> torch.Tensor:
+    """Keep strict escape proofs outside the dtype-scaled rounding band."""
+    eps = max(100.0 * torch.finfo(reference.dtype).eps, 1e-11)
+    return eps * reference.abs().clamp(min=1.0)
 
-    Used to evaluate the exact ``min`` of a linear form over an Lp input ball
-    (``min_{‖δ‖_p ≤ ε} ν·δ = −ε‖ν‖_q``): p=inf→q=1 (box), p=2→q=2, p=1→q=inf.
-    """
-    if p == float("inf"):
-        return 1.0
-    if p == 1.0:
-        return float("inf")
-    return p / (p - 1.0)
+
+def escaping_spec_rows(slack: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """UNSAFE_LINEAR requires at least one finite, strictly escaping row."""
+    return ~unproven_spec_rows(slack, OutKind.UNSAFE_LINEAR, reference)
 
 
 class DualSolver(Solver):
     """Dual (linear-relaxation) certified bounds solver. Strict [B, *shape] API."""
 
+    _PRE_ACTIVATION_BOUNDS_KINDS = {
+        LayerKind.RELU.value, LayerKind.LRELU.value, "LEAKY_RELU",
+        LayerKind.SIGMOID.value, LayerKind.TANH.value, LayerKind.ERF.value,
+        LayerKind.SQRT.value, LayerKind.SIN.value, LayerKind.COS.value,
+        LayerKind.QUANTIZE.value, LayerKind.SOFTMAX.value,
+        LayerKind.LAYERNORM.value, LayerKind.GELU.value,
+    }
     _AFFINE_CONTRIB_KINDS = {
         LayerKind.DENSE.value,
+        LayerKind.CONV1D.value,
         LayerKind.CONV2D.value,
         LayerKind.BIAS.value,
         LayerKind.BN.value,
@@ -188,9 +466,34 @@ class DualSolver(Solver):
         self.n_iters = n_iters
         self._last_bounds: Optional[Bounds] = None
         self.last_forward_bounds: Optional[Dict[int, Bounds]] = None
+        self.last_alpha_iterations = 0
+        self.last_alpha_stop_reason = "fixed"
 
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=True, supports_csp=False, supports_dual=True)
+
+    def _bilinear_operand_bounds(
+        self, net: Net, bounds_dict: Dict[int, Bounds], source_ids: List[int]
+    ) -> Dict[int, Bounds]:
+        """View activation outputs as boxes without changing stored pre-activation bounds."""
+        view = dict(bounds_dict)
+        for lid in set(source_ids):
+            layer = net.by_id[lid]
+            kind = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            if kind not in self._PRE_ACTIVATION_BOUNDS_KINDS:
+                continue
+            pre = bounds_dict[lid]
+            parent = Bounds(pre.lb.flatten(start_dim=1), pre.ub.flatten(start_dim=1))
+            lin, frame = _reset_forward_box(
+                parent.lb, parent.ub, parent.lb.device, parent.lb.dtype
+            )
+            handler = self.tf._FORWARD_REGISTRY[kind]
+            _, out, _, _ = handler(
+                layer, [parent], [lin], [frame], net.preds[lid], True,
+                parent.lb.device, parent.lb.dtype,
+            )
+            view[lid] = out
+        return view
 
     def solve_spec_batch(
         self,
@@ -204,12 +507,13 @@ class DualSolver(Solver):
         keep_rows: Optional[torch.Tensor] = None,
         split_signs: Optional[Dict[int, torch.Tensor]] = None,
         eta: Optional[Dict[int, torch.Tensor]] = None,
-        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[AlphaState] = None,
         incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
         optimize_alpha: bool = True,
         refresh_forward: bool = True,
         return_nu: bool = False,
         reuse_bounds_for_branching: bool = False,
+        forward_frame: Optional[ForwardFrame] = None,
     ) -> DualBatchResult:
         """Solve and decode one prepared K-lane output-spec batch.
 
@@ -269,6 +573,17 @@ class DualSolver(Solver):
             k_actual, m_specs, dtype=torch.bool, device=device
         )
 
+        def lanes_certified(row_bounds: torch.Tensor) -> torch.Tensor:
+            """Use the same row rule for final decoding and early stopping."""
+            values = row_bounds.reshape(k_actual, m_specs)
+            slack = values - thresholds
+            proven = ~unproven_spec_rows(
+                slack, out_spec.kind, torch.maximum(values.abs(), thresholds.abs())
+            )
+            if out_spec.kind == OutKind.UNSAFE_LINEAR:
+                return (proven & active_mask).any(dim=-1)
+            return ~(~proven & active_mask).any(dim=-1)
+
         compute_certified_bound = cast(Any, self.compute_certified_bound)
         if optimize:
             dual_result = compute_certified_bound(
@@ -291,6 +606,11 @@ class DualSolver(Solver):
                 return_optimized=True,
                 return_sce=True,
                 per_class_alpha=dual_config.per_class_alpha,
+                forward_frame=forward_frame,
+                dual_config=dual_config,
+                stop_criterion=(
+                    lambda values: bool(lanes_certified(values).all())
+                ) if dual_config.stop_when_verified else None,
                 **({"return_nu_per_layer": True} if return_nu else {}),
             )
         else:
@@ -300,20 +620,25 @@ class DualSolver(Solver):
                 c_rows,
                 M=m_specs,
                 return_sce=True,
+                forward_frame=forward_frame,
                 **({"return_nu_per_layer": True} if return_nu else {}),
             )
 
         margins = dual_result.margins.view(k_actual, m_specs)
         sce = cast(Optional[torch.Tensor], dual_result.sce)
         slack = margins - thresholds
+        certified = lanes_certified(margins)
+        assert dual_result.dual_margins is not None
+        dual_slack = dual_result.dual_margins.view(k_actual, m_specs) - thresholds
+        forward_only_certified = certified & ~lanes_certified(dual_result.dual_margins)
         if out_spec.kind == OutKind.UNSAFE_LINEAR:
-            certified = ((slack > 0) & active_mask).any(dim=-1)
             candidate_rows = torch.zeros(
                 k_actual, dtype=torch.long, device=device
             )
         else:
-            violations = (slack < 0) & active_mask
-            certified = ~violations.any(dim=-1)
+            violations = unproven_spec_rows(
+                slack, out_spec.kind, torch.maximum(margins.abs(), thresholds.abs())
+            ) & active_mask
             candidate_rows = torch.where(
                 violations.any(dim=1),
                 violations.to(torch.int64).argmax(dim=1),
@@ -357,7 +682,10 @@ class DualSolver(Solver):
         solution = BatchLPSolution(
             statuses=statuses,
             x=x_candidate,
-            max_viol=-slack.min(dim=1).values.detach(),
+            max_viol=-(
+                slack.max(dim=1).values if out_spec.kind == OutKind.UNSAFE_LINEAR
+                else slack.min(dim=1).values
+            ).detach(),
         )
 
         branch_bounds: Optional[Dict[int, Bounds]] = None
@@ -408,6 +736,8 @@ class DualSolver(Solver):
             c_rows=c_rows.detach(),
             thresholds=thresholds.detach(),
             m_specs=m_specs,
+            dual_row_slack=dual_slack.detach(),
+            forward_only_certified=forward_only_certified.detach(),
             reference_bounds=bounds_dict,
         )
 
@@ -416,7 +746,7 @@ class DualSolver(Solver):
         c: torch.Tensor, M: int = 1,
         return_sce: bool = False,
         enable_grad: bool = False,
-        alpha: Optional[Dict[int, torch.Tensor]] = None,
+        alpha: Optional[AlphaState] = None,
         eta: Optional[Dict[int, torch.Tensor]] = None,
         split_signs: Optional[Union[Dict[int, torch.Tensor], List[Dict[int, torch.Tensor]]]] = None,
         optimize: bool = False,
@@ -424,7 +754,7 @@ class DualSolver(Solver):
         lr_alpha: float = 0.1,
         lr_beta: float = 0.1,
         lr_decay: float = 0.98,
-        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[AlphaState] = None,
         incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
         return_optimized: bool = False,
         per_class_alpha: bool = True,
@@ -434,6 +764,10 @@ class DualSolver(Solver):
         start_lid: Optional[int] = None,
         local_phase_clamp: bool = False,
         forward_lin_max_perturbed: Optional[int] = None,
+        forward_frame: Optional[ForwardFrame] = None,
+        dual_config: Optional[DualConfig] = None,
+        stop_criterion: Optional[Callable[[torch.Tensor], bool]] = None,
+        phase_slope_signs: Optional[Dict[int, torch.Tensor]] = None,
     ) -> DualResult:
         """Batched certified lower bound on c^T @ output (DAG-aware).
 
@@ -473,6 +807,10 @@ class DualSolver(Solver):
         local_phase_clamp: For fixed-parameter replay, shallow-copy and clamp only
             the current ReLU handler's bounds. Reference bounds remain immutable;
             optimization is rejected because it requires globally hardened bounds.
+        phase_slope_signs: For fixed-parameter replay of a reduced core, the
+            source literals. A literal absent from ``split_signs`` keeps its
+            source slope on a line valid over the candidate interval; its
+            multiplier and phase clamp stay removed.
         η is applied to the TRUE pre-activation variable (immediately AFTER the
         activation handler in the reverse-topological backward loop):
         nu_pre = slope · nu_post − η · sign, so the multiplier acts on the
@@ -483,7 +821,16 @@ class DualSolver(Solver):
 
         forward_lin_max_perturbed: ``None`` resolves to the DualConfig default
             at call time rather than being frozen at import time.
+        forward_frame: a valid output relation for this domain. Combined
+            margins may use it; ``dual_margins`` always keeps backward evidence.
+        dual_config: optional stopping policy; direct optimizer arguments
+            still determine iterations and learning rates.
         """
+        if alpha is not None:
+            alpha = {
+                lid: tree.materialize(M) if isinstance(tree, MixedAlpha) else tree
+                for lid, tree in alpha.items()
+            }
         if forward_lin_max_perturbed is None:
             forward_lin_max_perturbed = DualConfig().forward_lin_max_perturbed
         if isinstance(split_signs, list):
@@ -492,13 +839,16 @@ class DualSolver(Solver):
             # backward pass (no leading-K vectorization).
             if not split_signs:
                 raise ValueError("split_signs list cannot be empty")
-            if optimize:
-                raise ValueError("list-form split_signs is only supported with optimize=False")
+            if optimize or phase_slope_signs is not None:
+                raise ValueError(
+                    "list-form split_signs requires optimize=False and no phase_slope_signs"
+                )
             if return_optimized:
                 raise ValueError("return_optimized requires optimize=True and single split_signs")
             stacked_split_signs = self._stack_split_sign_hypotheses(split_signs)
             normalized_split_signs = self._unstack_split_sign_hypotheses(stacked_split_signs)
             margins = []
+            dual_margins = []
             sce_values = []
             for hypo in normalized_split_signs:
                 result = self.compute_certified_bound(
@@ -523,22 +873,30 @@ class DualSolver(Solver):
                     return_nu_per_layer=False,
                     local_phase_clamp=local_phase_clamp,
                     forward_lin_max_perturbed=forward_lin_max_perturbed,
+                    forward_frame=forward_frame,
                 )
                 margins.append(result.margins)
+                assert result.dual_margins is not None
+                dual_margins.append(result.dual_margins)
                 if return_sce:
                     sce_values.append(result.sce)
             stacked_sce = None
             if return_sce and sce_values and all(sce is not None for sce in sce_values):
                 stacked_sce = torch.stack(cast(List[torch.Tensor], sce_values), dim=0)
-            return DualResult(margins=torch.stack(margins, dim=0), sce=stacked_sce)
+            return DualResult(
+                margins=torch.stack(margins, dim=0), sce=stacked_sce,
+                dual_margins=torch.stack(dual_margins, dim=0),
+            )
 
-        if optimize and local_phase_clamp:
-            raise ValueError("local_phase_clamp is only valid for fixed-parameter replay")
+        if optimize and (local_phase_clamp or phase_slope_signs is not None):
+            raise ValueError(
+                "local_phase_clamp and phase_slope_signs are only valid for fixed-parameter replay"
+            )
         if not local_phase_clamp:
             bounds_dict = self._harden_split_bounds(bounds_dict, split_signs)
 
         if optimize:
-            bound, sce, alpha_state, eta_state = self._optimize_alpha_eta(
+            result = self._optimize_alpha_eta(
                 net,
                 bounds_dict,
                 c,
@@ -556,17 +914,16 @@ class DualSolver(Solver):
                 refresh_forward=refresh_forward,
                 start_lid=start_lid,
                 forward_lin_max_perturbed=forward_lin_max_perturbed,
+                forward_frame=forward_frame,
+                dual_config=dual_config,
+                stop_criterion=stop_criterion,
             )
             if return_optimized:
-                return DualResult(
-                    margins=bound,
-                    sce=sce if return_sce else None,
-                    alpha_state=alpha_state if alpha_state else None,
-                    eta_state=eta_state if eta_state else None,
-                )
+                return result
             return DualResult(
-                margins=bound,
-                sce=sce if return_sce else None,
+                margins=result.margins, sce=result.sce,
+                dual_margins=result.dual_margins,
+                forward_margins=result.forward_margins,
             )
 
         if c.dim() != 2:
@@ -651,12 +1008,39 @@ class DualSolver(Solver):
                     handler_bounds = self._local_phase_bounds(
                         bounds_dict, lid, split_signs[lid]
                     )
+                if k in (LayerKind.MUL.value, LayerKind.MATMUL.value):
+                    handler_bounds = self._bilinear_operand_bounds(
+                        net, handler_bounds, preds
+                    )
+                elif k in (LayerKind.ATT_SCORES.value, LayerKind.ATT_MIX.value):
+                    source_keys = (
+                        ("q_src", "k_src")
+                        if k == LayerKind.ATT_SCORES.value else ("w_src", "v_src")
+                    )
+                    handler_bounds = self._bilinear_operand_bounds(
+                        net, handler_bounds,
+                        [cast(int, layer.params[key]) for key in source_keys],
+                    )
+                strip = None
+                if (
+                    phase_slope_signs is not None
+                    and split_signs is not None
+                    and k == LayerKind.RELU.value
+                    and lid in phase_slope_signs
+                ):
+                    nu_here, *strip = _source_phase_strip(
+                        nu_here, bounds_dict[lid], split_signs[lid],
+                        phase_slope_signs[lid], M,
+                    )
                 if alpha is None:
                     pred_nus, contrib = handler(layer, nu_here, handler_bounds, preds, M)
                 else:
                     pred_nus, contrib = handler(
                         layer, nu_here, handler_bounds, preds, M, alpha=alpha.get(lid)
                     )
+                if strip is not None:
+                    pred_nus = [pred_nus[0] + strip[0], *pred_nus[1:]]
+                    contrib = contrib + strip[1]
 
                 if eta is not None and split_signs is not None and lid in eta:
                     # Split Lagrangian on the TRUE pre-activation variable:
@@ -672,8 +1056,12 @@ class DualSolver(Solver):
                     eta_l = eta[lid].to(device=nu_here.device, dtype=nu_here.dtype)
                     signs_l = split_signs[lid].to(device=nu_here.device, dtype=nu_here.dtype)
                     if eta_l.dim() == 3:
+                        if eta_l.shape[1] == 1:
+                            eta_l = eta_l.expand(-1, M, -1)
                         eta_l = eta_l.reshape(-1, eta_l.shape[-1])
                     if signs_l.dim() == 3:
+                        if signs_l.shape[1] == 1:
+                            signs_l = signs_l.expand(-1, M, -1)
                         signs_l = signs_l.reshape(-1, signs_l.shape[-1])
                     pn = pred_nus[0]
                     n_clip = min(pn.shape[-1], eta_l.shape[-1])
@@ -706,35 +1094,39 @@ class DualSolver(Solver):
                         nu_accum[pred_id] = pred_nu.clone()
 
             input_lid = self._find_input_layer_id(net)
-            if input_lid is None:
-                return DualResult(
-                    margins=obj,
-                    sce=None if return_sce else None,
-                    nu_per_layer=nu_snapshot if return_nu_per_layer else None,
+            nu_final = nu_accum.get(input_lid) if input_lid is not None else None
+            sce = None
+            if input_lid is not None and nu_final is not None:
+                input_contrib, sce = self._input_contribution_from_nu(
+                    net, input_lid, nu_final, bounds_dict, M=M,
+                    return_sce=return_sce, enable_grad=enable_grad,
                 )
-
-            nu_final = nu_accum.get(input_lid)
-            if nu_final is None:
-                return DualResult(
-                    margins=obj,
-                    sce=None if return_sce else None,
-                    nu_per_layer=nu_snapshot if return_nu_per_layer else None,
-                )
-
-            input_contrib, sce = self._input_contribution_from_nu(
-                net,
-                input_lid,
-                nu_final,
-                bounds_dict,
-                M=M,
-                return_sce=return_sce,
-                enable_grad=enable_grad,
-            )
-            obj = obj + input_contrib
+                obj = obj + input_contrib
+            forward_margins = None
+            if start_lid is None:
+                # Activation entries can hold PRE-activation bounds; only
+                # known affine outputs may use the stored box directly.
+                if net.by_id[output_lid].kind in self._AFFINE_CONTRIB_KINDS:
+                    output_box = bounds_dict[output_lid]
+                    rows = c.reshape(B // M, M, -1)
+                    forward_margins = (
+                        (rows.clamp(min=0) * output_box.lb.flatten(1).unsqueeze(1)).sum(-1)
+                        + (rows.clamp(max=0) * output_box.ub.flatten(1).unsqueeze(1)).sum(-1)
+                    ).reshape(B)
+                if forward_frame is not None:
+                    if forward_frame.lid != output_lid:
+                        raise ValueError("Forward frame does not describe the objective layer")
+                    frame_bound = forward_frame_row_lower_bounds(forward_frame, c, M)
+                    forward_margins = (
+                        frame_bound if forward_margins is None
+                        else torch.maximum(forward_margins, frame_bound)
+                    )
             return DualResult(
-                margins=obj,
+                margins=obj if forward_margins is None else torch.maximum(obj, forward_margins),
                 sce=sce if return_sce else None,
                 nu_per_layer=nu_snapshot if return_nu_per_layer else None,
+                dual_margins=obj,
+                forward_margins=forward_margins,
             )
 
     def _stack_split_sign_hypotheses(
@@ -761,6 +1153,7 @@ class DualSolver(Solver):
 
     def _init_alpha(
         self,
+        net: Net,
         layer: Layer,
         bounds_dict: Dict[int, Bounds],
         B: int,
@@ -770,23 +1163,22 @@ class DualSolver(Solver):
         *,
         per_class_alpha: bool,
         optimize_alpha: bool,
-        incremental_alphas: Optional[Dict[int, torch.Tensor]],
-    ) -> Any:
+        incremental_alphas: Optional[AlphaState],
+    ) -> AlphaTree:
         """Per-kind dual-alpha allocation returning a pytree of leaves, or None.
 
         RELU allocates an optimizable lower-envelope slope ``[B, M, n]`` (or
         ``[B, n]`` when ``per_class_alpha`` is off), warm-started from
         ``incremental_alphas`` when present. SOFTMAX and LAYERNORM are
-        fixed-slope for now and allocate no alpha (``None``), so only RELU
-        contributes optimizer leaves; their backward kernels interpret the
-        absent alpha as the fixed relaxation. Each kind owns the shape of its
-        own pytree, which the matching backward kernel reads back via
+        fixed-slope and allocate no alpha; attention cores and MATMUL allocate
+        fusion slopes. Each kind owns the shape of its own pytree, which its
+        backward kernel reads back via
         ``alpha.get(lid)``.
         """
         k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
-        if k in (LayerKind.ATT_SCORES.value, LayerKind.ATT_MIX.value):
-            return self._init_attention_alpha(
-                layer, bounds_dict, device, dtype,
+        if k in (LayerKind.ATT_SCORES.value, LayerKind.ATT_MIX.value, LayerKind.MATMUL.value):
+            return self._init_bilinear_alpha(
+                net, layer, bounds_dict, device, dtype,
                 optimize_alpha=optimize_alpha,
                 incremental_alphas=incremental_alphas,
             )
@@ -795,8 +1187,16 @@ class DualSolver(Solver):
         b = bounds_dict.get(layer.id)
         assert b is not None, f"_init_alpha: no bounds for RELU layer {layer.id}"
         if incremental_alphas is not None and layer.id in incremental_alphas:
+            previous = incremental_alphas[layer.id]
+            if isinstance(previous, MixedAlpha):
+                previous = previous.materialize(M, shared=not per_class_alpha)
+            assert isinstance(previous, torch.Tensor)
+            if not per_class_alpha and previous.ndim == 3:
+                previous = previous.mean(dim=1)
+            elif per_class_alpha and previous.ndim == 2:
+                previous = previous.unsqueeze(1).expand(B, M, -1)
             alpha_init = (
-                incremental_alphas[layer.id]
+                previous
                 .detach()
                 .clone()
                 .to(device=device, dtype=dtype)
@@ -818,34 +1218,43 @@ class DualSolver(Solver):
                 alpha_init = alpha_init_bn.contiguous()
         return torch.nn.Parameter(alpha_init) if optimize_alpha else alpha_init.detach()
 
-    def _init_attention_alpha(
+    def _init_bilinear_alpha(
         self,
+        net: Net,
         layer: Layer,
         bounds_dict: Dict[int, Bounds],
         device: torch.device,
         dtype: torch.dtype,
         *,
         optimize_alpha: bool,
-        incremental_alphas: Optional[Dict[int, torch.Tensor]],
-    ) -> Any:
-        """Allocate the bilinear-attention fusion-slope pytree for one core.
+        incremental_alphas: Optional[AlphaState],
+    ) -> AlphaTree:
+        """Allocate lane-major fusion slopes for attention or MATMUL.
 
-        The pytree is ``{omega_l, omega_u}`` with per-output ``[B, 1]`` slopes,
+        The pytree is ``{omega_l, omega_u}`` with ``[B, outputs]`` slopes,
         warm-started at the rule init derived from the same local input boxes the
         backward kernel reads (so allocator, kernel, keep-best clone and the
         ``[0, 1]`` projection all agree on the shape). Returns ``None`` when the
         predecessor boxes are missing so the kernel falls back to its rule slope.
         """
         from act.back_end.dual_tf.tf_transformer import (
-            attention_rule_alpha, _attention_input_boxes,
+            attention_rule_alpha, _attention_input_boxes, matmul_rule_alpha, _matmul_shapes,
         )
         kind = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
-        src_keys = ("q_src", "k_src") if kind == "ATT_SCORES" else ("w_src", "v_src")
-        if any(int(layer.params[key]) not in bounds_dict for key in src_keys):
-            # Missing predecessor bounds disable learned attention slopes.
+        if kind == LayerKind.MATMUL.value:
+            source_ids = net.preds[layer.id]
+        else:
+            src_keys = ("q_src", "k_src") if kind == "ATT_SCORES" else ("w_src", "v_src")
+            source_ids = [cast(int, layer.params[key]) for key in src_keys]
+        if any(lid not in bounds_dict for lid in source_ids):
+            # Missing predecessor bounds leave the kernel at its fixed rule.
             return None
-        boxes = _attention_input_boxes(layer, bounds_dict)
-        x_l, x_u, y_l, y_u, _scale, _mask = boxes
+        operands = self._bilinear_operand_bounds(net, bounds_dict, source_ids)
+        if kind == LayerKind.MATMUL.value:
+            x_box, y_box = (operands[lid] for lid in source_ids)
+            x_l, x_u, y_l, y_u = (box.flatten(1) for box in (x_box.lb, x_box.ub, y_box.lb, y_box.ub))
+        else:
+            x_l, x_u, y_l, y_u, _scale, _mask = _attention_input_boxes(layer, operands)
         x_l = x_l.to(device=device, dtype=dtype)
         x_u = x_u.to(device=device, dtype=dtype)
         y_l = y_l.to(device=device, dtype=dtype)
@@ -857,7 +1266,12 @@ class DualSolver(Solver):
                 "omega_u": prior["omega_u"].detach().clone().to(device=device, dtype=dtype).clamp(0.0, 1.0),
             }
         else:
-            tree = attention_rule_alpha(x_l, x_u, y_l, y_u)
+            k_thresh = float(cast(float, layer.params.get("k_thresh", 1.0)))
+            if kind == LayerKind.MATMUL.value:
+                shape = _matmul_shapes(layer.params["x_shape"], layer.params["y_shape"])
+                tree = matmul_rule_alpha(x_l, x_u, y_l, y_u, *shape, k_thresh)
+            else:
+                tree = attention_rule_alpha(x_l, x_u, y_l, y_u, k_thresh)
         if optimize_alpha:
             return {key: torch.nn.Parameter(val.detach().clone()) for key, val in tree.items()}
         return {key: val.detach() for key, val in tree.items()}
@@ -872,7 +1286,7 @@ class DualSolver(Solver):
         lr_alpha: float = 0.1,
         lr_beta: float = 0.1,
         lr_decay: float = 0.98,
-        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[AlphaState] = None,
         incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
         split_signs: Optional[Dict[int, torch.Tensor]] = None,
         return_sce: bool = False,
@@ -881,27 +1295,23 @@ class DualSolver(Solver):
         refresh_forward: bool = True,
         start_lid: Optional[int] = None,
         forward_lin_max_perturbed: Optional[int] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Dict[int, torch.Tensor],
-        Dict[int, torch.Tensor],
-    ]:
+        forward_frame: Optional[ForwardFrame] = None,
+        dual_config: Optional[DualConfig] = None,
+        stop_criterion: Optional[Callable[[torch.Tensor], bool]] = None,
+    ) -> DualResult:
         """Joint α/η optimization: iterative dual lower-bound refinement.
 
         Each ReLU gets a learnable lower-envelope slope α constrained to [0, 1].
         Each split layer with a nonzero split sign gets a learnable η multiplier
         constrained to η ≥ 0.
 
-        Returns:
-            ``(best_bounds, best_sce, alpha_state, eta_state)`` where
-            ``best_bounds`` has shape ``[B*M]``, ``best_sce`` is optional,
-            ``alpha_state`` maps ReLU layer id to optimized α, and ``eta_state``
-            maps split layer id to optimized η.
-
-        ``forward_lin_max_perturbed=None`` resolves to the DualConfig default
-        at call time rather than being frozen at import time.
+        Keep independent best backward/forward bounds. Snapshots are taken
+        before Adam updates, and shared alpha states are replayed before they
+        become CLIMB evidence. Stop checks run after a completed evaluation.
         """
+        policy = dual_config if dual_config is not None else DualConfig()
+        self.last_alpha_iterations = 0
+        self.last_alpha_stop_reason = "fixed"
         if forward_lin_max_perturbed is None:
             forward_lin_max_perturbed = DualConfig().forward_lin_max_perturbed
         if c.dim() != 2:
@@ -950,12 +1360,12 @@ class DualSolver(Solver):
                         ancestor_lids.add(p)
                         stack.append(p)
 
-        alphas: Dict[int, Any] = {}
+        alphas: AlphaState = {}
         for layer in net.layers:
             if ancestor_lids is not None and layer.id not in ancestor_lids:
                 continue
             tree = self._init_alpha(
-                layer, bounds_dict, B, M, device, dtype,
+                net, layer, bounds_dict, B, M, device, dtype,
                 per_class_alpha=per_class_alpha,
                 optimize_alpha=optimize_alpha,
                 incremental_alphas=incremental_alphas,
@@ -983,13 +1393,6 @@ class DualSolver(Solver):
                     eta_init = torch.zeros_like(signs_init)
                 etas[lid] = torch.nn.Parameter(eta_init)
 
-        if not alphas and not etas:
-            result = self.compute_certified_bound(
-                net, bounds_dict, c, M=M, return_sce=return_sce,
-                start_lid=start_lid,
-            )
-            return result.margins.detach(), result.sce, {}, {}
-
         param_groups: List[Dict[str, object]] = []
         alpha_params = [
             leaf
@@ -1002,17 +1405,21 @@ class DualSolver(Solver):
             param_groups.append({"params": alpha_params, "lr": lr_alpha})
         if eta_params:
             param_groups.append({"params": eta_params, "lr": lr_beta})
-        if not param_groups:
+        if not param_groups or n_iters <= 0:
             result = self.compute_certified_bound(
                 net, bounds_dict, c, M=M, return_sce=return_sce,
-                alpha=cast(Dict[int, torch.Tensor], alphas) if alphas else None,
-                start_lid=start_lid,
+                alpha=alphas if alphas else None,
+                eta=cast(Dict[int, torch.Tensor], etas) if etas else None,
+                split_signs=split_signs, start_lid=start_lid,
+                forward_frame=forward_frame,
             )
-            return (
-                result.margins.detach(),
-                result.sce,
-                {lid: _clone_alpha_tree(tree) for lid, tree in alphas.items()},
-                {},
+            self.last_alpha_stop_reason = "n_iters" if n_iters <= 0 else "fixed"
+            return DualResult(
+                margins=result.margins.detach(), sce=result.sce,
+                alpha_state={lid: _clone_alpha_tree(tree) for lid, tree in alphas.items()},
+                eta_state={lid: value.detach().clone() for lid, value in etas.items()},
+                dual_margins=result.dual_margins,
+                forward_margins=result.forward_margins,
             )
         optimizer = torch.optim.Adam(param_groups)
         scheduler = (
@@ -1021,8 +1428,9 @@ class DualSolver(Solver):
             else None
         )
         best_bounds = torch.full((BM,), float("-inf"), device=device, dtype=dtype)
+        best_forward: Optional[torch.Tensor] = None
         best_sce: Optional[torch.Tensor] = None
-        best_alpha_state: Dict[int, Any] = {
+        best_alpha_state: AlphaState = {
             lid: _clone_alpha_tree(tree) for lid, tree in alphas.items()
         }
         best_eta_state: Dict[int, torch.Tensor] = {
@@ -1031,30 +1439,38 @@ class DualSolver(Solver):
 
         from act.back_end.dual_tf.tf_forward import compute_forward_bounds
 
+        forward_alphas = {
+            lid: value[:, 0, :] if value.dim() == 3 else value
+            for lid, value in alphas.items()
+            if isinstance(value, torch.Tensor)
+        }
+        started = _monotonic() if policy.max_time > 0 else 0.0
+        prefix = ForwardPrefixCache(
+            net, input_lb, input_ub, alpha_relu_ids=set(forward_alphas),
+            forward_lin_max_perturbed=forward_lin_max_perturbed,
+        ) if refresh_forward else None
+        flat_iterations = 0
+        self.last_alpha_stop_reason = "n_iters"
         with torch.enable_grad():
             for _ in range(n_iters):
                 optimizer.zero_grad()
-                alpha_tensors = cast(Dict[int, torch.Tensor], alphas)
                 eta_tensors = cast(Dict[int, torch.Tensor], etas)
                 if refresh_forward:
-                    forward_alphas = {
-                        lid: a[:, 0, :] if a.dim() == 3 else a
-                        for lid, a in alpha_tensors.items()
-                        if isinstance(a, torch.Tensor)
-                    }
-                    fresh_bounds = compute_forward_bounds(
+                    fresh_bounds, current_frame, _stats = compute_forward_bounds(
                         net,
                         input_lb,
                         input_ub,
                         post_activation=False,
                         alphas=forward_alphas,
                         forward_lin_max_perturbed=forward_lin_max_perturbed,
+                        prefix_cache=prefix,
                     )
                 else:
                     # Fixed intermediate bounds (root-reuse mode): alpha/eta
                     # only enter the backward pass; sound for any valid
                     # bounds_dict.
                     fresh_bounds = bounds_dict
+                    current_frame = forward_frame
                 result = self.compute_certified_bound(
                     net,
                     fresh_bounds,
@@ -1062,29 +1478,73 @@ class DualSolver(Solver):
                     M=M,
                     return_sce=return_sce,
                     enable_grad=True,
-                    alpha=alpha_tensors,
+                    alpha=alphas,
                     eta=eta_tensors,
                     split_signs=split_signs,
                     start_lid=start_lid,
+                    forward_frame=current_frame if start_lid is None else None,
                 )
-                bound_bm = result.margins
+                assert result.dual_margins is not None
+                bound_bm = result.dual_margins
                 sce = result.sce
 
-                if not bound_bm.requires_grad:
-                    # No autograd path reaches any α/η parameter (every ReLU
-                    # stable and every pool window dominant): gradient steps
-                    # cannot move the bound, and backward() would raise.
-                    # Return the fixed-slope bound as optimize=False would.
+                with torch.no_grad():
+                    if result.forward_margins is not None:
+                        values = result.forward_margins.detach()
+                        best_forward = values if best_forward is None else torch.maximum(best_forward, values)
                     detached = bound_bm.detach()
-                    improved = detached > best_bounds
+                    improved = torch.isfinite(detached) & (detached > best_bounds)
+                    gained = torch.isfinite(detached) & (detached > best_bounds + policy.stagnation_tol)
+                    flat_iterations = 0 if bool(gained.any()) else flat_iterations + 1
                     best_bounds = torch.where(improved, detached, best_bounds)
+                    rows_improved = improved.reshape(B, M)
+                    if bool(improved.any()):
+                        for lid, tree in alphas.items():
+                            evaluated = _clone_alpha_tree(tree)
+                            for old, new in zip(
+                                _alpha_tree_leaves(best_alpha_state[lid]),
+                                _alpha_tree_leaves(evaluated),
+                            ):
+                                if new.dim() and new.shape[0] == B:
+                                    per_row = (
+                                        per_class_alpha and net.by_id[lid].kind == LayerKind.RELU.value
+                                        and new.dim() == 3 and new.shape[1] == M
+                                    )
+                                    mask = rows_improved if per_row else rows_improved.any(dim=1)
+                                    new.copy_(torch.where(
+                                        mask.reshape(*mask.shape, *((1,) * (new.dim() - mask.dim()))),
+                                        new, old,
+                                    ))
+                            best_alpha_state[lid] = evaluated
+                        for lid, value in etas.items():
+                            per_row = value.dim() == 3 and value.shape[:2] == (B, M)
+                            mask = rows_improved if per_row else rows_improved.any(dim=1)
+                            best_eta_state[lid] = torch.where(
+                                mask.reshape(*mask.shape, *((1,) * (value.dim() - mask.dim()))),
+                                value.detach(), best_eta_state[lid],
+                            ).clone()
                     if return_sce and sce is not None:
                         if best_sce is None:
                             best_sce = sce.detach().clone()
                         else:
                             best_sce[improved] = sce[improved].detach()
-                    return best_bounds, best_sce, best_alpha_state, best_eta_state
-
+                    self.last_alpha_iterations += 1
+                    combined = best_bounds if best_forward is None else torch.maximum(best_bounds, best_forward)
+                    if stop_criterion is not None and stop_criterion(combined):
+                        self.last_alpha_stop_reason = "verified"
+                        break
+                    if policy.stagnation_patience > 0 and flat_iterations >= policy.stagnation_patience:
+                        self.last_alpha_stop_reason = "stagnation"
+                        break
+                    if policy.max_time > 0 and _monotonic() - started >= policy.max_time:
+                        self.last_alpha_stop_reason = "time"
+                        break
+                    if not bound_bm.requires_grad:
+                        self.last_alpha_stop_reason = "fixed"
+                        break
+                    if not bool(torch.isfinite(bound_bm).all()):
+                        self.last_alpha_stop_reason = "nonfinite"
+                        break
                 (-bound_bm.sum()).backward()
                 optimizer.step()
                 if scheduler is not None:
@@ -1093,122 +1553,15 @@ class DualSolver(Solver):
                 with torch.no_grad():
                     for tree in alphas.values():
                         for leaf in _alpha_tree_leaves(tree):
-                            leaf.data.clamp_(0.0, 1.0)
+                            leaf.clamp_(0.0, 1.0)
                     for e in etas.values():
-                        e.data.clamp_(min=0)
+                        e.clamp_(min=0)
 
-                    improved = bound_bm > best_bounds
-                    if improved.any():
-                        best_bounds = torch.where(improved, bound_bm.detach(), best_bounds)
-                        best_alpha_state = {
-                            lid: _clone_alpha_tree(tree) for lid, tree in alphas.items()
-                        }
-                        best_eta_state = {
-                            lid: e.detach().clone() for lid, e in etas.items()
-                        }
-                    if return_sce and sce is not None:
-                        if best_sce is None:
-                            best_sce = sce.detach().clone()
-                        else:
-                            best_sce[improved] = sce[improved].detach()
-
-        if n_iters <= 0:
-            result = self.compute_certified_bound(
-                net,
-                bounds_dict,
-                c,
-                M=M,
-                return_sce=return_sce,
-                enable_grad=False,
-                alpha=cast(Dict[int, torch.Tensor], alphas),
-                eta=cast(Dict[int, torch.Tensor], etas),
-                split_signs=split_signs,
-                start_lid=start_lid,
-            )
-            best_bounds = result.margins
-            best_sce = result.sce
-
-        return best_bounds.detach(), best_sce, best_alpha_state, best_eta_state
-
-    def _interval_refresh_bounds(
-        self,
-        net: Net,
-        base: Dict[int, Bounds],
-        split_signs: Dict[int, torch.Tensor],
-    ) -> Optional[Dict[int, Bounds]]:
-        """Re-propagate split phases with interval arithmetic and intersect base."""
-        from act.back_end.dual_tf.tf_forward import _fwd_conv2d_interval
-
-        out = dict(base)
-        vals: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer in net.layers:
-            k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
-            lid = layer.id
-            if k == LayerKind.ASSERT.value:
-                continue
-            if k in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
-                b = out.get(lid)
-                assert b is not None, f"_interval_refresh_bounds: no bounds for {k} layer {lid}"
-                vals[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
-                continue
-            preds = net.preds.get(lid, [])
-            if k == LayerKind.CONV2D.value:
-                plb, pub = vals[preds[0]]
-                lb, ub = _fwd_conv2d_interval(layer, plb, pub)
-                lb, ub = lb.flatten(start_dim=1), ub.flatten(start_dim=1)
-            elif k == LayerKind.DENSE.value:
-                w = layer.params["weight"]
-                bias = layer.params.get("bias")
-                assert isinstance(w, torch.Tensor), (
-                    f"_interval_refresh_bounds: DENSE layer {lid} weight is {type(w).__name__}"
-                )
-                plb, pub = vals[preds[0]]
-                c = (plb + pub) * 0.5
-                r = (pub - plb) * 0.5
-                m = c @ w.T
-                rho = r @ w.abs().T
-                lb = m - rho
-                ub = m + rho
-                if isinstance(bias, torch.Tensor):
-                    lb, ub = lb + bias, ub + bias
-            elif k == LayerKind.ADD.value:
-                (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
-                lb, ub = alb + blb, aub + bub
-            elif k in (LayerKind.FLATTEN.value, LayerKind.RESHAPE.value):
-                lb, ub = vals[preds[0]]
-            elif k == LayerKind.RELU.value:
-                lb, ub = vals[preds[0]]
-            else:
-                return None
-
-            b = out.get(lid)
-            if b is not None:
-                lb = torch.maximum(lb, b.lb.flatten(start_dim=1))
-                ub = torch.minimum(ub, b.ub.flatten(start_dim=1))
-                ub = torch.maximum(ub, lb)
-            if k == LayerKind.RELU.value:
-                s = split_signs.get(lid)
-                if s is not None:
-                    sl = s[:, 0, :] if s.dim() == 3 else s
-                    n = min(lb.shape[-1], sl.shape[-1])
-                    sn = sl[..., :n].to(lb.device)
-                    lb, ub = lb.clone(), ub.clone()
-                    lb[..., :n] = torch.where(
-                        sn > 0, lb[..., :n].clamp(min=0.0), lb[..., :n]
-                    )
-                    ub[..., :n] = torch.where(
-                        sn < 0, ub[..., :n].clamp(max=0.0), ub[..., :n]
-                    )
-                    ub[..., :n] = torch.maximum(ub[..., :n], lb[..., :n])
-            if b is not None:
-                out[lid] = Bounds(
-                    lb.view_as(b.lb).clone(), ub.view_as(b.ub).clone()
-                )
-            if k == LayerKind.RELU.value:
-                vals[lid] = (lb.clamp(min=0.0), ub.clamp(min=0.0))
-            else:
-                vals[lid] = (lb, ub)
-        return out
+        return DualResult(
+            margins=best_bounds if best_forward is None else torch.maximum(best_bounds, best_forward),
+            sce=best_sce, alpha_state=best_alpha_state, eta_state=best_eta_state,
+            dual_margins=best_bounds, forward_margins=best_forward,
+        )
 
     def _harden_split_bounds(
         self,
@@ -1282,6 +1635,7 @@ class DualSolver(Solver):
         blowup_ratio: float = 10.0,
         max_rows_per_call: int = 4096,
         optimize_iters: int = 20,
+        max_tensor_mib: float = 0.0,
     ) -> Dict[int, Bounds]:
         """Metric-driven backward refinement of selected pre-activation bounds.
 
@@ -1327,6 +1681,10 @@ class DualSolver(Solver):
         if not selected:
             return bounds_dict
 
+        max_rows_per_call, _ = self._refinement_chunks(
+            bounds_dict, max_rows_per_call, 1, max_tensor_mib, optimize_iters)
+        if max_rows_per_call == 0:
+            return bounds_dict
         out = dict(bounds_dict)
         for lid in selected:
             preds = net.preds.get(lid, [])
@@ -1388,6 +1746,7 @@ class DualSolver(Solver):
         rows_cap: int = 64,
         optimize_iters: int = 0,
         lane_chunk: int = 32,
+        max_tensor_mib: float = 0.0,
     ) -> Dict[int, Bounds]:
         """K-lane per-subproblem sparse refinement of pre-activation bounds.
 
@@ -1415,6 +1774,10 @@ class DualSolver(Solver):
             )
 
         out = self._harden_split_bounds(bounds_dict, split_signs)
+        rows_cap, lane_chunk = self._refinement_chunks(
+            out, rows_cap, lane_chunk, max_tensor_mib, optimize_iters)
+        if rows_cap == 0:
+            return out
 
         stats: List[tuple[int, int]] = []
         for layer in net.layers:
@@ -1487,13 +1850,38 @@ class DualSolver(Solver):
                 out[pred_lid] = refined
         return out
 
+    @staticmethod
+    def _refinement_chunks(
+        bounds_dict: Dict[int, Bounds], rows: int, lanes: int,
+        max_tensor_mib: float, optimize_iters: int,
+    ) -> tuple[int, int]:
+        """Limit existing refinement chunks before allocating query tensors.
+
+        Both signs and optimizer state are included in the conservative
+        per-query estimate. If even one query cannot fit, retain the already
+        valid bounds instead of skipping a necessary verification solve.
+        """
+        if not math.isfinite(max_tensor_mib) or max_tensor_mib < 0:
+            raise ValueError("max_tensor_mib must be finite and non-negative")
+        if max_tensor_mib == 0:
+            return rows, lanes
+        per_query = sum(
+            box.lb[0].numel() * box.lb.element_size()
+            for box in bounds_dict.values()
+        ) * (16 if optimize_iters > 0 else 4)
+        capacity = int(max_tensor_mib * 1024**2) // max(1, per_query)
+        if capacity == 0:
+            return 0, 0
+        rows = min(rows, capacity)
+        return rows, min(lanes, max(1, capacity // rows))
+
     def recompute_bounds_and_nu(
         self,
         net: Net,
         bounds_dict: Dict[int, Bounds],
         c: torch.Tensor,
         M: int,
-        alpha_state: Optional[Dict[int, torch.Tensor]] = None,
+        alpha_state: Optional[AlphaState] = None,
         eta_state: Optional[Dict[int, torch.Tensor]] = None,
         split_signs: Optional[Dict[int, torch.Tensor]] = None,
         per_class_alpha: bool = True,
@@ -1520,11 +1908,12 @@ class DualSolver(Solver):
 
         with torch.no_grad():
             forward_alphas = (
-                {lid: (a[:, 0, :] if a.dim() == 3 else a) for lid, a in alpha_state.items()}
+                {lid: (a[:, 0, :] if a.dim() == 3 else a)
+                 for lid, a in alpha_state.items() if isinstance(a, torch.Tensor)}
                 if alpha_state
                 else None
             )
-            fresh_bounds = compute_forward_bounds(
+            fresh_bounds, forward_frame, _stats = compute_forward_bounds(
                 net, input_lb, input_ub, post_activation=False, alphas=forward_alphas,
             )
             result = self.compute_certified_bound(
@@ -1537,6 +1926,7 @@ class DualSolver(Solver):
                 eta=eta_state if eta_state else None,
                 split_signs=split_signs,
                 return_nu_per_layer=True,
+                forward_frame=forward_frame,
             )
         return fresh_bounds, result.nu_per_layer
 
@@ -1565,10 +1955,11 @@ class DualSolver(Solver):
         opposite row aggregators.
 
         - ALL-rows kinds (LINEAR_LE, TOP1_ROBUST, MARGIN_ROBUST, RANGE):
-          ``encode_linear`` emits (C, thresholds) in UB-cert form (CERTIFIED
-          iff ``UB(C @ y) < threshold``). Pass ``-C`` / ``-thresholds`` to
-          ``compute_certified_bound`` and compare; ``slack >= 0`` means the
-          row passes. Certified iff every row passes (``.all()``).
+          ``encode_linear`` emits (C, thresholds) in UB-cert form.
+          Pass ``-C`` / ``-thresholds`` to
+          ``compute_certified_bound`` and compare using the unsafe-set boundary:
+          nonnegative slack for LINEAR_LE/RANGE, strictly escaping slack for
+          TOP1/MARGIN. Certified iff every active row passes (``.all()``).
         - EXISTS-row kind (UNSAFE_LINEAR): the unsafe polytope is
           ``P = {y : c_i^T y <= d_i for ALL i}``. SAFE iff for all reachable
           y, some row i satisfies ``c_i^T y > d_i`` (escape). Sound
@@ -1583,6 +1974,7 @@ class DualSolver(Solver):
                 or (when bounds_dict is supplied) the output layer's bounds are
                 missing / unbatched.
         """
+        forward_frame: Optional[ForwardFrame] = None
         if bounds_dict is None:
             from act.back_end.dual_tf.tf_forward import compute_forward_bounds
             from act.back_end.verifier import (
@@ -1591,7 +1983,7 @@ class DualSolver(Solver):
             )
             spec_layers = gather_input_spec_layers(net)
             seed_bounds = seed_from_input_specs(spec_layers)
-            bounds_dict = compute_forward_bounds(
+            bounds_dict, forward_frame, _stats = compute_forward_bounds(
                 net, seed_bounds.lb, seed_bounds.ub, post_activation=False,
             )
 
@@ -1616,7 +2008,6 @@ class DualSolver(Solver):
         # f64 tolerance (2.2e-14) was observed to false-CERTIFY such a draw
         # in CI while a concrete counterexample existed. float32 is
         # unaffected (100 ulp = 1.2e-5 > 1e-11).
-        cert_eps = max(100.0 * torch.finfo(dtype).eps, 1e-11)
         if sample.lb.dim() < 2:
             raise ValueError(
                 "DualSolver.evaluate_spec: bounds_dict entries must be batched "
@@ -1668,16 +2059,19 @@ class DualSolver(Solver):
                 if chunk_size is None or N <= chunk_size:
                     result = self.compute_certified_bound(
                         net, bounds_dict, C, M=N, enable_grad=enable_grad,
+                        forward_frame=forward_frame,
                     )
                     margins_flat = result.margins
                 else:
                     margins_flat = self._chunked_eval(
                         net, bounds_dict, C, B, N, n_out, chunk_size, enable_grad,
+                        forward_frame=forward_frame,
                     )
                 margins = margins_flat.view(B, N)
                 slack = margins - thresholds
-                cert_tol = cert_eps * margins.abs().clamp(min=1.0)
-                certified = ((slack > cert_tol) & active_mask).any(dim=-1)
+                certified = (escaping_spec_rows(
+                    slack, torch.maximum(margins.abs(), thresholds.abs())
+                ) & active_mask).any(dim=-1)
 
             return SpecBatchResult(
                 margins=margins,
@@ -1696,20 +2090,21 @@ class DualSolver(Solver):
             if chunk_size is None or M <= chunk_size:
                 result = self.compute_certified_bound(
                     net, bounds_dict, C_neg, M=M, enable_grad=enable_grad,
+                    forward_frame=forward_frame,
                 )
                 margins_flat = result.margins
             else:
                 margins_flat = self._chunked_eval(
                     net, bounds_dict, C_neg, B, M, n_out, chunk_size, enable_grad,
+                    forward_frame=forward_frame,
                 )
 
             margins = margins_flat.view(B, M)
             slack = margins - thresholds_neg
-            # margins is a SOUND LOWER bound on the true margin: certify iff
-            # every active row has slack >= 0. A positive tolerance band flags
-            # safe near-boundary rows (false UNKNOWN); slack < -cert_tol would be
-            # unsound. Hard zero boundary, matching bab.py.
-            violations = (slack < 0) & active_mask
+            violations = unproven_spec_rows(
+                slack, out_spec.kind,
+                torch.maximum(margins.abs(), thresholds_neg.abs()),
+            ) & active_mask
             certified = ~violations.any(dim=-1)
 
         return SpecBatchResult(
@@ -1723,6 +2118,7 @@ class DualSolver(Solver):
         self, net: Net, bounds_dict: Dict[int, Bounds],
         C_neg: torch.Tensor, B: int, M: int, n_out: int,
         chunk_size: int, enable_grad: bool,
+        forward_frame: Optional[ForwardFrame] = None,
     ) -> torch.Tensor:
         """Evaluate sign-flipped C in chunks along the M dimension.
 
@@ -1743,6 +2139,7 @@ class DualSolver(Solver):
             C_chunk = C_view[:, start:end, :].reshape(B * m_chunk, n_out).contiguous()
             result = self.compute_certified_bound(
                 net, bounds_dict, C_chunk, M=m_chunk, enable_grad=enable_grad,
+                forward_frame=forward_frame,
             )
             chunks.append(result.margins.view(B, m_chunk))
         return torch.cat(chunks, dim=1).reshape(B * M)
@@ -1821,254 +2218,61 @@ class DualSolver(Solver):
                                     return_sce: bool = False,
                                     enable_grad: bool = False
                                     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Exact dual lower bound of ``nu @ x`` over the input region.
+        """Bound the same linear form over the root balls and the current box.
 
-        For a box / L_inf spec (``p_norm`` unset or ``inf``) this is the box
-        concretization ``lb·[nu]_+ + ub·[nu]_-``. For a finite-p LP_EMBEDDING
-        spec it is the closed-form per-perturbed-word dual norm
-        ``nu·center − Σ_block ‖half_block ⊙ nu_block‖_q`` (``q`` the Hölder dual
-        of ``p``), which coincides with the box result exactly at p=inf, q=1.
-
-        Lazy M-broadcast: ``nu`` has leading dim ``B*M`` (sample-major)
-        while batched ``bounds_dict[input_lid]`` is ``[B, *shape]``. The
-        contribution per (b, m) reuses the same bounds for all m via
-        ``[B, 1, n]`` broadcast against ``[B, M, n]``. Bit-identical to
-        legacy M-expanded path.
-
-        The unbatched (``lb.dim() < 2``) and missing-bounds (lb/ub from
-        ``input_layer.params``) paths are preserved: they broadcast a single
-        ``[n]`` tensor against ``[BM, n]`` nu — the same as legacy with B=BM.
+        The returned candidate minimizes a root ball, not necessarily its
+        intersection with a child box. Concrete input/spec checks, not this
+        relaxation, decide whether a candidate is a counterexample.
         """
         with torch.set_grad_enabled(enable_grad):
             BM = nu.shape[0]
-            assert BM % M == 0, (
-                f"_input_contribution_from_nu: nu batch {BM} not divisible by M={M}"
-            )
+            if M <= 0 or BM % M:
+                raise ValueError(f"Input coefficient batch {BM} is incompatible with M={M}")
             B = BM // M
             input_layer = net.by_id[input_lid]
-
             bounds = bounds_dict.get(input_lid)
             if bounds is None:
-                if "lb" in input_layer.params and "ub" in input_layer.params:
-                    lb = cast(torch.Tensor, input_layer.params["lb"])
-                    ub = cast(torch.Tensor, input_layer.params["ub"])
-                else:
-                    raise ValueError(
-                        f"_input_contribution_from_nu: input layer {input_lid} has no "
-                        f"bounds in bounds_dict and no lb/ub params"
-                    )
+                lb, ub = input_layer.get_tensor("lb"), input_layer.get_tensor("ub")
+                if lb is None or ub is None:
+                    raise ValueError(f"Input layer {input_lid} has no bounds")
             else:
-                lb = bounds.lb
-                ub = bounds.ub
-
-            # A finite input Lp ball (LP_EMBEDDING) is concretized by its exact
-            # per-block dual norm; p=inf (or unset) falls through to the box
-            # path below, bit-identical for every current vision / box spec.
-            p_norm = _resolve_perturbation_norm(input_layer.params.get("p_norm"))
-            if p_norm != float("inf"):
-                return self._dual_norm_contribution(
-                    input_layer, lb, ub, nu, B, M,
-                    q=_dual_norm_exponent(p_norm),
-                    return_sce=return_sce,
-                )
-
-            orig_shape = lb.shape
-            v_flat = nu.flatten(start_dim=1)                       # [BM, n_in]
-
-            if lb.dim() < 2:
-                lb_b = lb.flatten().unsqueeze(0).expand(BM, -1)
-                ub_b = ub.flatten().unsqueeze(0).expand(BM, -1)
-                n = min(v_flat.shape[-1], lb_b.shape[-1])
-                if v_flat.shape[-1] != lb_b.shape[-1]:
-                    lb_b, ub_b, v_flat = lb_b[..., :n], ub_b[..., :n], v_flat[..., :n]
-                assert (lb_b <= ub_b).all(), "Invalid input bounds: lb > ub"
-                contrib = ((lb_b * v_flat.clamp(min=0)).sum(dim=-1)
-                           + (ub_b * v_flat.clamp(max=0)).sum(dim=-1))
-                sce = None
-                if return_sce:
-                    sce_flat = torch.where(v_flat > 0, lb_b, ub_b)
-                    if sce_flat.shape[-1] == lb.flatten().numel():
-                        sce = sce_flat.view(BM, *orig_shape)
-                    else:
-                        sce = sce_flat
-                return contrib, sce
-
-            lb_B = lb.flatten(start_dim=1)                         # [B, n_in]
-            ub_B = ub.flatten(start_dim=1)                         # [B, n_in]
-            n = min(v_flat.shape[-1], lb_B.shape[-1])
-            if v_flat.shape[-1] != lb_B.shape[-1]:
-                lb_B = lb_B[..., :n]
-                ub_B = ub_B[..., :n]
-                v_flat = v_flat[..., :n]
-            assert (lb_B <= ub_B).all(), "Invalid input bounds: lb > ub"
-
-            v = v_flat.view(B, M, n)                               # [B, M, n] view
-            lb_bc = lb_B.unsqueeze(1)                              # [B, 1, n]
-            ub_bc = ub_B.unsqueeze(1)                              # [B, 1, n]
-            contrib_BM = ((lb_bc * v.clamp(min=0)).sum(dim=-1)
-                          + (ub_bc * v.clamp(max=0)).sum(dim=-1))  # [B, M]
-            contrib = contrib_BM.view(BM)
-
-            sce = None
-            if return_sce:
-                sce_BMn = torch.where(v > 0, lb_bc, ub_bc)         # [B, M, n]
-                sce_flat = sce_BMn.view(BM, n)
-                total = int(torch.tensor(orig_shape[1:]).prod().item())
-                sce = sce_flat.view(BM, *orig_shape[1:]) if sce_flat.shape[-1] == total else sce_flat
-            return contrib, sce
-
-    def _dual_norm_contribution(self, input_layer: Layer,
-                                lb: torch.Tensor, ub: torch.Tensor,
-                                nu: torch.Tensor, B: int, M: int,
-                                q: float, return_sce: bool
-                                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Per-perturbed-word-block dual-norm input contribution (finite Lp).
-
-        Evaluates the inner minimization in closed form:
-        ``nu·center − Σ_block ‖half_block ⊙ nu_block‖_q`` with
-        ``center = (lb+ub)/2`` and ``half = (ub−lb)/2``. ``half`` equals the
-        radius ε on perturbed coordinates and 0 on degenerate (non-perturbed)
-        ones, so the latter contribute exactly ``nu·center`` with no penalty.
-        Each embedding block is normed independently, so word balls stay
-        decoupled. The dual norm is the exact value of ``min`` over the Lp ball,
-        so no second-order-cone constraint is needed (q=1↔p=inf reproduces the
-        box result, which the caller already routes through the box path).
-
-        Args:
-            input_layer: INPUT/INPUT_SPEC layer carrying ``p_norm`` and the
-                optional ``perturbed_positions`` / ``embed_dim`` block metadata.
-            lb: Input lower bounds, ``[B, *shape]`` (batched) or ``[*shape]``.
-            ub: Input upper bounds, matching ``lb``.
-            nu: Backward coefficient ``[B*M, *shape]`` (sample-major).
-            B: Number of samples (``B*M == nu.shape[0]``).
-            M: Spec rows per sample (lazy-M-broadcast factor).
-            q: Hölder dual exponent of the spec norm ``p``.
-            return_sce: Whether to also return the worst-case input witness.
-
-        Returns:
-            ``(contrib, sce)`` with ``contrib`` shape ``[B*M]`` and ``sce`` the
-            ball minimizer (``None`` when ``return_sce`` is False).
-        """
-        orig_shape = lb.shape
-        v_flat = nu.flatten(start_dim=1)                          # [BM, n_in]
-        batched = lb.dim() >= 2
-        if batched:
-            lb_f = lb.flatten(start_dim=1)                        # [B, n_in]
-            ub_f = ub.flatten(start_dim=1)
-        else:
-            lb_f = lb.flatten().unsqueeze(0)                      # [1, n_in]
-            ub_f = ub.flatten().unsqueeze(0)
-        n = min(v_flat.shape[-1], lb_f.shape[-1])
-        if v_flat.shape[-1] != lb_f.shape[-1]:
-            lb_f, ub_f, v_flat = lb_f[..., :n], ub_f[..., :n], v_flat[..., :n]
-        assert (lb_f <= ub_f).all(), "Invalid input bounds: lb > ub"
-
-        center = (lb_f + ub_f) * 0.5                              # [B|1, n]
-        half = (ub_f - lb_f) * 0.5
-        BM = v_flat.shape[0]
-        blocks = self._perturbed_block_slices(input_layer.params, orig_shape, n)
-
-        if batched:
-            v = v_flat.reshape(B, M, n)                           # [B, M, n]
-            center_bc = center.unsqueeze(1)                       # [B, 1, n]
-            half_bc = half.unsqueeze(1)
-            dot = (center_bc * v).sum(dim=-1)                     # [B, M]
-            penalty = torch.zeros_like(dot)
-            block_eps = input_layer.params.get("bab_block_eps")
-            if isinstance(block_eps, torch.Tensor):
-                eps_b = block_eps.to(device=v.device, dtype=v.dtype)
-                for block_idx, (s, e) in enumerate(blocks):
-                    penalty = penalty + eps_b[:, block_idx].unsqueeze(1) * torch.linalg.vector_norm(
-                        v[..., s:e], ord=q, dim=-1
-                    )
-            else:
-                for s, e in blocks:
-                    penalty = penalty + torch.linalg.vector_norm(
-                        half_bc[..., s:e] * v[..., s:e], ord=q, dim=-1
-                    )
-            contrib = (dot - penalty).reshape(BM)
-        else:
-            dot = (center * v_flat).sum(dim=-1)                   # [BM]
-            penalty = torch.zeros_like(dot)
-            for s, e in blocks:
-                penalty = penalty + torch.linalg.vector_norm(
-                    half[..., s:e] * v_flat[..., s:e], ord=q, dim=-1
-                )
-            contrib = dot - penalty
-
-        sce = None
-        if return_sce:
-            sce = self._dual_norm_sce(
-                center, half, v_flat, blocks, q, M, orig_shape, batched
+                lb, ub = bounds.lb, bounds.ub
+            box = Bounds(
+                lb.flatten(1) if lb.dim() >= 2 else lb.unsqueeze(0),
+                ub.flatten(1) if ub.dim() >= 2 else ub.unsqueeze(0),
             )
-        return contrib, sce
-
-    @staticmethod
-    def _perturbed_block_slices(params: Dict[str, Any], orig_shape: torch.Size,
-                                n: int) -> List[Tuple[int, int]]:
-        """Coordinate ranges ``[start, end)`` of each per-word embedding block.
-
-        Each word occupies ``embed_dim`` contiguous embedding coordinates, so the
-        dual norm is taken over those ``D`` coordinates independently and word
-        balls do not couple. Splitting every token (not only perturbed ones) is
-        sound and format-agnostic: a non-perturbed token has zero half-width, so
-        its block penalty ``‖0 ⊙ nu_block‖_q`` is exactly 0 — the box already
-        encodes which coordinates carry width, so ``perturbed_positions`` (index
-        list or bool mask, possibly per-sample) need not be parsed here. The block
-        size is read from ``embed_dim`` or, failing that, the trailing
-        ``[..., L, D]`` axis when ``perturbed_positions`` flags an embedding spec.
-        Otherwise the whole input is one Lp ball (e.g. an image L2 spec).
-        """
-        embed_dim = params.get("embed_dim")
-        if embed_dim is None:
-            if params.get("perturbed_positions") is not None and len(orig_shape) >= 2:
-                embed_dim = int(orig_shape[-1])
+            coefficients = nu.reshape(B, M, -1)
+            geometry = net.input_geometry
+            if geometry is not None:
+                geometry = geometry.to(nu)
+            if geometry is None or geometry.p == float("inf"):
+                # Preserve the existing backward box reduction order.
+                lower = (
+                    (coefficients.clamp(min=0) * box.lb.unsqueeze(1)).sum(-1)
+                    + (coefficients.clamp(max=0) * box.ub.unsqueeze(1)).sum(-1)
+                )
             else:
-                return [(0, n)]
-        d = int(embed_dim)
-        if d <= 0 or n % d != 0:
-            return [(0, n)]
-        return [(i * d, (i + 1) * d) for i in range(n // d)]
+                lower, _ = input_support(coefficients, Frame(box, geometry))
+            if not return_sce:
+                return lower.reshape(BM), None
 
-    def _dual_norm_sce(self, center: torch.Tensor, half: torch.Tensor,
-                       v_flat: torch.Tensor, blocks: List[Tuple[int, int]],
-                       q: float, M: int, orig_shape: torch.Size,
-                       batched: bool) -> torch.Tensor:
-        """Worst-case input on the per-block Lp ball that attains the bound.
-
-        The minimizer is ``center + δ*`` where, per block, ``δ*`` is the Hölder
-        witness of ``‖half ⊙ nu‖_q``: the scaled-L2 ray ``−(half²⊙nu)/‖half⊙nu‖₂``
-        for q=2 and a single max-coordinate spike for q=inf. Both lie on the ball
-        boundary, so the witness is a sound counterexample candidate (the box
-        corner is not, as it leaves the Lp ball). Non-perturbed coordinates stay
-        at center (zero width).
-        """
-        BM = v_flat.shape[0]
-        if batched:
-            center_bm = center.repeat_interleave(M, dim=0)        # [B,n] -> [BM,n]
-            half_bm = half.repeat_interleave(M, dim=0)
-        else:
-            center_bm = center.expand(BM, -1)                     # [1,n] -> [BM,n]
-            half_bm = half.expand(BM, -1)
-        sce_flat = center_bm.clone()
-        for s, e in blocks:
-            nu_b = v_flat[:, s:e]                                  # [BM, bs]
-            h_b = half_bm[:, s:e]
-            if q == 2.0:
-                hn = h_b * nu_b
-                norm = torch.linalg.vector_norm(hn, ord=2, dim=-1, keepdim=True)
-                delta = -(h_b * hn) / norm.clamp_min(_DUAL_NORM_EPS)
-            elif q == float("inf"):
-                idx = (h_b * nu_b).abs().argmax(dim=-1, keepdim=True)
-                spike = -torch.sign(nu_b.gather(-1, idx)) * h_b.gather(-1, idx)
-                delta = torch.zeros_like(h_b)
-                delta.scatter_(-1, idx, spike)
+            if geometry is None or geometry.p == float("inf"):
+                candidate = torch.where(
+                    coefficients > 0, box.lb.unsqueeze(1), box.ub.unsqueeze(1)
+                )
             else:
-                delta = torch.zeros_like(h_b)
-            sce_flat[:, s:e] = center_bm[:, s:e] + delta
-        if batched:
-            tail = orig_shape[1:]
-            total = int(torch.tensor(tail).prod().item()) if len(tail) else 1
-            return sce_flat.view(BM, *tail) if sce_flat.shape[-1] == total else sce_flat
-        total = int(torch.tensor(orig_shape).prod().item())
-        return sce_flat.view(BM, *orig_shape) if sce_flat.shape[-1] == total else sce_flat
+                coeff = coefficients.reshape(B, M, -1, geometry.embed_dim)
+                if geometry.q == float("inf"):
+                    index = coeff.abs().argmax(dim=-1, keepdim=True)
+                    direction = torch.zeros_like(coeff).scatter(
+                        -1, index, -coeff.gather(-1, index).sign()
+                    )
+                else:
+                    norm = lp_norm(coeff, geometry.q, keepdim=True)
+                    unit = coeff.abs() / torch.where(norm == 0, 1.0, norm)
+                    direction = -coeff.sign() * unit.pow(geometry.q - 1)
+                center = geometry.center.to(nu).reshape(geometry.center.shape[0], 1, -1, geometry.embed_dim)
+                radii = geometry.radii.to(nu).reshape(geometry.center.shape[0], 1, -1, 1)
+                candidate = center + radii * direction
+            tail = lb.shape[1:] if lb.dim() >= 2 else lb.shape
+            return lower.reshape(BM), candidate.reshape(BM, *tail)

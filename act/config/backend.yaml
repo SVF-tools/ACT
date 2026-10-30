@@ -36,16 +36,17 @@ bab_presets:
   # CLIMB: query-local certificate replay, core learning and phase propagation.
   # When the dual bound certifies a subproblem, its alpha/eta certificate is
   # replayed to measure what each split decision (ReLU phase literal) it relied
-  # on contributes, and literals are dropped while the budget
-  # theta * slack - delta covers them (the first recheck_k lanes get one extra
-  # replay). The surviving literals form a core, kept in a per-query library of
+  # on contributes. The budget proposes deletions, with up to recheck_k extra
+  # deletion attempts. Every changed row must pass final replay before it
+  # forms a core, kept in a per-query library of
   # at most max_cores cores (subsumption, resolution, eviction). Pending
   # subproblems whose split signs contain a core are discharged before
   # bounding, and unresolved ones before splitting.
   # validate_climb_config raises ConfigError unless solver_tier is
   # dual_alpha_eta, bounding is a TopKBounding pool, branching splits neurons,
-  # and root_bounds_reuse, intermediate_refine and per_subproblem_refine are
-  # "none".
+  # and per_subproblem_refine is "none". Both split-refresh modes are supported:
+  # replay rebuilds retained conditions from a required split-free base.
+  # Conditioned bounds must never substitute for that base.
   climb:
     # Replay needs the alpha/eta dual certificate.
     solver_tier: "dual_alpha_eta"
@@ -54,9 +55,9 @@ bab_presets:
     branching_method: "babsr"
     # CLIMB prunes the pending pool, which must be a TopKBounding pool.
     bounding: "depth_bound_blend"
-    # Prerequisite: children re-run the forward pass (no root-bound reuse).
+    # Baseline: children re-run the forward pass on the unchanged root box.
     root_bounds_reuse: "none"
-    # Prerequisite: no intermediate-bound refinement at the root.
+    # Baseline: no root intermediate-bound refinement.
     intermediate_refine: "none"
     # Prerequisite: no per-subproblem intermediate-bound refinement.
     per_subproblem_refine: "none"
@@ -68,6 +69,60 @@ bab_presets:
     climb_recheck_k: 2
     # One split per step, so small nets still learn cores.
     multi_split_levels: 1
+
+  climb_refined:
+    # Replay uses the evaluated alpha/eta backward certificate.
+    solver_tier: "dual_alpha_eta"
+    # Keep neuron-only splitting and the existing CLIMB-compatible pool.
+    branching_method: "babsr"
+    bounding: "depth_bound_blend"
+    # Reuse bounds tightened once on the full root domain.
+    root_bounds_reuse: "plain"
+    intermediate_refine: "all"
+    # Split-dependent tightening cannot be reused after literal deletion.
+    per_subproblem_refine: "none"
+    # Preserve the baseline coarsening policy and binary split width.
+    climb_enabled: true
+    climb_theta: 0.5
+    climb_recheck_k: 2
+    multi_split_levels: 1
+
+  climb_split:
+    solver_tier: "dual_alpha_eta"         # optimize slopes and split multipliers
+    branching_method: "babsr"            # neuron decisions shared by CLIMB
+    bounding: "depth_bound_blend"         # ordered frontier with merge support
+    root_bounds_reuse: "split_refresh"   # replay only retained split conditions
+    intermediate_refine: "all"           # tighten the root reference
+    per_subproblem_refine: "none"        # preserve the replay contract
+    climb_enabled: true                 # learn and propagate checked cores
+    climb_merge_enabled: true           # merge complementary root-domain rows
+    climb_complement_bounding: true      # bound newly learned core complements
+    climb_theta: 0.0                    # delete only exact zero-cost literals
+    climb_recheck_k: 0                   # no extra deletion probes
+    multi_split_levels: 1               # binary neuron splitting
+    terminal_lp_enabled: true            # checked terminal LP fallback
+    climb_terminal_cores: true           # checked root-domain terminal cores
+    frontier_mem_safety: 0.6             # opt into CUDA memory planning
+    intermediate_refine_max_tensor_mib: 1024.0 # cap optional refinement tensors
+
+  climb_split_lin:
+    solver_tier: "dual_alpha_eta"         # optimize slopes and split multipliers
+    branching_method: "babsr"            # neuron decisions shared by CLIMB
+    bounding: "depth_bound_blend"         # ordered frontier with merge support
+    root_bounds_reuse: "split_refresh_linear" # affine/ReLU halfspace refresh
+    intermediate_refine: "all"           # tighten the root reference
+    per_subproblem_refine: "none"        # preserve the replay contract
+    climb_enabled: true                 # learn and propagate checked cores
+    climb_merge_enabled: true           # merge complementary root-domain rows
+    climb_complement_bounding: false     # linear refresh replaces extra probes
+    climb_lin_support_refinement: false  # conservative halfspace supports
+    climb_theta: 0.0                    # delete only exact zero-cost literals
+    climb_recheck_k: 0                   # no extra deletion probes
+    multi_split_levels: 1               # binary neuron splitting
+    terminal_lp_enabled: true            # checked terminal LP fallback
+    climb_terminal_cores: true           # checked root-domain terminal cores
+    frontier_mem_safety: 0.6             # opt into CUDA memory planning
+    intermediate_refine_max_tensor_mib: 1024.0 # cap optional refinement tensors
 
 backend:
 
@@ -189,6 +244,10 @@ backend:
     lr_alpha: 0.1                   # Adam learning rate for alpha (relaxation slopes)
     lr_beta: 0.1                    # Adam learning rate for eta (split-constraint multipliers)
     lr_decay: 0.98                  # multiplicative learning-rate decay per Adam iteration
+    stagnation_patience: 0          # non-improving iterations before stopping; 0 disables
+    stagnation_tol: 0.00001         # minimum bound improvement to reset stagnation
+    stop_when_verified: false       # stop when every lane is certified
+    max_time: 0.0                   # optimization time limit in seconds; 0 disables
     per_class_alpha: true           # separate alpha tensors per output class
     incremental_start_enabled: true # children start from the parent's alpha/eta
     # Linear forward bounds are kept up to this many perturbed input dims;
@@ -213,6 +272,8 @@ backend:
     # Max pending subproblems; above it the lowest-priority ones are evicted,
     # which also rules out CERTIFIED. 0 = no cap.
     frontier_cap: 0
+    frontier_mem_safety: 0.0       # CUDA planner fraction; 0 preserves the existing path
+    frontier_offload: true        # allow host storage only when CUDA planner is active
     # Pieces per input-axis split (values below 2 are raised to 2).
     input_split_fanout: 2
     # -- Branching: which over-approximated activation (or input axis) to split
@@ -277,15 +338,19 @@ backend:
     # -- Intermediate-bound refinement and root-bound reuse (dual tiers) -----
     intermediate_refine: "none"           # root pre-activation refinement: none/auto/all
     intermediate_refine_ratio: 10.0       # auto mode: refine layers wider than ratio x median
-    root_bounds_reuse: "none"             # children reuse root bounds: none/plain/split_refresh
+    intermediate_refine_max_tensor_mib: 0.0 # extra refinement cap; 0 preserves existing chunks
+    root_bounds_reuse: "none"             # none/plain/split_refresh/split_refresh_linear
+    climb_lin_support_refinement: true   # winning halfspaces only in linear refresh
     eta_only_children: false              # children keep the parent's alpha, optimize only eta
     presplit_levels: 0                    # pre-split k root neurons into 2^k sign combinations
     per_subproblem_refine: "none"         # per-subproblem refinement: none/tail/all (needs reuse)
     per_subproblem_refine_iters: 0        # Adam iterations (0 = one fixed-slope backward pass)
     per_subproblem_refine_rows_cap: 64    # max refined neurons per layer per batch (widest first)
+    presolve_time_fraction: 0.0           # root time window in [0, 1] of timeout, from BaB entry (0 = remaining timeout)
+    child_n_iters: 0                      # alpha/eta iterations on optimized all-child batches (0 = dual.n_iters)
 
     # Automatic BaB batch sizing. Used only when verify_bab_batched is called with
-    # max_batch_size="auto"; the CLI passes the integer bab_max_batch_size.
+    # max_batch_size="auto"; bab_max_batch_size accepts a positive integer or auto.
     auto_batch_safety: 0.55       # fraction of total GPU memory the sizer may target
     auto_batch_cap: 2048          # upper bound on the auto batch size (also the CPU fallback)
     auto_batch_floor: 8           # lower bound on the auto batch size
@@ -309,13 +374,28 @@ backend:
     # dual_alpha_eta = optimized alpha and split multipliers (eta). See dual:.
     solver_tier: "lp"
 
+    # -- Terminal evidence and optional exact escalation ------------------
+    terminal_lp_enabled: false    # candidate-less lanes: checked LP certificates
+    climb_terminal_cores: true    # publish root-box LP cores; theta-budget subsets need a fresh LP
+    milp_escalation: false        # optional exact ReLU solve before BaB; lazy import
+    milp_max_variables: 2000      # includes unstable-ReLU binary variables
+    milp_max_constraints: 2000    # includes exact-ReLU and property constraints
+    milp_timeout: 60.0            # seconds, capped by the shared remaining deadline
+
     # -- CLIMB certificate reuse (ReLU neuron branching only) ---------------
     climb_enabled: false          # enable CLIMB (see bab_presets.climb above)
-    climb_theta: 0.0              # fraction of replay slack spent on dropping literals
+    # Ablation gates default on, preserving the existing CLIMB algorithm.
+    climb_coarsening_enabled: true  # false admits full replay-certified literal rows
+    climb_propagation_enabled: true # false learns cores but neither prunes, infers nor merges with them
+    climb_merge_enabled: false     # on an unseen core, merge root-domain complementary rows to a fixed point
+    climb_complement_bounding: false # one root-domain complement probe per new core
+    climb_steer: false             # core-frequency bias on finite branching scores only
+    climb_presplit_propagation_enabled: true # false defers propagation and merge to the next pre-bound step
+    climb_theta: 0.0              # fraction of slack spent on dropping literals; zero-cost ones always drop
     # Deletion-budget safety margin: delta = climb_delta_abs + climb_delta_rel * |slack|.
     climb_delta_abs: 0.000000001  # absolute part of delta
     climb_delta_rel: 0.0000001    # relative part of delta (scaled by |slack|)
-    climb_recheck_k: 0            # lanes that get one extra replay after coarsening
+    climb_recheck_k: 0            # dual lanes that get one extra replay after coarsening
     climb_max_cores: 1024         # max cores kept (after subsumption, then eviction)
     # Cores per propagate matmul chunk (memory only; fixpoint is chunk-independent).
     climb_propagate_core_chunk: 4096

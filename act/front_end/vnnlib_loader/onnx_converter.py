@@ -14,10 +14,13 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 import logging
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from onnx import ModelProto
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +206,43 @@ def _preprocess_onnx_for_onnx2torch(onnx_model):
     return onnx_model
 
 
+def _ensure_unique_node_names(onnx_model: ModelProto) -> ModelProto:
+    """Give graph nodes nonempty unique names without changing value edges."""
+    reserved = {node.name for node in onnx_model.graph.node if node.name}
+    seen: set[str] = set()
+    for index, node in enumerate(onnx_model.graph.node):
+        if node.name and node.name not in seen:
+            seen.add(node.name)
+            continue
+        base = f"act_{node.op_type}_{index}"
+        name = base
+        suffix = 1
+        while name in reserved:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        node.name = name
+        reserved.add(name)
+        seen.add(name)
+    return onnx_model
+
+
+def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
+    """Apply the same opset and graph preparation on main and raw retry."""
+    try:
+        from onnx import version_converter
+
+        current_opset = max(
+            (op.version for op in onnx_model.opset_import if not op.domain or op.domain == "ai.onnx"),
+            default=0,
+        )
+        if 0 < current_opset < 13:
+            logger.info("Upgrading ONNX opset %s → 13", current_opset)
+            onnx_model = version_converter.convert_version(onnx_model, 13)
+    except Exception as exc:
+        logger.warning("Opset upgrade failed (%s), proceeding with original opset", exc)
+    return _ensure_unique_node_names(_preprocess_onnx_for_onnx2torch(onnx_model))
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -233,17 +273,7 @@ def convert_onnx_to_pytorch(
         logger.info(f"Loading ONNX model from {onnx_path}")
         onnx_model = onnx.load(str(onnx_path))
         
-        # Upgrade old opsets for onnx2torch compatibility (e.g. ACAS Xu ships opset 8)
-        try:
-            from onnx import version_converter
-            current_opset = max((op.version for op in onnx_model.opset_import if not op.domain or op.domain == 'ai.onnx'), default=0)
-            if 0 < current_opset < 13:
-                logger.info(f"Upgrading ONNX opset {current_opset} → 13")
-                onnx_model = version_converter.convert_version(onnx_model, 13)
-        except Exception as e:
-            logger.warning(f"Opset upgrade failed ({e}), proceeding with original opset")
-        
-        onnx_model = _preprocess_onnx_for_onnx2torch(onnx_model)
+        onnx_model = _prepare_onnx_for_conversion(onnx_model)
 
         # Optionally simplify
         if simplify:
@@ -253,6 +283,7 @@ def convert_onnx_to_pytorch(
                 onnx_model, check = onnxsim.simplify(onnx_model)
                 if not check:
                     logger.warning("ONNX simplification check failed, using original model")
+                onnx_model = _ensure_unique_node_names(onnx_model)
             except ImportError:
                 logger.warning("onnxsim not available, skipping simplification")
             except Exception as e:
@@ -282,10 +313,7 @@ def convert_onnx_to_pytorch(
                     f"retrying with simplify=False"
                 )
                 raw_model = onnx.load(str(onnx_path))
-                # Apply the same preprocessing here too -- without it, the
-                # fallback can hit the very issues the main path's
-                # _preprocess_onnx_for_onnx2torch was added to fix.
-                raw_model = _preprocess_onnx_for_onnx2torch(raw_model)
+                raw_model = _prepare_onnx_for_conversion(raw_model)
                 try:
                     from onnx import shape_inference
                     raw_model = shape_inference.infer_shapes(raw_model)
@@ -329,7 +357,9 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
         onnx_path: Path to .onnx file
         
     Returns:
-        Input shape tuple WITH batch=1 (normalized to (1, C, H, W) format)
+        Declared input shape; only a dynamic leading dimension is normalized
+        to 1. Fixed leading extents remain model structure for the selected
+        supported conversion operators.
         
     Raises:
         ONNXConversionError: If shape extraction fails
@@ -356,13 +386,8 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
             shape = (1,) + tuple(shape[1:])
             logger.info(f"Normalized dynamic batch to 1: {shape}")
         else:
-            # Keep original batch dimension (whether 1, 32, etc.)
-            logger.info(f"Extracted input shape: {shape}")
-            if shape[0] != 1:
-                logger.warning(
-                    f"ONNX model has batch size {shape[0]}, but verification "
-                    f"assumes batch=1. Results may be incorrect."
-                )
+            # A fixed leading extent remains part of one model input.
+            logger.info("Extracted fixed ONNX input shape: %s", shape)
         
         return tuple(shape)
         
@@ -380,7 +405,8 @@ def get_onnx_output_shape(onnx_path: Path) -> Tuple[int, ...]:
         onnx_path: Path to .onnx file
         
     Returns:
-        Output shape tuple WITH batch=1 (normalized to (1, num_classes) format)
+        Declared output shape; only a dynamic leading dimension is normalized
+        to 1. A fixed leading extent does not imply multiple verifier lanes.
         
     Raises:
         ONNXConversionError: If shape extraction fails
@@ -407,13 +433,7 @@ def get_onnx_output_shape(onnx_path: Path) -> Tuple[int, ...]:
             shape = (1,) + tuple(shape[1:])
             logger.info(f"Normalized dynamic batch to 1: {shape}")
         else:
-            # Keep original batch dimension
-            logger.info(f"Extracted output shape: {shape}")
-            if shape[0] != 1:
-                logger.warning(
-                    f"ONNX model has output batch size {shape[0]}, but verification "
-                    f"assumes batch=1. Results may be incorrect."
-                )
+            logger.info("Extracted fixed ONNX output shape: %s", shape)
         
         return tuple(shape)
         
