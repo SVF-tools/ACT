@@ -31,7 +31,7 @@ from act.back_end.bab.node import (
     slice_bounds_dict,
 )
 from act.back_end.core import Bounds, Layer, Net
-from act.back_end.layer_schema import LayerKind
+from act.back_end.dual_tf.tf_forward import BoundSupport, refresh_bounds
 from act.back_end.solver.solver_base import SolveStatus
 from act.back_end.solver.solver_dual import (
     DualBatchResult, MixedAlpha, certification_tolerance, unproven_spec_rows,
@@ -60,10 +60,6 @@ if TYPE_CHECKING:
 _MERGE_PROBE_ROWS = 64
 _MERGE_GROUP_FANOUT = 64
 _SPLIT_REFRESH_MODES = ("split_refresh", "split_refresh_linear")
-_ENDPOINT_PRESERVING = frozenset({
-    LayerKind.ADD.value, LayerKind.BIAS.value, LayerKind.FLATTEN.value,
-    LayerKind.RELU.value, LayerKind.RESHAPE.value,
-})
 
 
 @dataclass(frozen=True)
@@ -137,112 +133,6 @@ class LiteralCodec:
             variables - offsets.index_select(0, flat_indices).reshape_as(literals),
             literals.sign(),
         )
-
-
-@dataclass(frozen=True)
-class BoundSupport:
-    """Lower/upper dependencies [K,N,S] and provenance validity [K,N]."""
-
-    lower: torch.Tensor
-    upper: torch.Tensor
-    known: torch.Tensor
-
-
-def _lane_phase(split_signs: dict[int, torch.Tensor], lid: int) -> torch.Tensor | None:
-    """Return one layer's [K,N] phases after checking spec invariance."""
-    phase = split_signs.get(lid)
-    if phase is None or phase.dim() != 3:
-        return phase
-    if not torch.equal(phase, phase[:, :1].expand_as(phase)):
-        raise ValueError("split phases must be spec invariant")
-    return phase[:, 0]
-
-
-def _phase_bits(
-    phase: torch.Tensor, lid: int, layers: torch.Tensor, neurons: torch.Tensor,
-    signs: torch.Tensor, active: torch.Tensor,
-) -> torch.Tensor:
-    """Name the slot behind each phase; an unnamed phase needs its whole row."""
-    bits = torch.zeros(*phase.shape, active.shape[1], dtype=torch.bool, device=phase.device)
-    own = torch.zeros_like(phase, dtype=torch.bool)
-    lanes, slots = torch.where(active & (layers == lid))
-    indices = neurons[lanes, slots]
-    matching = signs[lanes, slots] == phase[lanes, indices]
-    own[lanes[matching], indices[matching]] = True
-    bits[lanes[matching], indices[matching], slots[matching]] = True
-    return bits | (((phase != 0) & ~own)[:, :, None] & active[:, None, :])
-
-
-def _root_valid_supports(
-    net: Net, base: dict[int, Bounds], split_signs: dict[int, torch.Tensor],
-    literals: torch.Tensor, codec: LiteralCodec,
-) -> dict[int, BoundSupport]:
-    """Supports of the split-free fallback: only a ReLU's own phase clamp."""
-    layers, neurons, signs = codec.decode_tensor(literals.masked_fill(literals == 0, 1))
-    active = literals != 0
-    supports = {}
-    for lid, box in base.items():
-        lb, ub = box.lb.flatten(1), box.ub.flatten(1)
-        lower = torch.zeros(*lb.shape, literals.shape[1], dtype=torch.bool, device=lb.device)
-        upper = lower.clone()
-        known = torch.ones_like(lb, dtype=torch.bool)
-        phase = _lane_phase(split_signs, lid) if net.by_id[lid].kind == LayerKind.RELU.value else None
-        if phase is not None:
-            bits = _phase_bits(phase, lid, layers, neurons, signs, active)
-            lower = bits & ((phase > 0) & (lb < 0))[:, :, None]
-            upper = bits & ((phase < 0) & (ub > 0))[:, :, None]
-            known &= ~(phase.ne(0).any(1) & ~active.any(1))[:, None]
-        supports[lid] = BoundSupport(lower, upper, known)
-    return supports
-
-
-def _inherited_support(
-    layer: Layer, preds: list[int], post_support: dict[int, BoundSupport],
-    shape: tuple[int, int], width: int, device: torch.device,
-) -> BoundSupport:
-    """Follow the operands each output endpoint used, per endpoint when known."""
-    k, n = shape
-    operands = [post_support[pid] for pid in preds]
-    if layer.kind in _ENDPOINT_PRESERVING and all(ps.known.shape == shape for ps in operands):
-        lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
-        upper = lower.clone()
-        known = torch.ones(shape, dtype=torch.bool, device=device)
-        for operand in operands:
-            lower |= operand.lower
-            upper |= operand.upper
-            known &= operand.known
-        return BoundSupport(lower, upper, known)
-    weight = layer.params.get("weight") if layer.kind == LayerKind.DENSE.value else None
-    lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
-    upper = lower.clone()
-    known = torch.ones(shape, dtype=torch.bool, device=device)
-    # Bound the temporary union by slots rather than materializing
-    # [K,N_parent,N_output,S] adjacency or broadcasting across specs.
-    if (isinstance(weight, torch.Tensor) and weight.dim() == 2 and weight.shape[0] == n
-            and operands[0].known.shape[1] == weight.shape[1]):
-        parent = operands[0]
-        positive = (weight > 0).T.to(device=device, dtype=torch.float32)
-        negative = (weight < 0).T.to(device=device, dtype=torch.float32)
-
-        def reaches(mask: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:
-            return (mask.transpose(1, 2).to(selector) @ selector).transpose(1, 2) > 0
-
-        for start in range(0, width, 64):
-            end = start + 64
-            low, high = parent.lower[..., start:end], parent.upper[..., start:end]
-            lower[..., start:end] = reaches(low, positive) | reaches(high, negative)
-            upper[..., start:end] = reaches(high, positive) | reaches(low, negative)
-        known = ((~parent.known).to(positive) @ (positive + negative)) == 0
-        return BoundSupport(lower, upper, known)
-    for start in range(0, width, 64):
-        end = start + 64
-        inherited = torch.zeros(k, min(end, width) - start, dtype=torch.bool, device=device)
-        for operand in operands:
-            inherited |= (operand.lower[..., start:end] | operand.upper[..., start:end]).any(1)
-        lower[..., start:end] = inherited[:, None, :]
-    for operand in operands:
-        known &= operand.known.all(1, keepdim=True)
-    return BoundSupport(lower, lower.clone(), known)
 
 
 def _canonical_rows(rows: torch.Tensor) -> torch.Tensor:
@@ -1137,7 +1027,6 @@ def certificate_replay(
         raise ValueError("replay objectives must match lane/spec dimensions")
     supports = None
     if split_refresh:
-        from act.back_end.bab.bound_refresh import refresh_bounds
         assert base_reference_bounds is not None
         refreshed = refresh_bounds(
             net, base_reference_bounds, batch.split_signs,
@@ -2228,7 +2117,7 @@ if __name__ == "__main__":
 
     import numpy as np
 
-    from act.back_end.bab.bound_refresh import (
+    from act.back_end.dual_tf.tf_forward import (
         _backward_row_bounds, _inherited_support, _joint_halfspace_lower,
     )
     from act.back_end.bab.branching.bounding import DiverseTopKBounding
@@ -2814,7 +2703,6 @@ if __name__ == "__main__":
         assert cap == 1. and torch.equal(attempted_batch.lb, lower)
         assert torch.equal(attempted_batch.decision_literals, torch.tensor([[1]]))
         assert disabled.bound_complements(solve_complement, lambda: 1., 1) == 0
-        from act.back_end.bab.bound_refresh import refresh_bounds
 
         for precision in ("float32", "float64"):
             initialize_device("cpu", precision)
@@ -3363,7 +3251,7 @@ if __name__ == "__main__":
         # used only here to solve explicit two-variable phase polytopes.
         from itertools import product
         from scipy.optimize import linprog
-        from act.back_end.bab.bound_refresh import _halfspace_lower
+        from act.back_end.dual_tf.tf_forward import _halfspace_lower
         from act.back_end.dual_tf.tf_forward import Frame
 
         for precision in ("float32", "float64"):
@@ -3440,7 +3328,7 @@ if __name__ == "__main__":
                 feasibility = linprog([0., 0.], A_ub=a_ub, b_ub=b_ub, bounds=[(-1., 1.)] * 2, method="highs")
                 enum_phases = {3: first.reshape(1, 1, 3), 5: second.reshape(1, 1, 2)}
                 with patch(
-                    "act.back_end.bab.bound_refresh._backward_row_bounds", wraps=_backward_row_bounds,
+                    "act.back_end.dual_tf.tf_forward._backward_row_bounds", wraps=_backward_row_bounds,
                 ) as second_layer_spy:
                     observed = refresh_bounds(linear_net, oracle_base, enum_phases, linear=True)
                 assert second_layer_spy.call_count <= 1
@@ -3470,13 +3358,13 @@ if __name__ == "__main__":
                 objectives, w1.new_zeros(2, 3), Frame(Bounds(-cube, cube)),
                 halfspace, offset,
             )
-            with patch("act.back_end.bab.bound_refresh._lin_bound_lane_chunk", return_value=1):
+            with patch("act.back_end.dual_tf.tf_forward._lin_bound_lane_chunk", return_value=1):
                 chunked_estimates = _halfspace_lower(
                     objectives, w1.new_zeros(2, 3), Frame(Bounds(-cube, cube)),
                     halfspace, offset,
                 )
             assert torch.equal(estimates, chunked_estimates)
-            with patch("act.back_end.bab.bound_refresh._lin_bound_lane_chunk", return_value=None):
+            with patch("act.back_end.dual_tf.tf_forward._lin_bound_lane_chunk", return_value=None):
                 no_memory_bound = _halfspace_lower(
                     objectives, w1.new_zeros(2, 3), Frame(Bounds(-cube, cube)),
                     halfspace, offset,
@@ -3530,7 +3418,7 @@ if __name__ == "__main__":
                 target, shift, square, axes, zero_offset, values([[1., 0.]]).bool(), both,
             )
             assert warm_value.item() <= -1 and warm_witness[0, 0, 1] == 0
-            with patch("act.back_end.bab.bound_refresh._lin_bound_lane_chunk", return_value=None):
+            with patch("act.back_end.dual_tf.tf_forward._lin_bound_lane_chunk", return_value=None):
                 assert torch.isneginf(_joint_halfspace_lower(target, shift, square, axes, zero_offset, both)[0]).all()
 
             # Independent LP oracle: K=2 lanes, M=2 rows, with lane chunking.
@@ -3543,7 +3431,7 @@ if __name__ == "__main__":
             oracle_value = _joint_halfspace_lower(
                 oracle_a, torch.zeros(2, 2, dtype=kind_dtype), oracle_frame, oracle_h, oracle_g, oracle_active,
             )[0]
-            with patch("act.back_end.bab.bound_refresh._lin_bound_lane_chunk", return_value=1):
+            with patch("act.back_end.dual_tf.tf_forward._lin_bound_lane_chunk", return_value=1):
                 chunked_value = _joint_halfspace_lower(
                     oracle_a, torch.zeros(2, 2, dtype=kind_dtype), oracle_frame, oracle_h, oracle_g, oracle_active,
                 )[0]
@@ -3849,13 +3737,13 @@ if __name__ == "__main__":
             assert torch.equal(uncharged.bounds[3].lb, joint_results[1].bounds[3].lb)
             # A later layer's rows tighten through each lane's own relaxations.
             with patch(
-                "act.back_end.bab.bound_refresh._backward_row_bounds", wraps=_backward_row_bounds,
+                "act.back_end.dual_tf.tf_forward._backward_row_bounds", wraps=_backward_row_bounds,
             ) as backward_spy:
                 refresh_bounds(joint_net, lane_base, joint_signs, linear=True)
             assert backward_spy.call_count == 0  # No ReLU precedes this first layer.
             # Neuron 0 is clamped in both lanes, and the parent dense layer never queries.
             with patch(
-                "act.back_end.bab.bound_refresh._joint_halfspace_lower", wraps=_joint_halfspace_lower,
+                "act.back_end.dual_tf.tf_forward._joint_halfspace_lower", wraps=_joint_halfspace_lower,
             ) as joint_spy:
                 refresh_bounds(joint_net, lane_base, joint_signs, linear=True)
             assert joint_spy.call_count == 2 and all(call.args[0].shape[1] == 2 for call in joint_spy.call_args_list)

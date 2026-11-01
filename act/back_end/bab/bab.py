@@ -75,7 +75,7 @@ from act.back_end.bab.branching.bounding import (
 )
 
 from act.back_end.core import Bounds, Layer, Net
-from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+from act.back_end.dual_tf.tf_forward import compute_forward_bounds, refresh_bounds
 from act.back_end.layer_schema import LayerKind
 from act.back_end.bab.violation import _check_input_specs_batched, check_violations_batched
 from act.back_end.solver.solver_base import Solver, SolveStatus
@@ -299,7 +299,6 @@ def _solve_dual_batch(
             ):
                 bounds_dict[layer.id] = lane_box
         if config.root_bounds_reuse in ("split_refresh", "split_refresh_linear") and batch.split_signs:
-            from act.back_end.bab.bound_refresh import refresh_bounds
             base_reference_bounds = bounds_dict
             refreshed = refresh_bounds(
                 net, bounds_dict, batch.split_signs,
@@ -2240,7 +2239,6 @@ if __name__ == "__main__":
                 c_rows=layout_result.c_rows, thresholds=layout_result.thresholds,
                 m_specs=3, out_kind=OutKind.LINEAR_LE, with_costs=False,
             ) is None
-        from act.back_end.bab.bound_refresh import refresh_bounds
 
         for mode in ("split_refresh", "split_refresh_linear"):
             for count in (1, 2):

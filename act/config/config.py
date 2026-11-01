@@ -33,7 +33,7 @@ NO_REFINEMENT_MODE: Final[str] = "none"
 #   ---------------|------------------------------|----------------------------
 #   none           | no (children re-propagate)   | n/a
 #   plain          | yes, untouched               | no
-#   split_refresh  | yes                          | bound_refresh.refresh_bounds +
+#   split_refresh  | yes                          | tf_forward.refresh_bounds +
 #                  |                              | per_subproblem_refine
 VALID_ROOT_BOUNDS_REUSE: Final[tuple[str, ...]] = (
     "none", "plain", "split_refresh", "split_refresh_linear",
