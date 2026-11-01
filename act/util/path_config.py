@@ -77,12 +77,14 @@ def get_torchvision_data_root() -> str:
 
 
 def get_pipeline_log_dir() -> str:
-    """Get the pipeline log directory path.
+    """Get the pipeline log directory path, creating it because git keeps none of its files.
     
     Returns:
         Absolute path to act/pipeline/log/ directory
     """
-    return os.path.join(act_root, 'pipeline', 'log')
+    log_dir = os.path.join(act_root, 'pipeline', 'log')
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
 
 
 def get_vnnlib_data_root() -> str:
