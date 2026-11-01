@@ -189,6 +189,7 @@ class BaBConfig:
     climb_propagation_enabled: bool = True
     """Apply learned cores to pending and active subproblems; false also disables merging."""
     climb_merge_enabled: bool = False
+    climb_merge_min_proof_rate: float = 0.05
     """Merge complementary root-domain rows to a fixed point on an unseen core, then rebound."""
     climb_complement_bounding: bool = False
     """Bound each new core's deepest-decision complement once on the root domain."""
@@ -290,7 +291,7 @@ class BaBConfig:
     target; lowered on a shared GPU. The sizer also never exceeds 90% of the
     currently-reclaimable memory (free + this process's reserved cache)."""
 
-    auto_batch_cap: int = 2048
+    auto_batch_cap: int = 1024
     """Hard upper bound on the auto-sized batch (also the CPU fallback)."""
 
     auto_batch_floor: int = 8
@@ -379,6 +380,8 @@ class BaBConfig:
             raise ConfigError("climb_delta_rel must be finite and non-negative")
         if self.climb_recheck_k < 0:
             raise ConfigError("climb_recheck_k must be non-negative")
+        if not 0.0 <= self.climb_merge_min_proof_rate <= 1.0:
+            raise ConfigError("climb_merge_min_proof_rate must be in [0, 1]")
         if self.climb_max_cores < 1:
             raise ConfigError("climb_max_cores must be positive")
         if self.climb_propagate_core_chunk < 1:

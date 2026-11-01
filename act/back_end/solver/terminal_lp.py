@@ -1223,8 +1223,8 @@ def solve_terminal_batch(
             prepared[k] = (p, forms)
         except (TimeoutError, ImportError, ValueError, OverflowError) as error:
             lane_failure(k, error)
-    # Only eliminated lanes are pure inequality LPs. Unsafe lanes block their
-    # phase I, which decides feasibility on its own; others block each row.
+    # Phase I is always a pure inequality LP and decides feasibility on its own, so
+    # every unsafe lane blocks it; elsewhere only eliminated lanes block, row by row.
     jobs: list[tuple[tuple[int, int], _SparseLP, np.ndarray]] = []
     phase_problems: dict[int, tuple[_SparseLP, np.ndarray]] = {}
     objectives: dict[tuple[int, int], tuple[np.ndarray, float]] = {}
@@ -1233,9 +1233,8 @@ def solve_terminal_batch(
             for row in range(1 if unsafe else required):
                 if unsafe:
                     objectives[k, row] = (np.zeros(len(p.lb)), 0.0)
-                    if forms is not None:
-                        phase_problems[k] = _phase_problem(p)
-                        jobs.append(((k, row), *phase_problems[k]))
+                    phase_problems[k] = _phase_problem(p)
+                    jobs.append(((k, row), *phase_problems[k]))
                 else:
                     objectives[k, row] = _objective(
                         p, exported.output_ids, spec_c[k, row], float(spec_d[k, row]), forms,

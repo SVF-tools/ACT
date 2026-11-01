@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 # Partners tried per row and pivot; only exact duplicate rows ever reach this.
+_MERGE_PROBE_ROWS = 64
 _MERGE_GROUP_FANOUT = 64
 _SPLIT_REFRESH_MODES = ("split_refresh", "split_refresh_linear")
 
@@ -245,6 +246,7 @@ class ClimbMetrics:
     optional_rechecks: int = 0
     mandatory_admissions: int = 0
     terminal_admissions: int = 0
+    forward_core_rows: int = 0
     propagation_rows_scanned: int = 0
     propagation_rows_skipped: int = 0
     # Committed frontier changes: restored with the frontier on OOM rollback.
@@ -252,6 +254,9 @@ class ClimbMetrics:
     merge_calls: int = 0
     merge_rows: int = 0
     merge_literals: int = 0
+    merge_proved_rows: int = 0
+    merge_open_rows: int = 0
+    merge_stopped: bool = False
     library: Optional[CoreLibrary] = None
 
     def observe_frontier(self, pending_plus_active_rows: int) -> None:
@@ -293,11 +298,15 @@ class ClimbMetrics:
             "climb_optional_rechecks": self.optional_rechecks,
             "climb_mandatory_admissions": self.mandatory_admissions,
             "climb_terminal_admissions": self.terminal_admissions,
+            "climb_forward_core_rows": self.forward_core_rows,
             "climb_propagation_rows_scanned": self.propagation_rows_scanned,
             "climb_propagation_rows_skipped": self.propagation_rows_skipped,
             "climb_unit_writes": self.unit_writes,
             "climb_merge_calls": self.merge_calls,
             "climb_merge_rows": self.merge_rows,
+            "climb_merge_proved_rows": self.merge_proved_rows,
+            "climb_merge_open_rows": self.merge_open_rows,
+            "climb_merge_stopped": self.merge_stopped,
             "climb_merge_literals": self.merge_literals,
         }
 
@@ -1010,6 +1019,7 @@ def certificate_replay(
         or m_specs < 1
     ):
         return None
+    from act.back_end.dual_tf.tf_mlp import DegenerateIntervalError
     from act.back_end.solver.solver_dual import DualSolver
 
     n_lanes = batch.batch_size
@@ -1048,7 +1058,8 @@ def certificate_replay(
             local_phase_clamp=True,
             phase_slope_signs=phase_slope_signs,
         )
-    except (RuntimeError, ValueError):
+    except DegenerateIntervalError:
+        # The retained literals' refreshed box is inverted, so this replay proves nothing.
         return None
     assert result.dual_margins is not None
     margins = result.dual_margins.reshape(n_lanes, m_specs)
@@ -1358,6 +1369,8 @@ class ClimbSession:
         self._complement_bounding = config.climb_complement_bounding
         self._steer = config.climb_steer
         self._merge_enabled = config.climb_merge_enabled
+        self._merge_min_proof_rate = config.climb_merge_min_proof_rate
+        self._merge_pending = torch.empty(0, dtype=torch.long)
         # Every core ever considered, independent of later subsumption/eviction.
         self._seen_cores: set[tuple[int, ...]] = set()
         self._merge_armed = False
@@ -1569,11 +1582,30 @@ class ClimbSession:
             keep_active = torch.where(untouched[n_pending:])[0].to(active.lb.device)
             active = active.select(keep_active)
         self._merge_armed = False
+        if merged.node_id is not None:
+            self._merge_pending = torch.cat((self._merge_pending.to(merged.node_id), merged.node_id))
         self.metrics.merged_pairs += plan.pairs
         self.metrics.merge_calls += 1
         self.metrics.merge_rows += rows.numel()
         self.metrics.merge_literals += int(_row_literal_counts(merged).sum())
         return active, keep_active
+
+    def _settle_merged_rows(self, batch: SubproblemBatch, statuses: Sequence[str]) -> None:
+        """Stop merging once bounded unions rarely prove, as they then only split again."""
+        if not self._merge_pending.numel() or batch.node_id is None:
+            return
+        settled = torch.isin(batch.node_id, self._merge_pending.to(batch.node_id))
+        if not bool(settled.any()):
+            return
+        proved = torch.tensor([status == SolveStatus.UNSAT for status in statuses], device=settled.device)
+        self.metrics.merge_proved_rows += int((settled & proved).sum())
+        self.metrics.merge_open_rows += int((settled & ~proved).sum())
+        self._merge_pending = self._merge_pending[~torch.isin(self._merge_pending, batch.node_id)]
+        total = self.metrics.merge_proved_rows + self.metrics.merge_open_rows
+        if total >= _MERGE_PROBE_ROWS and self.metrics.merge_proved_rows < self._merge_min_proof_rate * total:
+            self._merge_enabled = False
+            self._merge_armed = False
+            self.metrics.merge_stopped = True
 
     def checkpoint_frontier(self) -> Tuple[bool, Tuple[int, ...]]:
         """Open an undo journal for this wave's uncommitted frontier bookkeeping."""
@@ -1622,6 +1654,7 @@ class ClimbSession:
         # replay must certify it before admission, or restore the original.
         if k_actual != batch.batch_size or len(statuses) != k_actual:
             raise ValueError("CLIMB admission lane count mismatch")
+        self._settle_merged_rows(batch, statuses)
         if self._refresh_mode in _SPLIT_REFRESH_MODES and dual_solve_result.base_reference_bounds is None:
             raise ValueError("split-dependent learning requires base_reference_bounds")
         unsat_idx = torch.tensor(
@@ -1629,12 +1662,21 @@ class ClimbSession:
             device=batch.lb.device,
             dtype=torch.long,
         )
-        if dual_solve_result.forward_only_certified is not None:
-            forward_only = dual_solve_result.forward_only_certified.to(unsat_idx.device)
-            unsat_idx = unsat_idx[~forward_only.index_select(0, unsat_idx)]
         # A proof learned on a smaller input box cannot become a global
         # root-domain core, even when that lane still carries ReLU decisions.
         unsat_idx = unsat_idx[self._on_root_domain(batch).index_select(0, unsat_idx)]
+        if dual_solve_result.forward_only_certified is not None:
+            forward_only = dual_solve_result.forward_only_certified.to(unsat_idx.device)
+            forward_rows = unsat_idx[forward_only.index_select(0, unsat_idx)]
+            unsat_idx = unsat_idx[~forward_only.index_select(0, unsat_idx)]
+            if forward_rows.numel():
+                # No dual multipliers can price a deletion, but the forward proof
+                # already covers this row's whole region: its complete conditions.
+                self.metrics.forward_core_rows += forward_rows.numel()
+                self.metrics.cores_inserted += self._insert_cores(
+                    self._source_literals(batch.select(forward_rows)),
+                    suppress_complements=not allow_complements,
+                )
         if (
             int(unsat_idx.numel()) == 0
             or dual_solve_result.c_rows is None
@@ -1774,7 +1816,7 @@ class ClimbSession:
         self.metrics.complement_row_passes += count
         try:
             result = solve(candidate, cap)
-        except (TimeoutError, RuntimeError):
+        except TimeoutError:
             return count
         finally:
             self.metrics.complement_time_s += time.perf_counter() - started
@@ -2629,7 +2671,7 @@ if __name__ == "__main__":
         from unittest.mock import Mock
 
         probing = ClimbSession(BaBConfig(climb_complement_bounding=True), net, OutKind.LINEAR_LE)
-        solve_complement = Mock(side_effect=RuntimeError("failed complement solve"))
+        solve_complement = Mock(side_effect=TimeoutError("complement budget spent"))
         assert probing.bound_complements(solve_complement, lambda: 1., 1) == 0
         probing.library.insert(torch.tensor([[-1]]))
         assert probing.bound_complements(solve_complement, lambda: 0., 1) == 0
@@ -2638,6 +2680,26 @@ if __name__ == "__main__":
         assert probing.bound_complements(solve_complement, lambda: 1., 1) == 1
         assert probing.bound_complements(solve_complement, lambda: 1., 1) == 0
         assert solve_complement.call_count == 1 and probing.metrics.complement_row_passes == 1
+        from types import SimpleNamespace
+        from typing import cast
+
+        for proved_rows, stops in ((0, True), (32, False)):
+            gated = ClimbSession(BaBConfig(climb_merge_enabled=True), net, OutKind.LINEAR_LE)
+            gated._merge_pending = torch.arange(_MERGE_PROBE_ROWS)
+            gated._settle_merged_rows(
+                cast(SubproblemBatch, SimpleNamespace(node_id=torch.arange(_MERGE_PROBE_ROWS))),
+                [SolveStatus.UNSAT] * proved_rows + ["open"] * (_MERGE_PROBE_ROWS - proved_rows),
+            )
+            assert gated.metrics.merge_stopped == stops and gated._merge_enabled != stops
+            assert gated.metrics.merge_proved_rows == proved_rows and not gated._merge_pending.numel()
+        failing_probe = ClimbSession(BaBConfig(climb_complement_bounding=True), net, OutKind.LINEAR_LE)
+        failing_probe.library.insert(torch.tensor([[-1]]))
+        try:
+            failing_probe.bound_complements(Mock(side_effect=RuntimeError("solver bug")), lambda: 1., 1)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("complement probing swallowed a solver failure")
         attempted_batch, cap = solve_complement.call_args.args
         assert cap == 1. and torch.equal(attempted_batch.lb, lower)
         assert torch.equal(attempted_batch.decision_literals, torch.tensor([[1]]))
@@ -2719,6 +2781,25 @@ if __name__ == "__main__":
             )
             assert unknown_replay is not None and unknown_replay[1] is not None
             assert bool(torch.isfinite(unknown_replay[1]).all())
+            # Only an inverted box means "no proof"; any other solver failure stays visible.
+            from act.back_end.dual_tf.tf_mlp import DegenerateIntervalError
+            from act.back_end.solver.solver_dual import DualSolver
+            replay_args = dict(
+                net=unsupported, batch=unknown_batch, reference_bounds=unknown_base,
+                base_reference_bounds=unknown_base, c_rows=refresh_box, thresholds=refresh_box * 0,
+                m_specs=1, out_kind=OutKind.LINEAR_LE, literals=unknown_literals, codec=codec,
+                refresh_mode="split_refresh",
+            )
+            with patch.object(DualSolver, "compute_certified_bound", side_effect=DegenerateIntervalError("inverted")):
+                assert certificate_replay(**replay_args) is None
+            for failure in (RuntimeError("solver bug"), ValueError("shape bug"), torch.cuda.OutOfMemoryError("full")):
+                with patch.object(DualSolver, "compute_certified_bound", side_effect=failure):
+                    try:
+                        certificate_replay(**replay_args)
+                    except type(failure):
+                        pass
+                    else:
+                        raise AssertionError(f"replay swallowed {failure!r}")
             assert nameless.supports is not None
             for layer_id, support in nameless.supports.items():
                 nameless.supports[layer_id] = BoundSupport(
@@ -3114,16 +3195,25 @@ if __name__ == "__main__":
             cheap_session.learn(cheap, replay_result.solution.statuses, replay_result, 1)
         assert cheap_session.library.pack(upper.device).shape == (1, 0)
         assert replay_spy.call_count == 2, "one changed candidate must not be replayed twice"
-        for bad_result, bad_batch in (
-            (replace(replay_result, forward_only_certified=torch.ones(1, dtype=torch.bool)), replay_batch),
-            (replay_result, replace(replay_batch, lb=replay_batch.lb / 2)),
-        ):
-            excluded = ClimbSession(split_config, net, OutKind.LINEAR_LE)
-            with patch.object(DualSolver, "compute_certified_bound", side_effect=AssertionError("must not replay")):
-                excluded.learn(bad_batch, bad_result.solution.statuses, bad_result, 1)
-            assert excluded.library.core_count == 0
+        # A forward-only proof has no multipliers to replay: it keeps its complete row.
+        forward_learned = ClimbSession(split_config, net, OutKind.LINEAR_LE)
+        with patch.object(DualSolver, "compute_certified_bound", side_effect=AssertionError("must not replay")):
+            forward_learned.learn(
+                replay_batch, replay_result.solution.statuses,
+                replace(replay_result, forward_only_certified=torch.ones(1, dtype=torch.bool)), 1,
+            )
+        assert forward_learned.metrics.forward_core_rows == 1
+        assert forward_learned.library.core_count == 1
+        # The same forward proof on a smaller input box is not a root-domain core.
+        excluded = ClimbSession(split_config, net, OutKind.LINEAR_LE)
+        with patch.object(DualSolver, "compute_certified_bound", side_effect=AssertionError("must not replay")):
+            excluded.learn(
+                replace(replay_batch, lb=replay_batch.lb / 2), replay_result.solution.statuses, replay_result, 1,
+            )
+        assert excluded.library.core_count == 0
         failed = ClimbSession(split_config, net, OutKind.LINEAR_LE)
-        with patch.object(DualSolver, "compute_certified_bound", side_effect=RuntimeError("failed solve")):
+        from act.back_end.dual_tf.tf_mlp import DegenerateIntervalError
+        with patch.object(DualSolver, "compute_certified_bound", side_effect=DegenerateIntervalError("inverted")):
             failed.learn(replay_batch, replay_result.solution.statuses, replay_result, 1)
         assert failed.library.core_count == 0
         forward_batch = replace(replay_batch, split_signs={2: torch.zeros_like(upper[:, None])})
@@ -3138,7 +3228,7 @@ if __name__ == "__main__":
         assert bool(forward_result.forward_only_certified.all())
         failed.learn(forward_batch, forward_result.solution.statuses,
                      replace(forward_result, base_reference_bounds=bounds), 1)
-        assert failed.library.core_count == 0
+        assert failed.library.core_count == 1 and failed.metrics.forward_core_rows == 1
         for bad_base, bad_thresholds, bad_count in (
             (None, threshold_rows, 1),
             (bounds, upper.expand(2, 1), 1),

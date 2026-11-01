@@ -354,7 +354,7 @@ backend:
     # Automatic BaB batch sizing. Used only when verify_bab_batched is called with
     # max_batch_size="auto"; bab_max_batch_size accepts a positive integer or auto.
     auto_batch_safety: 0.55       # fraction of total GPU memory the sizer may target
-    auto_batch_cap: 2048          # upper bound on the auto batch size (also the CPU fallback)
+    auto_batch_cap: 1024          # upper bound on the auto batch size (also the CPU fallback)
     auto_batch_floor: 8           # lower bound on the auto batch size
 
     # Neurons split jointly per branching step; each lane fans out into all 2^k
@@ -394,6 +394,7 @@ backend:
     climb_coarsening_enabled: true  # false admits full replay-certified literal rows
     climb_propagation_enabled: true # false learns cores but neither prunes, infers nor merges with them
     climb_merge_enabled: false     # on an unseen core, merge root-domain complementary rows to a fixed point
+    climb_merge_min_proof_rate: 0.05 # stop merging once fewer merged rows than this are proved; 0 never stops
     climb_complement_bounding: false # one root-domain complement probe per new core
     climb_steer: false             # core-frequency bias on finite branching scores only
     climb_presplit_propagation_enabled: true # false defers propagation and merge to the next pre-bound step

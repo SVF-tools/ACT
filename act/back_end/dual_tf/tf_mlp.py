@@ -35,6 +35,10 @@ _DEGENERATE_TOL_ABS = 1e-3
 _DEGENERATE_TOL_REL = 1e-3
 
 
+class DegenerateIntervalError(ValueError):
+    """A lower bound exceeds its upper bound beyond float tolerance."""
+
+
 def _repair_degenerate_interval(l: torch.Tensor, u: torch.Tensor, where: str) -> torch.Tensor:
     """Repair float32-rounding interval inversions (l slightly above u).
 
@@ -47,7 +51,7 @@ def _repair_degenerate_interval(l: torch.Tensor, u: torch.Tensor, where: str) ->
     gap = l - u
     tol = _DEGENERATE_TOL_ABS + _DEGENERATE_TOL_REL * torch.maximum(l.abs(), u.abs())
     if bool((gap > tol).any()):
-        raise ValueError(
+        raise DegenerateIntervalError(
             f"{where}: lb exceeds ub by {float(gap.max()):.3e} (beyond float tolerance)"
         )
     return torch.maximum(u, l)
