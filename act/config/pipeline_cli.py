@@ -203,6 +203,8 @@ _PIPELINE_BAB_ATTR_MAP: dict[str, str] = {
     "top_k": "bab_top_k",
     "input_split_fanout": "bab_input_split_fanout",
     "multi_split_levels": "bab_multi_split_levels",
+    "ramp_split_levels": "bab_ramp_split_levels",
+    "ramp_split_lanes": "bab_ramp_split_lanes",
     "provenance_enabled": "bab_provenance",
 }
 _PIPELINE_VAL_ATTR_MAP: dict[str, str] = {
@@ -265,6 +267,8 @@ def _apply_pipeline_config_defaults(args: Any) -> PipelineConfig:
     args.bab_top_k = config.bab.top_k
     args.bab_input_split_fanout = config.bab.input_split_fanout
     args.bab_multi_split_levels = config.bab.multi_split_levels
+    args.bab_ramp_split_levels = config.bab.ramp_split_levels
+    args.bab_ramp_split_lanes = config.bab.ramp_split_lanes
     args.bab_per_class_alpha = "true" if config.dual.per_class_alpha else "false"
     args.bab_no_incremental_start = not config.dual.incremental_start_enabled
     args.bab_provenance = config.bab.provenance_enabled

@@ -545,20 +545,28 @@ class BaBSRBranching(BranchingStrategy):
         keep = torch.zeros(n_lanes, dtype=torch.bool, device=sample.device)
         layers = torch.zeros(n_lanes, dtype=torch.long, device=sample.device)
         neurons = torch.zeros_like(layers)
+        primary = _lane_argmax(per_layer, n_lanes)
+        tables: Dict[int, tuple[list[Optional[int]], list[int], list[float]]] = {}
+
+        def choice(table: Dict[int, torch.Tensor], lane: int) -> tuple[Optional[int], int]:
+            """Read one lane from a table summarized at most once per wave."""
+            lids, indices, _ = tables.setdefault(id(table), _lane_argmax(table, n_lanes))
+            return lids[lane], indices[lane]
+
         for lane in range(n_lanes):
-            lid, neuron, value = _lane_argmax(per_layer, lane)
-            if lid is not None and value > self.decision_threshold:
+            lid, neuron = primary[0][lane], primary[1][lane]
+            if lid is not None and primary[2][lane] > self.decision_threshold:
                 self.icp_score_counter = 0
             else:
                 lid = None
                 if intercept and self.icp_score_counter < self.intercept_fallback_max:
-                    lid, neuron, _ = _lane_argmax(intercept, lane)
+                    lid, neuron = choice(intercept, lane)
                     if lid is not None:
                         self.icp_score_counter += 1
                 if lid is None:
                     self.icp_score_counter = 0
                     for table in (fallback, intercept):
-                        lid, neuron, _ = _lane_argmax(table, lane)
+                        lid, neuron = choice(table, lane)
                         if lid is not None:
                             break
             if lid is not None:
@@ -576,22 +584,25 @@ class BaBSRBranching(BranchingStrategy):
 
 
 def _lane_argmax(
-    per_layer: Dict[int, torch.Tensor], lane: int
-) -> Tuple[Optional[int], int, float]:
-    """Return the best finite candidate, including zero and negative scores."""
-    best_lid: Optional[int] = None
-    best_idx = 0
-    best_value = float("-inf")
-    for lid, score in per_layer.items():
-        row = score[lane]
-        if row.numel() == 0:
-            continue
-        value, index = row.masked_fill(~torch.isfinite(row), float("-inf")).max(dim=0)
-        if float(value.item()) > best_value:
-            best_lid = lid
-            best_idx = int(index.item())
-            best_value = float(value.item())
-    return best_lid, best_idx, best_value
+    per_layer: Dict[int, torch.Tensor], lanes: int,
+) -> tuple[list[Optional[int]], list[int], list[float]]:
+    """Each lane's best finite candidate, including zero and negative scores.
+
+    One host transfer for the whole table. Ties keep the earliest layer and
+    neuron; a lane with no finite candidate reports no layer.
+    """
+    lids = [lid for lid, score in per_layer.items() if score.numel()]
+    if not lids:
+        return [None] * lanes, [0] * lanes, [-math.inf] * lanes
+    values, indices = zip(*(
+        per_layer[lid].masked_fill(~torch.isfinite(per_layer[lid]), -torch.inf).max(dim=1)
+        for lid in lids
+    ))
+    best_value, best_layer = torch.stack(values).max(dim=0)
+    best_index = torch.stack(indices).gather(0, best_layer[None])[0]
+    chosen = [lids[layer] if value > -math.inf else None
+              for layer, value in zip(best_layer.tolist(), best_value.tolist())]
+    return chosen, best_index.tolist(), best_value.tolist()
 
 
 _WITNESS_GAP_TOL = 1e-6

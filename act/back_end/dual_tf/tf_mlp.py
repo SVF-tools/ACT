@@ -494,7 +494,13 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1,
         u_B = u_B[..., :n]
         if alpha is not None and alpha.shape[-1] != n:
             alpha = alpha[..., :n]
-    u_B = _repair_degenerate_interval(l_B, u_B, "dual_relu_backward")
+    # An optimization loop reuses one fixed Bounds per iteration, and this check
+    # synchronizes with the GPU; a Bounds is immutable, so one pass decides it.
+    repaired = bounds.__dict__.get("_repaired_ub")
+    if repaired is None or repaired.shape != u_B.shape:
+        repaired = _repair_degenerate_interval(l_B, u_B, "dual_relu_backward")
+        object.__setattr__(bounds, "_repaired_ub", repaired)
+    u_B = repaired
 
     v = v_flat.view(B, M, n)
     l = l_B.unsqueeze(1)

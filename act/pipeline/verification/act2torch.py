@@ -68,6 +68,25 @@ def _align_elementwise_param(
     return param
 
 
+class ACTHardsigmoid(nn.Hardsigmoid):
+    """clamp((x+3)/6, 0, 1) on every device.
+
+    The verifier's relaxations all use this exact function. Torch on CUDA uses
+    float32 constants even at float64, so its output can exceed the upper bound 1
+    by 3e-8, which no certified bound should have to account for.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((input + 3.0) / 6.0, 0.0, 1.0)
+
+
+class ACTHardswish(nn.Hardswish):
+    """x * clamp((x+3)/6, 0, 1), for the same reason as ACTHardsigmoid."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return input * torch.clamp((input + 3.0) / 6.0, 0.0, 1.0)
+
+
 class ACTErf(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.erf(x)
@@ -1221,6 +1240,10 @@ class ACTToTorch:
 
         if kind == LayerKind.ERF.value:
             return ACTErf()
+        if kind == LayerKind.HARDSIGMOID.value:
+            return ACTHardsigmoid()
+        if kind == LayerKind.HARDSWISH.value:
+            return ACTHardswish()
         if kind == LayerKind.SQRT.value:
             return ACTSqrt()
         if kind == LayerKind.SIN.value:

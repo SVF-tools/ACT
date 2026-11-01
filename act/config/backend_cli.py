@@ -299,6 +299,7 @@ def _verify_net(
         gather_input_spec_layers, seed_from_input_specs, verify_once, verify_lp_batched,
     )
     from act.util.stats import VerifyResult, VerifyStatus
+    import torch
 
     stop_at = time.monotonic() + backend_cfg.timeout if deadline is None else deadline
     clear_violation_check_module_cache()
@@ -339,13 +340,24 @@ def _verify_net(
     if is_hybridz:
         hz_timeout = min(backend_cfg.hybridz.timeout or remaining, remaining)
         hz_tolerance = backend_cfg.hybridz.tolerance
-    results: List[Any] = list(
-        verify_once(
-            net=net,
-            timelimit=hz_timeout,
-            hybridz_tolerance=hz_tolerance,
+    try:
+        results: List[Any] = list(
+            verify_once(
+                net=net,
+                timelimit=hz_timeout,
+                hybridz_tolerance=hz_tolerance,
+            )
         )
-    )
+    except torch.cuda.OutOfMemoryError as error:
+        # The GPU may be shared, so a one-shot bound failing to allocate proves
+        # nothing. BaB has its own memory planner and may still decide the query.
+        logger.warning("One-shot verification ran out of GPU memory: %s", error)
+        torch.cuda.empty_cache()
+        batch_size = seed_from_input_specs(gather_input_spec_layers(net)).lb.shape[0]
+        results = [
+            VerifyResult(VerifyStatus.UNKNOWN, metadata={"reason": "one_shot_out_of_memory"})
+            for _ in range(batch_size)
+        ]
 
     any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
@@ -1511,6 +1523,23 @@ Exit status (--verify):
         ),
     )
     verify_group.add_argument(
+        "--bab-ramp-split-levels",
+        type=int,
+        default=None,
+        dest="bab_ramp_split_levels",
+        help=(
+            "Joint splits per step on a convolutional network while fewer than "
+            "--bab-ramp-split-lanes lanes branch (default: from config.yaml)"
+        ),
+    )
+    verify_group.add_argument(
+        "--bab-ramp-split-lanes",
+        type=int,
+        default=None,
+        dest="bab_ramp_split_lanes",
+        help="Branching lanes below which --bab-ramp-split-levels applies; 0 disables it (default: from config.yaml)",
+    )
+    verify_group.add_argument(
         "--bab-top-k",
         type=int,
         default=None,
@@ -1710,6 +1739,8 @@ _BACKEND_ALIAS_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
     ("bab_llm_probe_decisions",          "bab_llm_probe_decisions",          None, None,  "not_none"),
     ("bab_llm_probe_log",                "bab_llm_probe_log",                None, None,  "user_set"),
     ("bab_multi_split_levels",           "bab_multi_split_levels",           None, int,   "not_none"),
+    ("bab_ramp_split_levels",            "bab_ramp_split_levels",            None, int,   "not_none"),
+    ("bab_ramp_split_lanes",             "bab_ramp_split_lanes",             None, int,   "not_none"),
     ("bab_top_k",                        "bab_top_k",                        None, int,   "not_none"),
     ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
     ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),
@@ -1826,6 +1857,18 @@ def _run_cli_cascade_smoke() -> int:
             assert lp_results[0].status in (
                 VerifyStatus.CERTIFIED, VerifyStatus.FALSIFIED, VerifyStatus.UNKNOWN
             )
+
+    def _t_one_shot_oom_reaches_bab():
+        """A one-shot allocator failure stays UNKNOWN, with BaB still able to run."""
+        from unittest.mock import patch
+        cfg = BackendConfig(solver="torchlp", lp_enabled=False, bab_enabled=False)
+        with patch(
+            "act.back_end.verifier.verify_once",
+            side_effect=torch.cuda.OutOfMemoryError("shared GPU full"),
+        ):
+            results, error, _ = _verify_net(_build_tiny_net(), cfg)
+        assert error is None and [r.status for r in results] == [VerifyStatus.UNKNOWN]
+        assert results[0].metadata["reason"] == "one_shot_out_of_memory"
 
     def _t_lp_disabled_skips_tier2():
         cfg = BackendConfig(solver="torchlp", lp_enabled=False, bab_enabled=False)
@@ -2141,6 +2184,7 @@ def _run_cli_cascade_smoke() -> int:
     _check("tier-1 interval verify_once returns VerifyStatus", _t_interval_only)
     _check("cascade with lp_enabled=True dispatches tier-2 on UNKNOWN", _t_cascade_default_config)
     _check("lp_enabled=False skips tier-2", _t_lp_disabled_skips_tier2)
+    _check("one-shot OOM stays UNKNOWN", _t_one_shot_oom_reaches_bab)
     _check("default bab_max_batch_size=8", _t_bab_max_batch_size_default)
     _check("frontier CLI budgets and automatic K", _t_frontier_config)
     _check("dual cascade accepts unsafe-linear escape and rejects ties", _t_dual_unsafe_linear)

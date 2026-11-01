@@ -298,7 +298,11 @@ def tf_scatter_nd(L: Layer, Bdata: Bounds, Bidx: Bounds, Bupdates: Bounds) -> Fa
 def tf_concat(L: Layer, Bs: List[Bounds]) -> Fact:
     """Concatenates tensors on dim=-1 (feature axis)."""
     B=Bounds(torch.cat([b.lb for b in Bs], dim=-1), torch.cat([b.ub for b in Bs], dim=-1))
-    C=ConSet(); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    C=ConSet(); C.add_box(L.id,L.out_vars,B)
+    # Only axis 1 is flat append order in every operand layout.
+    if L.params.get("concat_dim") == 1 and len(L.in_vars) == len(L.out_vars):
+        C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"concat:{L.id}"}))
+    return Fact(B,C)
 
 def tf_constant(L: Layer, Bin: Bounds) -> Fact:
     # CONSTANT bounds come from L.params["value"], not from Bin. The graph
@@ -310,6 +314,7 @@ def tf_constant(L: Layer, Bin: Bounds) -> Fact:
     val_b = val.unsqueeze(0).expand(B_size, -1).contiguous()
     Bout = Bounds(val_b.clone(), val_b.clone())
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    C.replace(Con("EQ", tuple(L.out_vars), {"tag": f"constant:{L.id}", "value": val}))
     return Fact(Bout, C)
 
 def tf_sign(L: Layer, Bin: Bounds) -> Fact:
@@ -399,6 +404,12 @@ def tf_reduce_sum(L: Layer, Bin: Bounds) -> Fact:
     ub_out = ub_in.sum(dim=dim, keepdim=keepdims)
     Bout = Bounds(lb_out.reshape(batch_size, -1), ub_out.reshape(batch_size, -1))
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    # The concrete operator numbers axes with the batch, and the box without it;
+    # they name the same axes only under a singleton leading input dimension.
+    if axes and in_shape is not None and in_shape[0] == 1 and all(int(a) > 0 for a in axes):
+        C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+            "tag": f"reduce_sum:{L.id}", "input_shape": tuple(in_shape), "axes": tuple(int(a) for a in axes),
+        }))
     return Fact(Bout, C)
 
 def tf_mean(L: Layer, Bin: Bounds) -> Fact:
@@ -415,6 +426,11 @@ def tf_mean(L: Layer, Bin: Bounds) -> Fact:
     ub_out = ub_in.mean(dim=dim, keepdim=keepdim)
     Bout = Bounds(lb_out.reshape(batch_size, -1), ub_out.reshape(batch_size, -1))
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    # A singleton leading input dimension may be the concrete batch axis.
+    if dims and in_shape is not None and all(int(a) >= (in_shape[0] == 1) for a in dims):
+        C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+            "tag": f"mean:{L.id}", "input_shape": tuple(in_shape), "axes": tuple(int(a) for a in dims),
+        }))
     return Fact(Bout, C)
 
 def tf_bn(L: Layer, Bin: Bounds) -> Fact:
@@ -692,11 +708,13 @@ def tf_expand(L: Layer, Bin: Bounds) -> Fact:
     in_shape = L.params.get("input_shape")
     out_shape = L.params.get("output_shape") or L.params.get("shape")
     n_out = len(L.out_vars)
+    relation = None
     if in_shape is not None and out_shape is not None:
         in_shape = tuple(int(d) for d in in_shape)
         out_shape = tuple(int(d) for d in out_shape)
         lb = Bin.lb.view(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
         ub = Bin.ub.view(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
+        relation = {"tag": f"expand:{L.id}", "input_shape": in_shape, "output_shape": out_shape}
     elif Bin.lb.shape[1] == n_out:
         lb, ub = Bin.lb.clone(), Bin.ub.clone()
     else:
@@ -706,6 +724,8 @@ def tf_expand(L: Layer, Bin: Bounds) -> Fact:
         ub = Bin.ub.repeat(1, repeat)[:, :n_out].clone()
     Bout = Bounds(lb, ub)
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    if relation is not None:
+        C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), relation))
     return Fact(Bout, C)
     
 def tf_slice(L: Layer, Bin: Bounds) -> Fact:

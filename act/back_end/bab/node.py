@@ -74,6 +74,9 @@ class SubproblemBatch:
     parent_id: Optional[torch.Tensor] = None  # [N] long; parent's node_id (-1 for root)
     decision_literals: Optional[torch.Tensor] = None  # [N, S] ordered decisions, never inferred phases
     warm_state_present: Optional[torch.Tensor] = None  # [N] bool; padded alpha is not a warm start
+    # [N] long; core-library revision this row's conditions reached a fixed point
+    # against. Absent or -1 is stale. Any row given other conditions must drop it.
+    propagation_revision: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         """Record whether each lane owns real, complete optimizer state."""
@@ -137,6 +140,7 @@ class SubproblemBatch:
             parent_id=_gather_optional_tensor(self.parent_id, indices),
             decision_literals=_gather_optional_tensor(self.decision_literals, indices),
             warm_state_present=_gather_optional_tensor(self.warm_state_present, indices),
+            propagation_revision=_gather_optional_tensor(self.propagation_revision, indices),
         )
 
     def concat(self, other: SubproblemBatch) -> SubproblemBatch:
@@ -184,6 +188,7 @@ class SubproblemBatch:
             parent_id=_concat_optional_tensor(self.parent_id, other.parent_id),
             decision_literals=_concat_decisions(self.decision_literals, other.decision_literals),
             warm_state_present=torch.cat((presence[0], presence[1].to(self.lb.device))),
+            propagation_revision=_concat_revisions(self, other),
         )
 
     def tensors(self) -> Iterator[torch.Tensor]:
@@ -354,6 +359,19 @@ def _concat_optional_tensor(
             raise ValueError("cannot concatenate known and missing node identity")
         y = x.new_zeros((n_y, *x.shape[1:]))
     return torch.cat([x, y.to(device=x.device, dtype=x.dtype)], dim=0)
+
+
+def _concat_revisions(x: SubproblemBatch, y: SubproblemBatch) -> Optional[torch.Tensor]:
+    """Stack propagation revisions; an unchecked side is stale, not revision zero."""
+    if x.propagation_revision is None and y.propagation_revision is None:
+        return None
+
+    def filled(batch: SubproblemBatch) -> torch.Tensor:
+        if batch.propagation_revision is not None:
+            return batch.propagation_revision.to(x.lb.device)
+        return torch.full((batch.batch_size,), -1, dtype=torch.long, device=x.lb.device)
+
+    return torch.cat((filled(x), filled(y)))
 
 
 def _concat_decisions(

@@ -36,6 +36,7 @@ from act.config.config import (
     VALID_SOLVER_TIERS,
 )
 from act.back_end.bab.node import (
+    slice_bounds_dict,
     SubproblemBatch,
     slice_branching_state,
     split_input,
@@ -505,7 +506,10 @@ def _root_oom_guard(function: Callable[..., VerifyResult]) -> Callable[..., Veri
         """Translate only allocator OOM, leaving all other errors visible."""
         try:
             return function(*args, **kwargs)
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError as error:
+            # A shared GPU can also fail inside cuBLAS, which reports a plain RuntimeError.
+            if not isinstance(error, torch.cuda.OutOfMemoryError) and "CUBLAS_STATUS_ALLOC_FAILED" not in str(error):
+                raise
             return VerifyResult(VerifyStatus.UNKNOWN, metadata={
                 "reason": "root_out_of_memory", "nodes": 0, "iterations": 0,
                 "pool_remaining": 1, "oom_failures": 1,
@@ -758,6 +762,8 @@ def verify_bab_batched(
                 mode=refine_mode,
                 blowup_ratio=config.intermediate_refine_ratio,
                 max_tensor_mib=config.intermediate_refine_max_tensor_mib,
+                dual_config=dual_config,
+                time_cap=_root_time_cap(),
             )
     # Per-node bound reuse is governed solely by root_bounds_reuse: root_fwd may
     # exist just for the root presolve/refine above, and passing it to descendant
@@ -1025,6 +1031,8 @@ def verify_bab_batched(
         planner.oom_retries += 1
         return True
 
+    terminal_lane_bases: Dict[tuple[bytes, bytes], Any] = {}
+    ramp_split_active = any(layer.kind == LayerKind.CONV2D.value for layer in net.layers)
     while not pool.empty:
         elapsed = _monotonic() - start
         if elapsed >= budget_s or processed >= config.max_nodes:
@@ -1285,6 +1293,11 @@ def verify_bab_batched(
                                 terminal_batch.ub.reshape(terminal_count, *input_shape),
                             ),
                             terminal_batch.split_signs, deadline=run_started + budget_s,
+                            reference_bounds=(
+                                None if terminal_bounds is None
+                                else slice_bounds_dict(terminal_bounds, terminal_rows)
+                            ),
+                            lane_bases=terminal_lane_bases,
                         )
                         terminal_stats["terminal_lp_calls"] += 1
                         terminal_stats["terminal_lp_lanes"] += terminal_count
@@ -1382,6 +1395,11 @@ def verify_bab_batched(
                             )
                         multi = None
                         multi_k = int(config.multi_split_levels)
+                        if ramp_split_active and branch_batch.batch_size < config.ramp_split_lanes:
+                            multi_k = max(multi_k, int(config.ramp_split_levels))
+                            multi_split_stats["multi_split_k_requested"] = max(
+                                multi_split_stats["multi_split_k_requested"], multi_k,
+                            )
                         if llm_probe is not None and _llm is not None and llm_probe.wants_neuron:
                             # neuron_topk>0 => never bail on candidate count: enumerate the
                             # full set (limit=None) and let advise_neuron_groups truncate to
@@ -2025,8 +2043,12 @@ if __name__ == "__main__":
         cold_session._insert_cores(torch.tensor([[1, 2]]))
         cold_session.before_pop(cold_pool)
         assert cold_session.metrics.merged_pairs == 1
-        cold_active = cold_pool.pop(1)
-        assert cold_active.node_id is not None
+        # The merged row keeps a finite rank, so select it rather than rely on order.
+        cold_rows = cold_pool.pop(len(cold_pool))
+        merged_row = cold_rows.split_signs[cold_lid][:, 0, 0] == 0
+        cold_active = cold_rows.select(torch.where(merged_row)[0])
+        cold_pool.push(cold_rows.select(torch.where(~merged_row)[0]))
+        assert cold_active.batch_size == 1 and cold_active.node_id is not None
         cold_base, _, _ = compute_forward_bounds(cold_net, cold_active.lb, cold_active.ub)
         cold_result = _solve_dual_batch(
             net=cold_net, assert_layer=cold_net.layers[-1],
@@ -2043,7 +2065,7 @@ if __name__ == "__main__":
         warm_children.parent_id = cold_active.node_id[child_parents]
         cold_pool.push(warm_children)
         cold_pool.replace_all(cold_pool.view_all())
-        # A merged lane stays cold beside warm lanes; zero padding is never a warm start.
+        # A lane without warm state stays cold beside warm lanes; zero padding is never a warm start.
         frontier = cold_pool.view_all()
         assert frontier.node_id is not None and frontier.warm_state_present is not None
         assert frontier.warm_state_present.tolist() == (frontier.node_id >= 31).tolist()
@@ -2395,7 +2417,7 @@ if __name__ == "__main__":
         finite_bounds, _, _ = compute_forward_bounds(finite_net, lp_box.lb, lp_box.ub)
         finite_phase = {4: lp_box.lb.new_ones(1, 2, 1)}
         finite_refresh = refresh_bounds(finite_net, finite_bounds, finite_phase, linear=True)
-        assert finite_refresh.linear_refined
+        assert not finite_refresh.linear_refined  # A clamped row gains nothing from a query.
         assert finite_refresh.bounds[4].ub.item() <= 10.0
         assert finite_refresh.bounds[4].ub.item() >= 9.99
         assert finite_net.input_geometry is not None
@@ -2555,6 +2577,14 @@ if __name__ == "__main__":
         assert bool(generic.certified.all()) and bool(affine.certified.all())
         assert generic.statuses == affine.statuses
         assert generic.tiers == ("generic", "generic") and affine.tiers == ("affine", "affine")
+        # Rational elimination is the reference: float composition may only relax it.
+        with patch("act.back_end.solver.terminal_lp._chain_reduce", return_value=None):
+            rational = solve_terminal_batch(net, twice, fixed_phases)
+        assert rational.tiers == ("affine", "affine") and bool(rational.certified.all())
+        for chain_proofs, exact_proofs in zip(affine.certificates, rational.certificates):
+            for chain_proof, exact_proof in zip(chain_proofs, exact_proofs):
+                assert chain_proof.lower_bound <= exact_proof.lower_bound + 1e-9
+                assert chain_proof.lower_bound >= exact_proof.lower_bound - 1e-9
         unsupported = solve_terminal_batch(lp_net, lp_box)
         assert unsupported.statuses == (VerifyStatus.UNKNOWN,)
         assert unsupported.reasons == ("unsupported_finite_p_input",)
@@ -2756,8 +2786,9 @@ if __name__ == "__main__":
                                for lid, value in attempted[0].split_signs.items())
                 assert recovered.metadata["terminal_input_fallback_lanes"] == 2
 
-        # Pre-pop CLIMB gathers the whole frontier: shrinking K cannot relieve it.
+        # Pre-pop CLIMB gathers its stale frontier rows: shrinking K cannot relieve it.
         real_before_pop, real_view = ClimbSession.before_pop, TopKBounding.view_all
+        real_stale = TopKBounding.propagation_batch
         for remedy in ("offload", "cold", "exhausted"):
             for max_k in (1, 2):
                 prepop_pool = TopKBounding()
@@ -2795,14 +2826,16 @@ if __name__ == "__main__":
                             session.library.insert(torch.tensor([[1, 2]]))
                     real_before_pop(session, frontier)
 
-                def prepop_view(frontier: TopKBounding) -> SubproblemBatch:
-                    """Fail the whole-pool gather until the real mitigation helps."""
+                def prepop_gather(
+                    frontier: TopKBounding, revision: int,
+                ) -> Optional[tuple[torch.Tensor, SubproblemBatch]]:
+                    """Fail the stale-row gather until the real mitigation helps."""
                     if needs_relief(frontier):
                         if not prepop_cover:
                             prepop_cover.append(real_view(frontier))
                         prepop_failures.append(len(frontier))
                         raise torch.cuda.OutOfMemoryError("pre-pop frontier pressure")
-                    return real_view(frontier)
+                    return real_stale(frontier, revision)
 
                 def prepop_pop(frontier: TopKBounding, batch_size: int = 1) -> SubproblemBatch:
                     """Observe the first actual wave after pre-pop recovery."""
@@ -2820,7 +2853,7 @@ if __name__ == "__main__":
                     patch(f"{__name__}._build_bounding", return_value=prepop_pool),
                     patch(f"{__name__}._solve_dual_batch", unresolved_bound),
                     patch.object(ClimbSession, "before_pop", prepop_hook),
-                    patch.object(TopKBounding, "view_all", prepop_view),
+                    patch.object(TopKBounding, "propagation_batch", prepop_gather),
                     patch.object(TopKBounding, "pop", prepop_pop),
                 ):
                     prepop_result = verify_bab_batched(

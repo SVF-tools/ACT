@@ -13,7 +13,7 @@
 from __future__ import annotations
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeAlias, Union, cast
 
 import torch
@@ -1636,6 +1636,8 @@ class DualSolver(Solver):
         max_rows_per_call: int = 4096,
         optimize_iters: int = 20,
         max_tensor_mib: float = 0.0,
+        dual_config: Optional[DualConfig] = None,
+        time_cap: Optional[float] = None,
     ) -> Dict[int, Bounds]:
         """Metric-driven backward refinement of selected pre-activation bounds.
 
@@ -1647,10 +1649,14 @@ class DualSolver(Solver):
         mode="all" refines every unstable activation layer. Refined bounds are
         intersected with the forward bounds (both are valid over-approximations,
         so the intersection is sound). Layers are processed in topological
-        order so later refinements consume earlier ones.
+        order so later refinements consume earlier ones. ``dual_config`` sets each
+        chunk's early stopping; ``time_cap`` (seconds) caps the whole call, after
+        which remaining layers keep their sound forward bounds.
         """
         if mode == "none":
             return bounds_dict
+        call_started = _monotonic()
+        policy = DualConfig() if dual_config is None else dual_config
         if mode not in ("auto", "all", "tail"):
             raise ValueError(
                 f"intermediate_refine mode must be none|auto|all|tail, got {mode!r}"
@@ -1681,12 +1687,11 @@ class DualSolver(Solver):
         if not selected:
             return bounds_dict
 
-        max_rows_per_call, _ = self._refinement_chunks(
-            bounds_dict, max_rows_per_call, 1, max_tensor_mib, optimize_iters)
-        if max_rows_per_call == 0:
-            return bounds_dict
         out = dict(bounds_dict)
         for lid in selected:
+            remaining = None if time_cap is None else time_cap - (_monotonic() - call_started)
+            if remaining is not None and remaining <= 0:
+                break
             preds = net.preds.get(lid, [])
             if len(preds) != 1:
                 continue
@@ -1705,6 +1710,12 @@ class DualSolver(Solver):
             n_amb = int(amb_idx.numel())
             if n_amb == 0:
                 continue
+            # Skip a layer whose densest backward tensor exceeds the cap; many small
+            # chunks would spend the root's whole time budget on one optional step.
+            width = max(out[layer_id].lb[0].numel() for layer_id in out)
+            dense_bytes = 2 * min(n_amb, max_rows_per_call) * width * lb0.element_size()
+            if max_tensor_mib > 0 and dense_bytes > max_tensor_mib * 1024**2:
+                continue
             lb_new = torch.empty(n_amb, device=device, dtype=dtype)
             ub_new = torch.empty(n_amb, device=device, dtype=dtype)
             for s in range(0, n_amb, max_rows_per_call):
@@ -1721,6 +1732,11 @@ class DualSolver(Solver):
                     lr_decay=0.98,
                     per_class_alpha=True,
                     refresh_forward=False,
+                    dual_config=(
+                        policy if time_cap is None else replace(
+                            policy, max_time=max(1e-6, time_cap - (_monotonic() - call_started)),
+                        )
+                    ),
                 )
                 lb_new[s:e] = res.margins[: e - s]
                 ub_new[s:e] = -res.margins[e - s:]

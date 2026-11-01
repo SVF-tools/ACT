@@ -304,6 +304,13 @@ class BaBConfig:
     split gains, because the split multipliers are optimized jointly
     against all constraints.     1 = single-split behavior."""
 
+    ramp_split_levels: int = 1
+    """Joint splits per step while a convolutional frontier is narrow. A wave's
+    cost there barely depends on K, so widening early spends fewer waves."""
+
+    ramp_split_lanes: int = 0
+    """Branching lanes below which ``ramp_split_levels`` applies; 0 disables it."""
+
     llm_probe_enabled: bool = False
     llm_probe_backend: str = "mock"
     llm_probe_model: str = ""

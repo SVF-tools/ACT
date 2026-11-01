@@ -849,35 +849,34 @@ def _certify_affine_collapse(l1: nn.Linear, l2: nn.Linear):
     n_merged = number of rows removed = sum over augmented-direction groups of
     (group_size - 1). Computation is in float64; the caller casts to model dtype.
     """
-    dev = l1.weight.device
-    W1 = l1.weight.detach().double()
+    # Exact host arithmetic: this decides per row, so GPU tensors would sync per pair.
+    dev = torch.device("cpu")
+    W1 = l1.weight.detach().double().to(dev)
     out1, in1 = W1.shape
-    b1 = l1.bias.detach().double() if l1.bias is not None else torch.zeros(out1, dtype=torch.float64, device=dev)
-    W2 = l2.weight.detach().double()
+    b1 = l1.bias.detach().double().to(dev) if l1.bias is not None else torch.zeros(out1, dtype=torch.float64, device=dev)
+    W2 = l2.weight.detach().double().to(dev)
     out2 = W2.shape[0]
-    b2 = l2.bias.detach().double() if l2.bias is not None else torch.zeros(out2, dtype=torch.float64, device=dev)
+    b2 = l2.bias.detach().double().to(dev) if l2.bias is not None else torch.zeros(out2, dtype=torch.float64, device=dev)
 
     aug = torch.cat([W1, b1.unsqueeze(1)], dim=1)
     norms = aug.norm(dim=1)
     unit = aug / norms.clamp_min(1e-30).unsqueeze(1)
+    usable = norms > 1e-30
 
-    visited = [False] * out1
+    visited = torch.zeros(out1, dtype=torch.bool, device=dev)
     groups: list[list[tuple[int, float]]] = []
     for i in range(out1):
         if visited[i]:
             continue
-        visited[i] = True
-        grp = [(i, 1.0)]
-        if norms[i] > 1e-30:
-            ui = unit[i]
-            for j in range(i + 1, out1):
-                if visited[j] or norms[j] <= 1e-30:
-                    continue
-                if abs(abs(float(ui @ unit[j])) - 1.0) <= _MERGE_RTOL:
-                    t = float(aug[j] @ aug[i] / (aug[i] @ aug[i]))
-                    grp.append((j, t))
-                    visited[j] = True
-        groups.append(grp)
+        members = torch.tensor([i], device=dev)
+        if usable[i]:
+            parallel = ((unit @ unit[i]).abs() - 1.0).abs() <= _MERGE_RTOL
+            parallel[:i + 1] = False
+            others = torch.where(parallel & usable & ~visited)[0]
+            members = torch.cat((members, others))
+        visited[members] = True
+        scales = (aug[members] @ aug[i] / (aug[i] @ aug[i])).tolist() if usable[i] else [1.0]
+        groups.append(list(zip(members.tolist(), scales)))
 
     thr = _MERGE_AFFINE_TOL * max(1.0, float(W2.abs().max()) if W2.numel() else 1.0)
     M = torch.zeros(out2, in1, dtype=torch.float64, device=dev)

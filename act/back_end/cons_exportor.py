@@ -1690,6 +1690,84 @@ def _emit_slice_gather(
         eq.add([ov, iv], vals, rhs)
 
 
+def _emit_copy_rows(
+    y: List[int], x: List[int], eq: _RowAcc, N: int,
+    device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Emit ``y_i - x_i = 0`` for one operator's resolved operand mapping."""
+    col_block = torch.tensor(list(zip(y, x)), device=device, dtype=torch.long)
+    val_block = torch.tensor([1.0, -1.0], device=device, dtype=dtype).expand(N, len(y), 2).contiguous()
+    eq.add_block(col_block, val_block, torch.zeros((N, len(y)), device=device, dtype=dtype))
+
+
+def _emit_concat(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Axis-1 concatenation lists every operand's variables in output order."""
+    n = len(con.var_ids) // 2
+    _emit_copy_rows(list(con.var_ids[:n]), list(con.var_ids[n:]), eq, N, device, dtype)
+
+
+def _emit_expand(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Each broadcast output copies its source element."""
+    input_shape = tuple(int(v) for v in con.meta["input_shape"])
+    mapped = np.broadcast_to(
+        np.arange(int(np.prod(input_shape))).reshape(input_shape),
+        tuple(int(v) for v in con.meta["output_shape"]),
+    ).ravel()
+    n_out = mapped.size
+    if len(con.var_ids) != n_out + int(np.prod(input_shape)):
+        raise ValueError(f"expand: {len(con.var_ids)} variables for {n_out} outputs")
+    x = con.var_ids[n_out:]
+    _emit_copy_rows(list(con.var_ids[:n_out]), [x[int(j)] for j in mapped], eq, N, device, dtype)
+
+
+def _emit_constant(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Fix each output: ``y_i = value_i``."""
+    value = _as_td(con.meta["value"], device, dtype).reshape(-1)
+    if value.numel() != len(con.var_ids):
+        raise ValueError(f"constant: {value.numel()} values for {len(con.var_ids)} outputs")
+    eq.add_block(
+        torch.tensor(con.var_ids, device=device, dtype=torch.long)[:, None],
+        torch.ones((N, value.numel(), 1), device=device, dtype=dtype),
+        value.expand(N, -1).contiguous(),
+    )
+
+
+def _emit_reduction(
+    con: Any, eq: _RowAcc, mean: bool, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """``group*y_j - sum(x_i) = 0`` for a mean, ``y_j - sum(x_i) = 0`` for a sum.
+
+    Multiplying out the integer group size keeps a mean's coefficients exact
+    instead of rounding ``1/group`` in the proof.
+    """
+    input_shape = tuple(int(v) for v in con.meta["input_shape"])
+    axes = tuple(int(v) for v in con.meta["axes"])
+    n_in = int(np.prod(input_shape))
+    kept = tuple(1 if axis in axes else size for axis, size in enumerate(input_shape))
+    n_out = int(np.prod(kept))
+    if len(con.var_ids) != n_out + n_in:
+        raise ValueError(f"reduction: {len(con.var_ids)} variables for {n_out}+{n_in}")
+    group = n_in // n_out
+    # Moving the reduced axes last leaves the kept axes in output order.
+    members = np.moveaxis(
+        np.arange(n_in).reshape(input_shape), axes, tuple(range(-len(axes), 0)),
+    ).reshape(n_out, group)
+    y, x = con.var_ids[:n_out], con.var_ids[n_out:]
+    col_block = torch.tensor(
+        [[y[j], *(x[int(i)] for i in owned)] for j, owned in enumerate(members)],
+        device=device, dtype=torch.long,
+    )
+    values = torch.full((N, n_out, group + 1), -1.0, device=device, dtype=dtype)
+    values[:, :, 0] = float(group) if mean else 1.0
+    eq.add_block(col_block, values, torch.zeros((N, n_out), device=device, dtype=dtype))
+
+
 def _emit_in_linpoly(
     con: Any,
     le: _RowAcc,
@@ -2177,6 +2255,16 @@ def export_to_batch_problem(
             _emit_slice_gather(con, eq, is_gather=False, N=N, device=device, dtype=dtype)
         elif tag.startswith("gather:"):
             _emit_slice_gather(con, eq, is_gather=True, N=N, device=device, dtype=dtype)
+        elif tag.startswith("concat:"):
+            _emit_concat(con, eq, N, device, dtype)
+        elif tag.startswith("expand:"):
+            _emit_expand(con, eq, N, device, dtype)
+        elif tag.startswith("constant:"):
+            _emit_constant(con, eq, N, device, dtype)
+        elif tag.startswith("reduce_sum:"):
+            _emit_reduction(con, eq, False, N, device, dtype)
+        elif tag.startswith("mean:"):
+            _emit_reduction(con, eq, True, N, device, dtype)
         elif tag == "in:linpoly":
             _emit_in_linpoly(con, le, N, device, dtype)
         elif tag.startswith(("max:", "min:", "div:", "clip:")):

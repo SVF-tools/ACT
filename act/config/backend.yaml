@@ -106,6 +106,8 @@ bab_presets:
     intermediate_refine_max_tensor_mib: 1024.0 # cap optional refinement tensors
 
   climb_split_lin:
+    ramp_split_levels: 3                 # widen a narrow convolutional frontier quickly
+    ramp_split_lanes: 32                 # single splits resume at this many branching lanes
     solver_tier: "dual_alpha_eta"         # optimize slopes and split multipliers
     branching_method: "babsr"            # neuron decisions shared by CLIMB
     bounding: "depth_bound_blend"         # ordered frontier with merge support
@@ -361,6 +363,10 @@ backend:
     # method (babsr / fsb / gain). The k neurons are always
     # chosen by the BaBSR heuristic (area x |nu|), whatever branching_method is.
     multi_split_levels: 1
+    # Convolutional networks only: while fewer than ramp_split_lanes lanes branch,
+    # split ramp_split_levels neurons jointly (a wave's cost barely depends on K there).
+    ramp_split_levels: 1                  # joint splits per step on a narrow frontier
+    ramp_split_lanes: 0                   # branching lanes below which it applies; 0 = off
 
     # Tag each subproblem with node_id + parent_id so the search tree survives
     # the flat push/pop batching. bounding: mcts enables it anyway (it credits
@@ -376,7 +382,7 @@ backend:
 
     # -- Terminal evidence and optional exact escalation ------------------
     terminal_lp_enabled: false    # candidate-less lanes: checked LP certificates
-    climb_terminal_cores: true    # publish root-box LP cores; theta-budget subsets need a fresh LP
+    climb_terminal_cores: true    # publish root-box LP cores (theta subsets need a fresh LP); false still solves terminal lanes
     milp_escalation: false        # optional exact ReLU solve before BaB; lazy import
     milp_max_variables: 2000      # includes unstable-ReLU binary variables
     milp_max_constraints: 2000    # includes exact-ReLU and property constraints

@@ -69,7 +69,7 @@ from typing import Callable, Dict, Iterator, List, Literal, Optional, Protocol, 
 
 import torch
 
-from act.back_end.bab.node import SubproblemBatch, tensor_storage_bytes
+from act.back_end.bab.node import SubproblemBatch, _state_spec_row_count, tensor_storage_bytes
 from act.back_end.solver.solver_base import SolveStatus
 from act.back_end.solver.solver_dual import AlphaState
 from act.util.device_manager import get_default_dtype
@@ -386,6 +386,7 @@ class TopKBounding(BoundingStrategy):
         self._split_signs: Optional[Dict[int, torch.Tensor]] = None
         self._decision_literals: Optional[torch.Tensor] = None
         self._warm_state_present: Optional[torch.Tensor] = None
+        self._propagation_revision: Optional[torch.Tensor] = None
 
     def push(self, batch: SubproblemBatch) -> None:
         if not batch.batch_size:
@@ -471,6 +472,61 @@ class TopKBounding(BoundingStrategy):
         staged = TopKBounding()
         staged.push(batch)
         self._assign(staged._resident_batch())
+
+    def propagation_batch(self, revision: int) -> Optional[Tuple[torch.Tensor, SubproblemBatch]]:
+        """Return rows not yet at a fixed point with ``revision``, without warm state.
+
+        A row with no decision provenance is always included, since its first
+        propagation snapshots it, and one pool tensor cannot hold it partially.
+        """
+        resident = self._resident_batch()
+        if resident is None:
+            return None
+        checked = resident.propagation_revision
+        if checked is None or resident.decision_literals is None:
+            stale = torch.arange(resident.batch_size, device=resident.lb.device)
+        else:
+            stale = torch.where(checked != revision)[0]
+        return (stale, resident.drop_warm_state().select(stale)) if stale.numel() else None
+
+    def apply_propagation(
+        self, selected: torch.Tensor, kept: torch.Tensor,
+        propagated: SubproblemBatch, revision: int,
+    ) -> None:
+        """Write a subset's inferred phases and drop its discharged rows.
+
+        Each new tensor is allocated before anything is published, so a failed
+        allocation leaves every row unmarked and intact. Lane order is preserved.
+        """
+        resident = self._resident_batch()
+        assert resident is not None
+        survivors = selected.index_select(0, kept)
+        spec_rows = _state_spec_row_count(resident)
+        signs = dict(resident.split_signs or {})
+        for lid, incoming in (propagated.split_signs or {}).items():
+            stored = signs.get(lid)
+            stored = (incoming.new_zeros(resident.batch_size, spec_rows, incoming.shape[2])
+                      if stored is None else stored.clone())
+            stored.index_copy_(
+                0, survivors.to(stored.device), incoming.expand(-1, stored.shape[1], -1).to(stored),
+            )
+            signs[lid] = stored
+        revisions = (
+            torch.full((resident.batch_size,), -1, dtype=torch.long, device=resident.lb.device)
+            if resident.propagation_revision is None else resident.propagation_revision.clone()
+        )
+        revisions[survivors] = revision
+        staged = replace(
+            resident, split_signs=signs or None, propagation_revision=revisions,
+            decision_literals=(resident.decision_literals if resident.decision_literals is not None
+                               else propagated.decision_literals),
+        )
+        if survivors.numel() != selected.numel():
+            retain = torch.ones(resident.batch_size, dtype=torch.bool, device=resident.lb.device)
+            retain[selected] = False
+            retain[survivors] = True
+            staged = staged.select(torch.where(retain)[0]) if retain.any() else None
+        self._assign(staged)
 
     def _priority_scores(self, *, next_wave: bool = False) -> torch.Tensor:
         depths_t, lb = self._depths, self._lower_bound

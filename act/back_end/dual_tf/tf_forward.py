@@ -21,7 +21,7 @@ with activation bounds stored PRE-activation unless ``post_activation=True``.
 import logging
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -138,6 +138,8 @@ _DENSE_LIN_BOUND_MAX_DIM: int = 10_000
 
 
 _LIN_BOUND_FREE_FRACTION: float = 0.8
+# Independent of free memory, so a verdict does not depend on what else uses the GPU.
+_LIN_BOUND_MAX_MIB: float = 1024.0
 
 # Peak transient working set of one lane of the symbolic composition, as a
 # multiple of that lane's persistent coefficient pair
@@ -184,14 +186,22 @@ def _lin_bound_lane_chunk(B: int, n_out: int, n_sym: int, ref: torch.Tensor,
     pair is concatenated back and stays resident either way, so it is checked
     against the full free memory separately.
     """
-    if not ref.is_cuda:
-        return B
     pair_bytes = 2 * n_out * n_sym * ref.element_size()
     if pair_bytes <= 0:
         return B
+    persistent = B * pair_bytes
+    if persistent > _LIN_BOUND_MAX_MIB * 2 ** 20:
+        _report_lin_bound_once(
+            layer_id, mode, logging.WARNING,
+            "forward linear bound %.2f GiB pair exceeds the %.2f GiB cap for [%d, %d, %d]; "
+            "using the interval box for this layer",
+            persistent / 2 ** 30, _LIN_BOUND_MAX_MIB / 1024.0, B, n_out, n_sym,
+        )
+        return None
+    if not ref.is_cuda:
+        return B
     free_bytes, _ = torch.cuda.mem_get_info(ref.device)
     budget = free_bytes * _LIN_BOUND_FREE_FRACTION
-    persistent = B * pair_bytes
     if persistent <= budget:
         return B
 
@@ -601,19 +611,67 @@ class ForwardPrefixCache:
             raise ValueError("ForwardPrefixCache: input box or root geometry changed")
 
 
+def _identical_forward_lanes(net: Net, lb_in: torch.Tensor, ub_in: torch.Tensor) -> bool:
+    """Whether every lane has bitwise the same box and root ball.
+
+    Equal boxes alone are not enough: lanes may hold different finite-p balls.
+    MAXPOOL2D leaves lane-shaped state on its layer for the backward pass.
+    """
+    if lb_in.shape[0] < 2 or any(layer.kind == LayerKind.MAXPOOL2D.value for layer in net.layers):
+        return False
+    geometry = net.input_geometry
+    tensors = [lb_in, ub_in]
+    if geometry is not None:
+        tensors += [geometry.center, geometry.eps, geometry.mask]
+    return all(
+        tensor.shape[0] in (1, lb_in.shape[0]) and torch.equal(tensor, tensor[:1].expand_as(tensor))
+        for tensor in tensors
+    )
+
+
+def _broadcast_forward_lanes(
+    bounds_dict: Dict[int, Bounds], frame: ForwardFrame | None, stats: ForwardPassStats,
+    lanes: int, geometry: InputGeometry | None,
+) -> tuple[Dict[int, Bounds], ForwardFrame | None, ForwardPassStats]:
+    """Publish one lane's result for all lanes.
+
+    Callers may write public boxes per lane, so those are materialized. Frame
+    tensors are read-only proof inputs, so they stay zero-stride views.
+    """
+    def spread(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.expand(lanes, *tensor.shape[1:])
+
+    public = {lid: Bounds(spread(bounds.lb).clone(), spread(bounds.ub).clone())
+              for lid, bounds in bounds_dict.items()}
+    if frame is None:
+        return public, None, stats
+    lin = frame.lin
+    return public, ForwardFrame(frame.lid, LinearBound(
+        None if lin.A_lb is None else spread(lin.A_lb), spread(lin.b_lb),
+        None if lin.A_ub is None else spread(lin.A_ub), spread(lin.b_ub),
+    ), Frame(
+        Bounds(spread(frame.frame.box.lb), spread(frame.frame.box.ub)),
+        None if frame.frame.geometry is None else geometry, frame.frame.columns,
+    )), stats
+
+
 @torch.no_grad()
 def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
                            post_activation: bool = False,
                            alphas: Optional[Dict[int, torch.Tensor]] = None,
                            forward_lin_max_perturbed: Optional[int] = None,
                            prefix_cache: ForwardPrefixCache | None = None,
+                           *,
+                           _shared_geometry: InputGeometry | None = None,
                            ) -> tuple[Dict[int, Bounds], ForwardFrame | None, ForwardPassStats]:
     """Forward bounds, natively batched with singleton auto-promotion.
 
     ``forward_lin_max_perturbed`` caps the number of perturbed input dims for
     which the linear track stays symbolic (see :func:`_entry_lin_frame`);
     ``None`` resolves to the DualConfig default at call time rather than being
-    frozen at import time.
+    frozen at import time. Lanes with one identical domain run as a single lane
+    when no per-lane alpha or cache is involved; ``_shared_geometry`` is that
+    lane's root ball.
     """
     # Lazy import to break circular dep (dual_tf imports compute_forward_bounds)
     from .dual_tf import DualTF
@@ -642,6 +700,17 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
     B = input_lb.shape[0]
     lb_in = input_lb.reshape(B, -1)
     ub_in = input_ub.reshape(B, -1)
+    if prefix_cache is None and alphas is None and _identical_forward_lanes(net, lb_in, ub_in):
+        geometry = net.input_geometry
+        shared = compute_forward_bounds(
+            net, input_lb[:1], input_ub[:1], post_activation, None, forward_lin_max_perturbed,
+            _shared_geometry=None if geometry is None else replace(
+                geometry, center=geometry.center[:1], eps=geometry.eps[:1], mask=geometry.mask[:1],
+            ),
+        )
+        # A lane-dependent layer parameter broadcasts the "single" lane back out.
+        if all(bounds.lb.shape[0] == 1 for bounds in shared[0].values()):
+            return _broadcast_forward_lanes(*shared, B, geometry)
 
     bounds_dict: Dict[int, Bounds] = {}
     box_state: Dict[int, Bounds] = {}
@@ -652,7 +721,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
     entry_box = Bounds(lb_in, ub_in)
     entry_lin = entry_frame = None
     if prefix_cache is None or not prefix_cache._bounds:
-        geometry = net.input_geometry
+        geometry = _shared_geometry if _shared_geometry is not None else net.input_geometry
         entry_lin, entry_frame = _entry_lin_frame(
             lb_in, ub_in, forward_lin_max_perturbed, device, dtype,
             geometry.to(lb_in) if geometry is not None else None,
@@ -878,6 +947,23 @@ def _fwd_dense_lanes(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     )
 
 
+def _relu_relaxation(
+    lb: torch.Tensor, ub: torch.Tensor, alpha: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Lower slope, upper slope and upper intercept of a ReLU on ``[lb, ub]``."""
+    on = lb >= 0
+    off = ub <= 0
+    amb = ~(on | off)
+    # An unstable width only needs to be nonzero: ub <= ub - lb keeps the slope in [0, 1].
+    width = (ub - lb).clamp(min=torch.finfo(lb.dtype).tiny)
+    up_slope = torch.where(amb, ub / width, on.to(lb))
+    up_inter = torch.where(amb, -up_slope * lb, torch.zeros_like(lb))
+    low_slope = (ub > -lb).to(lb) if alpha is None else alpha.to(lb)
+    low_slope = torch.where(on, torch.ones_like(low_slope), low_slope)
+    low_slope = torch.where(off, torch.zeros_like(low_slope), low_slope)
+    return low_slope, up_slope, up_inter
+
+
 def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor,
               alpha: Optional[torch.Tensor] = None
               ) -> Optional[LinearBound]:
@@ -891,22 +977,7 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor,
     is rare in practice (networks start with DENSE/CONV); the common case
     (RELU after DENSE/CONV) hits the second branch with a materialized A_lb.
     """
-    on = lb >= 0
-    off = ub <= 0
-    amb = ~(on | off)
-    denom = (ub - lb).clamp(min=1e-12)
-    up_slope = torch.where(
-        amb,
-        ub / denom,
-        torch.where(on, torch.ones_like(lb), torch.zeros_like(lb)),
-    )
-    up_inter = torch.where(amb, -up_slope * lb, torch.zeros_like(lb))
-    if alpha is None:
-        low_slope = (ub > -lb).to(lb.dtype)
-    else:
-        low_slope = alpha.to(device=lb.device, dtype=lb.dtype)
-    low_slope = torch.where(on, torch.ones_like(low_slope), low_slope)
-    low_slope = torch.where(off, torch.zeros_like(low_slope), low_slope)
+    low_slope, up_slope, up_inter = _relu_relaxation(lb, ub, alpha)
 
     if lin.A_lb is None or lin.A_ub is None:
         B, n = lb.shape
