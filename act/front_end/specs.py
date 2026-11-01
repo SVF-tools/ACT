@@ -31,6 +31,13 @@ def lp_norm(value: torch.Tensor, p: float, *, keepdim: bool = False) -> torch.Te
     return norm if keepdim else norm.squeeze(-1)
 
 
+def _expand_rows(c_mat: torch.Tensor, d_vec: torch.Tensor, B: int) -> tuple[torch.Tensor, ...]:
+    """Repeat shared (M, n_out) rows over B lanes: batched c, batched d, flat C rows, thresholds."""
+    c_lanes, d_lanes = c_mat.unsqueeze(0).expand(B, -1, -1), d_vec.unsqueeze(0).expand(B, -1)
+    c_rows = c_lanes.reshape(B * c_mat.shape[0], c_mat.shape[1]).contiguous()
+    return c_lanes.contiguous(), d_lanes.contiguous(), c_rows, d_lanes.contiguous()
+
+
 def normalize_position_mask(
     positions: "torch.Tensor | Sequence[int] | Sequence[bool] | None",
     token_count: int,
@@ -111,7 +118,6 @@ class InKind(str, Enum):
     # Unselected positions are pinned to center.
     # Analysis seeds the enclosing box; finite-p tightness is recovered by dual per-position input terms.
     LP_EMBEDDING = "LP_EMBEDDING"
-    SYNONYM_SUB = "SYNONYM_SUB"
 
 
 @dataclass(frozen=True)
@@ -224,8 +230,6 @@ class InputSpec:
     b: Optional[torch.Tensor] = None
     p_norm: ScalarTensor = float("inf")
     perturbed_positions: torch.Tensor | Sequence[int] | Sequence[bool] | None = None
-    budget: torch.Tensor | int | None = None
-    synonym_table: Optional[Any] = None
     
     def __post_init__(self) -> None:
         """Tensorize fields and normalize finite-p input parameters."""
@@ -235,9 +239,6 @@ class InputSpec:
 
         if self.p_norm is not None and not isinstance(self.p_norm, torch.Tensor):
             self.p_norm = torch.tensor([float(self.p_norm)])
-
-        if self.budget is not None and not isinstance(self.budget, torch.Tensor):
-            self.budget = torch.tensor([int(self.budget)], dtype=torch.int64)
 
         if (
             self.perturbed_positions is not None
@@ -533,12 +534,7 @@ class OutputSpec:
                     raise ValueError(
                         f"LINEAR_LE: d length {d_t.numel()} != rows {n_rows}"
                     )
-                params["c"] = c_full.unsqueeze(0).expand(B, -1, -1).contiguous()
-                params["d"] = d_t.unsqueeze(0).expand(B, -1).contiguous()
-                c_rows = c_full.unsqueeze(0).expand(B, -1, -1).reshape(
-                    B * n_rows, n_out
-                ).contiguous()
-                thresholds = d_t.unsqueeze(0).expand(B, -1).contiguous()
+                params["c"], params["d"], c_rows, thresholds = _expand_rows(c_full, d_t, B)
                 m_specs = n_rows
             else:
                 raise ValueError(
@@ -565,12 +561,7 @@ class OutputSpec:
                     f'with cd_group="shape", which batches per-lane d for fuzzing '
                     f"and is not consumable by the verifier."
                 )
-            params["c"] = c_mat.unsqueeze(0).expand(B, -1, -1).contiguous()
-            params["d"] = d_vec.unsqueeze(0).expand(B, -1).contiguous()
-            c_rows = c_mat.unsqueeze(0).expand(B, -1, -1).reshape(
-                B * N, n_out
-            ).contiguous()
-            thresholds = d_vec.unsqueeze(0).expand(B, -1).contiguous()
+            params["c"], params["d"], c_rows, thresholds = _expand_rows(c_mat, d_vec, B)
             m_specs = N
 
         elif self.kind in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):

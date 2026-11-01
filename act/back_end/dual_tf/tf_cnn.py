@@ -24,7 +24,7 @@ from .tf_mlp import forward_dense, backward_dense
 from .tf_forward import (
     LinearBound, Frame,
     _fwd_conv2d, _fwd_conv2d_interval, _fwd_maxpool2d, _fwd_maxpool2d_lin,
-    _fwd_avgpool2d, _reset_forward_box, _concretize, _intersect_boxes,
+    _fwd_avgpool2d, _concretize, _intersect_boxes, _compose_forward, _box_result, _conv_args,
 )
 
 
@@ -89,8 +89,6 @@ def forward_conv2d(
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
     """Conv2D forward bounds with dual-track fallback.
 
-    Source: tf_forward.py lines 380-391 (pre-refactor monolithic CONV2D branch).
-
     Tries linear-relaxation conv via ``_fwd_conv2d``; when it returns ``None``
     (kernel/stride shape unsupported), falls back to the interval conv
     ``_fwd_conv2d_interval`` and resets the dual-track state at the new
@@ -110,31 +108,30 @@ def forward_conv2d(
     frame = parent_frames[0]
 
     new_lin = _fwd_conv2d(L, parent_lin)
-    if new_lin is None:
-        lb, ub = _fwd_conv2d_interval(L, parent_box.lb, parent_box.ub)
-        out = Bounds(lb, ub)
-        stored = out
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    else:
-        lin = new_lin
-        lin_lb, lin_ub = _concretize(lin, frame)
-        int_lb, int_ub = _fwd_conv2d_interval(L, parent_box.lb, parent_box.ub)
-        lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-        out = Bounds(lb, ub)
-        stored = out
-    return stored, out, lin, frame
+    int_lb, int_ub = _fwd_conv2d_interval(L, parent_box.lb, parent_box.ub)
+    return _compose_forward(
+        new_lin, int_lb, int_ub, frame, None, post_activation, device, dtype)
 
 
 _CONV_CHANNEL_CHUNK_SIZE = 32
 
 
+def _fit_width(v_flat: torch.Tensor, expected: int) -> torch.Tensor:
+    """Truncate or zero-pad the feature axis of ``[B, n]`` to ``expected`` columns."""
+    n = v_flat.shape[-1]
+    if n == expected:
+        return v_flat
+    if n > expected:
+        return v_flat[:, :expected].contiguous()
+    v_pad = torch.zeros(v_flat.shape[0], expected, dtype=v_flat.dtype, device=v_flat.device)
+    v_pad[:, :n] = v_flat
+    return v_pad
+
+
 def backward_conv2d(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
                     preds: List[int], M: int = 1, alpha=None
                     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    stride = L.params.get("stride", 1)
-    padding = L.params.get("padding", 0)
-    if isinstance(stride, (list, tuple)): stride = stride[0]
-    if isinstance(padding, (list, tuple)): padding = padding[0]
+    stride, padding, _, _ = _conv_args(L)
     nu_out, contrib = dual_conv2d_backward(
         nu, L.params["weight"], L.params.get("bias"),
         stride=stride, padding=padding,
@@ -178,17 +175,7 @@ def dual_conv2d_backward(
         oH = oW = side
 
     expected = oC * oH * oW
-    if n == expected:
-        v_4d = v_flat.view(B, oC, oH, oW)
-    elif n > expected:
-        v_4d = v_flat[:, :expected].contiguous().view(B, oC, oH, oW)
-    else:
-        v_pad = torch.zeros(B, expected, dtype=v_flat.dtype, device=v_flat.device)
-        v_pad[:, :n] = v_flat
-        v_4d = v_pad.view(B, oC, oH, oW)
-
-    if isinstance(stride, (list, tuple)): stride = stride[0]
-    if isinstance(padding, (list, tuple)): padding = padding[0]
+    v_4d = _fit_width(v_flat, expected).view(B, oC, oH, oW)
 
     # Derive output_padding so conv_transpose2d exactly recovers the original
     # input spatial size (stride > 1 loses an increment of up to stride-1).
@@ -263,10 +250,7 @@ def forward_maxpool2d(
     result = _fwd_maxpool2d_lin(L, parent_lin, parent_box.lb, parent_box.ub, parent_frame)
     if result is None:
         lb, ub = _fwd_maxpool2d(L, parent_box.lb, parent_box.ub)
-        out = Bounds(lb, ub)
-        stored = out
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-        return stored, out, lin, frame
+        return _box_result(lb, ub, device, dtype)
     lin, idx_flat, dominant, box_lb, box_ub = result
     # Exact comparisons that tolerate NaN bounds, which degrade to UNKNOWN downstream.
     assert torch.isclose(
@@ -370,11 +354,7 @@ def backward_maxpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     input_shape = L.params.get("input_shape")
     if not isinstance(input_shape, (list, tuple)):
         raise ValueError(f"backward_maxpool2d: layer {L.id} missing/invalid 'input_shape' param")
-    shape = list(input_shape)
-    if len(shape) == 4:
-        _, c_in, iH, iW = shape
-    else:
-        c_in, iH, iW = shape[-3:]
+    c_in, iH, iW = input_shape[-3:]
     n_in = int(c_in) * int(iH) * int(iW)
     v_out = torch.zeros(BM, n_in, dtype=nu.dtype, device=nu.device)
 
@@ -421,19 +401,13 @@ def forward_avgpool2d(
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
     """AvgPool2D forward bounds (interval-only; dual-track resets).
 
-    Source: tf_forward.py lines 454-458 (pre-refactor monolithic AVGPOOL2D
-    branch).
-
     Analogous to :func:`forward_maxpool2d` using ``_fwd_avgpool2d``.
     ``stored`` equals ``out``.
     """
     assert len(parent_boxes) == 1, f"AVGPOOL2D expects 1 predecessor, got {len(parent_boxes)}"
     parent_box = parent_boxes[0]
     lb, ub = _fwd_avgpool2d(L, parent_box.lb, parent_box.ub)
-    out = Bounds(lb, ub)
-    stored = out
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return stored, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
@@ -456,12 +430,7 @@ def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
 
     if input_shape is None:
         raise ValueError(f"backward_avgpool2d: layer {L.id} missing 'input_shape' param")
-    shape = list(input_shape)
-    if len(shape) == 4:
-        _, c, iH, iW = shape
-    else:
-        c, iH, iW = shape[-3:]
-    c = int(c); iH = int(iH); iW = int(iW)
+    c, iH, iW = (int(d) for d in input_shape[-3:])
 
     oH, oW = avgpool2d_output_hw(
         (iH, iW), kernel_size, stride, padding, ceil_mode
@@ -469,16 +438,8 @@ def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
 
     BM = nu.shape[0]
     v_flat = nu.flatten(start_dim=1)
-    n = v_flat.shape[-1]
     expected = c * oH * oW
-    if n == expected:
-        v_4d = v_flat.view(BM, c, oH, oW)
-    elif n > expected:
-        v_4d = v_flat[:, :expected].contiguous().view(BM, c, oH, oW)
-    else:
-        v_pad = torch.zeros(BM, expected, dtype=v_flat.dtype, device=v_flat.device)
-        v_pad[:, :n] = v_flat
-        v_4d = v_pad.view(BM, c, oH, oW)
+    v_4d = _fit_width(v_flat, expected).view(BM, c, oH, oW)
 
     denominators = avgpool2d_denominators(
         (iH, iW),
@@ -561,9 +522,7 @@ def forward_upsample(
     kw = _upsample_kwargs(L, mode, in_shape)
     lb = F.interpolate(parent.lb.reshape(B, *in_shape[1:]), **kw).reshape(B, -1)
     ub = F.interpolate(parent.ub.reshape(B, *in_shape[1:]), **kw).reshape(B, -1)
-    out = Bounds(lb, ub)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_upsample(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],

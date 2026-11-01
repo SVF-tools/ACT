@@ -21,9 +21,9 @@ try:
 except ImportError:
     np = None
     sp = None
-from act.back_end.core import Bounds, Fact
-from act.back_end.solver.solver_hz import HZono, SparseHZono, sparse_hz_linear
-from act.back_end.hybridz_tf.tf_mlp import _hz_fact
+from act.back_end.core import Bounds
+from act.back_end.solver.solver_hz import HZono, SparseHZono
+from act.back_end.hybridz_tf.tf_mlp import _hz_fact, _sparse_apply_per_batch_linear, _sparse_available
 from act.back_end.utils import avgpool2d_denominators, avgpool2d_output_hw
 import act.back_end.interval_tf.tf_cnn as interval
 
@@ -54,10 +54,6 @@ def tf_maxpool2d(L, bounds, tf):
     return interval.tf_maxpool2d(L, bounds)
 
 
-def _sparse_available() -> bool:
-    return np is not None and sp is not None
-
-
 def _pair(x):
     return (int(x), int(x)) if isinstance(x, int) else (int(x[0]), int(x[1]))
 
@@ -70,20 +66,6 @@ def _spatial_shape(input_shape):
     else:
         raise ValueError(f"Unexpected input_shape={input_shape}")
     return int(C), int(H), int(W)
-
-
-def _sparse_apply_per_batch_linear(hz: SparseHZono, W, bias=None) -> SparseHZono:
-    Wsp = W.tocsr().astype(np.float64) if sp.issparse(W) else sp.csr_matrix(W)
-    in_dim = int(Wsp.shape[1])
-    if in_dim == 0 or hz.n_out % in_dim != 0:
-        raise ValueError(f"sparse spatial shape mismatch: {hz.n_out} vs {Wsp.shape}")
-    B = hz.n_out // in_dim
-    M = sp.kron(sp.eye(B, format="csr"), Wsp, format="csr") if B != 1 else Wsp
-    b = None
-    if bias is not None:
-        b0 = np.asarray(bias, dtype=np.float64).reshape(-1)
-        b = np.tile(b0, B) if B > 1 else b0
-    return sparse_hz_linear(hz, M, b)
 
 
 def sparse_conv2d_matrix_from_layer(layer):

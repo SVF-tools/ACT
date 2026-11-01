@@ -40,7 +40,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Union
 import json
 import sys
 import torch
@@ -665,7 +665,6 @@ class TraceAnalyzer:
     def _plot_strategy_effectiveness(self, ax=None) -> None:
         """Plot box plot of coverage gains per strategy."""
         import matplotlib.pyplot as plt
-        import numpy as np
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 5))
@@ -920,44 +919,6 @@ class TraceAnalyzer:
             data.append(row)
 
         return pd.DataFrame(data)
-
-    def export_summary(self, path: str) -> None:
-        """
-        Export summary statistics to CSV.
-
-        Args:
-            path: Output CSV file path
-        """
-        df = self.to_dataframe()
-        if df is not None:
-            df.to_csv(path, index=False)
-            print(f"✅ Exported summary to {os.path.relpath(path)}")
-
-    def export_trace(self, trace_idx: int, path: str) -> None:
-        """
-        Export single trace to PyTorch file.
-
-        Args:
-            trace_idx: Index of trace to export
-            path: Output file path
-        """
-        if trace_idx < 0 or trace_idx >= len(self.traces):
-            print(f"❌ Invalid trace index: {trace_idx}")
-            return
-
-        trace = self.traces[trace_idx]
-        torch.save(trace, path)
-        print(f"✅ Exported trace #{trace_idx} to {os.path.relpath(path)}")
-
-    def export_html_report(self, path: str) -> None:
-        """
-        Generate standalone HTML report with all visualizations.
-
-        Args:
-            path: Output HTML file path
-        """
-        print("⚠️  HTML export not yet implemented")
-        print("   Use Jupyter's 'File > Download as > HTML' to export notebook")
 
 
 if __name__ == "__main__":

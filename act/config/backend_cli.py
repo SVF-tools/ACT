@@ -19,19 +19,15 @@ License: AGPLv3+
 
 import argparse
 from dataclasses import fields, replace
-import datetime
-import glob
 import json
 import logging
 import os
-import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Union, cast, get_args, get_origin, get_type_hints
+from typing import Any, List, NamedTuple, Optional, Union, get_args, get_origin, get_type_hints
 
-from act.config.config import ConfigError, GurobiConfig, TorchLPConfig, VALID_BERT_METHODS, VALID_BOUNDINGS, VALID_ROOT_BOUNDS_REUSE, VALID_SOLVER_TIERS, _VALID_SOLVERS
-from act.back_end.layer_schema import LayerKind
+from act.config.config import ConfigError, GurobiConfig, TorchLPConfig, VALID_BERT_METHODS, VALID_BOUNDINGS, VALID_ROOT_BOUNDS_REUSE, VALID_SOLVER_TIERS, _BACKEND_SUBCONFIG_PREFIX, _VALID_SOLVERS
 from act.front_end.specs import OutKind
 from act.util.cli_utils import add_device_args, initialize_from_args
 from act.util.format_utils import rule
@@ -144,21 +140,6 @@ def _add_dataclass_config_args(parser: argparse.ArgumentParser) -> None:
     add_group(HybridZConfig, "HybridZ Config Overrides (generated)", "hz-", "hybridz_", set())
     add_group(GurobiConfig, "Gurobi Config Overrides (generated)", "gurobi-", "gurobi_", set())
     add_group(TorchLPConfig, "TorchLP Config Overrides (generated)", "torchlp-", "torchlp_", set())
-
-
-# Backend YAML sub-section (== the BackendConfig nested-dataclass field name) ->
-# the flat prefix its fields carry in the CLI/override namespace. Single source of
-# truth, shared by the override-key derivation below AND the config-parity check
-# (act/config/check_parity.py). Adding a field to an existing sub-config needs no
-# change here; only a brand-new sub-config does.
-_BACKEND_SUBCONFIG_PREFIX: dict[str, str] = {
-    "bab": "bab_",
-    "generation": "gen_",
-    "hybridz": "hybridz_",
-    "gurobi": "gurobi_",
-    "torchlp": "torchlp_",
-    "dual": "dual_",
-}
 
 
 def _backend_override_keys_from_dataclasses() -> set[str]:
@@ -401,7 +382,7 @@ def _verify_net(
         if bab_cfg.milp_escalation:
             # Optional import: default commands do not load either numerical
             # escalation owner or gurobipy through this gate.
-            from act.back_end.solver.milp_escalate import solve_milp
+            from act.back_end.solver.solver_gurobi import solve_milp
 
             attempt = solve_milp(net, bab_cfg, deadline=stop_at)
             for i, result in enumerate(results):
@@ -477,7 +458,7 @@ def _report_config_error(label: str, err: ConfigError) -> int:
 def run_vnnlib_verification(args, backend_cfg):
     """Verify every synthesized ONNX/VNNLIB disjunct through the shared cascade."""
     from act.back_end.serialization.serialization import save_net_to_file
-    from act.front_end.vnnlib_loader.vnncomp_instance import load_vnncomp_instance
+    from act.front_end.vnnlib_loader.data_model_loader import load_vnncomp_instance
     from act.pipeline.verification.instance import DisjunctResults, convert_model
     from act.util.stats import VerifyResult, VerifyStatus
 
@@ -570,11 +551,8 @@ def run_verification(args, backend_cfg):
 
 def run_query_verification(args, backend_cfg):
     """Build one indexed compact-BERT query and verify its converted Net."""
-    from act.front_end.bert_loader.query_index import (
-        QueryIndexError,
-        build_query_model,
-        read_query,
-    )
+    from act.front_end.bert_loader.create_specs import build_query_model, read_query
+    from act.front_end.bert_loader.data_model_loader import QueryIndexError
     from act.pipeline.verification.instance import convert_model
 
     label = f"{args.query_index} query {args.query_id}"
@@ -745,181 +723,6 @@ def list_examples(args):
     return 0
 
 
-def _bench_default_path(kind: str) -> str:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("act", "pipeline", "log", f"bench_{kind}_{ts}.json")
-
-
-def _write_bench_result(out_path: str, result: object) -> None:
-    parent = os.path.dirname(out_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(out_path, "w") as fh:
-        json.dump(result, fh, indent=2)
-    print(f"Wrote {out_path}")
-
-
-def _run_bench_cnn(out_path: str) -> int:
-    import torch
-    from act.back_end.serialization.serialization import load_net_from_file
-    from act.back_end.analyze import analyze
-    from act.back_end.core import Fact, ConSet
-    from act.back_end.verifier import find_entry_layer_id, gather_input_spec_layers, seed_from_input_specs
-
-    nets = sorted(
-        p for p in glob.glob("act/back_end/examples/nets/cnn2d_plain_*.json")
-        if "_meta" not in p
-    )
-    if not nets:
-        print("No CNN example nets found at act/back_end/examples/nets/cnn2d_plain_*.json")
-        return 1
-
-    results: Dict[str, Any] = {}
-    for path in nets:
-        net = load_net_from_file(path)
-        entry = find_entry_layer_id(net)
-        seed = seed_from_input_specs(gather_input_spec_layers(net))
-        fact = Fact(bounds=seed, cons=ConSet())
-        for _ in range(2):
-            analyze(net, entry, fact)
-        times: List[float] = []
-        for _ in range(5):
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            analyze(net, entry, fact)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            times.append(time.perf_counter() - t0)
-        results[path] = {
-            "mean": statistics.mean(times),
-            "std": statistics.stdev(times) if len(times) > 1 else 0.0,
-            "all": times,
-        }
-        print(f"  {path}: mean={results[path]['mean']:.4f}s")
-
-    _write_bench_result(out_path, results)
-    return 0
-
-
-def _run_bench_hybridz(out_path: str) -> int:
-    import torch
-    from act.back_end.core import Net, Layer, Bounds, Fact, ConSet
-    from act.back_end.layer_schema import LayerKind
-    from act.back_end.analyze import analyze
-    from act.back_end.transfer_functions import set_transfer_function_mode
-    from act.front_end.specs import OutputSpec
-
-    def _build_net(B: int = 1, n_in: int = 8, n_hid: int = 16, n_out: int = 8) -> Net:
-        layers: List[Any] = []
-        next_id = 0
-        next_var = 0
-
-        def alloc_vars(n: int) -> List[int]:
-            nonlocal next_var
-            vs = list(range(next_var, next_var + n))
-            next_var += n
-            return vs
-
-        in_v = alloc_vars(n_in)
-        layers.append(Layer(id=next_id, kind=LayerKind.INPUT.value,
-            params={"shape": (B, n_in), "dtype": "torch.float32"},
-            in_vars=[], out_vars=in_v))
-        next_id += 1
-        layers.append(Layer(id=next_id, kind=LayerKind.INPUT_SPEC.value,
-            params={"kind": "BOX",
-                    "lb": torch.full((B, n_in), -1.0),
-                    "ub": torch.full((B, n_in),  1.0)},
-            in_vars=in_v, out_vars=in_v))
-        next_id += 1
-        h1_v = alloc_vars(n_hid)
-        W1 = torch.randn(n_hid, n_in)
-        b1 = torch.zeros(n_hid)
-        layers.append(Layer(id=next_id, kind=LayerKind.DENSE.value,
-            params={"weight": W1, "in_features": n_in, "out_features": n_hid,
-                    "weight_pos": W1.clamp(min=0), "weight_neg": W1.clamp(max=0),
-                    "bias": b1, "input_shape": (n_in,)},
-            in_vars=in_v, out_vars=h1_v))
-        next_id += 1
-        layers.append(Layer(id=next_id, kind=LayerKind.RELU.value,
-            params={"input_shape": (n_hid,)},
-            in_vars=h1_v, out_vars=h1_v))
-        next_id += 1
-        out_v = alloc_vars(n_out)
-        W2 = torch.randn(n_out, n_hid)
-        b2 = torch.zeros(n_out)
-        layers.append(Layer(id=next_id, kind=LayerKind.DENSE.value,
-            params={"weight": W2, "in_features": n_hid, "out_features": n_out,
-                    "weight_pos": W2.clamp(min=0), "weight_neg": W2.clamp(max=0),
-                    "bias": b2, "input_shape": (n_hid,)},
-            in_vars=h1_v, out_vars=out_v))
-        next_id += 1
-        assert_params = OutputSpec(
-            kind="LINEAR_LE",
-            c=torch.zeros(n_out),
-            d=torch.tensor(1.0),
-        ).encode_linear(B=B, n_out=n_out, device=torch.device("cpu"), dtype=torch.float32)
-        layers.append(Layer(id=next_id, kind=LayerKind.ASSERT.value,
-            params=assert_params, in_vars=out_v, out_vars=out_v))
-        preds = {0: [], 1: [0], 2: [1], 3: [2], 4: [3], 5: [4]}
-        succs = {0: [1], 1: [2], 2: [3], 3: [4], 4: [5], 5: []}
-        return Net(layers=layers, preds=preds, succs=succs)
-
-    torch.manual_seed(42)
-    net = _build_net()
-    set_transfer_function_mode("hybridz")
-    entry_id = next(l.id for l in net.layers if l.kind == LayerKind.INPUT.value)
-    spec_layer = next(l for l in net.layers if l.kind == LayerKind.INPUT_SPEC.value)
-    import torch as _torch
-    lb_t = cast(_torch.Tensor, spec_layer.params["lb"])
-    ub_t = cast(_torch.Tensor, spec_layer.params["ub"])
-    seed = Bounds(lb_t.clone(), ub_t.clone())
-    fact = Fact(bounds=seed, cons=ConSet())
-    for _ in range(2):
-        analyze(net, entry_id, fact)
-    times: List[float] = []
-    for _ in range(5):
-        t0 = time.perf_counter()
-        analyze(net, entry_id, fact)
-        times.append(time.perf_counter() - t0)
-    result = {
-        "mean": statistics.mean(times),
-        "std": statistics.stdev(times) if len(times) > 1 else 0.0,
-    }
-    print(f"  hybridz synthetic 4-layer MLP: mean={result['mean']:.4f}s")
-    _write_bench_result(out_path, result)
-    return 0
-
-
-def run_bench(args) -> int:
-    """Run timing benchmarks for CNN and/or HybridZ analyze() code paths."""
-    kind = args.bench
-    bench_out = getattr(args, "bench_out", None)
-
-    print(f"\n{rule()}")
-    print(f"ACT BENCH: {kind.upper()}")
-    print(f"{rule()}\n")
-
-    if kind in ("cnn", "all"):
-        out_path = bench_out if (bench_out and kind == "cnn") else _bench_default_path("cnn")
-        print(f"--- CNN benchmark ---")
-        rc = _run_bench_cnn(out_path)
-        if rc != 0:
-            return rc
-
-    if kind in ("hybridz", "all"):
-        out_path = bench_out if (bench_out and kind == "hybridz") else _bench_default_path("hybridz")
-        print(f"\n--- HybridZ benchmark ---")
-        rc = _run_bench_hybridz(out_path)
-        if rc != 0:
-            return rc
-
-    print(f"\n{rule()}")
-    print(f"Bench complete")
-    print(f"{rule()}\n")
-    return 0
-
-
 def run_diff_nets(args) -> int:
     """Load two ACT Net JSON files and print a unified-diff-style layer comparison."""
     from act.back_end.serialization.serialization import load_net_from_file
@@ -1032,20 +835,6 @@ Examples:
   python -m act.back_end --test-serialization
   
   # ============================================================================
-  # BENCHMARKING - Time analyze() on example nets
-  # ============================================================================
-  
-  # Benchmark CNN analyze() on all cnn2d_plain_* example nets
-  python -m act.back_end --bench cnn
-  
-  # Benchmark HybridZ analyze() on a synthetic MLP
-  python -m act.back_end --bench hybridz
-  
-  # Run both benchmarks and write JSON output
-  python -m act.back_end --bench all
-  python -m act.back_end --bench cnn --bench-out /tmp/my_cnn_timing.json
-  
-  # ============================================================================
   # NET DIFF - Compare two network JSON files
   # ============================================================================
   
@@ -1099,33 +888,12 @@ Exit status (--verify):
         help="Run serialization tests",
     )
     cmd_group.add_argument(
-        "--bench",
-        type=str,
-        choices=["cnn", "hybridz", "all"],
-        metavar="{cnn,hybridz,all}",
-        dest="bench",
-        help="Run analyze() timing benchmarks: cnn nets, hybridz synthetic MLP, or all",
-    )
-    cmd_group.add_argument(
         "--diff-nets",
         nargs=2,
         metavar=("NET_A", "NET_B"),
         dest="diff_nets",
         help="Load two ACT Net JSON files and print a layer-level diff summary",
     )
-    # Bench options
-    bench_group = parser.add_argument_group("Bench Options")
-    bench_group.add_argument(
-        "--bench-out",
-        type=str,
-        default=None,
-        dest="bench_out",
-        help=(
-            "Output JSON path for bench results "
-            "(default: act/pipeline/log/bench_<kind>_<timestamp>.json)"
-        ),
-    )
-
     # Network factory options
     factory_group = parser.add_argument_group("Network Factory Options")
     factory_group.add_argument(
@@ -1251,54 +1019,6 @@ Exit status (--verify):
         default=None,
         help="SST/Yelp method: planar, rule, alpha, ibp, or discrete.",
     )
-    verify_group.add_argument(
-        "--p",
-        type=float,
-        default=None,
-        help="Text embedding perturbation norm metadata (2 or inf).",
-    )
-    verify_group.add_argument(
-        "--perturbed-words",
-        type=int,
-        choices=[1, 2],
-        default=None,
-        dest="perturbed_words",
-        help="Number of SST/Yelp token positions perturbed together.",
-    )
-    verify_group.add_argument(
-        "--eps",
-        type=float,
-        default=None,
-        help="Initial SST/Yelp verification radius.",
-    )
-    verify_group.add_argument(
-        "--max-eps",
-        type=float,
-        default=None,
-        dest="max_eps",
-        help="Maximum radius for SST/Yelp certified-radius search.",
-    )
-    verify_group.add_argument(
-        "--num-verify-iters",
-        type=int,
-        default=None,
-        dest="num_verify_iters",
-        help="Binary-search iterations for SST/Yelp certified radius.",
-    )
-    verify_group.add_argument(
-        "--k",
-        type=int,
-        default=None,
-        help="Rule threshold for rule-slope attention alpha.",
-    )
-    verify_group.add_argument(
-        "--alpha-opt-steps",
-        type=int,
-        default=None,
-        dest="alpha_opt_steps",
-        help="Optimization steps for optimized-alpha refinement.",
-    )
-
     # BaB mode: --bab enables, --no-bab disables, absent = from config.yaml
     bab_toggle = verify_group.add_mutually_exclusive_group()
     bab_toggle.add_argument(
@@ -1387,27 +1107,6 @@ Exit status (--verify):
         ),
     )
     verify_group.add_argument(
-        "--bab-sa-cooling-rate",
-        type=float,
-        default=None,
-        dest="bab_sa_cooling_rate",
-        help="Cooling rate for --bab-bounding annealed (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-frontier-cap",
-        type=int,
-        default=None,
-        dest="bab_frontier_cap",
-        help="Maximum pending BaB frontier leaves to retain; 0 disables eviction (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-enabled",
-        action="store_true",
-        default=None,
-        dest="bab_llm_probe_enabled",
-        help="Enable the LLM-probe BaB controller (default: from config.yaml)",
-    )
-    verify_group.add_argument(
         "--bab-llm-probe-backend",
         type=str,
         default=None,
@@ -1415,150 +1114,6 @@ Exit status (--verify):
         dest="bab_llm_probe_backend",
         help="LLM-probe backend (default: from config.yaml)",
     )
-    verify_group.add_argument(
-        "--bab-llm-probe-model",
-        type=str,
-        default=None,
-        dest="bab_llm_probe_model",
-        help="LLM-probe model name (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-base-url",
-        type=str,
-        default=None,
-        dest="bab_llm_probe_base_url",
-        help="LLM-probe OpenAI-compatible base URL (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-cadence",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_cadence",
-        help="LLM-probe consult cadence in waves (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-api-key-env",
-        type=str,
-        default=None,
-        dest="bab_llm_probe_api_key_env",
-        help="LLM-probe environment variable name holding the API key (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-temperature",
-        type=float,
-        default=None,
-        dest="bab_llm_probe_temperature",
-        help="LLM-probe sampling temperature (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-timeout",
-        type=float,
-        default=None,
-        dest="bab_llm_probe_timeout",
-        help="LLM-probe per-call wall-clock timeout in seconds; a slower response raises and "
-             "falls back to baseline for that wave (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-max-candidates",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_max_candidates",
-        help="LLM-probe maximum unstable neuron candidates per domain (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-max-candidates-total",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_max_candidates_total",
-        help="LLM-probe total candidate budget across all domains; exceeding falls back to FSB (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-neuron-topk",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_neuron_topk",
-        help="If >0, truncate the neuron-selection candidate set to the top-K by score before "
-             "sending to the LLM (0=full set up to max-candidates-total) (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-history",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_history",
-        help="LLM-probe number of past wave outcomes to include in context (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-max-failures",
-        type=int,
-        default=None,
-        dest="bab_llm_probe_max_failures",
-        help="LLM-probe consecutive failure threshold before circuit-breaker disables the controller (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-decisions",
-        type=str,
-        default=None,
-        dest="bab_llm_probe_decisions",
-        help="LLM-probe comma-separated decision types to enable; tokens: split,frontier,refine,neuron (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-llm-probe-log",
-        action="store_true",
-        default=None,
-        dest="bab_llm_probe_log",
-        help="Enable per-wave LLM-probe decision logging (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-multi-split-levels",
-        type=int,
-        default=None,
-        dest="bab_multi_split_levels",
-        help=(
-            "Neurons split jointly per branching step; each lane fans out into "
-            "all 2^k sign combinations (verdict-boundary joint splitting). "
-            "1 = single split. The k neurons are chosen by the BaBSR heuristic "
-            "(area x |nu|) regardless of --bab-branching. Requires "
-            "--bab-solver-tier dual_alpha or dual_alpha_eta "
-            "(default: from config.yaml)"
-        ),
-    )
-    verify_group.add_argument(
-        "--bab-ramp-split-levels",
-        type=int,
-        default=None,
-        dest="bab_ramp_split_levels",
-        help=(
-            "Joint splits per step on a convolutional network while fewer than "
-            "--bab-ramp-split-lanes lanes branch (default: from config.yaml)"
-        ),
-    )
-    verify_group.add_argument(
-        "--bab-ramp-split-lanes",
-        type=int,
-        default=None,
-        dest="bab_ramp_split_lanes",
-        help="Branching lanes below which --bab-ramp-split-levels applies; 0 disables it (default: from config.yaml)",
-    )
-    verify_group.add_argument(
-        "--bab-top-k",
-        type=int,
-        default=None,
-        dest="bab_top_k",
-        help=(
-            "Cap on subproblems popped per BaB wave, independent of the batch "
-            "size; 0 = unbounded. Honoured by --bab-bounding "
-            "depth_bound_blend/greedy/annealed/diverse_split_signs; rejected "
-            "for random/mcts (default: from config.yaml)"
-        ),
-    )
-    verify_group.add_argument(
-        "--bab-input-split-fanout",
-        type=int,
-        default=None,
-        dest="bab_input_split_fanout",
-        help="Uniform fanout for input splits (default: from config.yaml)",
-    )
-
     # Backend config file
     verify_group.add_argument(
         "--backend-config",
@@ -1690,8 +1245,6 @@ Exit status (--verify):
             return list_examples(args)
         elif args.test_serialization:
             return run_serialization_test(args)
-        elif args.bench:
-            return run_bench(args)
         else:
             parser.print_help()
             return 1
@@ -1709,39 +1262,11 @@ _BACKEND_ALIAS_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
     ("verbose",              "verbose",             None,             None, "user_set"),
     ("timeout",              "timeout",             None,             None, "not_none"),
     ("method",               "method",              None,             None, "not_none"),
-    ("p",                    "p",                   None,             None, "not_none"),
-    ("perturbed_words",      "perturbed_words",     None,             None, "not_none"),
-    ("eps",                  "eps",                 None,             None, "not_none"),
-    ("max_eps",              "max_eps",             None,             None, "not_none"),
-    ("num_verify_iters",     "num_verify_iters",    None,             None, "not_none"),
-    ("k",                    "k",                   None,             None, "not_none"),
-    ("alpha_opt_steps",      "alpha_opt_steps",     None,             None, "not_none"),
     ("bab_enabled",          "bab",                 None,             None, "not_none"),
     ("bab_max_depth",        "bab_max_depth",       None,             None, "not_none"),
     ("bab_max_nodes",        "bab_max_subproblems", None,             None, "not_none"),
     ("bab_branching_method", "bab_branching",       None,             None, "not_none"),
-    ("bab_sa_cooling_rate",  "bab_sa_cooling_rate", None,             None, "not_none"),
-    ("bab_frontier_cap",     "bab_frontier_cap",    None,             None, "not_none"),
-    ("bab_input_split_fanout", "bab_input_split_fanout", None,          None, "not_none"),
-    ("bab_llm_probe_enabled", "bab_llm_probe_enabled",  None,             None, "user_set"),
     ("bab_llm_probe_backend", "bab_llm_probe_backend",  None,             None, "not_none"),
-    ("bab_llm_probe_model",   "bab_llm_probe_model",    None,             None, "not_none"),
-    ("bab_llm_probe_base_url", "bab_llm_probe_base_url", None,            None, "not_none"),
-    ("bab_llm_probe_cadence", "bab_llm_probe_cadence",  None,             int,  "not_none"),
-    ("bab_llm_probe_api_key_env",        "bab_llm_probe_api_key_env",        None, None,  "not_none"),
-    ("bab_llm_probe_temperature",        "bab_llm_probe_temperature",        None, float, "not_none"),
-    ("bab_llm_probe_timeout",            "bab_llm_probe_timeout",            None, float, "not_none"),
-    ("bab_llm_probe_max_candidates",     "bab_llm_probe_max_candidates",     None, int,   "not_none"),
-    ("bab_llm_probe_max_candidates_total", "bab_llm_probe_max_candidates_total", None, int, "not_none"),
-    ("bab_llm_probe_neuron_topk",         "bab_llm_probe_neuron_topk",         None, int,   "not_none"),
-    ("bab_llm_probe_history",            "bab_llm_probe_history",            None, int,   "not_none"),
-    ("bab_llm_probe_max_failures",       "bab_llm_probe_max_failures",       None, int,   "not_none"),
-    ("bab_llm_probe_decisions",          "bab_llm_probe_decisions",          None, None,  "not_none"),
-    ("bab_llm_probe_log",                "bab_llm_probe_log",                None, None,  "user_set"),
-    ("bab_multi_split_levels",           "bab_multi_split_levels",           None, int,   "not_none"),
-    ("bab_ramp_split_levels",            "bab_ramp_split_levels",            None, int,   "not_none"),
-    ("bab_ramp_split_lanes",             "bab_ramp_split_lanes",             None, int,   "not_none"),
-    ("bab_top_k",                        "bab_top_k",                        None, int,   "not_none"),
     ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
     ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),
     ("gen_base_seed",        "base_seed",           "ACT_GEN_SEED",   int,  "not_none"),
@@ -1870,14 +1395,6 @@ def _run_cli_cascade_smoke() -> int:
         assert error is None and [r.status for r in results] == [VerifyStatus.UNKNOWN]
         assert results[0].metadata["reason"] == "one_shot_out_of_memory"
 
-    def _t_lp_disabled_skips_tier2():
-        cfg = BackendConfig(solver="torchlp", lp_enabled=False, bab_enabled=False)
-        assert not cfg.lp_enabled
-
-    def _t_bab_max_batch_size_default():
-        cfg = BackendConfig()
-        assert cfg.bab_max_batch_size == 8
-
     def _t_frontier_config() -> None:
         """Generated CLI preserves auto and rejects invalid memory budgets."""
         from act.config.config import BaBConfig
@@ -1903,17 +1420,31 @@ def _run_cli_cascade_smoke() -> int:
                 pass
             else:
                 raise AssertionError(f"accepted invalid K: {value!r}")
-        for field in ("frontier_mem_safety", "intermediate_refine_max_tensor_mib"):
-            for value in (-1.0, float("nan"), float("inf")):
-                try:
-                    if field == "frontier_mem_safety":
-                        BaBConfig(frontier_mem_safety=value)
-                    else:
-                        BaBConfig(intermediate_refine_max_tensor_mib=value)
-                except ConfigError:
-                    pass
-                else:
-                    raise AssertionError(f"accepted invalid {field}: {value}")
+        for value in (-1.0, float("nan"), float("inf")):
+            try:
+                BaBConfig(frontier_mem_safety=value)
+            except ConfigError:
+                pass
+            else:
+                raise AssertionError(f"accepted invalid frontier_mem_safety: {value}")
+            try:
+                BaBConfig(intermediate_refine_max_tensor_mib=value)
+            except ConfigError:
+                pass
+            else:
+                raise AssertionError(
+                    f"accepted invalid intermediate_refine_max_tensor_mib: {value}"
+                )
+        for kwargs, expected in (
+            ({"lp_enabled": True}, "lp_enabled"),
+            ({"lp_enabled": False, "bab_max_batch_size": 2}, "bab_max_batch_size"),
+        ):
+            try:
+                BackendConfig(solver="gurobi", **kwargs)
+            except ConfigError as error:
+                assert expected in str(error)
+            else:
+                raise AssertionError(f"Gurobi accepted invalid configuration: {kwargs}")
         try:
             BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size="auto")
         except ConfigError:
@@ -2043,14 +1574,22 @@ def _run_cli_cascade_smoke() -> int:
                 else:
                     raise AssertionError((key, value))
         import builtins
+        import sys
         original_import = builtins.__import__
+        gurobi_loaded = "gurobipy" in sys.modules
 
         def checked_import(name: str, *args: Any, **kwargs: Any) -> Any:
             """Reject numerical-tier imports while escalation is disabled."""
-            assert name not in {"act.back_end.solver.milp_escalate", "act.back_end.solver.terminal_lp"}
+            assert name not in {"act.back_end.solver.solver_gurobi", "act.back_end.solver.solver_torchlp"}
             return original_import(name, *args, **kwargs)
 
-        with patch.object(builtins, "__import__", side_effect=checked_import), patch(
+        with patch.object(
+            sys.modules["act.back_end.solver.solver_gurobi"], "solve_milp",
+        ) as milp_solve, patch.object(
+            sys.modules["act.back_end.solver.solver_torchlp"], "solve_terminal_batch",
+        ) as terminal_solve, patch.object(
+            builtins, "__import__", side_effect=checked_import,
+        ), patch(
             "act.back_end.verifier.verify_once", return_value=[VerifyResult(VerifyStatus.UNKNOWN)],
         ), patch(
             f"{__name__}._resolve_bab_config",
@@ -2058,12 +1597,16 @@ def _run_cli_cascade_smoke() -> int:
         ):
             result, error, _ = _verify_net(_milp_net(), cfg)
         assert error is None and result[0].status == VerifyStatus.UNKNOWN
+        milp_solve.assert_not_called()
+        terminal_solve.assert_not_called()
+        assert "scipy.optimize" not in sys.modules
+        assert ("gurobipy" in sys.modules) == gurobi_loaded
 
     def _t_milp_boundaries() -> None:
         """Failure paths neither certify nor accept an unchecked incumbent."""
         from types import SimpleNamespace
         from unittest.mock import patch
-        from act.back_end.solver import milp_escalate as milp
+        from act.back_end.solver import solver_gurobi as milp
         from act.config.config import BaBConfig
 
         cfg = BaBConfig(milp_escalation=True)
@@ -2098,7 +1641,7 @@ def _run_cli_cascade_smoke() -> int:
             candidate = net.layers[1].params["lb"].new_tensor([[value]])
             with patch.object(milp, "_optimize", return_value=("optimal", candidate)):
                 reason("invalid_incumbent")
-        with patch.object(milp, "import_gurobi", return_value=(False, None, None)):
+        with patch.object(milp, "GUROBI_AVAILABLE", False):
             reason("unavailable")
 
         class LicenseError(Exception):
@@ -2111,13 +1654,13 @@ def _run_cli_cascade_smoke() -> int:
 
         fake_gp = SimpleNamespace(GurobiError=LicenseError, Env=unavailable_env)
         fake_grb = SimpleNamespace(Error=SimpleNamespace(NO_LICENSE=10009))
-        with patch.object(milp, "import_gurobi", return_value=(True, fake_gp, fake_grb)):
+        with patch.object(milp, "GUROBI_AVAILABLE", True), patch.object(milp, "gp", fake_gp), patch.object(milp, "GRB", fake_grb):
             reason("license_unavailable")
 
     def _t_milp_real() -> None:
         """Real tiny exact SAT/UNSAT solves, explicitly reporting absent licenses."""
         from unittest.mock import patch
-        from act.back_end.solver.milp_escalate import solve_milp
+        from act.back_end.solver.solver_gurobi import solve_milp
         from act.config.config import BaBConfig
 
         cfg = BaBConfig(milp_escalation=True)
@@ -2148,7 +1691,7 @@ def _run_cli_cascade_smoke() -> int:
     def _t_milp_cascade() -> None:
         """Escalation consumes the common deadline and retains reasons after BaB."""
         from unittest.mock import patch
-        from act.back_end.solver import milp_escalate
+        from act.back_end.solver import solver_gurobi
         from act.config.config import BaBConfig
         from act.util.stats import VerifyResult
 
@@ -2172,7 +1715,7 @@ def _run_cli_cascade_smoke() -> int:
             with (
                 patch.object(time, "monotonic", side_effect=lambda: clock[0]),
                 patch("act.back_end.verifier.verify_once", return_value=[VerifyResult(VerifyStatus.UNKNOWN)]),
-                patch.object(milp_escalate, "solve_milp", side_effect=escalation),
+                patch.object(solver_gurobi, "solve_milp", side_effect=escalation),
                 patch("act.back_end.bab.bab.verify_bab_batched", side_effect=bab),
             ):
                 results, error, _ = _verify_net(_milp_net(), cfg)
@@ -2183,9 +1726,7 @@ def _run_cli_cascade_smoke() -> int:
     print("cli.py cascade smoke tests")
     _check("tier-1 interval verify_once returns VerifyStatus", _t_interval_only)
     _check("cascade with lp_enabled=True dispatches tier-2 on UNKNOWN", _t_cascade_default_config)
-    _check("lp_enabled=False skips tier-2", _t_lp_disabled_skips_tier2)
     _check("one-shot OOM stays UNKNOWN", _t_one_shot_oom_reaches_bab)
-    _check("default bab_max_batch_size=8", _t_bab_max_batch_size_default)
     _check("frontier CLI budgets and automatic K", _t_frontier_config)
     _check("dual cascade accepts unsafe-linear escape and rejects ties", _t_dual_unsafe_linear)
     _check("cascade shares one deadline across stages and lanes", _t_cascade_shares_deadline)

@@ -23,8 +23,7 @@ from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
 from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.vnnlib_loader.data_model_loader import (
     list_downloaded_pairs,
-    load_vnnlib_pair,
-    list_local_categories
+    load_vnnlib_pair
 )
 from act.front_end.vnnlib_loader.vnnlib_parser import (
     UnsupportedSpecError,
@@ -55,20 +54,8 @@ class VNNLibSpecCreator(BaseSpecCreator):
         ...     print(f"{category}/{instance_id}: {len(spec_pairs)} spec pairs")
     """
     
-    def __init__(
-        self,
-        config_name: Optional[str] = "vnnlib_default",
-        config_dict: Optional[Dict[str, Any]] = None
-    ):
-        """
-        Initialize VNNLIB spec creator.
-        
-        Args:
-            config_name: Name of YAML config file (without .yaml extension)
-            config_dict: Direct config dict (overrides config_name if provided)
-        """
-        super().__init__(config_name, config_dict)
-        
+    DEFAULT_CONFIG = "vnnlib_default"
+    
     @override
     def create_specs_for_data_model_pairs(
         self,
@@ -279,21 +266,6 @@ class VNNLibSpecCreator(BaseSpecCreator):
         labeled_tensors = [labeled_tensor]
         
         return (category, instance_id, pytorch_model, labeled_tensors, spec_pairs)
-    
-    def list_categories(self) -> List[str]:
-        """
-        List locally downloaded VNNLIB benchmark categories.
-        
-        Returns:
-            List of category names
-            
-        Example:
-            >>> creator = VNNLibSpecCreator()
-            >>> categories = creator.list_categories()
-            >>> print(categories)
-            ['mnist_fc', 'cifar10_resnet']
-        """
-        return list_local_categories()
 
 
 def create_specs_from_paths(onnx_path, vnnlib_path, category: str = "custom"):

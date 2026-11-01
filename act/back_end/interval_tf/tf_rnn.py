@@ -7,487 +7,507 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   RNN Interval Transfer Functions. Provides transfer functions for RNN layers
-#   to enable the abstraction framework to handle recurrent neural networks.
+#   RNN interval transfer functions shared by interval and HybridZ modes.
 
+from collections.abc import Callable
+from math import prod
+from typing import Any
 
 import torch
+
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
-from act.back_end.utils import affine_bounds, split_weight, four_corner_envelope
+from act.back_end.utils import affine_bounds, four_corner_envelope, split_weight
+
+
+State = tuple[torch.Tensor, ...]
+Step = Callable[
+    [torch.Tensor, torch.Tensor, State, dict[str, torch.Tensor | None], int, str | None],
+    State,
+]
 
 
 def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for LSTM layer.
-    
-    Handles LSTM cell computation with interval bounds propagation.
-    """
-    # Extract LSTM parameters
-    weight_ih = _get_tensor_param(L, "weight_ih_l0")  # input-to-hidden weights
-    weight_hh = _get_tensor_param(L, "weight_hh_l0")  # hidden-to-hidden weights
-    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
-    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
-    
-    # LSTM dimensions
-    input_size = L.get_int("input_size")
-    hidden_size = L.get_int("hidden_size")
-    num_layers = L.get_int("num_layers", 1)
-    batch_first = bool(L.get_scalar("batch_first", False))
-    bidirectional = bool(L.get_scalar("bidirectional", False))
-    
-    # Shape information
-    input_shape = _get_shape_param(L, "input_shape")  # [batch, seq_len, input_size] or [seq_len, batch, input_size]
-    output_shape = _get_shape_param(L, "output_shape")
-    
-    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
-    batch_size, seq_len, _ = seq_bounds.lb.shape
-
-    # For verification, we approximate LSTM with its linearized form
-    # This is a conservative approximation using the worst-case bounds
-
-    # Initialize hidden and cell states bounds (typically zeros)
-    h_bounds = Bounds(
-        Bin.lb.new_zeros(batch_size, hidden_size),
-        Bin.lb.new_zeros(batch_size, hidden_size),
-    )
-    c_bounds = Bounds(
-        Bin.lb.new_zeros(batch_size, hidden_size),
-        Bin.lb.new_zeros(batch_size, hidden_size),
-    )
-    
-    # Process each time step
-    output_bounds_list = []
-    
-    for t in range(seq_len):
-        # Extract input at time step t
-        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
-        
-        # LSTM cell computation with bounds
-        h_bounds, c_bounds = _lstm_cell_bounds(
-            x_t_bounds, h_bounds, c_bounds,
-            weight_ih, weight_hh, bias_ih, bias_hh
-        )
-        
-        output_bounds_list.append(h_bounds)
-    
-    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
-    
-    if bidirectional:
-        raise NotImplementedError(
-            "tf_lstm: bidirectional=True not supported (reverse-direction "
-            "sweep over weight_*_l0_reverse not implemented)."
-        )
-    
-    B_output = Bounds(output_lb, output_ub)
-    
-    # Create constraints
-    C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"lstm:{L.id}",
-        "input_size": input_size,
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
-        "bidirectional": bidirectional,
-        "batch_first": batch_first,
-        "input_shape": input_shape,
-        "output_shape": output_shape
-    }))
-    
-    C.add_box(L.id, L.out_vars, B_output)
-    return Fact(B_output, C)
+    """Apply the interval LSTM transfer function."""
+    return _recurrent_fact(L, Bin, "lstm", strict_num_layers=False, hybridz=False)
 
 
 def tf_gru(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for GRU layer.
-    
-    Handles GRU cell computation with interval bounds propagation.
-    """
-    # Extract GRU parameters
-    weight_ih = _get_tensor_param(L, "weight_ih_l0")
-    weight_hh = _get_tensor_param(L, "weight_hh_l0")
-    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
-    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
-    
-    # GRU dimensions
-    input_size = L.get_int("input_size")
-    hidden_size = L.get_int("hidden_size")
-    num_layers = L.get_int("num_layers", 1)
-    batch_first = bool(L.get_scalar("batch_first", False))
-    bidirectional = bool(L.get_scalar("bidirectional", False))
-    
-    # Input shape information
-    input_shape = _get_shape_param(L, "input_shape")
-    output_shape = _get_shape_param(L, "output_shape")
-    
-    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
-    batch_size, seq_len, _ = seq_bounds.lb.shape
+    """Apply the interval GRU transfer function."""
+    return _recurrent_fact(L, Bin, "gru", strict_num_layers=False, hybridz=False)
 
-    # Initialize hidden state bounds
-    h_bounds = Bounds(
-        Bin.lb.new_zeros(batch_size, hidden_size),
-        Bin.lb.new_zeros(batch_size, hidden_size),
+
+def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the interval vanilla RNN transfer function."""
+    return _recurrent_fact(L, Bin, "rnn", strict_num_layers=False, hybridz=False)
+
+
+def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the interval embedding transfer function."""
+    return _embedding_fact(L, hybridz=False)
+
+
+def tf_lstm_hybridz(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the HybridZ LSTM interval handler."""
+    return _recurrent_fact(L, Bin, "lstm", strict_num_layers=True, hybridz=True)
+
+
+def tf_gru_hybridz(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the HybridZ GRU interval handler."""
+    return _recurrent_fact(L, Bin, "gru", strict_num_layers=True, hybridz=True)
+
+
+def tf_rnn_hybridz(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the HybridZ vanilla RNN interval handler."""
+    return _recurrent_fact(L, Bin, "rnn", strict_num_layers=True, hybridz=True)
+
+
+def tf_embedding_hybridz(L: Layer, Bin: Bounds) -> Fact:
+    """Apply the HybridZ embedding interval handler."""
+    return _embedding_fact(L, hybridz=True)
+
+
+def _recurrent_fact(
+    L: Layer,
+    Bin: Bounds,
+    operation: str,
+    *,
+    strict_num_layers: bool,
+    hybridz: bool,
+) -> Fact:
+    """Run one recurrent layer through the common sequence engine."""
+    cfg = _read_rnn_config(L, operation, strict_num_layers)
+    seq_lb, seq_ub = _seq_view(Bin, cfg)
+    nonlinearity: str | None = None
+    if operation == "lstm":
+        step = _lstm_step
+        state = _zero_state(Bin, cfg["batch"], cfg["hidden_size"], 4)
+    elif operation == "gru":
+        step = _gru_step
+        state = _zero_state(Bin, cfg["batch"], cfg["hidden_size"], 2)
+    elif operation == "rnn":
+        step = _rnn_step
+        nonlinearity = L.params.get("nonlinearity", "tanh")
+        if nonlinearity not in ("tanh", "relu"):
+            if hybridz:
+                raise ValueError(
+                    f"hybridz tf_rnn: unsupported nonlinearity {nonlinearity!r}"
+                )
+            raise ValueError(f"Unsupported RNN nonlinearity: {nonlinearity}")
+    else:
+        raise ValueError(f"Unsupported recurrent operation: {operation}")
+
+    if operation == "rnn":
+        state = _zero_state(Bin, cfg["batch"], cfg["hidden_size"], 2)
+    out_lb, out_ub = _run_sequence(
+        seq_lb,
+        seq_ub,
+        cfg,
+        state,
+        step,
+        nonlinearity,
+        hybridz,
+    )
+    return _make_fact(
+        L,
+        cfg,
+        out_lb,
+        out_ub,
+        operation,
+        nonlinearity,
+        hybridz=hybridz,
     )
 
-    # Process each time step
-    output_bounds_list = []
 
-    for t in range(seq_len):
-        # Extract input at time step t
-        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
+def _embedding_fact(L: Layer, *, hybridz: bool) -> Fact:
+    """Build conservative embedding bounds for one transfer-function mode."""
+    if hybridz:
+        weight: torch.Tensor = L.params["weight"]
+        embedding_dim = int(L.params.get("embedding_dim", weight.shape[-1]))
+        output_shape = L.params.get("output_shape")
+        repeats = _embedding_repeats_hybridz(L, embedding_dim, output_shape)
+        meta = {
+            "tag": f"embedding:{L.id}",
+            "embedding_dim": embedding_dim,
+            "input_shape": L.params.get("input_shape"),
+            "output_shape": output_shape,
+        }
+    else:
+        weight = _get_tensor_param(L, "weight")
+        num_embeddings = L.get_int("num_embeddings")
+        embedding_dim = L.get_int("embedding_dim")
+        padding_idx = L.params.get("padding_idx", None)
+        input_shape = _get_shape_param(L, "input_shape")
+        output_shape = _get_shape_param(L, "output_shape")
+        repeats = prod(output_shape) // embedding_dim
+        meta = {
+            "tag": f"embedding:{L.id}",
+            "num_embeddings": num_embeddings,
+            "embedding_dim": embedding_dim,
+            "padding_idx": padding_idx,
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        }
 
-        # GRU cell computation with bounds
-        h_bounds = _gru_cell_bounds(
-            x_t_bounds, h_bounds,
-            weight_ih, weight_hh, bias_ih, bias_hh
-        )
-        
-        output_bounds_list.append(h_bounds)
-    
-    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
-    
-    if bidirectional:
-        # Same soundness issue as tf_lstm — see that function for details.
-        raise NotImplementedError(
-            "tf_gru: bidirectional=True not supported (reverse-direction "
-            "sweep over weight_*_l0_reverse not implemented)."
-        )
-    
-    B_output = Bounds(output_lb, output_ub)
-    
-    # Create constraints
+    B_out = Bounds(
+        weight.min(dim=0).values.repeat(repeats),
+        weight.max(dim=0).values.repeat(repeats),
+    )
     C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"gru:{L.id}",
-        "input_size": input_size,
-        "hidden_size": hidden_size,
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), meta))
+    C.add_box(L.id, L.out_vars, B_out)
+    return Fact(B_out, C)
+
+
+def _embedding_repeats_hybridz(
+    L: Layer,
+    embedding_dim: int,
+    output_shape: Any,
+) -> int:
+    """Validate HybridZ embedding output width and return table repetitions."""
+    n_out = len(L.out_vars)
+    if n_out % embedding_dim != 0:
+        raise ValueError(
+            f"hybridz tf_embedding: out_vars count {n_out} not divisible by "
+            f"embedding_dim {embedding_dim} (output_shape={output_shape})."
+        )
+    return n_out // embedding_dim
+
+
+def _read_rnn_config(
+    L: Layer,
+    operation: str,
+    strict_num_layers: bool,
+) -> dict[str, Any]:
+    """Read layer-zero recurrent weights and preserve mode-specific checks."""
+    num_layers = L.get_int("num_layers", 1)
+    bidirectional = bool(L.get_scalar("bidirectional", False))
+    if strict_num_layers and num_layers != 1:
+        raise ValueError(
+            f"hybridz tf_{operation}: only num_layers=1 supported, got {num_layers}."
+        )
+    if bidirectional:
+        if strict_num_layers:
+            raise NotImplementedError(
+                f"hybridz tf_{operation}: bidirectional=True not supported (reverse "
+                f"direction over weight_*_l0_reverse not implemented)."
+            )
+        raise NotImplementedError(
+            f"tf_{operation}: bidirectional=True not supported (reverse-direction "
+            f"sweep over weight_*_l0_reverse not implemented)."
+        )
+
+    input_shape = _get_shape_param(L, "input_shape")
+    batch_first = bool(L.get_scalar("batch_first", False))
+    if batch_first:
+        batch, seq_len, _ = input_shape
+    else:
+        seq_len, batch, _ = input_shape
+    return {
+        "input_size": L.get_int("input_size"),
+        "hidden_size": L.get_int("hidden_size"),
         "num_layers": num_layers,
         "bidirectional": bidirectional,
         "batch_first": batch_first,
         "input_shape": input_shape,
-        "output_shape": output_shape
-    }))
-    
-    C.add_box(L.id, L.out_vars, B_output)
-    return Fact(B_output, C)
+        "output_shape": _get_shape_param(L, "output_shape"),
+        "batch": batch,
+        "seq_len": seq_len,
+        "weights": {
+            "W_ih": _get_tensor_param(L, "weight_ih_l0"),
+            "W_hh": _get_tensor_param(L, "weight_hh_l0"),
+            "b_ih": L.get_tensor("bias_ih_l0"),
+            "b_hh": L.get_tensor("bias_hh_l0"),
+        },
+    }
 
 
-def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for vanilla RNN layer.
-    
-    Handles simple RNN cell computation with interval bounds propagation.
-    """
-    # Extract RNN parameters
-    weight_ih = _get_tensor_param(L, "weight_ih_l0")
-    weight_hh = _get_tensor_param(L, "weight_hh_l0")
-    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
-    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
-    
-    # RNN dimensions
-    input_size = L.get_int("input_size")
-    hidden_size = L.get_int("hidden_size")
-    nonlinearity = str(L.get_scalar("nonlinearity", "tanh"))  # 'tanh' or 'relu'
-    batch_first = bool(L.get_scalar("batch_first", False))
-    bidirectional = bool(L.get_scalar("bidirectional", False))
-    
-    # Input shape information
-    input_shape = _get_shape_param(L, "input_shape")
-    output_shape = _get_shape_param(L, "output_shape")
-    
-    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
-    batch_size, seq_len, _ = seq_bounds.lb.shape
+def _zero_state(Bin: Bounds, batch: int, hidden_size: int, count: int) -> State:
+    """Create the lower and upper tensors for a recurrent cell state."""
+    zero = Bin.lb.new_zeros(batch, hidden_size)
+    return (zero,) * count
 
-    # Initialize hidden state bounds
-    h_bounds = Bounds(
-        Bin.lb.new_zeros(batch_size, hidden_size),
-        Bin.lb.new_zeros(batch_size, hidden_size),
+
+def _run_sequence(
+    seq_lb: torch.Tensor,
+    seq_ub: torch.Tensor,
+    cfg: dict[str, Any],
+    state: State,
+    step: Step,
+    nonlinearity: str | None,
+    hybridz: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unroll one recurrent cell over normalized sequence bounds."""
+    out_lb_steps: list[torch.Tensor] = []
+    out_ub_steps: list[torch.Tensor] = []
+    for time_step in range(cfg["seq_len"]):
+        state = step(
+            seq_lb[:, time_step, :],
+            seq_ub[:, time_step, :],
+            state,
+            cfg["weights"],
+            cfg["hidden_size"],
+            nonlinearity,
+        )
+        out_lb_steps.append(state[0])
+        out_ub_steps.append(state[1])
+    return _stack_steps(out_lb_steps, out_ub_steps, cfg, hybridz)
+
+
+def _lstm_step(
+    x_lb: torch.Tensor,
+    x_ub: torch.Tensor,
+    state: State,
+    weights: dict[str, torch.Tensor | None],
+    hidden_size: int,
+    _nonlinearity: str | None,
+) -> State:
+    """Propagate interval bounds through one LSTM cell."""
+    h_lb, h_ub, c_lb, c_ub = state
+    pre_lb, pre_ub = _affine_block(
+        x_lb,
+        x_ub,
+        h_lb,
+        h_ub,
+        weights["W_ih"],
+        weights["W_hh"],
+        weights["b_ih"],
+        weights["b_hh"],
     )
-    
-    # Process each time step
-    output_bounds_list = []
-    
-    for t in range(seq_len):
-        # Extract input at time step t
-        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
-        
-        # RNN cell computation: h_t = tanh(W_ih * x_t + W_hh * h_{t-1} + b)
-        # Linear transformation
-        ih_transform = _apply_linear_bounds(x_t_bounds, weight_ih, bias_ih)
-        hh_transform = _apply_linear_bounds(h_bounds, weight_hh, bias_hh)
-        
-        # Add transformations
-        combined_bounds = Bounds(
-            ih_transform.lb + hh_transform.lb,
-            ih_transform.ub + hh_transform.ub
-        )
-        
-        # Apply nonlinearity
-        if nonlinearity == "tanh":
-            h_bounds = _apply_tanh_bounds(combined_bounds)
-        elif nonlinearity == "relu":
-            h_bounds = _apply_relu_bounds(combined_bounds)
-        else:
-            raise ValueError(f"Unsupported RNN nonlinearity: {nonlinearity}")
-        
-        output_bounds_list.append(h_bounds)
-    
-    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
-    
-    if bidirectional:
-        # Same soundness issue as tf_lstm — see that function for details.
-        raise NotImplementedError(
-            "tf_rnn: bidirectional=True not supported (reverse-direction "
-            "sweep over weight_*_l0_reverse not implemented)."
-        )
-    
-    B_output = Bounds(output_lb, output_ub)
-    
-    # Create constraints
+    i_lb, i_ub = (
+        torch.sigmoid(pre_lb[:, :hidden_size]),
+        torch.sigmoid(pre_ub[:, :hidden_size]),
+    )
+    f_lb, f_ub = (
+        torch.sigmoid(pre_lb[:, hidden_size : 2 * hidden_size]),
+        torch.sigmoid(pre_ub[:, hidden_size : 2 * hidden_size]),
+    )
+    g_lb, g_ub = (
+        torch.tanh(pre_lb[:, 2 * hidden_size : 3 * hidden_size]),
+        torch.tanh(pre_ub[:, 2 * hidden_size : 3 * hidden_size]),
+    )
+    o_lb, o_ub = (
+        torch.sigmoid(pre_lb[:, 3 * hidden_size :]),
+        torch.sigmoid(pre_ub[:, 3 * hidden_size :]),
+    )
+    fc_lb, fc_ub = _interval_mul(f_lb, f_ub, c_lb, c_ub)
+    ig_lb, ig_ub = _interval_mul(i_lb, i_ub, g_lb, g_ub)
+    new_c_lb, new_c_ub = fc_lb + ig_lb, fc_ub + ig_ub
+    tanh_c_lb, tanh_c_ub = torch.tanh(new_c_lb), torch.tanh(new_c_ub)
+    new_h_lb, new_h_ub = _interval_mul(o_lb, o_ub, tanh_c_lb, tanh_c_ub)
+    return new_h_lb, new_h_ub, new_c_lb, new_c_ub
+
+
+def _gru_step(
+    x_lb: torch.Tensor,
+    x_ub: torch.Tensor,
+    state: State,
+    weights: dict[str, torch.Tensor | None],
+    hidden_size: int,
+    _nonlinearity: str | None,
+) -> State:
+    """Propagate interval bounds through one Torch-compatible GRU cell."""
+    h_lb, h_ub = state
+    W_ih = weights["W_ih"]
+    W_hh = weights["W_hh"]
+    b_ih = weights["b_ih"]
+    b_hh = weights["b_hh"]
+    assert W_ih is not None and W_hh is not None
+
+    rz_lb, rz_ub = _affine_block(
+        x_lb,
+        x_ub,
+        h_lb,
+        h_ub,
+        W_ih[: 2 * hidden_size],
+        W_hh[: 2 * hidden_size],
+        None if b_ih is None else b_ih[: 2 * hidden_size],
+        None if b_hh is None else b_hh[: 2 * hidden_size],
+    )
+    r_lb, r_ub = (
+        torch.sigmoid(rz_lb[:, :hidden_size]),
+        torch.sigmoid(rz_ub[:, :hidden_size]),
+    )
+    z_lb, z_ub = (
+        torch.sigmoid(rz_lb[:, hidden_size : 2 * hidden_size]),
+        torch.sigmoid(rz_ub[:, hidden_size : 2 * hidden_size]),
+    )
+    in_lb, in_ub = _affine_only(
+        x_lb,
+        x_ub,
+        W_ih[2 * hidden_size : 3 * hidden_size],
+        None if b_ih is None else b_ih[2 * hidden_size : 3 * hidden_size],
+    )
+    hn_lb, hn_ub = _affine_only(
+        h_lb,
+        h_ub,
+        W_hh[2 * hidden_size : 3 * hidden_size],
+        None if b_hh is None else b_hh[2 * hidden_size : 3 * hidden_size],
+    )
+    rhn_lb, rhn_ub = _interval_mul(r_lb, r_ub, hn_lb, hn_ub)
+    n_lb, n_ub = torch.tanh(in_lb + rhn_lb), torch.tanh(in_ub + rhn_ub)
+    one_minus_z_lb, one_minus_z_ub = 1.0 - z_ub, 1.0 - z_lb
+    n_term_lb, n_term_ub = _interval_mul(
+        one_minus_z_lb,
+        one_minus_z_ub,
+        n_lb,
+        n_ub,
+    )
+    h_term_lb, h_term_ub = _interval_mul(z_lb, z_ub, h_lb, h_ub)
+    return n_term_lb + h_term_lb, n_term_ub + h_term_ub
+
+
+def _rnn_step(
+    x_lb: torch.Tensor,
+    x_ub: torch.Tensor,
+    state: State,
+    weights: dict[str, torch.Tensor | None],
+    _hidden_size: int,
+    nonlinearity: str | None,
+) -> State:
+    """Propagate interval bounds through one vanilla RNN cell."""
+    h_lb, h_ub = state
+    pre_lb, pre_ub = _affine_block(
+        x_lb,
+        x_ub,
+        h_lb,
+        h_ub,
+        weights["W_ih"],
+        weights["W_hh"],
+        weights["b_ih"],
+        weights["b_hh"],
+    )
+    if nonlinearity == "tanh":
+        return torch.tanh(pre_lb), torch.tanh(pre_ub)
+    return pre_lb.clamp(min=0), pre_ub.clamp(min=0)
+
+
+def _affine_only(
+    x_lb: torch.Tensor,
+    x_ub: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a sign-split affine map to an interval."""
+    assert weight is not None
+    weight_pos, weight_neg = split_weight(weight)
+    out = affine_bounds(
+        weight_pos,
+        weight_neg,
+        weight.new_zeros(weight.shape[0]),
+        Bounds(x_lb, x_ub),
+    )
+    if bias is None:
+        return out.lb, out.ub
+    return out.lb + bias, out.ub + bias
+
+
+def _affine_block(
+    x_lb: torch.Tensor,
+    x_ub: torch.Tensor,
+    h_lb: torch.Tensor,
+    h_ub: torch.Tensor,
+    weight_ih: torch.Tensor | None,
+    weight_hh: torch.Tensor | None,
+    bias_ih: torch.Tensor | None,
+    bias_hh: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the input and recurrent affine blocks to interval endpoints."""
+    ih_lb, ih_ub = _affine_only(x_lb, x_ub, weight_ih, bias_ih)
+    hh_lb, hh_ub = _affine_only(h_lb, h_ub, weight_hh, bias_hh)
+    return ih_lb + hh_lb, ih_ub + hh_ub
+
+
+def _interval_mul(
+    a_lb: torch.Tensor,
+    a_ub: torch.Tensor,
+    b_lb: torch.Tensor,
+    b_ub: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the four-corner product envelope for two intervals."""
+    return four_corner_envelope(a_lb, a_ub, b_lb, b_ub)
+
+
+def _seq_view(Bin: Bounds, cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize flat or time-major sequence bounds to batch-major tensors."""
+    shape = cfg["input_shape"]
+    time_dim = shape[1] if cfg["batch_first"] else shape[0]
+    feature_dim = shape[2]
+    runtime_batch = Bin.lb.numel() // (time_dim * feature_dim)
+    cfg["batch"] = runtime_batch
+    target = (
+        (runtime_batch, time_dim, feature_dim)
+        if cfg["batch_first"]
+        else (time_dim, runtime_batch, feature_dim)
+    )
+    seq_lb = Bin.lb.reshape(target)
+    seq_ub = Bin.ub.reshape(target)
+    if not cfg["batch_first"]:
+        seq_lb = seq_lb.permute(1, 0, 2).contiguous()
+        seq_ub = seq_ub.permute(1, 0, 2).contiguous()
+    return seq_lb, seq_ub
+
+
+def _stack_steps(
+    lb_steps: list[torch.Tensor],
+    ub_steps: list[torch.Tensor],
+    cfg: dict[str, Any],
+    hybridz: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack recurrent outputs and retain each mode's declared layout."""
+    out_lb = torch.stack(lb_steps, dim=1)
+    out_ub = torch.stack(ub_steps, dim=1)
+    if hybridz and not cfg["batch_first"]:
+        out_lb = out_lb.permute(1, 0, 2).contiguous()
+        out_ub = out_ub.permute(1, 0, 2).contiguous()
+    return out_lb, out_ub
+
+
+def _make_fact(
+    L: Layer,
+    cfg: dict[str, Any],
+    out_lb: torch.Tensor,
+    out_ub: torch.Tensor,
+    operation: str,
+    nonlinearity: str | None,
+    *,
+    hybridz: bool,
+) -> Fact:
+    """Build the recurrent box and constraint fact for one mode."""
+    if hybridz:
+        per_instance = len(L.out_vars)
+        actual = out_lb.numel()
+        if per_instance > 0 and actual % per_instance != 0:
+            raise RuntimeError(
+                f"hybridz tf_{operation}: produced {actual} outputs, not a multiple "
+                f"of len(out_vars)={per_instance} (output_shape={cfg['output_shape']})."
+            )
+    meta = {
+        "tag": f"{operation}:{L.id}",
+        "input_size": cfg["input_size"],
+        "hidden_size": cfg["hidden_size"],
+        "num_layers": cfg["num_layers"],
+        "bidirectional": cfg["bidirectional"],
+        "batch_first": cfg["batch_first"],
+        "input_shape": cfg["input_shape"],
+        "output_shape": cfg["output_shape"],
+    }
+    if nonlinearity is not None:
+        meta["nonlinearity"] = nonlinearity
+    B_out = Bounds(out_lb, out_ub)
     C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"rnn:{L.id}",
-        "input_size": input_size,
-        "hidden_size": hidden_size,
-        "nonlinearity": nonlinearity,
-        "bidirectional": bidirectional,
-        "batch_first": batch_first,
-        "input_shape": input_shape,
-        "output_shape": output_shape
-    }))
-    
-    C.add_box(L.id, L.out_vars, B_output)
-    return Fact(B_output, C)
+    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), meta))
+    C.add_box(L.id, L.out_vars, B_out)
+    return Fact(B_out, C)
 
-
-def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
-    """
-    Transfer function for Embedding layer.
-    
-    Handles embedding lookup with interval bounds.
-    """
-    # Extract embedding parameters
-    weight = _get_tensor_param(L, "weight")  # [num_embeddings, embedding_dim]
-    num_embeddings = L.get_int("num_embeddings")
-    embedding_dim = L.get_int("embedding_dim")
-    padding_idx = L.params.get("padding_idx", None)
-    
-    # Input shape information (indices)
-    input_shape = _get_shape_param(L, "input_shape")
-    output_shape = _get_shape_param(L, "output_shape")
-    
-    # For embedding, the bounds depend on the range of possible embeddings
-    # Since we don't know which embeddings will be selected, we use worst-case bounds
-    weight_min = torch.min(weight, dim=0)[0]  # [embedding_dim]
-    weight_max = torch.max(weight, dim=0)[0]  # [embedding_dim]
-    
-    # Broadcast to output shape
-    output_size = 1
-    for dim in output_shape:
-        output_size *= dim
-    embedding_elements = output_size // embedding_dim
-    
-    output_lb = weight_min.repeat(embedding_elements)
-    output_ub = weight_max.repeat(embedding_elements)
-    
-    B_output = Bounds(output_lb, output_ub)
-    
-    # Create constraints
-    C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"embedding:{L.id}",
-        "num_embeddings": num_embeddings,
-        "embedding_dim": embedding_dim,
-        "padding_idx": padding_idx,
-        "input_shape": input_shape,
-        "output_shape": output_shape
-    }))
-    
-    C.add_box(L.id, L.out_vars, B_output)
-    return Fact(B_output, C)
-
-
-# Helper functions for RNN computations
 
 def _get_tensor_param(L: Layer, key: str) -> torch.Tensor:
+    """Return a required tensor layer parameter."""
     value = L.get_tensor(key)
     if value is None:
         raise TypeError(f"Expected tensor param '{key}' on layer {L.id}")
     return value
 
 
-def _get_optional_tensor_param(L: Layer, key: str):
-    return L.get_tensor(key)
-
-
 def _get_shape_param(L: Layer, key: str) -> tuple[int, ...]:
+    """Return an integer tuple layer parameter."""
     return tuple(int(dim) for dim in L.get_tuple(key))
-
-def _reshape_sequence_bounds(Bin: Bounds, input_shape, batch_first: bool) -> Bounds:
-    """Reshape sequence inputs and normalize to [B, T, F] for the time loop.
-
-    ``input_shape`` records the JSON's native batch dim (typically B=1); the
-    actual bounds may have been batchified to B>1 by validate_verifier or
-    test fixtures. We infer the runtime B from the bounds' numel and the
-    per-batch shape recorded in ``input_shape``.
-    """
-    shape = tuple(int(d) for d in input_shape)
-    t_dim = shape[1] if batch_first else shape[0]
-    f_dim = shape[2]
-    per_batch_numel = t_dim * f_dim
-    B_runtime = Bin.lb.numel() // per_batch_numel
-    target = (B_runtime, t_dim, f_dim) if batch_first else (t_dim, B_runtime, f_dim)
-    seq_lb = Bin.lb.reshape(target)
-    seq_ub = Bin.ub.reshape(target)
-    if not batch_first:
-        seq_lb = seq_lb.permute(1, 0, 2).contiguous()
-        seq_ub = seq_ub.permute(1, 0, 2).contiguous()
-    return Bounds(seq_lb, seq_ub)
-
-
-def _stack_step_bounds(output_bounds_list):
-    """Stack per-step hidden-state bounds with batch preserved as dim 0."""
-    return (
-        torch.stack([b.lb for b in output_bounds_list], dim=1),
-        torch.stack([b.ub for b in output_bounds_list], dim=1),
-    )
-
-def _lstm_cell_bounds(x_bounds, h_bounds, c_bounds, weight_ih, weight_hh, bias_ih, bias_hh):
-    """Compute LSTM cell bounds for one time step."""
-    # LSTM gates: i, f, g, o = input, forget, cell, output gates
-    
-    # Linear transformations
-    ih_all = _apply_linear_bounds(x_bounds, weight_ih, bias_ih)
-    hh_all = _apply_linear_bounds(h_bounds, weight_hh, bias_hh)
-    
-    # Split into 4 gates
-    hidden_size = h_bounds.lb.shape[-1]
-    
-    # Input gate
-    i_bounds = Bounds(
-        ih_all.lb[:, :hidden_size] + hh_all.lb[:, :hidden_size],
-        ih_all.ub[:, :hidden_size] + hh_all.ub[:, :hidden_size]
-    )
-    i_bounds = _apply_sigmoid_bounds(i_bounds)
-    
-    # Forget gate
-    f_bounds = Bounds(
-        ih_all.lb[:, hidden_size:2*hidden_size] + hh_all.lb[:, hidden_size:2*hidden_size],
-        ih_all.ub[:, hidden_size:2*hidden_size] + hh_all.ub[:, hidden_size:2*hidden_size]
-    )
-    f_bounds = _apply_sigmoid_bounds(f_bounds)
-    
-    # Cell gate
-    g_bounds = Bounds(
-        ih_all.lb[:, 2*hidden_size:3*hidden_size] + hh_all.lb[:, 2*hidden_size:3*hidden_size],
-        ih_all.ub[:, 2*hidden_size:3*hidden_size] + hh_all.ub[:, 2*hidden_size:3*hidden_size]
-    )
-    g_bounds = _apply_tanh_bounds(g_bounds)
-    
-    # Output gate
-    o_bounds = Bounds(
-        ih_all.lb[:, 3*hidden_size:] + hh_all.lb[:, 3*hidden_size:],
-        ih_all.ub[:, 3*hidden_size:] + hh_all.ub[:, 3*hidden_size:]
-    )
-    o_bounds = _apply_sigmoid_bounds(o_bounds)
-    
-    # Cell state update: c_t = f * c_{t-1} + i * g
-    fc_bounds = _multiply_bounds(f_bounds, c_bounds)
-    ig_bounds = _multiply_bounds(i_bounds, g_bounds)
-    new_c_bounds = Bounds(
-        fc_bounds.lb + ig_bounds.lb,
-        fc_bounds.ub + ig_bounds.ub
-    )
-    
-    # Hidden state update: h_t = o * tanh(c_t)
-    tanh_c_bounds = _apply_tanh_bounds(new_c_bounds)
-    new_h_bounds = _multiply_bounds(o_bounds, tanh_c_bounds)
-    
-    return new_h_bounds, new_c_bounds
-
-
-def _gru_cell_bounds(x_bounds, h_bounds, weight_ih, weight_hh, bias_ih, bias_hh):
-    """Compute GRU cell bounds for one time step."""
-    # GRU gates: r, z, n = reset, update, new gates
-    
-    # Linear transformations
-    ih_all = _apply_linear_bounds(x_bounds, weight_ih, bias_ih)
-    hh_all = _apply_linear_bounds(h_bounds, weight_hh, bias_hh)
-    
-    hidden_size = h_bounds.lb.shape[-1]
-    
-    # Reset gate
-    r_bounds = Bounds(
-        ih_all.lb[:, :hidden_size] + hh_all.lb[:, :hidden_size],
-        ih_all.ub[:, :hidden_size] + hh_all.ub[:, :hidden_size]
-    )
-    r_bounds = _apply_sigmoid_bounds(r_bounds)
-    
-    # Update gate
-    z_bounds = Bounds(
-        ih_all.lb[:, hidden_size:2*hidden_size] + hh_all.lb[:, hidden_size:2*hidden_size],
-        ih_all.ub[:, hidden_size:2*hidden_size] + hh_all.ub[:, hidden_size:2*hidden_size]
-    )
-    z_bounds = _apply_sigmoid_bounds(z_bounds)
-    
-    # New gate computation: n = tanh(W_ih_n * x + W_hh_n * (r * h))
-    rh_bounds = _multiply_bounds(r_bounds, h_bounds)
-    # weight_hh has shape (3*H, H): rows index gates, cols index hidden.
-    # The "n" gate's hh sub-matrix is weight_hh[2H:3H, :] (rows), not [:, 2H:].
-    hh_n = _apply_linear_bounds(rh_bounds, weight_hh[2*hidden_size:3*hidden_size, :], bias_hh[2*hidden_size:3*hidden_size] if bias_hh is not None else None)
-    
-    n_bounds = Bounds(
-        ih_all.lb[:, 2*hidden_size:] + hh_n.lb,
-        ih_all.ub[:, 2*hidden_size:] + hh_n.ub
-    )
-    n_bounds = _apply_tanh_bounds(n_bounds)
-    
-    # Hidden state update: h_t = (1 - z) * n + z * h
-    one_minus_z_bounds = Bounds(1 - z_bounds.ub, 1 - z_bounds.lb)
-    term1 = _multiply_bounds(one_minus_z_bounds, n_bounds)
-    term2 = _multiply_bounds(z_bounds, h_bounds)
-    
-    new_h_bounds = Bounds(
-        term1.lb + term2.lb,
-        term1.ub + term2.ub
-    )
-    
-    return new_h_bounds
-
-
-def _apply_linear_bounds(input_bounds, weight, bias=None):
-    """Apply linear transformation to bounds."""
-    W_pos, W_neg = split_weight(weight)
-    if bias is None:
-        bias = weight.new_zeros(weight.shape[0])
-    # input_bounds.lb shape (..., in_features); weight shape (out, in).
-    out = affine_bounds(W_pos, W_neg, bias, Bounds(input_bounds.lb, input_bounds.ub))
-    return Bounds(out.lb, out.ub)
-
-
-def _apply_sigmoid_bounds(bounds):
-    """Apply sigmoid function to bounds."""
-    # Sigmoid is monotonic, so we can apply it directly
-    return Bounds(torch.sigmoid(bounds.lb), torch.sigmoid(bounds.ub))
-
-
-def _apply_tanh_bounds(bounds):
-    """Apply tanh function to bounds."""
-    # Tanh is monotonic, so we can apply it directly
-    return Bounds(torch.tanh(bounds.lb), torch.tanh(bounds.ub))
-
-
-def _apply_relu_bounds(bounds):
-    """Apply ReLU function to bounds."""
-    # ReLU: max(0, x)
-    return Bounds(
-        torch.clamp(bounds.lb, min=0),
-        torch.clamp(bounds.ub, min=0)
-    )
-
-
-def _multiply_bounds(bounds1, bounds2):
-    """Multiply two interval bounds."""
-    # For interval [a,b] * [c,d], result is [min(ac,ad,bc,bd), max(ac,ad,bc,bd)]
-    lb, ub = four_corner_envelope(bounds1.lb, bounds1.ub, bounds2.lb, bounds2.ub)
-    return Bounds(lb, ub)

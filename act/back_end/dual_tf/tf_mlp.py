@@ -27,9 +27,10 @@ from .tf_forward import (
     LinearBound, Frame, _align,
     _fwd_dense, _fwd_relu, _fwd_bias, _fwd_scale, _fwd_bn, _fwd_lrelu,
     _concretize, _box_dense, _box_bias, _box_scale, _box_bn, _box_relu,
-    _box_lrelu, _intersect_boxes, _reset_forward_box,
+    _box_lrelu, _intersect_boxes, _compose_forward, _box_result,
     _match_lin_input_dim, _DENSE_LIN_BOUND_MAX_DIM,
 )
+from .tf_smooth import _dual_constant_box_backward
 
 _DEGENERATE_TOL_ABS = 1e-3
 _DEGENERATE_TOL_REL = 1e-3
@@ -78,12 +79,7 @@ def forward_identity(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Pass-through handler for INPUT / INPUT_SPEC / ASSERT / TRANSPOSE / SQUEEZE / UNSQUEEZE.
-
-    Source: tf_forward.py lines 357-358 (INPUT family) and 460-461
-    (ASSERT / TRANSPOSE / SQUEEZE / UNSQUEEZE family). Both branches are
-    `pass`, so stored/out/lin/frame are whatever the predecessor produced.
-    """
+    """Pass through the predecessor state unchanged."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
@@ -93,17 +89,8 @@ def forward_identity(
 def backward_identity(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
                       preds: List[int], M: int = 1, alpha=None
                       ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    nu_out, contrib = dual_identity_backward(nu)
-    # 0 preds (pure INPUT) -> []; 1 pred (FLATTEN/RESHAPE/…) -> [nu_out].
-    return [nu_out] * len(preds), contrib
-
-
-def dual_identity_backward(nu: torch.Tensor
-                           ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Flatten/Reshape/Transpose backward: v_out = nu, contrib = zeros[B]."""
-    B = nu.shape[0]
-    contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
-    return nu, contrib
+    """Route identity dual coefficients unchanged."""
+    return [nu] * len(preds), torch.zeros(nu.shape[0], dtype=nu.dtype, device=nu.device)
 
 
 # ---- MEAN ----
@@ -136,9 +123,7 @@ def forward_mean(
     batch_dims = [d + 1 for d in dims]
     lb = parent.lb.reshape(B, *in_shape).mean(dim=batch_dims, keepdim=keepdim).reshape(B, -1)
     ub = parent.ub.reshape(B, *in_shape).mean(dim=batch_dims, keepdim=keepdim).reshape(B, -1)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_mean(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -180,9 +165,7 @@ def forward_reduce_sum(
     dims = tuple(a + 1 for a in axes) if axes else tuple(range(1, lb_in.dim()))
     lb = lb_in.sum(dim=dims, keepdim=keepdim).reshape(B, -1)
     ub = ub_in.sum(dim=dims, keepdim=keepdim).reshape(B, -1)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_reduce_sum(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -215,12 +198,7 @@ def forward_reshape(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for FLATTEN / RESHAPE.
-
-    Source: tf_forward.py lines 420-422. Reshapes predecessor box lb/ub to
-    ``[B, -1]`` and keeps lin/frame unchanged; downstream dense layers
-    rematch the output-feature axis via ``_match_lin_input_dim``.
-    """
+    """Reshape the predecessor box while keeping its symbolic frame."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
@@ -241,13 +219,7 @@ def forward_dense(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for DENSE (linear-relaxation dual-track + interval intersection).
-
-    Source: tf_forward.py lines 371-378. Composes lin via ``_fwd_dense``,
-    concretizes against the predecessor frame, intersects with the interval
-    box update, and returns ``stored == out`` (no pre/post distinction for
-    an affine layer). Frame passes through unchanged.
-    """
+    """Compose dense bounds over the predecessor's symbolic frame."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
@@ -315,18 +287,8 @@ def forward_dense(
                 A_lb=a_lower, b_lb=b_mid - b_spread,
                 A_ub=a_upper, b_ub=b_mid + b_spread,
             )
-    if new_lin is None:
-        lb, ub = int_lb, int_ub
-        out = Bounds(lb, ub)
-        stored = out
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-        return stored, out, lin, frame
-    lin = new_lin
-    lin_lb, lin_ub = _concretize(lin, parent_frame)
-    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-    out = Bounds(lb, ub)
-    stored = out
-    return stored, out, lin, parent_frame
+    return _compose_forward(
+        new_lin, int_lb, int_ub, parent_frame, None, post_activation, device, dtype)
 
 
 def backward_dense(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -388,35 +350,17 @@ def forward_relu(
     post_activation: bool,
     device: torch.device,
     dtype: torch.dtype,
+    alpha: Optional[torch.Tensor] = None,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for RELU (linear relaxation + interval intersection).
-
-    Source: tf_forward.py lines 360-369. When ``post_activation`` is True,
-    ``stored == out`` (post-ReLU box) and lin/frame are reset to identity
-    over the new concrete box via ``_reset_forward_box``. Otherwise
-    ``stored`` is the pre-activation box and lin/frame pass through.
-    """
+    """Compose ReLU bounds with an optional lower relaxation slope."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub)
+    new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub, alpha=alpha)
     int_lb, int_ub = _box_relu(pre_lb, pre_ub)
-    if new_lin is None:
-        lb, ub = int_lb, int_ub
-        out = Bounds(lb, ub)
-        stored = out if post_activation else Bounds(pre_lb, pre_ub)
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-        return stored, out, lin, frame
-    lin = new_lin
-    lin_lb, lin_ub = _concretize(lin, parent_frame)
-    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-    out = Bounds(lb, ub)
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    frame = parent_frame
-    if post_activation:
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return stored, out, lin, frame
+    return _compose_forward(
+        new_lin, int_lb, int_ub, parent_frame, parent_box, post_activation, device, dtype)
 
 
 def forward_lrelu(
@@ -429,14 +373,7 @@ def forward_lrelu(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for LRELU / LEAKY_RELU (triangle linear relaxation).
-
-    Source: tf_forward.py lines 436-446. Reads the canonical
-    ``negative_slope`` parameter. ``post_activation`` handling mirrors
-    :func:`forward_relu`: when True ``stored == out`` and lin/frame are
-    reset to identity on the new box; otherwise ``stored`` is the
-    pre-activation box and lin/frame pass through.
-    """
+    """Compose LeakyReLU bounds with the configured negative slope."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
@@ -444,19 +381,8 @@ def forward_lrelu(
     alpha = float(L.params["negative_slope"])
     lin = _fwd_lrelu(parent_lin, pre_lb, pre_ub, alpha)
     int_lb, int_ub = _box_lrelu(pre_lb, pre_ub, alpha)
-    if lin is None:
-        out = Bounds(int_lb, int_ub)
-        stored = out if post_activation else Bounds(pre_lb, pre_ub)
-        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
-        return stored, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, parent_frame)
-    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-    out = Bounds(lb, ub)
-    stored = out if post_activation else Bounds(pre_lb, pre_ub)
-    frame = parent_frame
-    if post_activation:
-        lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return stored, out, lin, frame
+    return _compose_forward(
+        lin, int_lb, int_ub, parent_frame, parent_box, post_activation, device, dtype)
 
 
 def backward_relu(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -565,39 +491,18 @@ def forward_sign(
     pre = parent_boxes[0]
     lb = torch.sign(pre.lb)
     ub = torch.sign(pre.ub)
-    out = Bounds(lb, ub)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_sign(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
                   preds: List[int], M: int = 1, alpha=None
                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    """Backward for SIGN: a step relaxed by two ZERO-slope constant planes.
-
-    Sound relaxation over [l, u]: sign(l) <= sign(x) <= sign(u) (constants,
-    since sign is monotone). Both planes have slope 0, so no ν flows to the
-    input (nu_in = 0) and each output contributes its constant plane, selected
-    by the sign of ν (>=0 -> lower plane sign(l), <0 -> upper plane sign(u)).
-    The stored box already holds sign(l)/sign(u). Fully batched over B and M.
-    """
+    """Relax SIGN by its stored constant output box."""
     bounds = bounds_dict.get(L.id)
     if bounds is None:
         raise ValueError(f"backward_sign: layer {L.id} missing bounds in bounds_dict")
     assert len(preds) == 1, f"SIGN expects 1 predecessor, got {len(preds)}"
-    BM = nu.shape[0]
-    assert BM % M == 0, f"backward_sign: nu batch {BM} not divisible by M={M}"
-    B = BM // M
-    v_flat = nu.flatten(start_dim=1)
-    lo_B = bounds.lb.flatten(start_dim=1)
-    hi_B = bounds.ub.flatten(start_dim=1)
-    n = min(v_flat.shape[-1], lo_B.shape[-1])
-    v = v_flat[..., :n].view(B, M, n)
-    lo = lo_B[..., :n].unsqueeze(1)
-    hi = hi_B[..., :n].unsqueeze(1)
-    const = torch.where(v >= 0, lo.expand_as(v), hi.expand_as(v))
-    contrib = (v * const).sum(dim=-1).reshape(BM)
-    nu_in = torch.zeros(BM, n, dtype=nu.dtype, device=nu.device)
+    nu_in, contrib = _dual_constant_box_backward(nu, bounds.lb, bounds.ub, M)
     return [nu_in], contrib
 
 
@@ -612,11 +517,7 @@ def forward_bias(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for BIAS (``y = x + c``).
-
-    Source: tf_forward.py lines 393-400. Composes via ``_fwd_bias``,
-    concretizes, intersects with interval box update; ``stored == out``.
-    """
+    """Compose an additive bias over the predecessor frame."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
@@ -658,26 +559,15 @@ def forward_scale(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for SCALE (``y = a * x``, element-wise).
-
-    Source: tf_forward.py lines 402-409. Composes via ``_fwd_scale``,
-    concretizes, intersects with interval box update; ``stored == out``.
-    """
+    """Compose an elementwise scale over the predecessor frame."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_scale(L, parent_lin)
     int_lb, int_ub = _box_scale(L, prev_lb, prev_ub)
-    if lin is None:
-        out = Bounds(int_lb, int_ub)
-        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
-        return out, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, parent_frame)
-    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-    out = Bounds(lb, ub)
-    stored = out
-    return stored, out, lin, parent_frame
+    return _compose_forward(
+        lin, int_lb, int_ub, parent_frame, None, post_activation, device, dtype)
 
 
 def backward_scale(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -710,26 +600,15 @@ def forward_bn(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for BN (``y = A * x + c``, element-wise).
-
-    Source: tf_forward.py lines 411-418. Composes via ``_fwd_bn``,
-    concretizes, intersects with interval box update; ``stored == out``.
-    """
+    """Compose batch normalization over the predecessor frame."""
     parent_box = parent_boxes[0]
     parent_lin = parent_lins[0]
     parent_frame = parent_frames[0]
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bn(L, parent_lin)
     int_lb, int_ub = _box_bn(L, prev_lb, prev_ub)
-    if lin is None:
-        out = Bounds(int_lb, int_ub)
-        lin, frame = _reset_forward_box(int_lb, int_ub, device, dtype)
-        return out, out, lin, frame
-    lin_lb, lin_ub = _concretize(lin, parent_frame)
-    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-    out = Bounds(lb, ub)
-    stored = out
-    return stored, out, lin, parent_frame
+    return _compose_forward(
+        lin, int_lb, int_ub, parent_frame, None, post_activation, device, dtype)
 
 
 def backward_bn(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -743,10 +622,6 @@ def backward_bn(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
 def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor
                      ) -> Tuple[torch.Tensor, torch.Tensor]:
     """y = A*x + c ; v_out = A*nu, contrib = -(v * c_flat).sum(dim=-1)."""
-    B = nu.shape[0]
-    v = nu.flatten(start_dim=1)
-    A_aligned = _align(A, v.shape[-1])
-    c_aligned = _align(c, v.shape[-1])
-    out = (A_aligned * v).view(nu.shape)
-    contrib = -(v * c_aligned).sum(dim=-1)                       # [B]
-    return out, contrib
+    nu_out, _ = dual_scale_backward(nu, A)
+    _, contrib = dual_bias_backward(nu, c)
+    return nu_out, contrib

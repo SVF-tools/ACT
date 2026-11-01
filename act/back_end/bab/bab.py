@@ -46,12 +46,12 @@ from act.back_end.bab.node import (
 from act.back_end.bab.climb import ClimbSession
 from act.back_end.bab.frontier_memory import (
     FrontierMemoryPlanner, allow_per_class_alpha, allow_warm_state,
+    auto_initial_batch, auto_recalibrate_batch,
 )
 from act.back_end.bab.branching.branching import (
-    BranchingStrategy,
     SplitDecision,
     _assert_witness_residual_decision_unstable,
-    _build_branching_strategy as _build_branching_strategy_impl,
+    _build_branching_strategy,
     witness_relu_preactivations,
 )
 from act.back_end.bab.branching.multi_split import (
@@ -100,19 +100,6 @@ from act.util.stats import VerifyStatus, VerifyResult
 log = logging.getLogger(__name__)
 
 _monotonic = time.monotonic
-
-
-# ---------------------------------------------------------------------------
-# Strategy factories
-# ---------------------------------------------------------------------------
-
-
-def _build_branching_strategy(
-    method: str, *, dual_solver: Any = None, neuron_only: bool = False
-) -> BranchingStrategy:
-    return _build_branching_strategy_impl(
-        method, dual_solver=dual_solver, neuron_only=neuron_only
-    )
 
 
 def _build_bounding(
@@ -406,7 +393,7 @@ def _solve_dual_batch(
         m_specs = int(keep_rows.numel()) if keep_rows is not None else int(assert_layer.params["M"])
         relu_width = sum(len(layer.out_vars) for layer in net.layers if layer.kind == LayerKind.RELU)
         estimated_alpha = k_actual * m_specs * relu_width * batched_bounds.lb.element_size()
-        if not allow_per_class_alpha(estimated_alpha, enabled=True):
+        if not allow_per_class_alpha(estimated_alpha):
             capped_dual_config = replace(capped_dual_config, per_class_alpha=False)
     result = solver.solve_spec_batch(
         net,
@@ -450,7 +437,7 @@ def _solve_dual_batch(
             tensor_storage_bytes((
                 *_alpha_tree_leaves(batch.incremental_alpha),
                 *_alpha_tree_leaves(batch.incremental_eta),
-            )), k_actual, enabled=True,
+            )), k_actual,
         ):
             batch.incremental_alpha = batch.incremental_eta = None
             batch.warm_state_present.fill_(False)
@@ -458,45 +445,6 @@ def _solve_dual_batch(
             if memory_planner is not None:
                 memory_planner.warm_drop_count += 1
     return result
-
-
-def _auto_batch_budget_bytes(safety: float) -> float:
-    """Memory the auto sizer may use: min(safety*total, 90% of what this
-    process can reclaim), so it shares the GPU with other processes."""
-    free, total = torch.cuda.mem_get_info()
-    reclaimable = free + torch.cuda.memory_reserved()
-    return min(float(total) * safety, float(reclaimable) * 0.9)
-
-
-def _auto_initial_batch(
-    net: Net, config: BaBConfig, budget_bytes: Optional[float] = None,
-) -> int:
-    """Conservative first batch from net size; the loop recalibrates it from
-    the measured per-lane peak after the first real round."""
-    safety = float(config.auto_batch_safety)
-    cap = int(config.auto_batch_cap)
-    floor = int(config.auto_batch_floor)
-    per_lane = 4.0 * max(1, _net_bound_elements(net)) * 256.0
-    k = int((_auto_batch_budget_bytes(safety) if budget_bytes is None else budget_bytes) / per_lane)
-    return max(floor, min(cap, k))
-
-
-def _auto_recalibrate_batch(
-    peak_bytes: float, max_k_seen: int, config: BaBConfig,
-    budget_bytes: Optional[float] = None,
-) -> int:
-    """Batch for the next round = budget / measured bytes-per-lane.
-
-    ``peak_bytes / max_k_seen`` over-estimates the marginal per-lane cost (it
-    folds in the one-time root/presolve peak), so the sizer errs toward fewer
-    lanes - safe against OOM while still ramping up on small nets with spare
-    memory."""
-    safety = float(config.auto_batch_safety)
-    cap = int(config.auto_batch_cap)
-    floor = int(config.auto_batch_floor)
-    bpl = max(peak_bytes / max(1, max_k_seen), 1.0)
-    k = int((_auto_batch_budget_bytes(safety) if budget_bytes is None else budget_bytes) / bpl)
-    return max(floor, min(cap, k))
 
 
 def _root_oom_guard(function: Callable[..., VerifyResult]) -> Callable[..., VerifyResult]:
@@ -528,7 +476,6 @@ def verify_bab_batched(
     max_batch_size: Union[int, str],
     time_budget_s: Optional[float] = None,
     dual_config: Optional[DualConfig] = None,
-    verbose: bool = False,
     trace: Optional[List[Dict[str, Any]]] = None,
 ) -> VerifyResult:
     """[BATCHED-API] K-batched Branch-and-Bound verification (single instance).
@@ -561,7 +508,6 @@ def verify_bab_batched(
             implicit default: callers pass the central
             ``BackendConfig.bab_max_batch_size`` or an explicit value.
         time_budget_s: wall-clock budget (default 300 s).
-        verbose: reserved.
         trace: if a list is supplied, one dict per iteration is appended with
             keys iter, K, pool_before, pool_after, pruned_unsat, branched,
             falsified_lane, max_depth, spec_rows_kept, elapsed_s.
@@ -699,8 +645,9 @@ def verify_bab_batched(
         4 * max(1, _net_bound_elements(net)) * 256,
     )
     if auto_batch and root_bounds.lb.device.type == "cuda":
-        effective_batch = _auto_initial_batch(
-            net, config, planner.snapshot(pool).available if planner.active else None,
+        effective_batch = auto_initial_batch(
+            _net_bound_elements(net), config,
+            planner.snapshot(pool).available if planner.active else None,
         )
     batch_policy = (
         replace(
@@ -1274,7 +1221,7 @@ def verify_bab_batched(
                     unresolved, kept_rows = climb.before_split(cast(TopKBounding, pool), unresolved)
                     unresolved_idx = unresolved_idx.index_select(0, kept_rows)
                 if config.terminal_lp_enabled and unresolved.batch_size:
-                    from act.back_end.solver.terminal_lp import solve_terminal_batch
+                    from act.back_end.solver.solver_torchlp import solve_terminal_batch
 
                     terminal_bounds, terminal_nu = slice_branching_state(
                         bounds_dict_for_branching, nu_per_layer_for_branching,
@@ -1635,7 +1582,7 @@ def verify_bab_batched(
                 )
             if (auto_batch or planner.active) and root_bounds.lb.device.type == "cuda":
                 max_k_seen = max(max_k_seen, k_actual)
-                effective_batch = _auto_recalibrate_batch(
+                effective_batch = auto_recalibrate_batch(
                     (planner.lane_bytes * max_k_seen if planner.active
                      else torch.cuda.max_memory_allocated(root_bounds.lb.device)),
                     max_k_seen, batch_policy,
@@ -1771,7 +1718,6 @@ def verify_bab(
     max_subproblems: Optional[int] = None,
     time_budget_s: Optional[float] = None,
     timelimit: Optional[float] = None,
-    verbose: bool = False,
     dual_config: Optional[DualConfig] = None,
     trace: Optional[List[Dict[str, Any]]] = None,
 ) -> VerifyResult:
@@ -1785,7 +1731,6 @@ def verify_bab(
         config = BaBConfig(
             max_depth=max_depth if max_depth is not None else 20,
             max_nodes=(max_nodes or max_subproblems or 2000),
-            verbose=verbose,
         )
     budget = (
         time_budget_s if time_budget_s is not None
@@ -1803,7 +1748,6 @@ def verify_bab(
         config=config,
         max_batch_size=1,
         time_budget_s=budget,
-        verbose=verbose,
         dual_config=dual_config,
         trace=trace,
     )
@@ -1923,11 +1867,10 @@ if __name__ == "__main__":
         assert missing.warm_state_present.tolist() == [False, True]
         assert missing.incremental_eta is not None and not bool(missing.incremental_eta[2][1].any())
         assert missing.split_signs is not None and not bool(missing.split_signs[2][1].any())
-        assert allow_per_class_alpha(PER_CLASS_ALPHA_MAX_BYTES, enabled=True)
-        assert not allow_per_class_alpha(PER_CLASS_ALPHA_MAX_BYTES + 1, enabled=True)
-        assert allow_per_class_alpha(PER_CLASS_ALPHA_MAX_BYTES + 1, enabled=False)
-        assert allow_warm_state(2 * WARM_STATE_MAX_BYTES_PER_LANE, 2, enabled=True)
-        assert not allow_warm_state(2 * WARM_STATE_MAX_BYTES_PER_LANE + 1, 2, enabled=True)
+        assert allow_per_class_alpha(PER_CLASS_ALPHA_MAX_BYTES)
+        assert not allow_per_class_alpha(PER_CLASS_ALPHA_MAX_BYTES + 1)
+        assert allow_warm_state(2 * WARM_STATE_MAX_BYTES_PER_LANE, 2)
+        assert not allow_warm_state(2 * WARM_STATE_MAX_BYTES_PER_LANE + 1, 2)
 
         inactive = FrontierMemoryPlanner(upper.device, .6, True, 100)
         inactive_pool = TopKBounding()
@@ -1951,7 +1894,7 @@ if __name__ == "__main__":
         allocator_peak[0] = max(allocator_peak[0], 2200)
         calibrated.observe_wave(allocator_peak[0] - bound_start, 2)
         batch_limit = BaBConfig(auto_batch_floor=1, auto_batch_cap=16)
-        expected_k = _auto_recalibrate_batch(200, 2, batch_limit, budget_bytes=1000)
+        expected_k = auto_recalibrate_batch(200, 2, batch_limit, budget_bytes=1000)
         with patch.object(calibrated, "snapshot", return_value=MemoryBudget(1000, 0, 0, 0, 0, 0)):
             assert calibrated.plan_wave(calibration_pool, 16) == expected_k == 10
             calibrated.observe_wave(40, 2)
@@ -2444,14 +2387,14 @@ if __name__ == "__main__":
             bounding="depth_bound_blend", climb_enabled=True,
             climb_coarsening_enabled=False, max_depth=4, max_nodes=31,
         )
-        import sys
 
-        with patch.dict(sys.modules, {"act.back_end.solver.terminal_lp": None}):
+        with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch") as terminal_solve:
             gate_off = verify_bab_batched(
                 net, DualSolver, terminal_config, max_batch_size=4,
                 dual_config=DualConfig(n_iters=0),
             )
         assert gate_off.status == VerifyStatus.UNKNOWN
+        terminal_solve.assert_not_called()
         assert gate_off.metadata["reason"] == "climb_retired_without_relu_candidate"
         assert "terminal_lp_calls" not in gate_off.metadata
         for climb_enabled in (False, True):
@@ -2467,16 +2410,16 @@ if __name__ == "__main__":
             assert gate_on.metadata["iterations"] == len(terminal_trace)
             assert all(len(row) == 10 for row in terminal_trace)
             assert sum(row["K"] for row in terminal_trace) == gate_on.metadata["nodes"]
-        from act.back_end.solver.terminal_lp import solve_terminal_batch
+        from act.back_end.solver.solver_torchlp import solve_terminal_batch
         import numpy as np
         from scipy import sparse
         from types import SimpleNamespace
-        from act.back_end.solver import terminal_lp as terminal_lp_module
+        from act.back_end.solver import solver_torchlp as terminal_module
 
         # Concrete ADD supports three operands, but the reused exporter is
         # binary. A valid Net must not certify a different, truncated graph.
         from act.back_end.bab.violation import _forward_for_violation_check
-        from act.back_end.solver.milp_escalate import solve_milp
+        from act.back_end.solver.solver_gurobi import solve_milp
 
         add_box = Bounds(upper.new_zeros((1, 1)), upper.new_ones((1, 1)))
         add_layers = [
@@ -2531,7 +2474,7 @@ if __name__ == "__main__":
             assert solve_terminal_batch(malformed, add_box).statuses == (VerifyStatus.UNKNOWN,)
 
         # Residual proofs, not optimizer labels/objectives, own certification.
-        problem = terminal_lp_module._SparseLP(
+        problem = terminal_module._SparseLP(
             sparse.csr_matrix((0, 1)), np.empty(0),
             sparse.csr_matrix([[1.]]), np.array([1.]),
             np.array([-1.]), np.array([1.]),
@@ -2541,10 +2484,10 @@ if __name__ == "__main__":
             problem.eq, problem.eq_rhs, problem.le, problem.le_rhs,
             problem.lb, problem.ub, objective, np.empty(0),
         )
-        corrected = terminal_lp_module.certified_lower_bound(*proof_args, np.array([-1.]))
+        corrected = terminal_module.certified_lower_bound(*proof_args, np.array([-1.]))
         assert corrected is not None and corrected <= -1.
         for invalid_dual in (1., float("nan"), float("inf")):
-            assert terminal_lp_module.certified_lower_bound(
+            assert terminal_module.certified_lower_bound(
                 *proof_args, np.array([invalid_dual]),
             ) is None
         forged_optimizer = SimpleNamespace(
@@ -2553,7 +2496,7 @@ if __name__ == "__main__":
         )
         for optimizer_status in (0, 2):
             forged_optimizer.status = optimizer_status
-            assert terminal_lp_module._certificate(
+            assert terminal_module._certificate(
                 problem, objective, 0., forged_optimizer, "lp_residual",
                 OutKind.LINEAR_LE, upper.new_tensor(1.),
             ) is None
@@ -2561,7 +2504,7 @@ if __name__ == "__main__":
             problem, le=sparse.csr_matrix([[1.], [-1.]]),
             le_rhs=np.array([-.5, -.5]),
         )
-        phase_proof = terminal_lp_module._phase_one(impossible, None, upper.new_tensor(1.))
+        phase_proof = terminal_module._phase_one(impossible, None, upper.new_tensor(1.))
         assert phase_proof is not None and phase_proof.verify()
         assert phase_proof.kind == "phase1_residual"
         assert not replace(phase_proof, le_dual=np.full_like(phase_proof.le_dual, np.nan)).verify()
@@ -2578,7 +2521,7 @@ if __name__ == "__main__":
         assert generic.statuses == affine.statuses
         assert generic.tiers == ("generic", "generic") and affine.tiers == ("affine", "affine")
         # Rational elimination is the reference: float composition may only relax it.
-        with patch("act.back_end.solver.terminal_lp._chain_reduce", return_value=None):
+        with patch("act.back_end.solver.solver_torchlp._chain_reduce", return_value=None):
             rational = solve_terminal_batch(net, twice, fixed_phases)
         assert rational.tiers == ("affine", "affine") and bool(rational.certified.all())
         for chain_proofs, exact_proofs in zip(affine.certificates, rational.certificates):
@@ -2588,11 +2531,11 @@ if __name__ == "__main__":
         unsupported = solve_terminal_batch(lp_net, lp_box)
         assert unsupported.statuses == (VerifyStatus.UNKNOWN,)
         assert unsupported.reasons == ("unsupported_finite_p_input",)
-        with patch("act.back_end.solver.terminal_lp._solve", side_effect=ImportError("solver unavailable")):
+        with patch("act.back_end.solver.solver_torchlp._solve", side_effect=ImportError("solver unavailable")):
             no_solver = solve_terminal_batch(net, terminal_box)
         assert no_solver.statuses == (VerifyStatus.UNKNOWN,)
         assert no_solver.reasons == ("no_solver",)
-        with patch("act.back_end.solver.terminal_lp._solve", side_effect=TimeoutError("smoke deadline")):
+        with patch("act.back_end.solver.solver_torchlp._solve", side_effect=TimeoutError("smoke deadline")):
             timed_out = solve_terminal_batch(net, terminal_box)
         assert timed_out.statuses == (VerifyStatus.TIMEOUT,) and not bool(timed_out.certified.any())
 
@@ -2638,7 +2581,7 @@ if __name__ == "__main__":
         with (
             patch(f"{__name__}._solve_dual_batch", unresolved_bound),
             patch(f"{__name__}.lanes_with_relu_candidates", mixed_candidates),
-            patch("act.back_end.solver.terminal_lp.solve_terminal_batch", unproved_terminal),
+            patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", unproved_terminal),
         ):
             mixed_result = verify_bab_batched(
                 net, DualSolver, replace(
@@ -2667,7 +2610,7 @@ if __name__ == "__main__":
         with (
             patch(f"{__name__}._solve_dual_batch", unresolved_bound),
             patch(f"{__name__}.lanes_with_relu_candidates", mixed_candidates),
-            patch("act.back_end.solver.terminal_lp.solve_terminal_batch", unproved_terminal),
+            patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", unproved_terminal),
         ):
             budget_with_retirement = verify_bab_batched(
                 net, DualSolver, replace(
@@ -2749,7 +2692,7 @@ if __name__ == "__main__":
                 patch.object(SplitDecision, "apply", failing_split),
                 patch(f"{__name__}._solve_dual_batch", failing_bound),
                 patch(f"{__name__}.lanes_with_relu_candidates", mixed_candidates),
-                patch("act.back_end.solver.terminal_lp.solve_terminal_batch", unproved_terminal),
+                patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", unproved_terminal),
             ):
                 recovered = verify_bab_batched(
                     net, DualSolver, replace(
@@ -3042,7 +2985,7 @@ if __name__ == "__main__":
             patch(f"{__name__}._solve_dual_batch", unresolved_bound),
             patch(f"{__name__}.lanes_with_relu_candidates",
                   side_effect=lambda candidate, *_: torch.zeros(candidate.batch_size, dtype=torch.bool)),
-            patch("act.back_end.solver.terminal_lp.solve_terminal_batch", expired_terminal),
+            patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", expired_terminal),
         ):
             terminal_timeout = verify_bab_batched(
                 net, DualSolver, replace(terminal_config, terminal_lp_enabled=True),

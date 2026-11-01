@@ -24,9 +24,8 @@
 #   |                     |                     | temp = cooling_rate**step      |             |
 #   |                     |                     | (Oliva-SA)                     |             |
 #   +---------------------+---------------------+--------------------------------+-------------+
-#   | diverse_split_signs | DiverseTopKBounding | any order, then hash/soft      | honoured    |
-#   |                     |                     | repulsion over split-sign      |             |
-#   |                     |                     | signatures                     |             |
+#   | diverse_split_signs | DiverseTopKBounding | any order, then split-sign     | honoured    |
+#   |                     |                     | de-duplication                 |             |
 #   +---------------------+---------------------+--------------------------------+-------------+
 #   | random              | RandomBounding      | none — uniform sampling        | ValueError  |
 #   +---------------------+---------------------+--------------------------------+-------------+
@@ -65,7 +64,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from copy import copy
 from dataclasses import fields, replace
-from typing import Callable, Dict, Iterator, List, Literal, Optional, Protocol, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Protocol, Sequence, Set, Tuple
 
 import torch
 
@@ -578,16 +577,7 @@ class TopKBounding(BoundingStrategy):
 
 
 class DiverseTopKBounding(TopKBounding):
-    """Top-k priority pool with optional diversity-aware scheduling.
-
-    ``diversity_mode='hash'`` preserves the original exact split-sign
-    de-duplication behaviour.  ``'soft'`` uses a value-weighted farthest-point
-    selector over split-sign vectors (neuron splitting) or box centres (input
-    splitting / no split signs).  This is scheduling-only: no node is pruned, no
-    bound is changed, and all non-selected nodes remain in the pool for later
-    waves.  ``'none'`` is an explicit off switch and is equivalent to
-    :class:`TopKBounding` selection.
-    """
+    """Top-k priority pool with split-sign de-duplication."""
 
     def __init__(
         self,
@@ -595,17 +585,8 @@ class DiverseTopKBounding(TopKBounding):
         select_probe: Optional[Callable[[SubproblemBatch], None]] = None,
         *,
         k: int = 0,
-        diversity_mode: Literal["hash", "soft", "none"] = "hash",
-        diversity_weight: float = 1.0,
     ) -> None:
         super().__init__(order, select_probe=select_probe, k=k)
-        if diversity_mode not in {"hash", "soft", "none"}:
-            raise ValueError(
-                "diversity_mode must be one of 'hash', 'soft', or 'none', "
-                f"got {diversity_mode!r}"
-            )
-        self.diversity_mode = diversity_mode
-        self.diversity_weight = float(diversity_weight)
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
         lb = self._lb
@@ -620,12 +601,7 @@ class DiverseTopKBounding(TopKBounding):
             remaining: Optional[torch.Tensor] = None
         else:
             order = torch.argsort(self._priority_scores(next_wave=True), descending=True)
-            if self.diversity_mode == "none":
-                selected = order[:n]
-            elif self.diversity_mode == "soft":
-                selected = self._soft_diverse_select(order, n)
-            else:
-                selected = self._dedup_select(order, n)
+            selected = self._dedup_select(order, n)
             selected_mask = torch.zeros(total, dtype=torch.bool, device=lb.device)
             selected_mask[selected] = True
             remaining = order[~selected_mask.index_select(0, order)]
@@ -689,86 +665,6 @@ class DiverseTopKBounding(TopKBounding):
             return None
         return [tuple(int(v) for v in row.tolist()) for row in features]
 
-    def _soft_diverse_select(self, order: torch.Tensor, n: int) -> torch.Tensor:
-        features = self._diversity_features()
-        if features is None or features.shape[0] < 2:
-            return order[:n]
-
-        candidate_features = features.index_select(0, order.to(features.device))
-        distances = torch.cdist(candidate_features, candidate_features, p=2)
-        max_distance = distances.max().clamp(min=torch.finfo(distances.dtype).eps)
-        distances = distances / max_distance
-
-        lb = self._lb
-        assert lb is not None
-        priorities = self._priority_scores(next_wave=True).index_select(0, order.to(lb.device))
-        priorities = priorities.to(device=features.device, dtype=features.dtype)
-        priority_span = (priorities.max() - priorities.min()).clamp(
-            min=torch.finfo(priorities.dtype).eps
-        )
-        priorities = (priorities - priorities.min()) / priority_span
-
-        selected_positions: List[int] = [0]
-        remaining = torch.ones(order.shape[0], dtype=torch.bool, device=features.device)
-        remaining[0] = False
-        min_dist_to_selected = distances[0].clone()
-
-        while len(selected_positions) < n and bool(remaining.any().item()):
-            scores = priorities + self.diversity_weight * min_dist_to_selected
-            scores = scores.masked_fill(~remaining, -torch.inf)
-            next_pos = int(torch.argmax(scores).item())
-            selected_positions.append(next_pos)
-            remaining[next_pos] = False
-            min_dist_to_selected = torch.minimum(
-                min_dist_to_selected, distances[next_pos]
-            )
-
-        if len(selected_positions) < n:
-            for pos in range(order.shape[0]):
-                if pos not in selected_positions:
-                    selected_positions.append(pos)
-                    if len(selected_positions) == n:
-                        break
-        return order[torch.tensor(selected_positions, dtype=torch.long, device=order.device)]
-
-    def _diversity_features(self) -> Optional[torch.Tensor]:
-        split_features = self._split_sign_features()
-        if split_features is not None:
-            return split_features
-        return self._box_center_features()
-
-    def _split_sign_features(self) -> Optional[torch.Tensor]:
-        split_signs = self._split_signs
-        if not split_signs:
-            return None
-        pieces: List[torch.Tensor] = []
-        for layer_id in sorted(split_signs):
-            value = split_signs[layer_id]
-            if value.shape[0] == 0:
-                continue
-            pieces.append(
-                value.detach().reshape(value.shape[0], -1).to(dtype=get_default_dtype())
-            )
-        if not pieces:
-            return None
-        features = torch.cat(pieces, dim=1)
-        if features.shape[1] == 0:
-            return None
-        return features
-
-    def _box_center_features(self) -> Optional[torch.Tensor]:
-        if self._lb is None or self._ub is None:
-            return None
-        centers = (
-            ((self._lb + self._ub) / 2.0)
-            .detach()
-            .to(dtype=get_default_dtype())
-        )
-        if centers.ndim > 2:
-            centers = centers.reshape(centers.shape[0], -1)
-        if centers.shape[1] == 0:
-            return None
-        return centers
 
 
 ROOT_PARENT = -1

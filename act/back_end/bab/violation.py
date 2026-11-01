@@ -17,12 +17,12 @@
 
 from __future__ import annotations
 
-from typing import List, cast
+from typing import Any, List, cast
 
 import torch
 
 from act.back_end.core import Layer, Net
-from act.front_end.specs import InKind, OutKind
+from act.front_end.specs import InKind, OutKind, OutputSpec
 from act.util.model_inference import infer_single_model
 
 
@@ -292,3 +292,79 @@ def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) 
             ub_t = ub.to(device=x_batch.device, dtype=x_batch.dtype)
             result &= ((x_batch >= lb_t - tol) & (x_batch <= ub_t + tol)).flatten(start_dim=1).all(dim=1)
     return result
+
+
+@torch.no_grad()
+def validate_terminal_candidates(export: Any, candidates: torch.Tensor) -> torch.Tensor:
+    """Validate a K-aligned candidate batch against lane AND original geometry.
+
+    The existing concrete reconstruction/forward owner is reused. Pre-hooks
+    observe actual ReLU inputs, not LP activations. Original InputGeometry
+    membership has zero tolerance; unsupported input kinds were rejected at
+    export. Nonfinite inputs, intermediates, outputs, and severities fail closed.
+    """
+    from act.pipeline.verification.act2torch import ACTToTorch, ActGraphModule
+
+    box = export.input_bounds
+    if candidates.shape != box.lb.shape:
+        raise ValueError("terminal candidates must preserve the exported K lanes")
+    valid = torch.isfinite(candidates).flatten(1).all(1)
+    valid &= ((candidates >= box.lb) & (candidates <= box.ub)).flatten(1).all(1)
+    for layer in export.net.layers:
+        if layer.kind != "INPUT_SPEC":
+            continue
+        params = layer.params
+        if layer.input_geometry is not None:
+            valid &= layer.input_geometry.contains(candidates, tol=0.0)
+        elif params["kind"] == InKind.LIN_POLY:
+            a, b = params["A"].to(candidates), params["b"].to(candidates)
+            valid &= (candidates.flatten(1) @ a.T <= b).all(1)
+        else:
+            if "lb" in params and "ub" in params:
+                lb, ub = params["lb"].to(candidates), params["ub"].to(candidates)
+            else:
+                center = params["center"].to(candidates)
+                eps = torch.as_tensor(params["eps"], device=center.device, dtype=center.dtype)
+                lb, ub = center - eps, center + eps
+            valid &= ((candidates >= lb) & (candidates <= ub)).flatten(1).all(1)
+    if not bool(valid.any()):
+        return valid
+    # Invalid/absent lanes still occupy their original indices during one
+    # concrete pass, but receive finite filler to avoid poisoning good lanes.
+    safe = torch.where(valid.reshape(-1, *([1] * (candidates.ndim - 1))),
+                       candidates, box.lb)
+    key = id(export.net)
+    module = _VIOLATION_CHECK_MODULE_CACHE.get(key)
+    if module is None:
+        module = ACTToTorch(export.net).run().to(device=safe.device, dtype=safe.dtype)
+        _VIOLATION_CHECK_MODULE_CACHE[key] = module
+    observed, handles = {}, []
+    try:
+        for graph in module.modules():
+            if not isinstance(graph, ActGraphModule):
+                continue
+            for lid in export.split_signs:
+                if str(lid) not in graph.layers:
+                    raise NotImplementedError(f"unsupported_phase_capture:{lid}")
+                def capture(_module: torch.nn.Module, args: tuple[torch.Tensor, ...],
+                            layer_id: int = lid) -> None:
+                    """Capture the actual preactivation while concrete forward runs."""
+                    observed[layer_id] = args[0].flatten(1).detach()
+                handles.append(graph.layers[str(lid)].register_forward_pre_hook(capture))
+        output = _forward_for_violation_check(export.net, safe)
+    finally:
+        for handle in handles:
+            handle.remove()
+    valid &= torch.isfinite(output).all(1)
+    for lid, signs in export.split_signs.items():
+        if lid not in observed:
+            return torch.zeros_like(valid)
+        values = observed[lid]
+        valid &= (torch.isfinite(values) & ((signs == 0) | (values * signs >= 0))).all(1)
+    # Canonical row interpretation stays with OutputSpec; closed unsafe
+    # properties differ only in their shared boundary rule.
+    spec = OutputSpec(kind=OutKind.UNSAFE_LINEAR if export.out_kind == OutKind.UNSAFE_LINEAR
+                      else OutKind.LINEAR_LE, c=export.spec_c.to(output), d=export.spec_d.to(output))
+    severity = spec.severity(output)
+    violated = severity >= 0 if export.out_kind in OutputSpec.CLOSED_KINDS else severity > 0
+    return valid & torch.isfinite(severity) & violated

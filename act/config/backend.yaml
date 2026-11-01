@@ -178,17 +178,8 @@ backend:
   # Must be 1 when solver = "gurobi" (same N=1 restriction as lp_enabled).
   bab_max_batch_size: 8
 
-  # Text-verification settings. When `method` is set, these overwrite the
-  # corresponding bab.* values (bab.method/p/perturbed_words/eps/max_eps/
-  # num_verify_iters/k/alpha_opt_steps) and bab.solver_tier.
+  # Text-verification method selection.
   method: null                  # SST/Yelp method: planar, rule, alpha, ibp or discrete
-  p: 2.0                        # text embedding perturbation norm metadata (2 or inf)
-  perturbed_words: 1            # token positions perturbed together (1 or 2)
-  eps: 0.00001                  # initial verification radius (>= 0)
-  max_eps: 0.01                 # maximum radius for the certified-radius search (>= 0)
-  num_verify_iters: 5           # binary-search iterations for the certified radius (>= 0)
-  k: 1                          # rule threshold for the rule-slope attention alpha
-  alpha_opt_steps: 1000         # optimization steps for optimized-alpha refinement
 
   # ─────────────────────────────────────────────────────────────────────────
   # TorchLP solver tuning  (torchlp)
@@ -427,17 +418,5 @@ backend:
     llm_probe_decisions: "split,frontier,refine"
     llm_probe_log: false                  # append per-wave JSONL to act/pipeline/log/llm_probe/
 
-    # Reserved: BaB does not read this yet (use backend.verbose for diagnostics).
-    verbose: false
-
     # -- BERT/text method ---------------------------------------------------
     method: null                  # SST/Yelp method: planar, rule, alpha, ibp or discrete
-    baf: true                     # BaF flag; true for planar/rule/alpha, false for ibp/discrete
-    alpha_mode: "fixed"           # attention alpha: fixed (planar), rule, optimized (alpha), none
-    p: 2.0                        # text embedding perturbation norm metadata (2 or inf)
-    perturbed_words: 1            # token positions perturbed together (1 or 2)
-    eps: 0.00001                  # initial verification radius (>= 0)
-    max_eps: 0.01                 # maximum radius for the certified-radius search (>= 0)
-    num_verify_iters: 5           # binary-search iterations for the certified radius (>= 0)
-    k: 1                          # rule threshold for the rule-slope attention alpha
-    alpha_opt_steps: 1000         # optimization steps for optimized-alpha refinement

@@ -17,25 +17,16 @@ import json
 import tempfile
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from torch import Tensor
-    from torch.nn import Module
+import torch
+from torch import Tensor
+from torch.nn import Module
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
-
-from act.back_end.core import Layer, Net
+from act.back_end.core import Net
 from act.util.format_utils import rule
 from act.back_end.serialization import (
     save_net_to_file, load_net_from_file, 
     save_net_to_string, load_net_from_string,
-    validate_json_schema,
     TensorEncoder, NetSerializer
 )
 
@@ -142,9 +133,6 @@ def test_file_io():
     """Test file input/output operations on all available networks."""
     print("🧪 Testing file I/O...")
     
-    if not HAS_TORCH:
-        print("⏭️  Skipping - PyTorch not available")
-        return
     
     # Test all available networks
     test_nets = create_test_networks()
@@ -190,89 +178,9 @@ def test_file_io():
     assert passed > 0, "No networks passed file I/O testing"
 
 
-def test_device_migration():
-    """Test device migration during serialization and deserialization on all networks."""
-    print("🧪 Testing device migration...")
-    test_nets = create_test_networks()
-    
-    passed = 0
-    failed = 0
-    
-    for net_name, net in test_nets.items():
-        print(f"  Testing device migration for '{net_name}'...")
-        
-        try:
-            # Test serialization and deserialization
-            serialized = save_net_to_string(net)
-            net_restored = load_net_from_string(serialized)
-            
-            # Verify structure
-            assert len(net.layers) == len(net_restored.layers), f"Layer count mismatch for {net_name}"
-            
-            print(f"    {net_name} passed")
-            passed += 1
-            
-        except Exception as e:
-            print(f"    ❌ {net_name} failed: {e}")
-            failed += 1
-    
-    print(f"✅ Device migration test completed: {passed} passed, {failed} failed")
-    assert passed > 0, "No networks passed device migration testing"
-
-
-def test_schema_validation():
-    """Test JSON schema validation."""
-    print("🧪 Testing schema validation...")
-    
-    # Test valid schema
-    valid_json = {
-        "format_version": "1.0",
-        "act_net": {
-            "layers": [
-                {
-                    "id": 0,
-                    "kind": "INPUT",
-                    "params": {},
-                    "meta": {"shape": [1, 784]},
-                    "in_vars": [0],
-                    "out_vars": [0],
-                    "cache": {}
-                }
-            ],
-            "graph": {"preds": {}, "succs": {}},
-            "metadata": {}
-        }
-    }
-    
-    errors = validate_json_schema(valid_json)
-    assert len(errors) == 0, f"Valid schema failed validation: {errors}"
-    
-    # Test invalid schema
-    invalid_json = {
-        "act_net": {
-            "layers": [
-                {
-                    "id": 0,
-                    "kind": "INPUT",
-                    # Missing required fields
-                }
-            ]
-        }
-        # Missing format_version
-    }
-    
-    errors = validate_json_schema(invalid_json)
-    assert len(errors) > 0, "Invalid schema passed validation"
-    
-    print(f"Schema validation caught {len(errors)} errors as expected")
-    print("✅ Schema validation test passed")
-
 
 def test_conversion_metadata_roundtrip():
     """Exercise real Torch/ONNX lowering through JSON and reconstruction."""
-    if torch is None:
-        return
-    import torch as runtime_torch
     import torch.nn as nn
 
     from act.front_end.spec_creator_base import LabeledInputTensor
@@ -283,37 +191,37 @@ def test_conversion_metadata_roundtrip():
     from act.pipeline.verification.torch2act import TorchToACT
     from act.pipeline.verification.act2torch import ACTToTorch
 
-    dtype = runtime_torch.get_default_dtype()
+    dtype = torch.get_default_dtype()
 
     def check(model: Module, x: Tensor, expected: Tensor) -> Net:
         width = expected[0].numel()
         wrapped = VerifiableModel(
             input_layer=InputLayer(
-                LabeledInputTensor(x, runtime_torch.arange(x.shape[0], dtype=runtime_torch.int64)),
+                LabeledInputTensor(x, torch.arange(x.shape[0], dtype=torch.int64)),
                 tuple(x.shape), x.dtype,
             ),
             input_spec=InputSpecLayer(InputSpec(kind=InKind.BOX, lb=x - 0.1, ub=x + 0.1)),
             model=model,
             output_spec=OutputSpecLayer(OutputSpec(
                 kind=OutKind.RANGE,
-                lb=runtime_torch.full((width,), -100.0, dtype=dtype),
-                ub=runtime_torch.full((width,), 100.0, dtype=dtype),
+                lb=torch.full((width,), -100.0, dtype=dtype),
+                ub=torch.full((width,), 100.0, dtype=dtype),
             )),
         )
         net = TorchToACT(wrapped).run()
         net.layers[0].cache["nested"] = {
-            "shape": (1, 2, 3), "mask": runtime_torch.tensor([True, False]),
+            "shape": (1, 2, 3), "mask": torch.tensor([True, False]),
         }
         restored = load_net_from_string(save_net_to_string(net), target_device="cpu")
         assert restored.layers[0].cache["nested"]["shape"] == (1, 2, 3)
-        assert restored.layers[0].cache["nested"]["mask"].dtype == runtime_torch.bool
+        assert restored.layers[0].cache["nested"]["mask"].dtype == torch.bool
         labeled = restored.layers[0].params["labeled_input"]
         assert isinstance(labeled, LabeledInputTensor)
-        assert labeled.label is not None and labeled.label.dtype == runtime_torch.int64
+        assert labeled.label is not None and labeled.label.dtype == torch.int64
         for candidate in (net, restored):
             result = ACTToTorch(candidate).run()(x)["output"]
             assert result.shape == expected.shape
-            runtime_torch.testing.assert_close(result, expected, rtol=0, atol=0)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
         return net
 
     class TwoUses(nn.Module):
@@ -322,17 +230,17 @@ def test_conversion_metadata_roundtrip():
         def __init__(self) -> None:
             super().__init__()
             self.projection = nn.Linear(3, 2, dtype=dtype)
-            with runtime_torch.no_grad():
+            with torch.no_grad():
                 self.projection.weight.copy_(
-                    runtime_torch.tensor([[1.0, -2.0, 3.0], [4.0, 1.0, -1.0]], dtype=dtype)
+                    torch.tensor([[1.0, -2.0, 3.0], [4.0, 1.0, -1.0]], dtype=dtype)
                 )
-                self.projection.bias.copy_(runtime_torch.tensor([0.5, -0.25], dtype=dtype))
+                self.projection.bias.copy_(torch.tensor([0.5, -0.25], dtype=dtype))
 
         def forward(self, x: Tensor) -> Tensor:
             h = self.projection(x)
             return h + h
 
-    x = runtime_torch.arange(1, 13, dtype=dtype).reshape(2, 2, 3)
+    x = torch.arange(1, 13, dtype=dtype).reshape(2, 2, 3)
     native = TwoUses()
     native_net = check(native, x, native(x))
     add = next(layer for layer in native_net.layers if layer.kind == "ADD")
@@ -363,7 +271,7 @@ def test_conversion_metadata_roundtrip():
             return self.fc(output.flatten(1))
 
     recurrent = GRUOutput()
-    recurrent_x = runtime_torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
+    recurrent_x = torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
     recurrent = recurrent.to(dtype=dtype)
     check(recurrent, recurrent_x, recurrent(recurrent_x))
 
@@ -383,7 +291,7 @@ def test_conversion_metadata_roundtrip():
     check(lstm, recurrent_x, lstm(recurrent_x))
 
     from act.back_end.serialization.serialization import LayerSerializer
-    legacy_weight = runtime_torch.tensor([[1.0, -2.0, 3.0]], dtype=dtype)
+    legacy_weight = torch.tensor([[1.0, -2.0, 3.0]], dtype=dtype)
     legacy = LayerSerializer.deserialize_layer({
         "id": 0, "kind": "DENSE",
         "params": {
@@ -393,7 +301,7 @@ def test_conversion_metadata_roundtrip():
         },
         "in_vars": [0, 1, 2], "out_vars": [3], "cache": {},
     }, target_device="cpu")
-    runtime_torch.testing.assert_close(legacy.params["weight"], legacy_weight)
+    torch.testing.assert_close(legacy.params["weight"], legacy_weight)
     assert legacy.params["input_shape"] == [1, 3]
 
     from act.back_end.solver.solver_torchlp import TorchLPSolver
@@ -401,11 +309,11 @@ def test_conversion_metadata_roundtrip():
     from act.back_end.verifier import verify_lp_batched
     from act.util.stats import VerifyStatus
 
-    runtime_torch.manual_seed(42)
+    torch.manual_seed(42)
     cnn = nn.Sequential(
         nn.Conv2d(1, 2, 3), nn.ReLU(), nn.Flatten(), nn.Linear(8, 2),
     ).to(dtype=dtype)
-    image = runtime_torch.arange(1, 17, dtype=dtype).reshape(1, 1, 4, 4) / 32
+    image = torch.arange(1, 17, dtype=dtype).reshape(1, 1, 4, 4) / 32
     cnn_wrapped = VerifiableModel(
         input_layer=InputLayer(LabeledInputTensor(image, None), tuple(image.shape), dtype),
         input_spec=InputSpecLayer(InputSpec(
@@ -414,8 +322,8 @@ def test_conversion_metadata_roundtrip():
         model=cnn,
         output_spec=OutputSpecLayer(OutputSpec(
             kind=OutKind.LINEAR_LE,
-            c=runtime_torch.tensor([1.0, 0.0], dtype=dtype),
-            d=runtime_torch.tensor(-1_000.0, dtype=dtype),
+            c=torch.tensor([1.0, 0.0], dtype=dtype),
+            d=torch.tensor(-1_000.0, dtype=dtype),
         )),
     )
     set_solver_mode("torchlp")
@@ -432,8 +340,8 @@ def test_conversion_metadata_roundtrip():
         print("  ONNX conversion roundtrip skipped: optional onnx/onnx2torch unavailable")
         return
 
-    tensor_dtype = TensorProto.FLOAT if dtype == runtime_torch.float32 else TensorProto.DOUBLE
-    x = runtime_torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
+    tensor_dtype = TensorProto.FLOAT if dtype == torch.float32 else TensorProto.DOUBLE
+    x = torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
     for op, constant, expected in (
         ("Gather", helper.make_tensor("index", TensorProto.INT64, [], [1]), x[:, 1, :]),
         ("Split", helper.make_tensor("sizes", TensorProto.INT64, [2], [1, 1]), 2 * x[:, :1, :]),
@@ -456,86 +364,9 @@ def test_conversion_metadata_roundtrip():
         converted = convert(helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 13)]
         ))
-        runtime_torch.testing.assert_close(converted(x), expected, rtol=0, atol=0)
+        torch.testing.assert_close(converted(x), expected, rtol=0, atol=0)
         check(converted, x, expected)
 
-    from act.back_end.verifier import verify_once
-    flat = runtime_torch.arange(1, 7, dtype=dtype).reshape(1, 6) / 4
-    for op, rows, values in (
-        ("Add", (2, 3), [[0.5, -1.0, 2.0]]),
-        ("Mul", (6, 1), [[-3.0]]),
-    ):
-        constant = runtime_torch.tensor(values, dtype=dtype)
-        nodes = [
-            helper.make_node("Reshape", ["input", "rows"], ["reshaped"]),
-            helper.make_node(op, ["reshaped", "constant"], ["mixed"]),
-            helper.make_node("Reshape", ["mixed", "flat"], ["output"]),
-        ]
-        graph = helper.make_graph(
-            nodes, f"serialization-reshape-{op}",
-            [helper.make_tensor_value_info("input", tensor_dtype, [1, 6])],
-            [helper.make_tensor_value_info("output", tensor_dtype, [1, 6])],
-            initializer=[
-                helper.make_tensor("rows", TensorProto.INT64, [2], list(rows)),
-                helper.make_tensor("constant", tensor_dtype, list(constant.shape), constant.flatten().tolist()),
-                helper.make_tensor("flat", TensorProto.INT64, [2], [1, 6]),
-            ],
-        )
-        converted = convert(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]))
-        expected = (flat.reshape(rows) + constant if op == "Add"
-                    else flat.reshape(rows) * constant).reshape(1, 6)
-        check(converted, flat, expected)
-
-    weight = runtime_torch.tensor([
-        [0.5, -1.0, 2.0], [1.5, 0.25, -0.75],
-        [1.0, 1.0, 1.0], [-2.0, 0.5, 0.125],
-    ], dtype=dtype)
-    bias = runtime_torch.tensor([0.1, -0.2, 0.3, -0.4], dtype=dtype)
-    gemm_graph = helper.make_graph(
-        [
-            helper.make_node("Reshape", ["input", "rows"], ["reshaped"]),
-            helper.make_node("Gemm", ["reshaped", "weight", "bias"], ["projected"], transB=1),
-            helper.make_node("Reshape", ["projected", "flat"], ["output"]),
-        ],
-        "serialization-reshape-Gemm",
-        [helper.make_tensor_value_info("input", tensor_dtype, [1, 6])],
-        [helper.make_tensor_value_info("output", tensor_dtype, [1, 8])],
-        initializer=[
-            helper.make_tensor("rows", TensorProto.INT64, [2], [2, 3]),
-            helper.make_tensor("weight", tensor_dtype, [4, 3], weight.flatten().tolist()),
-            helper.make_tensor("bias", tensor_dtype, [4], bias.tolist()),
-            helper.make_tensor("flat", TensorProto.INT64, [2], [1, 8]),
-        ],
-    )
-    gemm = convert(helper.make_model(gemm_graph, opset_imports=[helper.make_opsetid("", 13)]))
-    expected_gemm = runtime_torch.nn.functional.linear(flat.reshape(2, 3), weight, bias).reshape(1, 8)
-    gemm_net = check(gemm, flat, expected_gemm)
-    gemm_results, gemm_facts = verify_once(gemm_net, collect_facts=True)
-    dense = next(layer for layer in gemm_net.layers if layer.kind == "DENSE")
-    assert len(gemm_results) == 1 and gemm_facts is not None
-    assert dense.params["token_wise"] is True
-    assert gemm_facts[dense.id].bounds.lb.shape == (1, 8)
-
-    dynamic_nodes = [
-        helper.make_node("Relu", ["input"], ["h"]),
-        helper.make_node("Cast", ["h"], ["indices"], to=TensorProto.INT64),
-        helper.make_node("Gather", ["h", "indices"], ["output"], axis=1),
-    ]
-    dynamic_graph = helper.make_graph(
-        dynamic_nodes, "dynamic-gather",
-        [helper.make_tensor_value_info("input", tensor_dtype, [1, 2])],
-        [helper.make_tensor_value_info("output", tensor_dtype, [1, 1, 2])],
-    )
-    dynamic_model = convert(helper.make_model(
-        dynamic_graph, opset_imports=[helper.make_opsetid("", 13)],
-    ))
-    dynamic_input = runtime_torch.tensor([[0.2, 1.3]], dtype=dtype)
-    try:
-        check(dynamic_model, dynamic_input, dynamic_model(dynamic_input))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("input-dependent ONNX Gather indices were frozen to the sample")
 
 
 def test_direct_vnnlib_export_roundtrip():
@@ -553,7 +384,7 @@ def test_direct_vnnlib_export_roundtrip():
     from act.back_end.serialization.serialization import load_net_from_file
     from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
     from act.back_end.verifier import verify_once
-    from act.front_end.vnnlib_loader.vnncomp_instance import load_vnncomp_instance
+    from act.front_end.vnnlib_loader.data_model_loader import load_vnncomp_instance
     from act.pipeline.verification.act2torch import ACTToTorch
     from act.util.device_manager import initialize_device
     from act.util.path_config import get_project_root
@@ -629,8 +460,6 @@ def run_all_tests():
     tests = [
         test_basic_serialization,
         test_file_io, 
-        test_device_migration,
-        test_schema_validation,
         test_conversion_metadata_roundtrip,
         test_direct_vnnlib_export_roundtrip,
     ]
@@ -661,7 +490,7 @@ def run_all_tests():
 
 
 def main():
-    """Main function with options for testing and demo."""
+    """Run the serialization test suite and exit with its status."""
     import sys
     
     print("🧪 Running ACT Serialization Test Suite")

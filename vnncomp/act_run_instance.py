@@ -55,7 +55,7 @@ def run_vnncomp_instance(args) -> None:
     from act.back_end.bab.violation import clear_violation_check_module_cache
     from act.config.config import build_vnncomp_bab_config
     from act.back_end.solver.solver_torchlp import TorchLPSolver
-    from act.front_end.vnnlib_loader.vnncomp_instance import load_vnncomp_instance
+    from act.front_end.vnnlib_loader.data_model_loader import load_vnncomp_instance
     from act.front_end.vnnlib_loader.vnnlib_parser import (
         extract_vnnlib_2_io_decls, write_vnncomp_result)
     from act.pipeline.fuzzing.actfuzzer import pgd_preattack

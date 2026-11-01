@@ -119,11 +119,6 @@ class DualResult(BoundResult):
         """Return the certified lower bounds."""
         return self.margins
 
-    def row_witness_inputs(self) -> Optional[torch.Tensor]:
-        """Return the optional dual witness inputs."""
-        return cast(Optional[torch.Tensor], self.sce)
-
-
 @dataclass(frozen=True)
 class DualBatchResult(BatchBoundResult):
     """Decoded result of :meth:`DualSolver.solve_spec_batch` for one K-lane batch."""

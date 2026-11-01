@@ -207,10 +207,6 @@ def validate_wrapper_graph(layers: List["Layer"]) -> None:
             seen_model_layer = True
 
 
-def is_supported_op(op: str) -> bool:
-    return op in SUPPORTED_EXPORT_OPS
-
-
 def validate_conset_ops(conset) -> None:
     for con in conset:
         tag = str(con.meta.get("tag", ""))

@@ -10,6 +10,8 @@ License: AGPLv3+
 """
 
 import argparse
+from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 
 from act.util.cli_utils import add_device_args, initialize_from_args
@@ -55,12 +57,10 @@ def print_category_list(category_type: Optional[str] = None):
         return
     
     # Group by type for display
-    by_type = {}
+    by_type = defaultdict(list)
     for cat_name in categories:
         info = CATEGORY_MAPPING[cat_name]
         cat_type = info['type']
-        if cat_type not in by_type:
-            by_type[cat_type] = []
         by_type[cat_type].append((cat_name, info))
     
     # Print by type
@@ -178,13 +178,6 @@ def main():
         help="Force re-download even if files exist (use with --download)"
     )
     parser.add_argument(
-        "--max-instances",
-        type=int,
-        metavar="N",
-        dest="max_instances",
-        help="Maximum number of instances to download (use with --download)"
-    )
-    parser.add_argument(
         "--list-downloads",
         action="store_true",
         dest="list_downloads",
@@ -250,8 +243,6 @@ def main():
             print(f"Description: {info['description']}")
             print(f"Year: {info['year']}")
             
-            if args.max_instances:
-                print(f"Max instances: {args.max_instances}")
             if args.force:
                 print(f"Force re-download: Yes")
             
@@ -306,11 +297,9 @@ def main():
             return
         
         # Group by category
-        by_category = {}
+        by_category = defaultdict(list)
         for pair in downloaded:
             cat = pair['category']
-            if cat not in by_category:
-                by_category[cat] = []
             by_category[cat].append(pair)
         
         print(f"\n{rule(100)}")
@@ -325,7 +314,7 @@ def main():
             if info:
                 print(f"  Type: {info.get('type', 'N/A')}")
                 print(f"  Description: {info.get('description', 'N/A')}")
-            print(f"  Path: {instances[0]['category_path']}")
+            print(f"  Path: {Path(instances[0]['paths']['vnnlib']).parent}")
         
         print(f"\n{rule(100)}")
         print(f"Total instances: {len(downloaded)}")

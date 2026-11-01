@@ -9,7 +9,7 @@ License: AGPLv3+
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import List, Tuple, Dict, Any, Optional
 import logging
 import torch
 
@@ -49,11 +49,6 @@ class LabeledInputTensor:
         >>> # Property access
         >>> assert labeled.tensor.shape == (1, 3, 32, 32)  # Batch dimension included
         >>> assert labeled.label.shape == (1,) and labeled.label.item() == 5
-        
-        >>> # Device management
-        >>> cuda_labeled = labeled.to('cuda')
-        >>> assert cuda_labeled.tensor.device.type == 'cuda'
-        >>> assert cuda_labeled.label.device.type == 'cuda'
         
         >>> # Unlabeled data
         >>> unlabeled = LabeledInputTensor(tensor, label=None)
@@ -118,92 +113,6 @@ class LabeledInputTensor:
         """Return length for tuple unpacking (always 2)."""
         return 2
     
-    def to(self, device: Union[str, torch.device]) -> LabeledInputTensor:
-        """
-        Move tensor and label to specified device.
-        
-        Args:
-            device: Target device ('cpu', 'cuda', torch.device, etc.)
-        
-        Returns:
-            New LabeledInputTensor with both tensor and label on target device
-        
-        Examples:
-            >>> tensor = torch.randn(1, 3, 32, 32)
-            >>> label = torch.tensor([5], dtype=torch.int64)
-            >>> labeled = LabeledInputTensor(tensor, label=label)
-            >>> cuda_labeled = labeled.to('cuda')
-            >>> assert cuda_labeled.tensor.device.type == 'cuda'
-            >>> assert cuda_labeled.label.device.type == 'cuda'
-        """
-        return LabeledInputTensor(
-            tensor=self.tensor.to(device),
-            label=self.label.to(device) if self.label is not None else None
-        )
-    
-    def cpu(self) -> LabeledInputTensor:
-        """
-        Move tensor to CPU.
-        
-        Returns:
-            New LabeledInputTensor with tensor on CPU
-        """
-        return self.to('cpu')
-    
-    def cuda(self, device: Optional[int] = None) -> LabeledInputTensor:
-        """
-        Move tensor to CUDA device.
-        
-        Args:
-            device: CUDA device index (None for current device)
-        
-        Returns:
-            New LabeledInputTensor with tensor on CUDA device
-        """
-        if device is None:
-            return self.to('cuda')
-        else:
-            return self.to(f'cuda:{device}')
-    
-    def detach(self) -> LabeledInputTensor:
-        """
-        Detach tensor and label from computation graph.
-        
-        Returns:
-            New LabeledInputTensor with detached tensor and label
-        """
-        return LabeledInputTensor(
-            tensor=self.tensor.detach(),
-            label=self.label.detach() if self.label is not None else None
-        )
-    
-    def clone(self) -> LabeledInputTensor:
-        """
-        Create a deep copy.
-        
-        Returns:
-            New LabeledInputTensor with cloned tensor and label
-        """
-        return LabeledInputTensor(
-            tensor=self.tensor.clone(),
-            label=self.label.clone() if self.label is not None else None
-        )
-    
-    @property
-    def shape(self) -> torch.Size:
-        """Convenience property for tensor shape."""
-        return self.tensor.shape
-    
-    @property
-    def device(self) -> torch.device:
-        """Convenience property for tensor device."""
-        return self.tensor.device
-    
-    @property
-    def dtype(self) -> torch.dtype:
-        """Convenience property for tensor dtype."""
-        return self.tensor.dtype
-    
     def __repr__(self) -> str:
         """String representation for debugging."""
         if self.label is not None:
@@ -226,6 +135,8 @@ class BaseSpecCreator(ABC):
     for different spec sources (TorchVision datasets, VNNLIB files, etc.)
     """
     
+    DEFAULT_CONFIG: Optional[str] = None
+    
     def __init__(
         self,
         config_name: Optional[str] = None,
@@ -235,10 +146,11 @@ class BaseSpecCreator(ABC):
         Initialize spec creator with configuration.
         
         Args:
-            config_name: Named front-end spec config (e.g., 'torchvision_classification')
+            config_name: Named front-end spec config (e.g., 'torchvision_classification');
+                defaults to the creator's DEFAULT_CONFIG
             config_dict: Runtime configuration overrides
         """
-        self.config = self._load_config(config_name)
+        self.config = self._load_config(self.DEFAULT_CONFIG if config_name is None else config_name)
         if config_dict:
             self.config.update(config_dict)
     

@@ -298,40 +298,28 @@ class InputLayer(nn.Module):
         """Get label tensor (always (N,) shape)."""
         return self._label_tensor
 
-    def _validate_schema(self):
-        """Validate parameters against INPUT layer schema"""
-        schema = REGISTRY[LayerKind.INPUT.value]
-        
-        # Build unified params dict
+    def _params(self, **required: Any) -> Dict[str, Any]:
+        """Build the INPUT layer params: required fields, non-default desc and set optional fields."""
         params = {
             "labeled_input": self.labeled_input,
             "shape": self.shape,
             "dtype": str(self.dtype),  # REQUIRED
+            **required,
         }
         
-        # Add non-default desc
         if self.desc != "input":
             params["desc"] = self.desc
         
-        # Add optional fields (only if not None)
-        if self.layout is not None:
-            params["layout"] = self.layout
-        if self.dataset_name is not None:
-            params["dataset_name"] = self.dataset_name
-        if self.num_classes is not None:
-            params["num_classes"] = self.num_classes
-        if self.value_range is not None:
-            params["value_range"] = self.value_range
-        if self.scale_hint is not None:
-            params["scale_hint"] = self.scale_hint
-        if self.distribution is not None:
-            params["distribution"] = self.distribution
-        if self.sample_id is not None:
-            params["sample_id"] = self.sample_id
-        if self.domain is not None:
-            params["domain"] = self.domain
-        if self.channels is not None:
-            params["channels"] = self.channels
+        for name in ("layout", "dataset_name", "num_classes", "value_range", "scale_hint",
+                     "distribution", "sample_id", "domain", "channels"):
+            if getattr(self, name) is not None:
+                params[name] = getattr(self, name)
+        return params
+
+    def _validate_schema(self):
+        """Validate parameters against INPUT layer schema"""
+        schema = REGISTRY[LayerKind.INPUT.value]
+        params = self._params()
         
         # Check required/optional params
         for key in schema["params_required"]:
@@ -352,64 +340,14 @@ class InputLayer(nn.Module):
         N = batch_size * per_sample  # Total vars for all samples in batch
         out_vars = list(range(len(in_vars), len(in_vars) + N))
         
-        # Build unified params dict
-        params = {
-            "labeled_input": self.labeled_input,
-            "shape": self.shape,
-            "dtype": str(self.dtype),  # REQUIRED
-            "batch_size": batch_size,  # Track batch size for batched verification
-        }
-        
-        if self.desc != "input":
-            params["desc"] = self.desc
-        
-        # Add all optional fields (only if not None)
-        if self.layout is not None:
-            params["layout"] = self.layout
-        if self.dataset_name is not None:
-            params["dataset_name"] = self.dataset_name
-        if self.num_classes is not None:
-            params["num_classes"] = self.num_classes
-        if self.value_range is not None:
-            params["value_range"] = self.value_range
-        if self.scale_hint is not None:
-            params["scale_hint"] = self.scale_hint
-        if self.distribution is not None:
-            params["distribution"] = self.distribution
-        if self.sample_id is not None:
-            params["sample_id"] = self.sample_id
-        if self.domain is not None:
-            params["domain"] = self.domain
-        if self.channels is not None:
-            params["channels"] = self.channels
-        
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT.value,
-            params=params,
+            params=self._params(batch_size=batch_size),  # Track batch size for batched verification
             in_vars=in_vars,
             out_vars=out_vars
         )
         return [layer], out_vars
-
-    def get_attributes_summary(self) -> Dict[str, Any]:
-        """Return a summary of all attributes for debugging/logging."""
-        return {
-            "shape": self.shape,
-            "desc": self.desc,
-            "dtype": str(self.dtype),
-            "layout": self.layout,
-            "dataset_name": self.dataset_name,
-            "num_classes": self.num_classes,
-            "value_range": self.value_range,
-            "scale_hint": self.scale_hint,
-            "distribution": self.distribution,
-            "label": self.label.tolist(),
-            "sample_id": self.sample_id,
-            "domain": self.domain,
-            "channels": self.channels,
-            "input_tensor_shape": tuple(self.input_tensor.shape),
-        }
 
     def __repr__(self) -> str:
         """Enhanced string representation with key attributes."""

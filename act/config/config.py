@@ -82,43 +82,28 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
-@dataclass(frozen=True)
-class BertMethodSelection:
-    """Resolved attention-relaxation BERT verification method."""
-
-    method: str
-    internal_method: str
-    baf: bool
-    alpha_mode: str
-    solver_tier: str
-    use_bab: bool = True
-
-
-_BERT_METHOD_SELECTIONS: Final[dict[str, BertMethodSelection]] = {
-    "planar": BertMethodSelection("planar", "planar", True, "fixed", "dual"),
-    "rule": BertMethodSelection("rule", "rule", True, "rule", "dual"),
-    "alpha": BertMethodSelection("alpha", "alpha", True, "optimized", "dual_alpha"),
-    "ibp": BertMethodSelection("ibp", "ibp", False, "none", "dual"),
-    "discrete": BertMethodSelection("discrete", "discrete", False, "none", "dual"),
-}
-
 BERT_METHOD_TIERS: Final[dict[str, str]] = {
-    key: value.solver_tier for key, value in _BERT_METHOD_SELECTIONS.items()
+    "planar": "dual",
+    "rule": "dual",
+    "alpha": "dual_alpha",
+    "ibp": "dual",
+    "discrete": "dual",
 }
 
 
 def normalize_bert_method(method: str) -> str:
     """Normalize a public BERT method name."""
     key = method.strip().lower().replace("-", "_")
-    if key not in _BERT_METHOD_SELECTIONS:
+    if key not in BERT_METHOD_TIERS:
         valid = ", ".join(name.replace("_", "-") for name in VALID_BERT_METHODS)
         raise ConfigError(f"Invalid bert method {method!r}; expected one of: {valid}")
     return key
 
 
-def select_bert_method(method: str) -> BertMethodSelection:
+def select_bert_method(method: str) -> tuple[str, str]:
     """Resolve a user-facing SST/Yelp method into ACT back-end settings."""
-    return _BERT_METHOD_SELECTIONS[normalize_bert_method(method)]
+    normalized = normalize_bert_method(method)
+    return normalized, BERT_METHOD_TIERS[normalized]
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +118,6 @@ class BaBConfig:
     Construction::
 
         BaBConfig()                     # programmatic defaults
-        BaBConfig.from_yaml()           # load from act/config/backend.yaml
-        BaBConfig.from_yaml(path, **kw) # custom YAML + overrides
     """
 
     max_depth: int = 20
@@ -332,18 +315,7 @@ class BaBConfig:
     dimension to bisect and its fanout, input-domain-splitting BaB only)."""
     llm_probe_log: bool = False
 
-    verbose: bool = False
-
     method: Optional[str] = None
-    baf: bool = True
-    alpha_mode: str = "fixed"
-    p: float = 2.0
-    perturbed_words: int = 1
-    eps: float = 1e-5
-    max_eps: float = 0.01
-    num_verify_iters: int = 5
-    k: int = 1
-    alpha_opt_steps: int = 1000
 
     def __post_init__(self) -> None:
         if self.solver_tier not in VALID_SOLVER_TIERS:
@@ -404,47 +376,9 @@ class BaBConfig:
                 f"it applies only to the order-ranked pools {TOP_K_BOUNDINGS}"
             )
         if self.method is not None:
-            selection = select_bert_method(self.method)
-            self.method = selection.method
+            self.method, solver_tier = select_bert_method(self.method)
             if self.solver_tier == "lp":
-                self.solver_tier = selection.solver_tier
-        if self.perturbed_words not in (1, 2):
-            raise ConfigError("perturbed_words must be 1 or 2")
-        if self.num_verify_iters < 0:
-            raise ConfigError("num_verify_iters must be non-negative")
-        if self.max_eps < 0 or self.eps < 0:
-            raise ConfigError("eps and max_eps must be non-negative")
-
-    @classmethod
-    def from_yaml(
-        cls,
-        config_path: Optional[Union[str, Path]] = None,
-        **overrides,
-    ) -> BaBConfig:
-        """Load BaB settings from YAML with optional keyword overrides.
-
-        Reads from ``backend.bab`` in the unified backend config, falling
-        back to a top-level ``bab`` key for standalone BaB YAML files.
-        """
-        path = Path(config_path) if config_path else _BACKEND_YAML
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Backend config not found: {path}\nExpected: act/config/backend.yaml"
-            )
-
-        with open(path) as f:
-            yaml_data = yaml.safe_load(f) or {}
-
-        # Support both nested (backend.bab) and flat (bab) YAML layouts.
-        backend_section = yaml_data.get("backend", {})
-        yaml_config: dict[str, Any] = backend_section.get("bab", yaml_data.get("bab", {}))
-
-        valid_keys = {fld.name for fld in fields(cls)}
-        merged = {k: v for k, v in yaml_config.items() if k in valid_keys}
-        merged.update({k: v for k, v in overrides.items() if k in valid_keys})
-
-        return cls(**merged)
+                self.solver_tier = solver_tier
 
 
 def _validate_bab_presets(
@@ -626,6 +560,19 @@ class TorchLPConfig:
     feas_check_stride: int = 5
 
 
+_BACKEND_SUBCONFIGS: Final[dict[str, tuple[type[Any], str]]] = {
+    "bab": (BaBConfig, "bab_"),
+    "generation": (GenerationConfig, "gen_"),
+    "hybridz": (HybridZConfig, "hybridz_"),
+    "gurobi": (GurobiConfig, "gurobi_"),
+    "torchlp": (TorchLPConfig, "torchlp_"),
+    "dual": (DualConfig, "dual_"),
+}
+_BACKEND_SUBCONFIG_PREFIX: Final[dict[str, str]] = {
+    name: prefix for name, (_, prefix) in _BACKEND_SUBCONFIGS.items()
+}
+
+
 # ---------------------------------------------------------------------------
 # BackendConfig — unified back-end configuration
 # ---------------------------------------------------------------------------
@@ -682,13 +629,6 @@ class BackendConfig:
     dual: DualConfig = field(default_factory=DualConfig)
 
     method: Optional[str] = None
-    p: float = 2.0
-    perturbed_words: int = 1
-    eps: float = 1e-5
-    max_eps: float = 0.01
-    num_verify_iters: int = 5
-    k: int = 1
-    alpha_opt_steps: int = 1000
 
     # -- validation ---------------------------------------------------------
 
@@ -712,17 +652,9 @@ class BackendConfig:
                 f"Invalid dtype {self.dtype!r}; expected one of {_VALID_DTYPES}"
             )
         if self.method is not None:
-            selection = select_bert_method(self.method)
-            self.method = selection.method
-            self.bab.method = selection.method
-            self.bab.solver_tier = selection.solver_tier
-            self.bab.p = float(self.p)
-            self.bab.perturbed_words = int(self.perturbed_words)
-            self.bab.eps = float(self.eps)
-            self.bab.max_eps = float(self.max_eps)
-            self.bab.num_verify_iters = int(self.num_verify_iters)
-            self.bab.k = int(self.k)
-            self.bab.alpha_opt_steps = int(self.alpha_opt_steps)
+            self.method, solver_tier = select_bert_method(self.method)
+            self.bab.method = self.method
+            self.bab.solver_tier = solver_tier
         # Gurobi solve_batch is restricted to N=1 (commit af797ff / C6).
         # Fail loud at config-load time rather than at the first batched call.
         if self.solver == "gurobi":
@@ -779,71 +711,39 @@ class BackendConfig:
         bab_presets = load_bab_presets()
 
         backend_raw: dict[str, Any] = raw.get("backend", {})
-        bab_raw: dict[str, Any] = backend_raw.pop("bab", {})
-        gen_raw: dict[str, Any] = _load_yaml(_NETGEN_YAML) if _NETGEN_YAML.exists() else {}
-        hz_raw: dict[str, Any] = backend_raw.pop("hybridz", {})
-        gurobi_raw: dict[str, Any] = backend_raw.pop("gurobi", {})
-        torchlp_raw: dict[str, Any] = backend_raw.pop("torchlp", {})
-        dual_raw: dict[str, Any] = backend_raw.pop("dual", {})
-
-        # Extract "enabled" from bab section → top-level bab_enabled
-        bab_enabled = bab_raw.pop("enabled", None)
-
-        # Route prefixed overrides to the right sub-config
-        bab_fields = {fld.name for fld in fields(BaBConfig)}
-        gen_fields = {fld.name for fld in fields(GenerationConfig)}
-        hz_fields = {fld.name for fld in fields(HybridZConfig)}
-        gurobi_fields = {fld.name for fld in fields(GurobiConfig)}
-        torchlp_fields = {fld.name for fld in fields(TorchLPConfig)}
-        dual_fields = {fld.name for fld in fields(DualConfig)}
-        bab_overrides: dict[str, Any] = {}
-        gen_overrides: dict[str, Any] = {}
-        hz_overrides: dict[str, Any] = {}
-        gurobi_overrides: dict[str, Any] = {}
-        torchlp_overrides: dict[str, Any] = {}
-        dual_overrides: dict[str, Any] = {}
+        subconfig_raw = {
+            name: (
+                _load_yaml(_NETGEN_YAML) if _NETGEN_YAML.exists() else {}
+            ) if name == "generation" else backend_raw.pop(name, {})
+            for name in _BACKEND_SUBCONFIGS
+        }
+        bab_enabled = subconfig_raw["bab"].pop("enabled", None)
+        subconfig_fields = {
+            name: {fld.name for fld in fields(subconfig_type)}
+            for name, (subconfig_type, _) in _BACKEND_SUBCONFIGS.items()
+        }
+        subconfig_overrides = {
+            name: {} for name in _BACKEND_SUBCONFIGS
+        }
         top_overrides: dict[str, Any] = {}
         for k, v in overrides.items():
-            if k.startswith("bab_") and k[4:] in bab_fields:
-                bab_overrides[k[4:]] = v
-            elif k.startswith("gen_") and k[4:] in gen_fields:
-                gen_overrides[k[4:]] = v
-            elif k.startswith("hybridz_") and k[8:] in hz_fields:
-                hz_overrides[k[8:]] = v
-            elif k.startswith("gurobi_") and k[7:] in gurobi_fields:
-                gurobi_overrides[k[7:]] = v
-            elif k.startswith("torchlp_") and k[8:] in torchlp_fields:
-                torchlp_overrides[k[8:]] = v
-            elif k.startswith("dual_") and k[5:] in dual_fields:
-                dual_overrides[k[5:]] = v
+            for name, (_, prefix) in _BACKEND_SUBCONFIGS.items():
+                field_name = k.removeprefix(prefix)
+                if k.startswith(prefix) and field_name in subconfig_fields[name]:
+                    subconfig_overrides[name][field_name] = v
+                    break
             else:
                 top_overrides[k] = v
 
-        # Build BaBConfig
-        bab_merged = {k: v for k, v in bab_raw.items() if k in bab_fields}
-        bab_merged.update(bab_overrides)
-        bab_config = BaBConfig(**bab_merged)
-
-        # Build GenerationConfig
-        gen_merged = {k: v for k, v in gen_raw.items() if k in gen_fields}
-        gen_merged.update(gen_overrides)
-        gen_config = GenerationConfig(**gen_merged)
-
-        hz_merged = {k: v for k, v in hz_raw.items() if k in hz_fields}
-        hz_merged.update(hz_overrides)
-        hz_config = HybridZConfig(**hz_merged)
-
-        gurobi_config = GurobiConfig(
-            **{k: v for k, v in gurobi_raw.items() if k in gurobi_fields} | gurobi_overrides
-        )
-
-        torchlp_merged = {k: v for k, v in torchlp_raw.items() if k in torchlp_fields}
-        torchlp_merged.update(torchlp_overrides)
-        torchlp_config = TorchLPConfig(**torchlp_merged)
-
-        dual_merged = {k: v for k, v in dual_raw.items() if k in dual_fields}
-        dual_merged.update(dual_overrides)
-        dual_config = DualConfig(**dual_merged)
+        subconfigs = {}
+        for name, (subconfig_type, _) in _BACKEND_SUBCONFIGS.items():
+            merged = {
+                key: value
+                for key, value in subconfig_raw[name].items()
+                if key in subconfig_fields[name]
+            }
+            merged.update(subconfig_overrides[name])
+            subconfigs[name] = subconfig_type(**merged)
 
         # Build top-level config
         top_fields = {fld.name for fld in fields(cls)} - {
@@ -865,12 +765,7 @@ class BackendConfig:
         top_merged.update({k: v for k, v in top_overrides.items() if k in top_fields})
 
         config = cls(
-            bab=bab_config,
-            generation=gen_config,
-            hybridz=hz_config,
-            gurobi=gurobi_config,
-            torchlp=torchlp_config,
-            dual=dual_config,
+            **subconfigs,
             **top_merged,
         )
         if config.bab_preset is not None:
@@ -880,49 +775,6 @@ class BackendConfig:
     def bab_preset_values(self, name: str) -> dict[str, Any]:
         """Return a validated named preset from the canonical backend YAML."""
         return load_bab_preset(name)
-
-
-if __name__ == "__main__":
-    import sys
-
-    def _check(label: str, fn) -> None:  # pragma: no cover
-        fn()
-        print(f"  PASS  {label}")
-
-    print("BackendConfig.__post_init__ rejection tests")
-
-    def _t1():  # pragma: no cover
-        try:
-            BackendConfig(solver="gurobi", lp_enabled=True)
-            raise AssertionError("expected ValueError not raised")
-        except ValueError as e:
-            assert "lp_enabled" in str(e), f"wrong message: {e}"
-
-    def _t2():  # pragma: no cover
-        try:
-            BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=2)
-            raise AssertionError("expected ValueError not raised")
-        except ValueError as e:
-            assert "bab_max_batch_size" in str(e), f"wrong message: {e}"
-
-    def _t3():  # pragma: no cover
-        cfg = BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=1)
-        assert cfg.solver == "gurobi"
-        assert not cfg.lp_enabled
-        assert cfg.bab_max_batch_size == 1
-
-    def _t4():  # pragma: no cover
-        cfg = BackendConfig()
-        assert cfg.lp_enabled is True
-        assert cfg.bab_max_batch_size == 8
-
-    _check("gurobi + lp_enabled=True raises ValueError", _t1)
-    _check("gurobi + bab_max_batch_size=2 raises ValueError", _t2)
-    _check("gurobi + lp_enabled=False + bab_max_batch_size=1 succeeds", _t3)
-    _check("default config has lp_enabled=True, bab_max_batch_size=8", _t4)
-
-    sys.exit(0)
-
 
 def build_vnncomp_bab_config(
     config_label: str,

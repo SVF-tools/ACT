@@ -1119,10 +1119,10 @@ def _convert_OnnxFunction(self, mod: nn.Module, node: fx.Node) -> None:
     self._register_node(node.name, layer_id)
 
 def _convert_OnnxCast(self, mod: nn.Module, node: fx.Node) -> None:
-    """OnnxCast: dtype-only conversion; ACT tracks values, not dtype, so passthrough."""
+    """OnnxCast / OnnxDropoutDynamic (eval mode): value passthrough, no layer emitted."""
     args = [a for a in node.args if isinstance(a, fx.Node)]
     if not args:
-        raise ValueError(f"OnnxCast at {node.name}: no inputs")
+        raise ValueError(f"{type(mod).__name__} at {node.name}: no inputs")
     self._propagate_node_state(node.name, args[0].name)
 
 def _convert_OnnxArgExtremum(self, mod: nn.Module, node: fx.Node) -> None:
@@ -1180,13 +1180,6 @@ def _convert_OnnxCompare(self, mod: nn.Module, node: fx.Node) -> None:
     self.shape = output_shape
     self._register_node(node.name, layer_id)
 
-def _convert_OnnxDropoutDynamic(self, mod: nn.Module, node: fx.Node) -> None:
-    """OnnxDropoutDynamic in eval mode: identity passthrough (no layer emitted)."""
-    args = [a for a in node.args if isinstance(a, fx.Node)]
-    if not args:
-        raise ValueError(f"OnnxDropoutDynamic at {node.name}: no inputs")
-    self._propagate_node_state(node.name, args[0].name)
-
 def _convert_OnnxUnsqueezeStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxUnsqueezeStaticAxes: insert size-1 dims at static ``_axes``."""
     if not self._get_predecessor_state(node):
@@ -1217,7 +1210,7 @@ ONNX_HANDLERS = {
     'OnnxCompare': _convert_OnnxCompare,
     'OnnxConcat': _convert_OnnxConcat,
     'OnnxConstant': _convert_OnnxConstant,
-    'OnnxDropoutDynamic': _convert_OnnxDropoutDynamic,
+    'OnnxDropoutDynamic': _convert_OnnxCast,
     'OnnxExpand': _convert_OnnxExpand,
     'OnnxFlatten': _convert_OnnxFlatten,
     'OnnxQuantizeLinear': _convert_OnnxQuantizeLinear,

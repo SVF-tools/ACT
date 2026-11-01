@@ -176,11 +176,8 @@ class LoadedCompactBert:
     word_embeddings: torch.Tensor
     position_embeddings: torch.Tensor
     token_type_embeddings: torch.Tensor
-    model_dir: Path
     checkpoint_dir: Path
     config: BertConfig
-    consumed_checkpoint_keys: tuple[str, ...]
-    unused_checkpoint_keys: tuple[str, ...]
 
 
 def resolve_checkpoint(model_dir: str | Path) -> Path:
@@ -198,7 +195,7 @@ def resolve_checkpoint(model_dir: str | Path) -> Path:
 
 def load_compact_bert(
     model_dir: str | Path, *, device: torch.device | str | None = None,
-    dtype: torch.dtype | None = None, strict: bool = True,
+    dtype: torch.dtype | None = None,
 ) -> LoadedCompactBert:
     """Load explicit parameter mappings and reject missing, malformed or unused weights."""
     checkpoint = resolve_checkpoint(model_dir)
@@ -224,7 +221,7 @@ def load_compact_bert(
                        for name in ("word", "position", "token_type"))
     consumed = set(key_map.values()) | set(table_keys)
     missing, unused = sorted(consumed - state.keys()), tuple(sorted(state.keys() - consumed))
-    if missing or (strict and unused):
+    if missing or unused:
         raise CompactCheckpointError(f"missing checkpoint keys: {missing}; unused keys: {unused}")
     expected = {source: model.state_dict()[target].shape for target, source in key_map.items()}
     expected.update(zip(table_keys, ((config.vocab_size, config.hidden_size),
@@ -244,8 +241,7 @@ def load_compact_bert(
         vocab_file=str(checkpoint / "vocab.txt"),
         do_lower_case=True,
     )
-    return LoadedCompactBert(model, tokenizer, tables[0], tables[1], tables[2], checkpoint.parent, checkpoint,
-                             config, tuple(sorted(consumed)), unused)
+    return LoadedCompactBert(model, tokenizer, tables[0], tables[1], tables[2], checkpoint, config)
 
 
 def tokenize_act_tokens(tokens: Sequence[str], tokenizer: BertTokenizer) -> CompactBertTokenizedInput:

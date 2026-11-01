@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import base64
 import io
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 import numpy as np
 import torch
 
@@ -253,37 +253,3 @@ def load_net_from_string(json_str: str, target_device: Optional[str] = None) -> 
     """Deserialize ACT Net from JSON string."""
     net_dict = json.loads(json_str)
     return NetSerializer.deserialize_net(net_dict, target_device)
-
-# Validation utilities
-def validate_json_schema(net_dict: Dict[str, Any]) -> List[str]:
-    """Validate JSON schema structure before deserialization."""
-    errors = []
-    
-    # Check required top-level fields
-    if "format_version" not in net_dict:
-        errors.append("Missing 'format_version' field")
-    
-    if "act_net" not in net_dict:
-        errors.append("Missing 'act_net' field")
-        return errors
-    
-    act_net = net_dict["act_net"]
-    
-    # Check required act_net fields
-    if "layers" not in act_net:
-        errors.append("Missing 'layers' field in act_net")
-    elif not isinstance(act_net["layers"], list):
-        errors.append("'layers' must be a list")
-    
-    # Validate each layer structure
-    for i, layer in enumerate(act_net.get("layers", [])):
-        if not isinstance(layer, dict):
-            errors.append(f"Layer {i} must be a dictionary")
-            continue
-            
-        required_fields = ["id", "kind", "params", "in_vars", "out_vars"]
-        for field in required_fields:
-            if field not in layer:
-                errors.append(f"Layer {i} missing required field '{field}'")
-    
-    return errors

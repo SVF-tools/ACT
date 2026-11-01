@@ -342,13 +342,9 @@ class BaBSRBranching(BranchingStrategy):
     def __init__(
         self,
         decision_threshold: float = 1e-3,
-        intercept_fallback_max: int = 2,
-        sparsest_layer: Optional[int] = None,
         neuron_only: bool = False,
     ) -> None:
         self.decision_threshold = decision_threshold
-        self.intercept_fallback_max = intercept_fallback_max
-        self.sparsest_layer = sparsest_layer
         self.neuron_only = neuron_only
         self.icp_score_counter = 0
 
@@ -368,8 +364,6 @@ class BaBSRBranching(BranchingStrategy):
         intercept_per_layer: Dict[int, torch.Tensor] = {}
         for lid, bounds in bounds_dict.items():
             if self.neuron_only and _layer_kind_upper(net.by_id[lid]) != LayerKind.RELU.value:
-                continue
-            if self.sparsest_layer is not None and lid != self.sparsest_layer:
                 continue
             if lid not in nu_per_layer:
                 continue
@@ -504,7 +498,7 @@ class BaBSRBranching(BranchingStrategy):
                 continue
 
             intercept = scores.intercept_per_layer
-            if intercept is not None and self.icp_score_counter < self.intercept_fallback_max:
+            if intercept is not None and self.icp_score_counter < 2:
                 ic_lid: Optional[int] = None
                 ic_idx = 0
                 ic_val = float("-inf")
@@ -559,7 +553,7 @@ class BaBSRBranching(BranchingStrategy):
                 self.icp_score_counter = 0
             else:
                 lid = None
-                if intercept and self.icp_score_counter < self.intercept_fallback_max:
+                if intercept and self.icp_score_counter < 2:
                     lid, neuron = choice(intercept, lane)
                     if lid is not None:
                         self.icp_score_counter += 1
@@ -900,20 +894,10 @@ class FSBBranching(BaBSRBranching):
     def __init__(
         self,
         dual_solver: Any,
-        branching_candidates: int = 3,
-        decision_threshold: float = 1e-3,
-        intercept_fallback_max: int = 2,
-        sparsest_layer: Optional[int] = None,
         neuron_only: bool = False,
     ) -> None:
-        super().__init__(
-            decision_threshold=decision_threshold,
-            intercept_fallback_max=intercept_fallback_max,
-            sparsest_layer=sparsest_layer,
-            neuron_only=neuron_only,
-        )
+        super().__init__(neuron_only=neuron_only)
         self.dual_solver = dual_solver
-        self.branching_candidates = branching_candidates
 
     def compute_scores(
         self,
@@ -937,7 +921,7 @@ class FSBBranching(BaBSRBranching):
         hypothesis_list: List[Dict[int, torch.Tensor]] = []
         candidate_metadata: List[Tuple[int, torch.Tensor]] = []
         candidate_validity: List[torch.Tensor] = []
-        topk = self.branching_candidates
+        topk = 3
         for lid, score in bsr.per_layer.items():
             if self.neuron_only:
                 score = score.masked_fill(~torch.isfinite(score), float("-inf"))
@@ -1111,7 +1095,6 @@ def _build_branching_strategy(
     method: str,
     *,
     dual_solver: Any = None,
-    branching_candidates: int = 3,
     neuron_only: bool = False,
 ) -> BranchingStrategy:
     if method == "random":
@@ -1127,7 +1110,6 @@ def _build_branching_strategy(
             raise ValueError("FSB branching requires a dual_solver instance (inject via factory).")
         return FSBBranching(
             dual_solver=dual_solver,
-            branching_candidates=branching_candidates,
             neuron_only=neuron_only,
         )
     raise ValueError(f"Unknown branching method: {method!r}")

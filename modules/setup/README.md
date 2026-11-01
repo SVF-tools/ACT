@@ -21,8 +21,7 @@ This directory contains the environment setup script and dependency requirements
 
 ### Quick Setup
 ```
-cd setup/
-source setup.sh
+source modules/setup/setup.sh
 ```
 
 ## Troubleshooting

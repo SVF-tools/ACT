@@ -1,4 +1,4 @@
-#===- act/front_end/bert_loader/__init__.py - BERT Loader Exports -------====#
+#===- act/front_end/bert_loader/__init__.py - BERT Loader Package -------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -7,33 +7,9 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   Exposes BERT-style text dataset loading and specification creation for
-#   embedding-space verification tasks.
+#   Package marker for BERT-style text dataset loading and specification
+#   creation for embedding-space verification tasks.
 #
 #===---------------------------------------------------------------------===#
 
-"""BERT-style text front-end exports for embedding-space verification."""
-
-from __future__ import annotations
-
-from act.front_end.bert_loader.create_specs import BertSpecCreator
-from act.front_end.bert_loader.data_loader import (
-    BertEmbeddingClassifier,
-    BertExample,
-    BertVocabulary,
-    find_bert_dataset_name,
-    list_bert_datasets,
-    load_bert_dataset,
-    sample_correctly_classified,
-)
-
-__all__ = [
-    "BertEmbeddingClassifier",
-    "BertExample",
-    "BertSpecCreator",
-    "BertVocabulary",
-    "find_bert_dataset_name",
-    "list_bert_datasets",
-    "load_bert_dataset",
-    "sample_correctly_classified",
-]
+"""BERT-style text front-end for embedding-space verification; import from the submodules."""

@@ -14,7 +14,6 @@ from act.util.stats import VerifyResult, VerifyStatus
 
 if TYPE_CHECKING:
     from scipy.sparse import csr_matrix
-    from act.back_end.solver.solver_base import BatchLPProblem, BatchLPSolution
     from act.front_end.specs import OutputSpec
 
 logger = logging.getLogger(__name__)
@@ -22,8 +21,6 @@ logger = logging.getLogger(__name__)
 try:
     import numpy as np
     import scipy.sparse as sp
-    from scipy.optimize import Bounds as SciPyBounds
-    from scipy.optimize import LinearConstraint, linprog, milp
 
     _HAS_SCIPY = True
 except ImportError:
@@ -1418,6 +1415,8 @@ def _softmax_value_cross_radius(
     score_differences,
     groups,
 ):
+    from scipy.optimize import linprog
+
     width = int(probability_lower.shape[1])
     if width > 8:
         positive = np.maximum(probability_upper - reference, 0.0)
@@ -2065,6 +2064,8 @@ def _hz_bounds_unconstrained(hz: HZono) -> Bounds:
 
 
 def _hz_compute_bounds_scipy(hz: HZono) -> Optional[Bounds]:
+    from scipy.optimize import Bounds as SciPyBounds, LinearConstraint, milp
+
     model = _lower_hz_milp(hz)
     if model.n_var == 0:
         LB = UB = model.value_center.copy()
@@ -2350,6 +2351,8 @@ def _solve_hz_feasibility(
     remaining = deadline - time.monotonic()
     if remaining <= 0.0:
         return _MILPResult("unknown", None)
+    from scipy.optimize import Bounds as SciPyBounds, LinearConstraint, milp
+
     constraints = (
         LinearConstraint(A, row_lb, row_ub) if A.shape[0] else None
     )
@@ -2906,18 +2909,3 @@ class HZSolver(Solver):
         for result in results:
             result.metadata.update(self.last_stats)
         return results
-
-    def solve_batch(
-        self,
-        problem: "BatchLPProblem",
-        timelimit: Optional[float] = None,
-    ) -> "BatchLPSolution":
-        """HZSolver does not accept BatchLPProblem inputs.
-
-        HZSolver operates on HZono domains via compute_bounds() and
-        evaluate_spec(), not on LP/CSP batch problems. Callers that
-        need batch LP solving should use TorchLPSolver or GurobiSolver.
-        """
-        raise NotImplementedError(
-            "HZSolver does not accept BatchLPProblem; use evaluate_spec()."
-        )

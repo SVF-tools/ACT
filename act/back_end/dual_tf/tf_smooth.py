@@ -20,7 +20,7 @@ from typing import Tuple, Callable, Dict, Any, List, Final
 from act.back_end.core import Bounds
 from act.back_end.interval_tf.tf_mlp import _sin_interval, _cos_interval, _quantize_params_flat, _quantize_qdq_value
 from .tf_forward import (
-    LinearBound, Frame, _reset_forward_box, _concretize,
+    LinearBound, Frame, _reset_forward_box, _box_result, _concretize,
     _fwd_elementwise_planes, _intersect_boxes,
 )
 
@@ -134,8 +134,8 @@ def compute_smooth_relaxation(
 
 def dual_smooth_backward(
     nu: torch.Tensor, bounds: Bounds,
-    func: Callable[[torch.Tensor], torch.Tensor],
-    dfunc: Callable[[torch.Tensor], torch.Tensor],
+    planes_fn: Callable[[torch.Tensor, torch.Tensor],
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     M: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Batched smooth activation backward (sigmoid/tanh) with lazy M-broadcast.
@@ -148,7 +148,7 @@ def dual_smooth_backward(
     Args:
         nu: dual variable, shape ``[B*M, *shape]``.
         bounds: layer bounds, shape ``[B, *shape]``. NOT M-expanded.
-        func/dfunc: activation function and its derivative.
+        planes_fn: builds enclosing affine planes from lower and upper bounds.
         M: spec-row multiplicity (default 1).
     """
     BM = nu.shape[0]
@@ -168,7 +168,7 @@ def dual_smooth_backward(
 
     l = l_B.unsqueeze(1)                                          # [B, 1, n]
     u = u_B.unsqueeze(1)                                          # [B, 1, n]
-    k_lower, b_lower, k_upper, b_upper = compute_smooth_relaxation(l, u, func, dfunc)
+    k_lower, b_lower, k_upper, b_upper = planes_fn(l, u)
 
     v = v_flat.view(B, M, n)                                      # [B, M, n] view
     v_pos = v >= 0                                                # [B, M, n]
@@ -204,100 +204,45 @@ def _forward_smooth_planes(
     return stored, out, lin, frame
 
 
-# ---- SIGMOID ----
+def _smooth_handlers(
+    function: Callable[[torch.Tensor], torch.Tensor],
+    derivative: Callable[[torch.Tensor], torch.Tensor],
+    kind: str,
+) -> Tuple[Callable[..., Any], Callable[..., Any]]:
+    """Create forward and backward registry adapters for one smooth activation."""
+    planes = lambda l, u: compute_smooth_relaxation(l, u, function, derivative)
 
-@torch.no_grad()
-def forward_sigmoid(
-    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
-    parent_frames: List[Frame], preds: List[int], post_activation: bool,
-    device: torch.device, dtype: torch.dtype,
-) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Propagate sigmoid bounds and compose its planes on an explicit frame."""
-    parent_box = parent_boxes[0]
-    return _forward_smooth_planes(
-        parent_boxes, parent_lins, parent_frames, post_activation,
-        torch.sigmoid(parent_box.lb), torch.sigmoid(parent_box.ub),
-        lambda l, u: compute_smooth_relaxation(l, u, sigmoid, dsigmoid),
-    )
+    @torch.no_grad()
+    def forward(
+        L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+        parent_frames: List[Frame], preds: List[int], post_activation: bool,
+        device: torch.device, dtype: torch.dtype,
+    ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+        parent_box = parent_boxes[0]
+        return _forward_smooth_planes(
+            parent_boxes, parent_lins, parent_frames, post_activation,
+            function(parent_box.lb), function(parent_box.ub), planes,
+        )
 
+    def backward(
+        L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+        preds: List[int], M: int = 1, alpha=None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        bounds = bounds_dict.get(L.id)
+        if bounds is None:
+            raise ValueError(f"backward_{kind.lower()}: layer {L.id} missing bounds in bounds_dict")
+        nu_out, contrib = dual_smooth_backward(nu, bounds, planes, M)
+        assert len(preds) == 1, f"{kind} expects 1 predecessor, got {len(preds)}"
+        return [nu_out], contrib
 
-def backward_sigmoid(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                     preds: List[int], M: int = 1, alpha=None
-                     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    bounds = bounds_dict.get(L.id)
-    if bounds is None:
-        raise ValueError(f"backward_sigmoid: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_sigmoid_backward(nu, bounds, M)
-    assert len(preds) == 1, f"SIGMOID expects 1 predecessor, got {len(preds)}"
-    return [nu_out], contrib
-
-
-def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
-    return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid, M)
-
-
-# ---- TANH ----
-
-@torch.no_grad()
-def forward_tanh(
-    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
-    parent_frames: List[Frame], preds: List[int], post_activation: bool,
-    device: torch.device, dtype: torch.dtype,
-) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Propagate tanh bounds and compose its planes on an explicit frame."""
-    parent_box = parent_boxes[0]
-    return _forward_smooth_planes(
-        parent_boxes, parent_lins, parent_frames, post_activation,
-        torch.tanh(parent_box.lb), torch.tanh(parent_box.ub),
-        lambda l, u: compute_smooth_relaxation(l, u, tanh, dtanh),
-    )
+    forward.__name__ = f"forward_{kind.lower()}"
+    backward.__name__ = f"backward_{kind.lower()}"
+    return forward, backward
 
 
-def backward_tanh(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int], M: int = 1, alpha=None
-                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    bounds = bounds_dict.get(L.id)
-    if bounds is None:
-        raise ValueError(f"backward_tanh: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_tanh_backward(nu, bounds, M)
-    assert len(preds) == 1, f"TANH expects 1 predecessor, got {len(preds)}"
-    return [nu_out], contrib
-
-
-def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
-    return dual_smooth_backward(nu, bounds, tanh, dtanh, M)
-
-
-# ---- ERF ----
-
-@torch.no_grad()
-def forward_erf(
-    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
-    parent_frames: List[Frame], preds: List[int], post_activation: bool,
-    device: torch.device, dtype: torch.dtype,
-) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward pass for ERF activation, mirroring TANH."""
-    parent_box = parent_boxes[0]
-    return _forward_smooth_planes(
-        parent_boxes, parent_lins, parent_frames, post_activation,
-        torch.erf(parent_box.lb), torch.erf(parent_box.ub),
-        lambda l, u: compute_smooth_relaxation(l, u, erf, derf),
-    )
-
-
-def backward_erf(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                 preds: List[int], M: int = 1, alpha=None
-                 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    bounds = bounds_dict.get(L.id)
-    if bounds is None:
-        raise ValueError(f"backward_erf: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_erf_backward(nu, bounds, M)
-    assert len(preds) == 1, f"ERF expects 1 predecessor, got {len(preds)}"
-    return [nu_out], contrib
-
-
-def dual_erf_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
-    return dual_smooth_backward(nu, bounds, erf, derf, M)
+forward_sigmoid, backward_sigmoid = _smooth_handlers(sigmoid, dsigmoid, "SIGMOID")
+forward_tanh, backward_tanh = _smooth_handlers(tanh, dtanh, "TANH")
+forward_erf, backward_erf = _smooth_handlers(erf, derf, "ERF")
 
 
 # ---- SQRT ----
@@ -348,9 +293,7 @@ def forward_square(
         torch.minimum(lower.square(), upper.square()),
     )
     ub = torch.maximum(lower.square(), upper.square())
-    out = Bounds(lb, ub)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_square(
@@ -439,7 +382,7 @@ def forward_quantize(
     parent_box = parent_boxes[0]
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
     n = pre_lb.numel()
-    scale, zp, qmin, qmax = _quantize_params_flat(L, n, pre_lb.device, pre_lb.dtype)
+    scale, zp, qmin, qmax = _quantize_params_flat(L.params, f"quantize:{L.id}", n, pre_lb.device, pre_lb.dtype)
     lo = pre_lb.reshape(-1)
     hi = torch.maximum(pre_ub.reshape(-1), lo)
     z_lo = _quantize_qdq_value(lo, scale, zp, qmin, qmax)
@@ -463,7 +406,7 @@ def backward_quantize(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
 
 def dual_quantize_backward(L: Any, nu: torch.Tensor, bounds: Bounds, M: int = 1):
     n = bounds.lb.numel()
-    scale, zp, qmin, qmax = _quantize_params_flat(L, n, bounds.lb.device, bounds.lb.dtype)
+    scale, zp, qmin, qmax = _quantize_params_flat(L.params, f"quantize:{L.id}", n, bounds.lb.device, bounds.lb.dtype)
     lo = bounds.lb.reshape(-1)
     hi = torch.maximum(bounds.ub.reshape(-1), lo)
     z_lo = _quantize_qdq_value(lo, scale, zp, qmin, qmax).reshape_as(bounds.lb)

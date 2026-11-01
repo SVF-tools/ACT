@@ -476,18 +476,7 @@ def verify_once(
     net,
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    timelimit: Optional[float] = None,
-    hybridz_tolerance: Optional[float] = None,
-) -> List[VerifyResult]:
-    ...
-
-
-@overload
-def verify_once(
-    net,
-    *,
-    model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    collect_facts: Literal[False],
+    collect_facts: Literal[False] = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult]:

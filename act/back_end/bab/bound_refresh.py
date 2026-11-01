@@ -11,13 +11,19 @@ each bit names a packed literal slot, never a spec row. An endpoint equal to
 its split-free reference needs no bits, because that reference holds on every
 retained subset. Unknown provenance must not be read as an empty set.
 """
+from __future__ import annotations
+
 from collections import Counter
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Callable, cast
 
 import torch
 
-from act.back_end.core import Bounds, Layer, Net, topological_sort
+from act.back_end.bab.climb import (
+    BoundSupport, _inherited_support, _lane_phase, _phase_bits,
+    _root_valid_supports,
+)
+from act.back_end.core import Bounds, Net, topological_sort
 from act.back_end.dual_tf.tf_forward import (
     Frame, LinearBound, _entry_lin_frame, _fwd_relu, _relu_relaxation,
     _box_bias, _box_bn, _box_dense, _box_scale, _fwd_conv2d_interval,
@@ -25,6 +31,9 @@ from act.back_end.dual_tf.tf_forward import (
 )
 from act.back_end.layer_schema import LayerKind
 from act.config.config import DualConfig
+
+if TYPE_CHECKING:
+    from act.back_end.bab.climb import LiteralCodec
 
 # Iterations and step decay of the joint multiplier ascent.
 _JOINT_HALFSPACE_STEPS = 30
@@ -36,32 +45,6 @@ _JOINT_HALFSPACE_ROWS = 1024
 # Coefficient entries per backward pass; larger waves run in lane chunks.
 _BACKWARD_MAX_ELEMENTS = 1 << 26
 
-# Each output endpoint reads only the same endpoint of the same-index operand.
-_ENDPOINT_PRESERVING = frozenset({
-    LayerKind.ADD.value, LayerKind.BIAS.value, LayerKind.FLATTEN.value,
-    LayerKind.RELU.value, LayerKind.RESHAPE.value,
-})
-
-
-class _LiteralDecoder(Protocol):
-    """The existing LiteralCodec surface needed by the numerical traversal."""
-
-    def decode_tensor(
-        self, literals: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode packed literal slots into layer, neuron and sign tensors."""
-        ...
-
-
-@dataclass(frozen=True)
-class BoundSupport:
-    """Lower/upper dependencies [K,N,S] and provenance validity [K,N]."""
-
-    lower: torch.Tensor
-    upper: torch.Tensor
-    known: torch.Tensor
-
-
 @dataclass(frozen=True)
 class RefreshResult:
     """Numerical bounds plus an optional, spec-independent support sidecar."""
@@ -69,107 +52,6 @@ class RefreshResult:
     bounds: dict[int, Bounds]
     supports: dict[int, BoundSupport] | None
     linear_refined: bool = False
-
-
-def _lane_phase(split_signs: dict[int, torch.Tensor], lid: int) -> torch.Tensor | None:
-    """Return one layer's [K,N] phases after checking spec invariance."""
-    phase = split_signs.get(lid)
-    if phase is None or phase.dim() != 3:
-        return phase
-    if not torch.equal(phase, phase[:, :1].expand_as(phase)):
-        raise ValueError("split phases must be spec invariant")
-    return phase[:, 0]
-
-
-def _phase_bits(
-    phase: torch.Tensor, lid: int, layers: torch.Tensor, neurons: torch.Tensor,
-    signs: torch.Tensor, active: torch.Tensor,
-) -> torch.Tensor:
-    """Name the slot behind each phase; an unnamed phase needs its whole row."""
-    bits = torch.zeros(*phase.shape, active.shape[1], dtype=torch.bool, device=phase.device)
-    own = torch.zeros_like(phase, dtype=torch.bool)
-    lanes, slots = torch.where(active & (layers == lid))
-    indices = neurons[lanes, slots]
-    matching = signs[lanes, slots] == phase[lanes, indices]
-    own[lanes[matching], indices[matching]] = True
-    bits[lanes[matching], indices[matching], slots[matching]] = True
-    return bits | (((phase != 0) & ~own)[:, :, None] & active[:, None, :])
-
-
-def _root_valid_supports(
-    net: Net, base: dict[int, Bounds], split_signs: dict[int, torch.Tensor],
-    literals: torch.Tensor, codec: _LiteralDecoder,
-) -> dict[int, BoundSupport]:
-    """Supports of the split-free fallback: only a ReLU's own phase clamp.
-
-    Every interval, including those of additional nonlinear operators, is the
-    root reference, so no residual depends on any other literal.
-    """
-    layers, neurons, signs = codec.decode_tensor(literals.masked_fill(literals == 0, 1))
-    active = literals != 0
-    supports = {}
-    for lid, box in base.items():
-        lb, ub = box.lb.flatten(1), box.ub.flatten(1)
-        lower = torch.zeros(*lb.shape, literals.shape[1], dtype=torch.bool, device=lb.device)
-        upper = lower.clone()
-        known = torch.ones_like(lb, dtype=torch.bool)
-        phase = _lane_phase(split_signs, lid) if net.by_id[lid].kind == LayerKind.RELU.value else None
-        if phase is not None:
-            bits = _phase_bits(phase, lid, layers, neurons, signs, active)
-            lower = bits & ((phase > 0) & (lb < 0))[:, :, None]
-            upper = bits & ((phase < 0) & (ub > 0))[:, :, None]
-            known &= ~(phase.ne(0).any(1) & ~active.any(1))[:, None]
-        supports[lid] = BoundSupport(lower, upper, known)
-    return supports
-
-
-def _inherited_support(
-    layer: Layer, preds: list[int], post_support: dict[int, BoundSupport],
-    shape: tuple[int, int], width: int, device: torch.device,
-) -> BoundSupport:
-    """Follow the operands each output endpoint used, per endpoint when known."""
-    k, n = shape
-    operands = [post_support[pid] for pid in preds]
-    if layer.kind in _ENDPOINT_PRESERVING and all(ps.known.shape == shape for ps in operands):
-        lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
-        upper = lower.clone()
-        known = torch.ones(shape, dtype=torch.bool, device=device)
-        for operand in operands:
-            lower |= operand.lower
-            upper |= operand.upper
-            known &= operand.known
-        return BoundSupport(lower, upper, known)
-    weight = layer.params.get("weight") if layer.kind == LayerKind.DENSE.value else None
-    lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
-    upper = lower.clone()
-    known = torch.ones(shape, dtype=torch.bool, device=device)
-    # Bound the temporary union by slots rather than materializing
-    # [K,N_parent,N_output,S] adjacency or broadcasting across specs.
-    if (isinstance(weight, torch.Tensor) and weight.dim() == 2 and weight.shape[0] == n
-            and operands[0].known.shape[1] == weight.shape[1]):
-        parent = operands[0]
-        positive = (weight > 0).T.to(device=device, dtype=torch.float32)
-        negative = (weight < 0).T.to(device=device, dtype=torch.float32)
-
-        def reaches(mask: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:
-            return (mask.transpose(1, 2).to(selector) @ selector).transpose(1, 2) > 0
-
-        for start in range(0, width, 64):
-            end = start + 64
-            low, high = parent.lower[..., start:end], parent.upper[..., start:end]
-            lower[..., start:end] = reaches(low, positive) | reaches(high, negative)
-            upper[..., start:end] = reaches(high, positive) | reaches(low, negative)
-        known = ((~parent.known).to(positive) @ (positive + negative)) == 0
-        return BoundSupport(lower, upper, known)
-    for start in range(0, width, 64):
-        end = start + 64
-        inherited = torch.zeros(k, min(end, width) - start, dtype=torch.bool, device=device)
-        for operand in operands:
-            inherited |= (operand.lower[..., start:end] | operand.upper[..., start:end]).any(1)
-        lower[..., start:end] = inherited[:, None, :]
-    for operand in operands:
-        known &= operand.known.all(1, keepdim=True)
-    return BoundSupport(lower, lower.clone(), known)
 
 
 def _frame_lanes(frame: Frame, start: int, end: int) -> Frame:
@@ -181,6 +63,21 @@ def _frame_lanes(frame: Frame, start: int, end: int) -> Frame:
             eps=geometry.eps[start:end], mask=geometry.mask[start:end],
         )
     return Frame(Bounds(frame.box.lb[start:end], frame.box.ub[start:end]), geometry, frame.columns)
+
+
+def _chunk_lanes(
+    frame: Frame, chunk: int,
+    run: Callable[[int, int, Frame], torch.Tensor | tuple[torch.Tensor, ...]],
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Run a lane-wise calculation in chunks and concatenate its unchanged result."""
+    parts = [
+        run(start, min(start + chunk, frame.box.lb.shape[0]),
+            _frame_lanes(frame, start, min(start + chunk, frame.box.lb.shape[0])))
+        for start in range(0, frame.box.lb.shape[0], chunk)
+    ]
+    if isinstance(parts[0], tuple):
+        return tuple(torch.cat(values) for values in zip(*parts))
+    return torch.cat(parts)
 
 
 def _halfspace_lower(
@@ -199,14 +96,12 @@ def _halfspace_lower(
     if chunk is None:
         return torch.full_like(b, -torch.inf)
     if chunk < lanes:
-        return torch.cat([
-            _halfspace_lower(
-                a[start:start + chunk], b[start:start + chunk],
-                _frame_lanes(frame, start, min(start + chunk, lanes)),
-                h[start:start + chunk], g[start:start + chunk],
-            )
-            for start in range(0, lanes, chunk)
-        ])
+        return cast(torch.Tensor, _chunk_lanes(
+            frame, chunk,
+            lambda start, end, local: _halfspace_lower(
+                a[start:end], b[start:end], local, h[start:end], g[start:end],
+            ),
+        ))
     lo, hi = frame.box.lb[:, None], frame.box.ub[:, None]
     h = h[:, None]
     corner = torch.where(a >= 0, lo, hi)
@@ -299,14 +194,13 @@ def _backward_row_bounds(
     largest = max(op[0].shape[-1] for op in ops if len(op) == 2)
     chunk = max(1, _BACKWARD_MAX_ELEMENTS // (2 * count * max(width, largest)))
     if chunk < lanes:
-        parts = [
-            _backward_row_bounds(
-                [op if len(op) == 2 else tuple(t[start:start + chunk] for t in op) for op in ops],
-                rows, _frame_lanes(frame, start, min(start + chunk, lanes)),
-            )
-            for start in range(0, lanes, chunk)
-        ]
-        return torch.cat([part[0] for part in parts]), torch.cat([part[1] for part in parts])
+        return cast(tuple[torch.Tensor, torch.Tensor], _chunk_lanes(
+            frame, chunk,
+            lambda start, end, local: _backward_row_bounds(
+                [op if len(op) == 2 else tuple(t[start:end] for t in op) for op in ops],
+                rows, local,
+            ),
+        ))
     dtype = frame.box.lb
     coefficients = dtype.new_zeros(lanes, 2 * count, width)
     picked = torch.arange(count, device=rows.device)
@@ -357,16 +251,14 @@ def _joint_halfspace_lower(
     if chunk is None:
         return torch.full_like(b, -torch.inf), a.new_zeros(lanes, rows, h.shape[1])
     if chunk < lanes:
-        parts = [
-            _joint_halfspace_lower(
-                a[start:start + chunk], b[start:start + chunk],
-                _frame_lanes(frame, start, min(start + chunk, lanes)),
-                h[start:start + chunk], g[start:start + chunk], active[start:start + chunk],
-                None if warm_active is None else warm_active[start:start + chunk],
-            )
-            for start in range(0, lanes, chunk)
-        ]
-        return torch.cat([part[0] for part in parts]), torch.cat([part[1] for part in parts])
+        return cast(tuple[torch.Tensor, torch.Tensor], _chunk_lanes(
+            frame, chunk,
+            lambda start, end, local: _joint_halfspace_lower(
+                a[start:end], b[start:end], local, h[start:end], g[start:end],
+                active[start:end],
+                None if warm_active is None else warm_active[start:end],
+            ),
+        ))
     best, witness = _ascend_joint_dual(a, b, frame, h, g, active)
     if warm_active is not None:
         hint = _ascend_joint_dual(a, b, frame, h, g, warm_active)[1] * active[:, None].to(a)
@@ -383,7 +275,7 @@ def refresh_bounds(
     split_signs: dict[int, torch.Tensor],
     *,
     literals: torch.Tensor | None = None,
-    codec: _LiteralDecoder | None = None,
+    codec: LiteralCodec | None = None,
     linear: bool = False,
     support_refinement: bool = True,
     rows_cap: int = 64,

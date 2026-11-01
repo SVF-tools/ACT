@@ -67,6 +67,14 @@ def _is_fixed_model_input(labeled: LabeledInputTensor, spec: InputSpec) -> bool:
     )
 
 
+def _assert_same_center_shape(in_specs: List[InputSpec]) -> None:
+    """Require every ball spec to carry a center of the first spec's shape."""
+    first_center = in_specs[0].center
+    assert first_center is not None
+    assert all(s.center is not None and s.center.shape == first_center.shape for s in in_specs), \
+        f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+
+
 def _merge_specs_to_batch(
     lts: List[LabeledInputTensor],
     in_specs: List[InputSpec],
@@ -147,13 +155,7 @@ def _merge_specs_to_batch(
         ub = torch.cat([s.ub for s in in_specs], dim=0)
         center, eps = None, None
     elif in_kind == InKind.LINF_BALL:
-        # Assert all center tensors have the same shape
-        first_center = in_specs[0].center
-        assert first_center is not None
-        if len(in_specs) > 1:
-            first_center_shape = first_center.shape
-            assert all(s.center is not None and s.center.shape == first_center_shape for s in in_specs), \
-                f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+        _assert_same_center_shape(in_specs)
         
         centers: List[torch.Tensor] = []
         lbs: List[torch.Tensor] = []
@@ -161,23 +163,17 @@ def _merge_specs_to_batch(
         eps_values: List[torch.Tensor] = []
         for spec in in_specs:
             assert spec.center is not None and spec.eps is not None
-            eps_tensor = spec.eps if isinstance(spec.eps, torch.Tensor) else torch.tensor([float(spec.eps)])
             centers.append(spec.center)
-            lbs.append(torch.clamp(spec.center - eps_tensor, 0))
-            ubs.append(torch.clamp(spec.center + eps_tensor, 1))
-            eps_values.append(eps_tensor.reshape(-1)[0])
+            lbs.append(torch.clamp(spec.center - spec.eps, 0))
+            ubs.append(torch.clamp(spec.center + spec.eps, 1))
+            eps_values.append(spec.eps.reshape(-1)[0])
         center = torch.cat(centers, dim=0)
         lb = torch.cat(lbs, dim=0)
         ub = torch.cat(ubs, dim=0)
         eps = torch.stack(eps_values)
         eps = eps.reshape(center.shape[0], *([1] * (center.ndim - 1)))
     elif in_kind == InKind.LP_EMBEDDING:
-        first_center = in_specs[0].center
-        assert first_center is not None
-        if len(in_specs) > 1:
-            first_center_shape = first_center.shape
-            assert all(s.center is not None and s.center.shape == first_center_shape for s in in_specs), \
-                f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+        _assert_same_center_shape(in_specs)
 
         centers = []
         lbs = []
@@ -187,12 +183,11 @@ def _merge_specs_to_batch(
         p_norm_values = []
         for spec in in_specs:
             assert spec.center is not None and spec.eps is not None
-            eps_tensor = spec.eps if isinstance(spec.eps, torch.Tensor) else torch.tensor([float(spec.eps)])
             spec_lb, spec_ub = spec.materialize_box_seed()
             centers.append(spec.center)
             lbs.append(spec_lb)
             ubs.append(spec_ub)
-            eps_values.append(eps_tensor.reshape(-1)[0])
+            eps_values.append(spec.eps.reshape(-1)[0])
             position_masks.append((spec_lb != spec_ub).any(dim=-1))
             p_norm = spec.p_norm if isinstance(spec.p_norm, torch.Tensor) else torch.tensor([float(spec.p_norm)])
             p_norm_values.append(p_norm.reshape(-1)[0])
@@ -542,11 +537,6 @@ def model_synthesis(
     print(f"✓ Successfully created specs using {creator.upper()} spec creator")
     print(f"  Found {len(spec_results)} dataset-model pair(s)")
     
-    # Calculate statistics from spec_results BEFORE synthesis
-    total_samples = sum(len(input_tensors) for _, _, _, input_tensors, _ in spec_results)
-    total_spec_pairs = sum(len(spec_pairs) for _, _, _, _, spec_pairs in spec_results)
-    specs_per_sample = total_spec_pairs // total_samples if total_samples else 0
-    
     # Synthesize wrapped models from spec results
     wrapped_models = synthesize_models_from_specs(spec_results)
     
@@ -576,16 +566,6 @@ def model_synthesis(
         unique_pairs.add((dataset, model))
     print(f"  • Unique dataset-model pairs: {len(unique_pairs)}")
     
-    # Print detailed breakdown (using pre-calculated stats)
-    if total_samples > 0 and total_spec_pairs > 0:
-        print(f"\n📊 Breakdown:")
-        print(f"  • Input samples: {total_samples}")
-        print(f"  • Spec pairs per sample: {specs_per_sample}")
-        print(f"    (= 2 input kinds × 4 epsilons × 3 output specs)")
-        print(f"    (= BOX, LINF_BALL × 0.01,0.03,0.05,0.1 × MARGIN_ROBUST(m=0.0,0.5), TOP1_ROBUST)")
-        print(f"  • Total spec pairs: {total_spec_pairs}")
-        print(f"  • Calculation: {total_samples} samples × {specs_per_sample} specs/sample = {total_spec_pairs} wrapped models")
-    
     return wrapped_models
 
 
@@ -606,7 +586,10 @@ def _smoke_compact_bert() -> None:
         CompactBertRouteBModel, NoVarLayerNorm, embedding_sum,
         load_compact_bert, tokenize_act_tokens,
     )
-    from act.front_end.bert_loader.create_specs import BertSpecCreator
+    from act.front_end.bert_loader.create_specs import (
+        BertSpecCreator, build_query_model, read_query, verify_checkpoint_sha256,
+    )
+    from act.front_end.bert_loader.data_model_loader import QueryIndexError, yelp_partition_indices
     from act.util import path_config
     from act.util.device_manager import get_current_settings, initialize_device
     from act.util.stats import VerifyStatus
@@ -614,7 +597,6 @@ def _smoke_compact_bert() -> None:
     # These clients import synthesis themselves; load them only for this smoke.
     backend_cli = import_module("act.config.backend_cli")
     frontend_cli = import_module("act.config.frontend_cli")
-    query_index = import_module("act.front_end.bert_loader.query_index")
     verify_once = import_module("act.back_end.verifier").verify_once
     ACTToTorch = import_module("act.pipeline.verification.act2torch").ACTToTorch
     TorchToACT = import_module("act.pipeline.verification.torch2act").TorchToACT
@@ -716,23 +698,23 @@ def _smoke_compact_bert() -> None:
                             )
                 vocabulary.assert_not_called()
 
-            query = query_index.read_query(index, 0)
-            assert query_index.verify_checkpoint_sha256(query) == weights
+            query = read_query(index, 0)
+            assert verify_checkpoint_sha256(query) == weights
             with patch.object(
                 BertSpecCreator, "_single_spec_pair", wraps=BertSpecCreator._single_spec_pair
             ) as single:
-                wrapped_query = query_index.build_query_model(query)
+                wrapped_query = build_query_model(query)
                 assert single.call_count == 1
             mask = wrapped_query.input_spec.spec.perturbed_positions
             assert mask.shape == seed.shape[:2]
             assert mask[0].nonzero().flatten().tolist() == [1]
             try:
-                query_index.build_query_model(query_index.read_query(index, 1))
-            except query_index.QueryIndexError:
+                build_query_model(read_query(index, 1))
+            except QueryIndexError:
                 pass
             else:
                 raise AssertionError("WordPiece continuation accepted as a query position")
-            partition = query_index.yelp_partition_indices(10)
+            partition = yelp_partition_indices(10)
             assert len(partition["calibration"]) == 2
             assert sorted(partition["calibration"] + partition["evaluation"]) == list(range(10))
             assert not set(partition["calibration"]) & set(partition["evaluation"])
@@ -766,24 +748,10 @@ def _smoke_compact_bert() -> None:
 if __name__ == "__main__":
     import sys
 
-    if "--compact-smoke" in sys.argv:
-        _smoke_compact_bert()
-        sys.exit(0)
-
-    from act.util.model_inference import model_inference
-    from act.util.device_manager import initialize_device
-    
-    # Initialize device/dtype before synthesis (models typically use float32)
-    initialize_device(device='cuda', dtype='float32')
-    
-    # Step 1: Synthesize all wrapped models using new spec creators
-    wrapped_models = model_synthesis()
-    
-    # Step 2: Test all models with inference (input data extracted from wrapped models)
-    successful_models = model_inference(wrapped_models)
-    
-    print(f"\n✅ Successfully inferred {len(successful_models)} out of {len(wrapped_models)} models")
-    print(f"\n🎯 NEW SPEC CREATOR INTEGRATION: COMPLETE ✅")
+    if "--compact-smoke" not in sys.argv:
+        sys.exit("usage: python -m act.front_end.model_synthesis --compact-smoke")
+    _smoke_compact_bert()
+    sys.exit(0)
 
 
 # Merge split-ReLUs: invert the ReluSplitter benchmark transformation.

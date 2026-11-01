@@ -20,19 +20,53 @@ import torch
 if TYPE_CHECKING:
     from act.back_end.bab.branching.bounding import BoundingStrategy
     from act.back_end.bab.node import SubproblemBatch
+    from act.config.config import BaBConfig
 
 PER_CLASS_ALPHA_MAX_BYTES = 1024 * 1024**2
 WARM_STATE_MAX_BYTES_PER_LANE = 32 * 1024**2
 
 
-def allow_per_class_alpha(estimated_bytes: int, *, enabled: bool) -> bool:
-    """Keep the legacy policy unless the CUDA planner explicitly opts in."""
-    return not enabled or estimated_bytes <= PER_CLASS_ALPHA_MAX_BYTES
+def _cuda_budget_bytes(safety: float, device: torch.device | None = None) -> float:
+    """Return the shared CUDA budget from total and process-reclaimable bytes."""
+    if device is None:
+        free, total = torch.cuda.mem_get_info()
+        reclaimable = free + torch.cuda.memory_reserved()
+    else:
+        free, total = torch.cuda.mem_get_info(device)
+        reclaimable = free + torch.cuda.memory_reserved(device)
+    return min(float(total) * safety, float(reclaimable) * .9)
 
 
-def allow_warm_state(estimated_bytes: int, lanes: int, *, enabled: bool) -> bool:
+def auto_initial_batch(
+    bound_elements: int, config: BaBConfig, budget_bytes: float | None = None,
+) -> int:
+    """Choose the conservative startup lane count before measured recalibration."""
+    per_lane = 4.0 * max(1, bound_elements) * 256.0
+    budget = _cuda_budget_bytes(float(config.auto_batch_safety)) if budget_bytes is None else budget_bytes
+    return max(int(config.auto_batch_floor), min(int(config.auto_batch_cap), int(budget / per_lane)))
+
+
+def auto_recalibrate_batch(
+    peak_bytes: float, max_k_seen: int, config: BaBConfig,
+    budget_bytes: float | None = None,
+) -> int:
+    """Choose the next lane count from the conservative measured bytes per lane."""
+    bytes_per_lane = max(peak_bytes / max(1, max_k_seen), 1.0)
+    budget = _cuda_budget_bytes(float(config.auto_batch_safety)) if budget_bytes is None else budget_bytes
+    return max(
+        int(config.auto_batch_floor),
+        min(int(config.auto_batch_cap), int(budget / bytes_per_lane)),
+    )
+
+
+def allow_per_class_alpha(estimated_bytes: int) -> bool:
+    """Keep per-row alpha storage within its memory budget."""
+    return estimated_bytes <= PER_CLASS_ALPHA_MAX_BYTES
+
+
+def allow_warm_state(estimated_bytes: int, lanes: int) -> bool:
     """Bound retained optimizer state without changing a domain or its proof."""
-    return not enabled or estimated_bytes <= max(1, lanes) * WARM_STATE_MAX_BYTES_PER_LANE
+    return estimated_bytes <= max(1, lanes) * WARM_STATE_MAX_BYTES_PER_LANE
 
 
 @dataclass(frozen=True)
@@ -132,10 +166,8 @@ class FrontierMemoryPlanner:
         fbytes = tensor_storage_bytes(frontier, self.device)
         fibytes = tensor_storage_bytes(chain(frontier, arriving), self.device)
         owned = tensor_storage_bytes(chain(frontier, arriving, held), self.device)
-        free, total = torch.cuda.mem_get_info(self.device)
         allocated = torch.cuda.memory_allocated(self.device)
-        reclaimable = free + torch.cuda.memory_reserved(self.device)
-        limit = int(min(total * self.safety, reclaimable * .9))
+        limit = int(_cuda_budget_bytes(self.safety, self.device))
         return MemoryBudget(
             limit, max(0, allocated - owned), fbytes, fibytes - fbytes,
             owned - fibytes, temporary,
@@ -163,17 +195,13 @@ class FrontierMemoryPlanner:
 
         Both gather outputs together contain the full logical payload. A second
         payload covers padding/selection scratch; ranking uses linear indices.
-        Diverse soft selection additionally holds a dense pairwise distance map.
         """
         target = torch.device(device) if device is not None else self.device
         tensors = tuple(t for t in pool.resident_tensors() if t.device.type == target.type)
         if not tensors:
             return 0
         payload = sum(t.numel() * t.element_size() for t in tensors)
-        temporary = 2 * payload + 64 * len(pool)
-        if getattr(pool, "diversity_mode", None) == "soft":
-            temporary += 4 * len(pool)**2 * tensors[0].element_size()
-        return temporary
+        return 2 * payload + 64 * len(pool)
 
     def plan_wave(self, pool: BoundingStrategy, requested: int) -> int:
         """Relieve storage, shrink K, then evict only if one lane cannot fit."""
@@ -243,7 +271,7 @@ class FrontierMemoryPlanner:
             _alpha_tree_leaves(incoming.incremental_alpha),
             _alpha_tree_leaves(incoming.incremental_eta),
         ))
-        if not allow_warm_state(warm_bytes, incoming.batch_size, enabled=True):
+        if not allow_warm_state(warm_bytes, incoming.batch_size):
             incoming = incoming.drop_warm_state()
             self.warm_drop_count += 1
         extra = pool.projected_push_bytes(incoming)

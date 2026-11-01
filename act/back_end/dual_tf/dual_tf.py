@@ -12,8 +12,8 @@
 
 
 import torch
-from typing import Dict, List, Optional, Sequence, Tuple, cast
-from act.back_end.core import Bounds, Layer, Net
+from typing import Dict, List, Sequence, Tuple, cast
+from act.back_end.core import Bounds, Layer
 from act.back_end.layer_schema import LayerKind
 from .tf_mlp import (
     backward_dense, backward_relu, backward_bias, backward_scale,
@@ -32,21 +32,19 @@ from .tf_smooth import (
     backward_sigmoid, backward_tanh, backward_erf, backward_sqrt, backward_sin, backward_cos, backward_quantize,
     forward_sigmoid, forward_tanh, forward_erf, forward_sqrt, forward_sin, forward_cos, forward_quantize,
 )
-from .tf_rnn import forward_lstm, backward_lstm, forward_gru, backward_gru
 from .tf_transformer import (
     forward_attention, backward_attention,
     forward_matmul, backward_matmul,
     forward_mul, backward_mul,
-    forward_mha, backward_mha,
     forward_mha_split, backward_mha_split,
     forward_layernorm, backward_layernorm,
     forward_softmax, backward_softmax,
     forward_gelu, backward_gelu,
 )
 from .tf_forward import (
-    compute_forward_bounds, LinearBound, Frame,
+    LinearBound, Frame,
     _sum_linear_bounds, _sum_interval_bounds, _concretize,
-    _reset_forward_box, _align, _int_param,
+    _reset_forward_box, _box_result, _align, _int_param,
     _shared_explicit_frame, _intersect_boxes,
 )
 
@@ -61,9 +59,7 @@ def forward_constant(
     value = L.params["value"].reshape(1, -1).to(device=device, dtype=dtype)
     lb = value.expand(batch_size, -1).contiguous()
     ub = lb.clone()
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_constant(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -97,9 +93,7 @@ def forward_expand(
     out_shape = tuple(int(d) for d in cast(Tuple[int, ...], output_shape_value))
     lb = parent.lb.reshape(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
     ub = parent.ub.reshape(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_expand(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -140,9 +134,7 @@ def forward_gather(
     x_ub = parent.ub.reshape(batch_size, *input_shape)
     lb = torch.index_select(x_lb, dim=axis + 1, index=indices).reshape(batch_size, -1)
     ub = torch.index_select(x_ub, dim=axis + 1, index=indices).reshape(batch_size, -1)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_gather(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -256,9 +248,7 @@ def forward_slice(
     x_ub = parent.ub.reshape(batch_size, *input_shape)
     lb = x_lb[slc].reshape(batch_size, -1).contiguous()
     ub = x_ub[slc].reshape(batch_size, -1).contiguous()
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    out = Bounds(lb, ub)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_slice(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -375,9 +365,7 @@ def forward_sub(
     n = min(xl.shape[1], yl.shape[1])
     lb = xl[:, :n] - yu[:, :n]
     ub = xu[:, :n] - yl[:, :n]
-    out = Bounds(lb, ub)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_sub(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
@@ -409,9 +397,7 @@ def forward_div(
     crosses_zero = (yl <= 0) & (yu >= 0)
     lb = torch.where(crosses_zero, torch.full_like(xl, -torch.inf), corners.amin(0))
     ub = torch.where(crosses_zero, torch.full_like(xu, torch.inf), corners.amax(0))
-    out = Bounds(lb, ub)
-    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-    return out, out, lin, frame
+    return _box_result(lb, ub, device, dtype)
 
 
 def backward_div(
@@ -437,7 +423,6 @@ def forward_concat(
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
     """CONCAT multi-pred forward handler.
 
-    Source: tf_forward.py lines 324-346 (CONCAT branch of compute_forward_bounds).
     Semantics preserved verbatim — when all predecessor frames share the same
     object identity and A_lb batch/input axes match, concatenate dual-track
     linear bounds along dim=1 and concretize; otherwise fall back to torch.cat
@@ -494,10 +479,20 @@ def backward_concat(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     return pred_nus, contrib
 
 
+def _unsupported_forward(L: Layer, *args, **kwargs):
+    """Reject a layer kind without a dual forward implementation."""
+    raise NotImplementedError(f"forward for {L.kind.upper()} not implemented in dual_tf")
+
+
+def _unsupported_backward(L: Layer, *args, **kwargs):
+    """Reject a layer kind without a dual backward implementation."""
+    raise NotImplementedError(f"backward for {L.kind.upper()} not implemented in dual_tf")
+
+
 class DualTF:
     """Backward-kernel registry holder for the dual solver.
 
-    Holder of three registries (forward, backward, unimplemented). Dual
+    Holder of forward and backward registries. Dual
     semantics live in DualSolver's backward pass, not in propagated LP
     constraints, so this class is intentionally NOT a TransferFunction.
 
@@ -508,67 +503,9 @@ class DualTF:
       * ``_BACKWARD_REGISTRY`` — per-kind backward dispatch consumed by
         ``DualSolver.compute_certified_bound``. Each entry has signature
         ``(L, nu, bounds_dict, preds, M=1, alpha=None) -> (pred_nus, contrib)``.
-      * ``_UNIMPLEMENTED_KINDS`` — kinds whose backward is a stub
-        (raises ``NotImplementedError``); ``supports_layer`` filters them
-        so dual-incompatible nets get cleanly SKIPPED.
-
     DualSolver instantiates this internally; external code uses ``--solver
     dual`` rather than touching DualTF directly.
     """
-
-    _FORWARD_REGISTRY = {
-        LayerKind.INPUT.value:      forward_identity,
-        LayerKind.INPUT_SPEC.value: forward_identity,
-        LayerKind.ASSERT.value:     forward_identity,
-        LayerKind.CONSTANT.value:   forward_constant,
-        LayerKind.DENSE.value:      forward_dense,
-        LayerKind.BIAS.value:       forward_bias,
-        LayerKind.SCALE.value:      forward_scale,
-        LayerKind.BN.value:         forward_bn,
-        LayerKind.RELU.value:       forward_relu,
-        LayerKind.LRELU.value:      forward_lrelu,
-        "LEAKY_RELU":               forward_lrelu,   # alias (not a LayerKind member)
-        LayerKind.SIGMOID.value:    forward_sigmoid,
-        LayerKind.TANH.value:       forward_tanh,
-        LayerKind.ERF.value:        forward_erf,
-        LayerKind.SQRT.value:       forward_sqrt,
-        LayerKind.SQUARE.value:     forward_square,
-        LayerKind.SIN.value:        forward_sin,
-        LayerKind.COS.value:        forward_cos,
-        LayerKind.QUANTIZE.value:   forward_quantize,
-        LayerKind.CONV1D.value:     forward_conv1d,
-        LayerKind.CONV2D.value:     forward_conv2d,
-        LayerKind.MAXPOOL2D.value:  forward_maxpool2d,
-        LayerKind.AVGPOOL2D.value:  forward_avgpool2d,
-        LayerKind.UPSAMPLE.value:   forward_upsample,
-        LayerKind.FLATTEN.value:    forward_reshape,
-        LayerKind.RESHAPE.value:    forward_reshape,
-        LayerKind.TRANSPOSE.value:  forward_transpose,
-        LayerKind.SQUEEZE.value:    forward_identity,
-        LayerKind.UNSQUEEZE.value:  forward_identity,
-        LayerKind.EXPAND.value:     forward_expand,
-        LayerKind.GATHER.value:     forward_gather,
-        LayerKind.SLICE.value:      forward_slice,
-        LayerKind.MEAN.value:       forward_mean,
-        LayerKind.REDUCE_SUM.value: forward_reduce_sum,
-        LayerKind.ADD.value:        forward_add,
-        LayerKind.SUB.value:        forward_sub,
-        LayerKind.DIV.value:        forward_div,
-        LayerKind.CONCAT.value:     forward_concat,
-        LayerKind.LSTM.value:       forward_lstm,
-        LayerKind.GRU.value:        forward_gru,
-        LayerKind.ATT_SCORES.value: forward_attention,
-        LayerKind.ATT_MIX.value:    forward_attention,
-        LayerKind.MATMUL.value:     forward_matmul,
-        LayerKind.MUL.value:        forward_mul,
-        LayerKind.SIGN.value:       forward_sign,
-        LayerKind.MHA_SPLIT.value:  forward_mha_split,
-        LayerKind.MHA_JOIN.value:   forward_concat,
-        LayerKind.MASK_ADD.value:   forward_mha,
-        LayerKind.LAYERNORM.value:  forward_layernorm,
-        LayerKind.SOFTMAX.value:    forward_softmax,
-        LayerKind.GELU.value:       forward_gelu,
-    }
 
     # η placement invariant (split-constraint KKT multipliers)
     # ---------------------------------------------------------
@@ -587,104 +524,65 @@ class DualTF:
     #     α.data.clamp_(0.0, 1.0)   # slope variables, α ∈ [0, 1]
     #     η.data.clamp_(min=0)      # KKT multipliers, η ≥ 0
 
-    _BACKWARD_REGISTRY = {
-        LayerKind.INPUT.value:      backward_identity,
-        LayerKind.INPUT_SPEC.value: backward_identity,
-        LayerKind.ASSERT.value:     backward_identity,
-        LayerKind.CONSTANT.value:   backward_constant,
-        LayerKind.DENSE.value:      backward_dense,
-        LayerKind.BIAS.value:       backward_bias,
-        LayerKind.SCALE.value:      backward_scale,
-        LayerKind.BN.value:         backward_bn,
-        LayerKind.RELU.value:       backward_relu,
-        LayerKind.LRELU.value:      backward_relu,
-        "LEAKY_RELU":               backward_relu,   # alias (not a LayerKind member)
-        LayerKind.SIGMOID.value:    backward_sigmoid,
-        LayerKind.TANH.value:       backward_tanh,
-        LayerKind.ERF.value:        backward_erf,
-        LayerKind.SQRT.value:       backward_sqrt,
-        LayerKind.SQUARE.value:     backward_square,
-        LayerKind.SIN.value:        backward_sin,
-        LayerKind.COS.value:        backward_cos,
-        LayerKind.QUANTIZE.value:   backward_quantize,
-        LayerKind.CONV1D.value:     backward_conv1d,
-        LayerKind.CONV2D.value:     backward_conv2d,
-        LayerKind.MAXPOOL2D.value:  backward_maxpool2d,
-        LayerKind.AVGPOOL2D.value:  backward_avgpool2d,
-        LayerKind.UPSAMPLE.value:   backward_upsample,
-        LayerKind.FLATTEN.value:    backward_identity,
-        LayerKind.RESHAPE.value:    backward_identity,
-        LayerKind.TRANSPOSE.value:  backward_transpose,
-        LayerKind.SQUEEZE.value:    backward_identity,
-        LayerKind.UNSQUEEZE.value:  backward_identity,
-        LayerKind.EXPAND.value:     backward_expand,
-        LayerKind.GATHER.value:     backward_gather,
-        LayerKind.SLICE.value:      backward_slice,
-        LayerKind.MEAN.value:       backward_mean,
-        LayerKind.REDUCE_SUM.value: backward_reduce_sum,
-        LayerKind.ADD.value:        backward_add,
-        LayerKind.SUB.value:        backward_sub,
-        LayerKind.DIV.value:        backward_div,
-        LayerKind.CONCAT.value:     backward_concat,
-        LayerKind.LSTM.value:       backward_lstm,
-        LayerKind.GRU.value:        backward_gru,
-        LayerKind.ATT_SCORES.value: backward_attention,
-        LayerKind.ATT_MIX.value:    backward_attention,
-        LayerKind.MATMUL.value:     backward_matmul,
-        LayerKind.MUL.value:        backward_mul,
-        LayerKind.SIGN.value:       backward_sign,
-        LayerKind.MHA_SPLIT.value:  backward_mha_split,
-        LayerKind.MHA_JOIN.value:   backward_concat,
-        LayerKind.MASK_ADD.value:   backward_mha,
-        LayerKind.LAYERNORM.value:  backward_layernorm,
-        LayerKind.SOFTMAX.value:    backward_softmax,
-        LayerKind.GELU.value:       backward_gelu,
-    }
-
+    _HANDLERS = (
+        (LayerKind.INPUT.value, forward_identity, backward_identity),
+        (LayerKind.INPUT_SPEC.value, forward_identity, backward_identity),
+        (LayerKind.ASSERT.value, forward_identity, backward_identity),
+        (LayerKind.CONSTANT.value, forward_constant, backward_constant),
+        (LayerKind.DENSE.value, forward_dense, backward_dense),
+        (LayerKind.BIAS.value, forward_bias, backward_bias),
+        (LayerKind.SCALE.value, forward_scale, backward_scale),
+        (LayerKind.BN.value, forward_bn, backward_bn),
+        (LayerKind.RELU.value, forward_relu, backward_relu),
+        (LayerKind.LRELU.value, forward_lrelu, backward_relu),
+        ("LEAKY_RELU", forward_lrelu, backward_relu),
+        (LayerKind.SIGMOID.value, forward_sigmoid, backward_sigmoid),
+        (LayerKind.TANH.value, forward_tanh, backward_tanh),
+        (LayerKind.ERF.value, forward_erf, backward_erf),
+        (LayerKind.SQRT.value, forward_sqrt, backward_sqrt),
+        (LayerKind.SQUARE.value, forward_square, backward_square),
+        (LayerKind.SIN.value, forward_sin, backward_sin),
+        (LayerKind.COS.value, forward_cos, backward_cos),
+        (LayerKind.QUANTIZE.value, forward_quantize, backward_quantize),
+        (LayerKind.CONV1D.value, forward_conv1d, backward_conv1d),
+        (LayerKind.CONV2D.value, forward_conv2d, backward_conv2d),
+        (LayerKind.MAXPOOL2D.value, forward_maxpool2d, backward_maxpool2d),
+        (LayerKind.AVGPOOL2D.value, forward_avgpool2d, backward_avgpool2d),
+        (LayerKind.UPSAMPLE.value, forward_upsample, backward_upsample),
+        (LayerKind.FLATTEN.value, forward_reshape, backward_identity),
+        (LayerKind.RESHAPE.value, forward_reshape, backward_identity),
+        (LayerKind.TRANSPOSE.value, forward_transpose, backward_transpose),
+        (LayerKind.SQUEEZE.value, forward_identity, backward_identity),
+        (LayerKind.UNSQUEEZE.value, forward_identity, backward_identity),
+        (LayerKind.EXPAND.value, forward_expand, backward_expand),
+        (LayerKind.GATHER.value, forward_gather, backward_gather),
+        (LayerKind.SLICE.value, forward_slice, backward_slice),
+        (LayerKind.MEAN.value, forward_mean, backward_mean),
+        (LayerKind.REDUCE_SUM.value, forward_reduce_sum, backward_reduce_sum),
+        (LayerKind.ADD.value, forward_add, backward_add),
+        (LayerKind.SUB.value, forward_sub, backward_sub),
+        (LayerKind.DIV.value, forward_div, backward_div),
+        (LayerKind.CONCAT.value, forward_concat, backward_concat),
+        (LayerKind.LSTM.value, _unsupported_forward, _unsupported_backward),
+        (LayerKind.GRU.value, _unsupported_forward, _unsupported_backward),
+        (LayerKind.ATT_SCORES.value, forward_attention, backward_attention),
+        (LayerKind.ATT_MIX.value, forward_attention, backward_attention),
+        (LayerKind.MATMUL.value, forward_matmul, backward_matmul),
+        (LayerKind.MUL.value, forward_mul, backward_mul),
+        (LayerKind.SIGN.value, forward_sign, backward_sign),
+        (LayerKind.MHA_SPLIT.value, forward_mha_split, backward_mha_split),
+        (LayerKind.MHA_JOIN.value, forward_concat, backward_concat),
+        (LayerKind.MASK_ADD.value, _unsupported_forward, _unsupported_backward),
+        (LayerKind.LAYERNORM.value, forward_layernorm, backward_layernorm),
+        (LayerKind.SOFTMAX.value, forward_softmax, backward_softmax),
+        (LayerKind.GELU.value, forward_gelu, backward_gelu),
+    )
+    _FORWARD_REGISTRY = {kind: forward for kind, forward, _ in _HANDLERS}
+    _BACKWARD_REGISTRY = {kind: backward for kind, _, backward in _HANDLERS}
     _UNIMPLEMENTED_KINDS = frozenset({
-        LayerKind.LSTM.value,
-        LayerKind.GRU.value,
-        LayerKind.MASK_ADD.value,
-        # Backward kernels for these are stubs that raise NotImplementedError
-        # at runtime. Listing them here makes supports_layer return False so
-        # upstream callers (validate_verifier) cleanly SKIP affected nets
-        # instead of surfacing runtime ERROR. ATT_SCORES / ATT_MIX / CONCAT now
-        # have real backward kernels and are intentionally absent.
+        LayerKind.LSTM.value, LayerKind.GRU.value, LayerKind.MASK_ADD.value,
     })
 
     def supports_layer(self, layer_kind: str) -> bool:
         k = layer_kind.upper()
         return k in self._BACKWARD_REGISTRY and k not in self._UNIMPLEMENTED_KINDS
-
-
-# Explicit stub registry: any handler whose semantics are "raise NotImplementedError"
-# goes here. Membership is the ground truth for stub detection; net_factory filters
-# by identity against these sets.
-# To implement a stub: fill its body AND remove it from this set in the same commit.
-_FORWARD_STUBS = frozenset({
-    forward_lstm, forward_gru, forward_mha,
-})
-_BACKWARD_STUBS = frozenset({
-    backward_lstm, backward_gru, backward_mha,
-})
-
-# --- registry invariants (fire once at module import) ---
-assert set(DualTF._FORWARD_REGISTRY.keys()) == set(DualTF._BACKWARD_REGISTRY.keys()), (
-    f"DualTF registry keyset mismatch: "
-    f"forward-only={set(DualTF._FORWARD_REGISTRY) - set(DualTF._BACKWARD_REGISTRY)}, "
-    f"backward-only={set(DualTF._BACKWARD_REGISTRY) - set(DualTF._FORWARD_REGISTRY)}"
-)
-
-# _UNIMPLEMENTED_KINDS must exactly equal the set of layer kinds whose backward
-# handler is a stub (raises NotImplementedError). Drift between these two sets
-# is a real risk: implementing a stub without updating _UNIMPLEMENTED_KINDS
-# would silently keep skipping a now-working kind; the reverse causes runtime
-# NotImplementedError on a kind that supports_layer claims to support.
-_stub_kinds_from_registry = frozenset(
-    k for k, fn in DualTF._BACKWARD_REGISTRY.items() if fn in _BACKWARD_STUBS
-)
-assert DualTF._UNIMPLEMENTED_KINDS == _stub_kinds_from_registry, (
-    f"DualTF _UNIMPLEMENTED_KINDS drift: "
-    f"declared={sorted(DualTF._UNIMPLEMENTED_KINDS)}, "
-    f"stub-derived={sorted(_stub_kinds_from_registry)}"
-)

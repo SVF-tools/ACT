@@ -62,7 +62,6 @@ InputLayer → InputSpecLayer → Model → OutputSpecLayer
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from typing import Dict, Any, override
 import enum
 
@@ -70,7 +69,7 @@ import enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .core import Layer
+    pass
 
 import torch
 import torch.nn as nn
@@ -196,18 +195,6 @@ TRANSFORMER_KINDS: frozenset[str] = frozenset(
         LayerKind.MASK_ADD.value,
     }
 )
-
-# Activations with a 1:1 standard torch module surface (hook-traceable).
-HOOKABLE_ACTIVATION_KINDS: frozenset[str] = frozenset(
-    {
-        LayerKind.RELU.value,
-        LayerKind.SIGMOID.value,
-        LayerKind.TANH.value,
-        LayerKind.SILU.value,
-        LayerKind.LRELU.value,
-    }
-)
-
 
 # -------------------------------------------
 # Strict schema: flat registry (easy to edit)

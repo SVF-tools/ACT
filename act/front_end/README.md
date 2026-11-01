@@ -218,7 +218,7 @@ python -m act.front_end.torchvision_loader --download MNIST simple_cnn
 # VNNLIB-specific features
 python -m act.front_end.vnnlib_loader --list
 python -m act.front_end.vnnlib_loader --info acasxu_2023
-python -m act.front_end.vnnlib_loader --download cifar100_2024 --max-instances 10
+python -m act.front_end.vnnlib_loader --download cifar100_2024
 ```
 
 ## Programmatic Usage

@@ -10,6 +10,7 @@ License: AGPLv3+
 """
 
 import argparse
+from collections import defaultdict
 from typing import Any, Optional, cast
 
 from act.front_end.creator_registry import detect_creator, list_creators, get_creator
@@ -21,7 +22,7 @@ from act.util.download_utils import UNAVAILABLE, report_unavailable
 from act.front_end.torchvision_loader import data_model_mapping as tv_mapping
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.vnnlib_loader import category_mapping as vnnlib_mapping
-from act.front_end.bert_loader import data_loader as bert_loader
+from act.front_end.bert_loader import data_model_loader as bert_loader
 from act.config.config import VALID_BERT_METHODS
 
 
@@ -343,11 +344,9 @@ def print_list_downloads(creator: Optional[str] = None):
             print(rule(100, "-"))
             
             # Group by category
-            categories = {}
+            categories = defaultdict(list)
             for item in vnnlib_downloads:
                 cat = item['category']
-                if cat not in categories:
-                    categories[cat] = []
                 categories[cat].append(item)
             
             for cat in sorted(categories.keys()):

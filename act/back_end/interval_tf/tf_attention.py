@@ -447,16 +447,6 @@ class LinearBounds:
         w = l.unsqueeze(-2) * 0
         return self._like(w, w, l, u)
 
-    def dot_product(self, other: "LinearBounds") -> "LinearBounds":
-        """Single-planar attention bound for ``Q Kt`` / context.
-
-        Implements the dual-norm linear bound of the multi-head dot-product:
-        one valid plane per side, summed over the head dimension.
-        """
-        if self.dim_in == 0:
-            return self._dot_product_degenerate(other)
-        return self._dot_product_planes(other, z=False)
-
     def dot_product_double(
         self, other: "LinearBounds",
     ) -> tuple["LinearBounds", "LinearBounds"]:
@@ -472,16 +462,6 @@ class LinearBounds:
             self._dot_product_planes(other, z=False),
             self._dot_product_planes(other, z=True),
         )
-
-    def context(self, value: "LinearBounds") -> "LinearBounds":
-        """Attention-weighted value ``probs @ value`` (single plane)."""
-        return self.dot_product(value.t())
-
-    def context_double(
-        self, value: "LinearBounds",
-    ) -> tuple["LinearBounds", "LinearBounds"]:
-        """Attention-weighted value keeping both planes for the fusion."""
-        return self.dot_product_double(value.t())
 
     # -- elementwise relaxations (softmax / layer-norm building blocks) --------
 
@@ -544,15 +524,6 @@ class LinearBounds:
         """Softmax over the last axis as ``exp`` then ``divide`` by the sum."""
         bounds_exp, bounds_sum = self._softmax_sum()
         return bounds_exp.divide(bounds_sum)
-
-    def softmax_double(self) -> tuple["LinearBounds", "LinearBounds"]:
-        """Dual-planar softmax: both divide planes for the catalytic fusion."""
-        bounds_exp, bounds_sum = self._softmax_sum()
-        recip = bounds_sum.reciprocal()
-        return (
-            bounds_exp._multiply_bound_plane(recip, z=False),
-            bounds_exp._multiply_bound_plane(recip, z=True),
-        )
 
     def sqr(self) -> "LinearBounds":
         """Bound ``x^2``: secant upper and a sign-aware tangent lower.

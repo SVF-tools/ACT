@@ -279,24 +279,6 @@ def parse_vnnlib_queries(
     )
 
 
-def validate_vnnlib_file(vnnlib_path: Path) -> bool:
-    """
-    Validate that a VNNLIB file is parseable.
-    
-    Args:
-        vnnlib_path: Path to .vnnlib file
-        
-    Returns:
-        True if valid, False otherwise
-    """
-    try:
-        parse_vnnlib_to_tensors(vnnlib_path)
-        return True
-    except VNNLibParseError as e:
-        logger.error(f"VNNLIB validation failed: {e}")
-        return False
-
-
 def extract_label_from_vnnlib(vnnlib_path: Path) -> Optional[int]:
     """
     Extract ground truth label from VNNLIB file comment.

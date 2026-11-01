@@ -21,7 +21,6 @@ from .serialization import (
     load_net_from_file,
     save_net_to_string,
     load_net_from_string,
-    validate_json_schema
 )
 
 __all__ = [
@@ -33,5 +32,4 @@ __all__ = [
     'load_net_from_file',
     'save_net_to_string',
     'load_net_from_string',
-    'validate_json_schema'
 ]

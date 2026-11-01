@@ -46,10 +46,6 @@ class BoundResult(ABC):
     def row_lower_bounds(self) -> "torch.Tensor":
         """Return the certified lower bound for each packed specification row."""
 
-    @abstractmethod
-    def row_witness_inputs(self) -> Optional["torch.Tensor"]:
-        """Return a witness input per packed row when the solver produced one."""
-
 
 class BatchBoundResult(ABC):
     """Decoded result of one K-lane output-spec batch.
@@ -146,8 +142,8 @@ class Solver:
             M: number of spec rows packed into ``c``'s leading axis per
                 sample. DualSolver-specific (lazy M-broadcast);
                 LP/MILP solvers ignore this. Defaults to 1.
-            return_sce: if True, expose an input witness per packed row via
-                ``BoundResult.row_witness_inputs()``. Defaults to False.
+            return_sce: if True, expose an input witness per packed row on the
+                concrete result's witness field. Defaults to False.
             enable_grad: if True, allow gradient flow through the bound
                 computation (for adversarial / robust-training loops).
 

@@ -36,7 +36,7 @@ import torch  # pyright: ignore[reportMissingImports]
 
 from act.back_end.core import Layer, Net
 from act.back_end.layer_schema import LayerKind, REGISTRY
-from act.back_end.serialization.serialization import NetSerializer
+from act.back_end.serialization.serialization import save_net_to_file
 from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
 from act.util.device_manager import get_default_device, get_default_dtype
 from act.util.format_utils import rule
@@ -133,93 +133,6 @@ def _as_block_param(v: Any, i: int, n_blocks: int, name: str) -> int:
 
 
 # ============================================================================
-# Unified N-D Convolution & Pooling
-# ============================================================================
-
-
-def append_conv_nd(
-    layers: List[Dict[str, Any]],
-    *,
-    ndim: int,
-    in_ch: int,
-    out_ch: int,
-    spatial_dims: Tuple[int, ...],
-    kernel: int,
-    stride: int,
-    padding: int,
-    dilation: int = 1,
-    groups: int = 1,
-) -> Tuple[int, ...]:
-    if ndim not in (1, 2, 3):
-        raise ValueError(f"ndim must be 1, 2, or 3, got {ndim}")
-    if len(spatial_dims) != ndim:
-        raise ValueError(f"spatial_dims length ({len(spatial_dims)}) != ndim ({ndim})")
-
-    output_spatial = tuple(
-        _out_dim(d, kernel, stride, padding, dilation) for d in spatial_dims
-    )
-    for i, od in enumerate(output_spatial):
-        if od <= 0:
-            raise ValueError(
-                f"CONV{ndim}D: output dim {i} = {od} (input={spatial_dims[i]})"
-            )
-
-    layers.append(
-        {
-            "kind": f"CONV{ndim}D",
-            "params": {
-                "in_channels": int(in_ch),
-                "out_channels": int(out_ch),
-                "kernel_size": int(kernel),
-                "stride": int(stride),
-                "padding": int(padding),
-                "dilation": int(dilation),
-                "groups": int(groups),
-                "input_shape": [1, int(in_ch)] + [int(d) for d in spatial_dims],
-                "output_shape": [1, int(out_ch)] + [int(d) for d in output_spatial],
-            },
-        }
-    )
-    return output_spatial
-
-
-def append_pool_nd(
-    layers: List[Dict[str, Any]],
-    *,
-    ndim: int,
-    kind: str,
-    in_ch: int,
-    spatial_dims: Tuple[int, ...],
-    kernel: int,
-    stride: int,
-    padding: int = 0,
-) -> Tuple[int, ...]:
-    if ndim not in (1, 2, 3):
-        raise ValueError(f"ndim must be 1, 2, or 3, got {ndim}")
-    if len(spatial_dims) != ndim:
-        raise ValueError(f"spatial_dims length ({len(spatial_dims)}) != ndim ({ndim})")
-
-    output_spatial = tuple(_out_dim(d, kernel, stride, padding) for d in spatial_dims)
-    for i, od in enumerate(output_spatial):
-        if od <= 0:
-            raise ValueError(f"{kind}: output dim {i} = {od} (input={spatial_dims[i]})")
-
-    layers.append(
-        {
-            "kind": kind,
-            "params": {
-                "kernel_size": int(kernel),
-                "stride": int(stride),
-                "padding": int(padding),
-                "input_shape": [1, int(in_ch)] + [int(d) for d in spatial_dims],
-                "output_shape": [1, int(in_ch)] + [int(d) for d in output_spatial],
-            },
-        }
-    )
-    return output_spatial
-
-
-# ============================================================================
 # Single-Layer Appenders
 # ============================================================================
 
@@ -246,26 +159,17 @@ def append_dense(
     )
 
 
-def append_bias(layers, **meta_kw) -> None:
-    _append_layer(
-        layers,
-        LayerKind.BIAS.value,
-        params={k: v for k, v in meta_kw.items() if v is not None},
-    )
+def append_bias(layers) -> None:
+    _append_layer(layers, LayerKind.BIAS.value)
 
 
-def append_scale(layers, **meta_kw) -> None:
-    _append_layer(
-        layers,
-        LayerKind.SCALE.value,
-        params={k: v for k, v in meta_kw.items() if v is not None},
-    )
+def append_scale(layers) -> None:
+    _append_layer(layers, LayerKind.SCALE.value)
 
 
-def append_bn(layers, **meta_kw) -> None:
-    filtered = {k: v for k, v in meta_kw.items() if v is not None}
-    append_scale(layers, **filtered)
-    append_bias(layers, **filtered)
+def append_bn(layers) -> None:
+    append_scale(layers)
+    append_bias(layers)
 
 
 def append_act(
@@ -278,12 +182,6 @@ def append_act(
         elif act_kind == LayerKind.POW.value and "power_exponent" in act_params:
             params["exponent"] = float(act_params["power_exponent"])
     _append_layer(layers, act_kind, params=params)
-
-
-def append_add(layers, *, skip_idx: int, main_idx: int) -> None:
-    append_binary_op(
-        layers, op_kind=LayerKind.ADD.value, x_idx=skip_idx, y_idx=main_idx
-    )
 
 
 def append_binary_op(layers, *, op_kind: str, x_idx: int, y_idx: int) -> None:
@@ -363,18 +261,12 @@ def _inject_extra_ops(
 ) -> None:
     norm_op = cfg.get("inject_norm_op")
     if norm_op:
-        layers.append({"kind": norm_op, "params": {}})
+        _append_layer(layers, norm_op)
 
     binary_op = cfg.get("inject_binary_op")
     if binary_op and allow_dag:
         branch1_idx = len(layers) - 1
-        layers.append(
-            {
-                "kind": LayerKind.RELU.value,
-                "params": {},
-                "preds": [branch1_idx],
-            }
-        )
+        _append_layer(layers, LayerKind.RELU.value, preds=[branch1_idx])
         branch2_idx = len(layers) - 1
         append_binary_op(
             layers, op_kind=binary_op, x_idx=branch1_idx, y_idx=branch2_idx
@@ -382,30 +274,17 @@ def _inject_extra_ops(
 
     shape_op = cfg.get("inject_shape_op")
     if shape_op in (LayerKind.UNSQUEEZE.value, LayerKind.SQUEEZE.value):
-        layers.append({"kind": LayerKind.UNSQUEEZE.value, "params": {"dims": [2]}})
-        layers.append({"kind": LayerKind.SQUEEZE.value, "params": {"dims": [2]}})
+        _append_layer(layers, LayerKind.UNSQUEEZE.value, params={"dims": [2]})
+        _append_layer(layers, LayerKind.SQUEEZE.value, params={"dims": [2]})
     elif shape_op == LayerKind.RESHAPE.value:
-        layers.append(
-            {
-                "kind": LayerKind.RESHAPE.value,
-                "params": {"target_shape": [1, feat_size]},
-            }
+        _append_layer(
+            layers, LayerKind.RESHAPE.value, params={"target_shape": [1, feat_size]}
         )
     elif shape_op == LayerKind.TRANSPOSE.value:
-        layers.append({"kind": LayerKind.UNSQUEEZE.value, "params": {"dims": [2]}})
-        layers.append(
-            {
-                "kind": LayerKind.TRANSPOSE.value,
-                "params": {"perm": [0, 2, 1]},
-            }
-        )
-        layers.append(
-            {
-                "kind": LayerKind.TRANSPOSE.value,
-                "params": {"perm": [0, 2, 1]},
-            }
-        )
-        layers.append({"kind": LayerKind.SQUEEZE.value, "params": {"dims": [2]}})
+        _append_layer(layers, LayerKind.UNSQUEEZE.value, params={"dims": [2]})
+        _append_layer(layers, LayerKind.TRANSPOSE.value, params={"perm": [0, 2, 1]})
+        _append_layer(layers, LayerKind.TRANSPOSE.value, params={"perm": [0, 2, 1]})
+        _append_layer(layers, LayerKind.SQUEEZE.value, params={"dims": [2]})
 
 
 # ============================================================================
@@ -429,7 +308,12 @@ def _build_residual_block(
         main_op()
         append_act(layers, act_kind, act_params=cfg)
         main_op()
-        append_add(layers, skip_idx=skip_idx, main_idx=len(layers) - 1)
+        append_binary_op(
+            layers,
+            op_kind=LayerKind.ADD.value,
+            x_idx=skip_idx,
+            y_idx=len(layers) - 1,
+        )
         append_act(layers, act_kind, act_params=cfg)
 
 
@@ -565,29 +449,49 @@ _POOL_KIND_TO_LAYER = {
 
 
 def _conv2d(layers, *, in_ch, out_ch, H, W, kernel=3, stride=1, padding=1):
-    return append_conv_nd(
-        layers,
-        ndim=2,
-        in_ch=in_ch,
-        out_ch=out_ch,
-        spatial_dims=(H, W),
-        kernel=kernel,
-        stride=stride,
-        padding=padding,
+    H_out, W_out = (
+        _out_dim(H, kernel, stride, padding),
+        _out_dim(W, kernel, stride, padding),
     )
+    if H_out <= 0 or W_out <= 0:
+        raise ValueError(f"CONV2D: invalid output shape ({H_out}, {W_out})")
+    _append_layer(
+        layers,
+        LayerKind.CONV2D.value,
+        params={
+            "in_channels": int(in_ch),
+            "out_channels": int(out_ch),
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "dilation": 1,
+            "groups": 1,
+            "input_shape": [1, int(in_ch), int(H), int(W)],
+            "output_shape": [1, int(out_ch), H_out, W_out],
+        },
+    )
+    return H_out, W_out
 
 
 def _pool2d(layers, *, kind, in_ch, H, W, kernel=2, stride=2, padding=0):
-    return append_pool_nd(
-        layers,
-        ndim=2,
-        kind=kind,
-        in_ch=in_ch,
-        spatial_dims=(H, W),
-        kernel=kernel,
-        stride=stride,
-        padding=padding,
+    H_out, W_out = (
+        _out_dim(H, kernel, stride, padding),
+        _out_dim(W, kernel, stride, padding),
     )
+    if H_out <= 0 or W_out <= 0:
+        raise ValueError(f"{kind}: invalid output shape ({H_out}, {W_out})")
+    _append_layer(
+        layers,
+        kind,
+        params={
+            "kernel_size": int(kernel),
+            "stride": int(stride),
+            "padding": int(padding),
+            "input_shape": [1, int(in_ch), int(H), int(W)],
+            "output_shape": [1, int(in_ch), H_out, W_out],
+        },
+    )
+    return H_out, W_out
 
 
 def build_cnn_layers(
@@ -1132,7 +1036,6 @@ class NetFactory:
         registry_mode: str = "intersection",
     ):
         self.config = config
-        self.config_path = "gen_act_net.yaml"
         common = self.config["common"]
 
         self.tf_targets = tf_targets
@@ -1410,15 +1313,15 @@ class NetFactory:
             }
         )
 
-        ik = str(instance["input_spec"]["kind"])
-        sm: Dict[str, Any] = {"kind": ik}
-        if ik == "BOX":
-            sm["lb_val"] = float(instance["input_spec"]["lb_val"])
-            sm["ub_val"] = float(instance["input_spec"]["ub_val"])
-        elif ik == "LINF_BALL":
-            sm["center_val"] = float(instance["input_spec"]["center_val"])
-            sm["eps"] = float(instance["input_spec"]["eps"])
-        layers.append({"kind": LayerKind.INPUT_SPEC.value, "params": sm})
+        input_spec = instance["input_spec"]
+        layers.append(
+            {
+                "kind": LayerKind.INPUT_SPEC.value,
+                "params": {
+                    key: value for key, value in input_spec.items() if key != "value_range"
+                },
+            }
+        )
 
         if instance["family"] == "mlp":
             build_mlp_layers(layers, cfg=cfg)
@@ -1429,21 +1332,12 @@ class NetFactory:
         else:
             raise ValueError(f"Unsupported family: {instance['family']}")
 
-        ok = str(instance["output_spec"]["kind"])
-        om: Dict[str, Any] = {"kind": ok}
-        op: Dict[str, Any] = {}
-        if ok == "TOP1_ROBUST":
-            om["y_true"] = int(instance["output_spec"]["y_true"])
-        elif ok == "MARGIN_ROBUST":
-            om["y_true"] = int(instance["output_spec"]["y_true"])
-            om["margin"] = float(instance["output_spec"]["margin"])
-        elif ok == "LINEAR_LE":
-            op["c"] = list(instance["output_spec"]["c"])
-            om["d"] = float(instance["output_spec"]["d"])
-        elif ok == "RANGE":
-            op["lb"] = list(instance["output_spec"]["lb"])
-            op["ub"] = list(instance["output_spec"]["ub"])
-        layers.append({"kind": LayerKind.ASSERT.value, "params": {**om, **op}})
+        layers.append(
+            {
+                "kind": LayerKind.ASSERT.value,
+                "params": dict(instance["output_spec"]),
+            }
+        )
 
         return {"layers": layers}
 
@@ -1569,9 +1463,7 @@ class NetFactory:
 
     def save_network(self, net: Net, name: str) -> None:
         path = self.output_dir / f"{name}.json"
-        d = NetSerializer.serialize_net(net)
-        with open(path, "w") as f:
-            json.dump(d, f, indent=2)
+        save_net_to_file(net, str(path))
         print(f"  Saved: {path}")
 
     def _write_manifest(self, names: List[str]) -> None:
@@ -2307,68 +2199,56 @@ def _lt_spec_conv3d() -> Dict[str, Any]:
     ]}
 
 
-def _lt_spec_gelu() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
-        {"kind": LayerKind.GELU.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 100.0),
+def _lt_spec_unary(
+    kind: LayerKind,
+    lb: float,
+    ub: float,
+    rhs: float,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a one-operator four-feature layer-testing specification."""
+    return {"layers": _lt_input([1, 4], lb, ub) + [
+        {"kind": kind.value, "params": params or {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], rhs),
     ]}
+
+
+def _lt_spec_gelu() -> Dict[str, Any]:
+    return _lt_spec_unary(LayerKind.GELU, -2.0, 2.0, 100.0)
 
 
 def _lt_spec_relu6() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -2.0, 8.0) + [
-        {"kind": LayerKind.RELU6.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 24.0),
-    ]}
+    return _lt_spec_unary(LayerKind.RELU6, -2.0, 8.0, 24.0)
 
 
 def _lt_spec_hardtanh() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
-        {"kind": LayerKind.HARDTANH.value,
-         "params": {"min_val": -1.0, "max_val": 1.0}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(
+        LayerKind.HARDTANH, -3.0, 3.0, 4.0, {"min_val": -1.0, "max_val": 1.0}
+    )
 
 
 def _lt_spec_hardsigmoid() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -4.0, 4.0) + [
-        {"kind": LayerKind.HARDSIGMOID.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.HARDSIGMOID, -4.0, 4.0, 4.0)
 
 
 def _lt_spec_hardswish() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -2.5, 2.5) + [
-        {"kind": LayerKind.HARDSWISH.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 10.0),
-    ]}
+    return _lt_spec_unary(LayerKind.HARDSWISH, -2.5, 2.5, 10.0)
 
 
 def _lt_spec_mish() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
-        {"kind": LayerKind.MISH.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
-    ]}
+    return _lt_spec_unary(LayerKind.MISH, -2.0, 2.0, 8.0)
 
 
 def _lt_spec_softsign() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
-        {"kind": LayerKind.SOFTSIGN.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.SOFTSIGN, -3.0, 3.0, 4.0)
 
 
 def _lt_spec_square() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -2.0, 1.5) + [
-        {"kind": LayerKind.SQUARE.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 16.0),
-    ]}
+    return _lt_spec_unary(LayerKind.SQUARE, -2.0, 1.5, 16.0)
 
 
 def _lt_spec_pow() -> Dict[str, Any]:
-    return {"layers": _lt_input([1, 4], -1.0, 2.0) + [
-        {"kind": LayerKind.POWER.value, "params": {"p": 2.0}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 16.0),
-    ]}
+    return _lt_spec_unary(LayerKind.POWER, -1.0, 2.0, 16.0, {"p": 2.0})
 
 
 def _lt_spec_max_op() -> Dict[str, Any]:
@@ -2552,11 +2432,10 @@ def _lt_spec_abs() -> Dict[str, Any]:
     # ABS exercises the pos/neg/ambiguous partition in tf_abs. Input range
     # [-2, 2] ensures every element lands in the `amb` (crossing-zero) bucket
     # so the masked-index logic runs end-to-end.
-    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
-        {"kind": LayerKind.ABS.value,
-         "params": {"input_shape": [1, 4], "output_shape": [1, 4]}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
-    ]}
+    return _lt_spec_unary(
+        LayerKind.ABS, -2.0, 2.0, 8.0,
+        {"input_shape": [1, 4], "output_shape": [1, 4]},
+    )
 
 
 def _lt_spec_bias() -> Dict[str, Any]:
@@ -2648,34 +2527,22 @@ def _lt_spec_unsafe_linear() -> Dict[str, Any]:
 
 def _lt_spec_erf() -> Dict[str, Any]:
     # ERF: input [-2, 2] spans the sigmoid-like curve's convex/concave halves.
-    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
-        {"kind": LayerKind.ERF.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.ERF, -2.0, 2.0, 4.0)
 
 
 def _lt_spec_sqrt() -> Dict[str, Any]:
     # SQRT: strictly positive domain (clamped op) exercising the concave hull.
-    return {"layers": _lt_input([1, 4], 0.1, 4.0) + [
-        {"kind": LayerKind.SQRT.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
-    ]}
+    return _lt_spec_unary(LayerKind.SQRT, 0.1, 4.0, 8.0)
 
 
 def _lt_spec_sin() -> Dict[str, Any]:
     # SIN: [-4, 4] contains interior max AND min (periodic critical points).
-    return {"layers": _lt_input([1, 4], -4.0, 4.0) + [
-        {"kind": LayerKind.SIN.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.SIN, -4.0, 4.0, 4.0)
 
 
 def _lt_spec_cos() -> Dict[str, Any]:
     # COS: [-1, 7] covers the has-max / has-min / near-full-period branches.
-    return {"layers": _lt_input([1, 4], -1.0, 7.0) + [
-        {"kind": LayerKind.COS.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.COS, -1.0, 7.0, 4.0)
 
 
 def _lt_spec_quantize() -> Dict[str, Any]:
@@ -2694,10 +2561,7 @@ def _lt_spec_quantize() -> Dict[str, Any]:
 def _lt_spec_tanh() -> Dict[str, Any]:
     # TANH: input [-3, 3] hits the saturation region (|tanh(3)| ≈ 0.995),
     # exercising tf_tanh's concave/convex branches in tf_mlp.py.
-    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
-        {"kind": LayerKind.TANH.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.TANH, -3.0, 3.0, 4.0)
 
 
 def _lt_spec_sigmoid() -> Dict[str, Any]:
@@ -2714,10 +2578,7 @@ def _lt_spec_sigmoid() -> Dict[str, Any]:
 def _lt_spec_lrelu() -> Dict[str, Any]:
     # LRELU: negative_slope=0.2, input [-2, 2] exercises the on/off/amb
     # partition in tf_lrelu (tf_mlp.py) and the lrelu: constraint handler.
-    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
-        {"kind": LayerKind.LRELU.value, "params": {"negative_slope": 0.2}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
-    ]}
+    return _lt_spec_unary(LayerKind.LRELU, -2.0, 2.0, 4.0, {"negative_slope": 0.2})
 
 
 def _lt_spec_scale() -> Dict[str, Any]:

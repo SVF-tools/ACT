@@ -1,20 +1,7 @@
 {
     "python.terminal.activateEnvironment": false,
-    "python.debugging.debugpyPath": "/srv/scratch/PAG/ysui/miniconda3/lib/python3.13/site-packages/debugpy",
-    "python.testing.unittestArgs": [
-        "-v",
-        "-s",
-        "./verifier",
-        "-p",
-        "*test.py"
-    ],
     "python.testing.pytestEnabled": true,
     "python.testing.unittestEnabled": false,
-    "python.testing.pytestArgs": [
-        "-v",
-        "-s",
-        "unit-tests"
-    ],
     "terminal.integrated.env.linux": {
         "PYTHONPATH": "${workspaceFolder}"
     },

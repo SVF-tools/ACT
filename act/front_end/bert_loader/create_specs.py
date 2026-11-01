@@ -8,17 +8,23 @@
 #
 # Purpose:
 #   Creates embedding-space InputSpec and OutputSpec pairs for SST/Yelp BERT
-#   classifiers whose verification graph starts after token embedding lookup.
+#   classifiers whose verification graph starts after token embedding lookup,
+#   and builds the compact BERT model named by one SST/Yelp query-index row.
 #
 #===---------------------------------------------------------------------===#
 
-"""Specification creator for BERT verify-from-embeddings tasks."""
+"""Specification creator and query index for BERT verify-from-embeddings tasks."""
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import logging
 import math
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,22 +33,25 @@ import torch.nn as nn
 
 from act.front_end.bert_loader.compact_bert import (
     CompactBertTokenizedInput,
-    LoadedCompactBert,
     CompactBertRouteBModel,
     embedding_sum,
     load_compact_bert,
+    resolve_checkpoint,
     tokenize_act_tokens,
 )
 from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
 from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
-from act.front_end.bert_loader.data_loader import (
+from act.front_end.bert_loader.data_model_loader import (
     BertEmbeddingClassifier,
     BertExample,
     BertVocabulary,
+    QueryIndexError,
+    _load_query_examples,
     find_bert_dataset_name,
     load_bert_dataset,
     sample_correctly_classified,
 )
+from act.util.path_config import get_bert_artifact_root, get_data_root
 
 logger = logging.getLogger(__name__)
 
@@ -50,28 +59,14 @@ _VALID_POSITION_MODES = frozenset(("prefix", "sweep"))
 _VALID_CONVERSION_ROUTES = frozenset(("a", "b"))
 _SPECIAL_WORDPIECES = frozenset(("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"))
 MAX_COMPACT_VERIFY_LENGTH = 20
+REQUIRED_COLUMNS = ("dataset", "split", "depth", "example_id", "position", "p", "eps")
 
 
 class BertSpecCreator(BaseSpecCreator):
     """Create verification specifications from BERT dataset-model pairs."""
 
-    def __init__(
-        self,
-        config_name: str | None = None,
-        config_dict: dict[str, Any] | None = None,
-    ) -> None:
-        """Initialize the BERT specification creator.
-
-        Args:
-            config_name: Optional YAML config name.
-            config_dict: Runtime configuration overrides.
-        """
-        super().__init__(config_name, config_dict)
-
     def create_specs_for_data_model_pairs(
         self,
-        max_samples: int | None = None,
-        filter_fn: Callable[[str, str], bool] | None = None,
         validate_shapes: bool = True,
         *,
         dataset_names: list[str] | None = None,
@@ -106,8 +101,6 @@ class BertSpecCreator(BaseSpecCreator):
         Returns:
             List of ``(dataset, model_name, model_from_embeddings, labeled_embeddings, spec_pairs)``.
         """
-        if max_samples is not None:
-            num_samples = max_samples
         if epsilon is None:
             epsilon = float(self.config.get("eps", 0.1))
         if p_norm is None:
@@ -140,20 +133,20 @@ class BertSpecCreator(BaseSpecCreator):
         for dataset in datasets:
             examples = load_bert_dataset(dataset, split)
             for model_name in models:
-                if filter_fn is not None and not filter_fn(dataset, model_name):
-                    continue
                 if model_name == "embedding_classifier":
                     vocabulary = BertVocabulary(
                         examples,
                         embedding_dim=int(self.config.get("embedding_dim", 8)),
                     )
                     model = BertEmbeddingClassifier().eval()
+                    token_cap = 8 if max_verify_length is None else max_verify_length
+
+                    def embed_tokens(example: BertExample) -> tuple[BertExample, torch.Tensor] | None:
+                        embeddings = vocabulary.lookup(example.tokens)
+                        return None if embeddings.shape[1] > token_cap else (example, embeddings)
+
                     selected = sample_correctly_classified(
-                        examples,
-                        model,
-                        vocabulary,
-                        num_samples=num_samples,
-                        max_verify_length=8 if max_verify_length is None else max_verify_length,
+                        examples, model, embed_tokens, num_samples=num_samples, sample_kind="text"
                     )
                     labeled_embeddings = [
                         LabeledInputTensor(
@@ -188,7 +181,8 @@ class BertSpecCreator(BaseSpecCreator):
                     continue
                 if checkpoint_dir is None:
                     raise ValueError("compact_bert requires checkpoint_dir")
-                compact_specs = self.create_compact_specs_for_examples(
+                results.extend(self.create_compact_specs_for_examples(
+                    dataset,
                     examples,
                     checkpoint_dir=checkpoint_dir,
                     num_samples=num_samples,
@@ -199,11 +193,7 @@ class BertSpecCreator(BaseSpecCreator):
                     position_mode=position_mode,
                     conversion_route=conversion_route,
                     validate_shapes=validate_shapes,
-                )
-                results.extend(
-                    (dataset, model_name, model, labeled, pairs)
-                    for model, labeled, pairs in compact_specs
-                )
+                ))
 
         return cast(
             list[tuple[str, str, nn.Module, list[torch.Tensor], list[tuple[InputSpec, OutputSpec]]]],
@@ -212,6 +202,7 @@ class BertSpecCreator(BaseSpecCreator):
 
     def create_compact_specs_for_examples(
         self,
+        dataset: str,
         examples: Sequence[BertExample],
         *,
         checkpoint_dir: str | Path,
@@ -224,19 +215,23 @@ class BertSpecCreator(BaseSpecCreator):
         position: int | None = None,
         conversion_route: str | None = None,
         validate_shapes: bool = True,
-    ) -> list[tuple[nn.Module, list[LabeledInputTensor], list[tuple[InputSpec, OutputSpec]]]]:
+    ) -> list[tuple[str, str, nn.Module, list[LabeledInputTensor], list[tuple[InputSpec, OutputSpec]]]]:
         """Build compact models and specs, optionally for one eligible sweep position."""
         route = conversion_route or str(self.config.get("conversion_route", "b"))
         if route not in _VALID_CONVERSION_ROUTES:
             raise ValueError("conversion_route must be 'a' or 'b'")
         loaded = load_compact_bert(checkpoint_dir)
-        selected = self._sample_compact_bert_inputs(
-            examples,
-            loaded,
-            num_samples=num_samples,
-            max_verify_length=(
-                MAX_COMPACT_VERIFY_LENGTH if max_verify_length is None else max_verify_length
-            ),
+        token_cap = MAX_COMPACT_VERIFY_LENGTH if max_verify_length is None else max_verify_length
+
+        def embed_wordpieces(example: Any) -> tuple[CompactBertTokenizedInput, torch.Tensor] | None:
+            tokenized = tokenize_act_tokens(example.tokens, loaded.tokenizer)
+            if tokenized.input_ids.numel() > token_cap:
+                return None
+            return tokenized, embedding_sum(loaded, tokenized.input_ids, tokenized.token_type_ids)
+
+        selected = sample_correctly_classified(
+            examples, loaded.model, embed_wordpieces,
+            num_samples=num_samples, sample_kind="compact BERT",
         )
         results = []
         for tokenized, embeddings, predicted in selected:
@@ -262,7 +257,7 @@ class BertSpecCreator(BaseSpecCreator):
             if validate_shapes:
                 pairs = self._validate_and_filter_specs(pairs, model, embeddings)
             if pairs:
-                results.append((model, [labeled], pairs))
+                results.append((dataset, "compact_bert", model, [labeled], pairs))
         return results
 
     def _create_spec_pair(
@@ -332,33 +327,153 @@ class BertSpecCreator(BaseSpecCreator):
         )
         return input_spec, output_spec
 
-    @staticmethod
-    def _sample_compact_bert_inputs(
-        examples: Sequence[Any],
-        loaded: LoadedCompactBert,
-        *,
-        num_samples: int,
-        max_verify_length: int,
-    ) -> list[tuple[CompactBertTokenizedInput, torch.Tensor, int]]:
-        """Select correctly classified compact-checkpoint inputs in file order."""
-        selected: list[tuple[CompactBertTokenizedInput, torch.Tensor, int]] = []
-        with torch.no_grad():
-            for example in examples:
-                tokenized = tokenize_act_tokens(example.tokens, loaded.tokenizer)
-                if tokenized.input_ids.numel() > max_verify_length:
-                    continue
-                embeddings = embedding_sum(
-                    loaded, tokenized.input_ids, tokenized.token_type_ids
-                )
-                logits = loaded.model(embeddings)
-                predicted = int(logits.argmax(dim=-1).item())
-                if predicted != example.label:
-                    continue
-                selected.append((tokenized, embeddings, predicted))
-                if len(selected) >= num_samples:
-                    break
-        if not selected:
-            raise ValueError(
-                "No correctly classified compact BERT samples found within max_verify_length"
-            )
-        return selected
+
+@dataclass(frozen=True)
+class TextQuery:
+    """One SST/Yelp verification query parsed from a query-index row."""
+
+    dataset: str
+    split: str
+    depth: int
+    example_id: int
+    position: int
+    p: float
+    eps: float
+    checkpoint_sha256: str | None = None
+
+    @property
+    def model_dir(self) -> Path:
+        """Return the compact BERT directory that owns its checkpoint marker."""
+        return Path(get_bert_artifact_root()) / "models" / f"model_{self.dataset}_{self.depth}"
+
+
+def _query_field(
+    row: Mapping[str, str | None],
+    column: str,
+    where: str,
+    convert: Callable[[str], Any] = str,
+    minimum: int | None = None,
+) -> Any:
+    """Return one required query-row cell, converted and checked against ``minimum``."""
+    raw = (row.get(column) or "").strip()
+    if not raw:
+        raise QueryIndexError(f"{where}: column '{column}' is empty")
+    try:
+        value = convert(raw)
+    except ValueError as error:
+        kind = "an integer" if convert is int else "a number"
+        raise QueryIndexError(f"{where}: {column}={raw!r} is not {kind}") from error
+    if minimum is not None and value < minimum:
+        raise QueryIndexError(f"{where}: {column}={value} must be >= {minimum}")
+    return value
+
+
+def parse_query_row(row: Mapping[str, str | None], where: str = "query") -> TextQuery:
+    """Validate one CSV row and return its immutable verification query."""
+    dataset_name = _query_field(row, "dataset", where)
+    try:
+        dataset = find_bert_dataset_name(dataset_name)
+    except ValueError as error:
+        raise QueryIndexError(f"{where}: {error}") from error
+    p = _query_field(row, "p", where, float)
+    if p not in (1.0, math.inf):
+        raise QueryIndexError(f"{where}: p={p} is not supported; use inf or 1")
+    eps = _query_field(row, "eps", where, float)
+    if not (math.isfinite(eps) and eps > 0.0):
+        raise QueryIndexError(f"{where}: eps={eps} must be finite and > 0")
+    checksum = (row.get("checkpoint_sha256") or "").strip().lower() or None
+    if checksum is not None and not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise QueryIndexError(f"{where}: checkpoint_sha256 is not a hex SHA-256 digest")
+    return TextQuery(
+        dataset=dataset,
+        split=_query_field(row, "split", where),
+        depth=_query_field(row, "depth", where, int, minimum=1),
+        example_id=_query_field(row, "example_id", where, int, minimum=0),
+        position=_query_field(row, "position", where, int, minimum=1),
+        p=p,
+        eps=eps,
+        checkpoint_sha256=checksum,
+    )
+
+
+def read_query(index_path: str | Path, query_id: int) -> TextQuery:
+    """Read and validate data row ``query_id`` (zero-based) from a CSV index."""
+    path = Path(index_path)
+    if query_id < 0:
+        raise QueryIndexError(f"{path}: query id {query_id} must be >= 0")
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except OSError as error:
+        raise QueryIndexError(f"cannot read query index {path}: {error}") from error
+    with handle:
+        reader = csv.DictReader(handle)
+        missing = [name for name in REQUIRED_COLUMNS if name not in (reader.fieldnames or [])]
+        if missing:
+            raise QueryIndexError(f"{path}: missing required columns {missing}")
+        rows = 0
+        for row_number, row in enumerate(reader):
+            if row_number == query_id:
+                return parse_query_row(row, where=f"{path} query {query_id}")
+            rows += 1
+    raise QueryIndexError(f"{path}: query id {query_id} out of range ({rows} data rows)")
+
+
+def _recorded_sha256(relative_path: str) -> str:
+    """Return the manifest digest for a data-root-relative BERT artifact."""
+    sums_path = Path(get_bert_artifact_root()) / "SHA256SUMS"
+    try:
+        lines = sums_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise QueryIndexError(f"cannot read checkpoint manifest {sums_path}: {error}") from error
+    for line in lines:
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) == 2 and parts[1].lstrip("*") == relative_path:
+            return parts[0].lower()
+    raise QueryIndexError(f"{sums_path} has no entry for {relative_path}")
+
+
+def verify_checkpoint_sha256(query: TextQuery) -> Path:
+    """Verify an optional row checksum against the manifest and weights file."""
+    if query.checkpoint_sha256 is None:
+        raise QueryIndexError("query has no checkpoint_sha256 to verify")
+    checkpoint_file = resolve_checkpoint(query.model_dir) / "pytorch_model.bin"
+    relative = checkpoint_file.relative_to(Path(get_data_root()).resolve()).as_posix()
+    recorded = _recorded_sha256(relative)
+    if query.checkpoint_sha256 != recorded:
+        raise QueryIndexError(
+            f"checkpoint_sha256 {query.checkpoint_sha256} != SHA256SUMS {recorded} for {relative}"
+        )
+    with checkpoint_file.open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != recorded:
+            raise QueryIndexError(f"{checkpoint_file} does not match SHA256SUMS {recorded}")
+    return checkpoint_file
+
+
+def build_query_model(query: TextQuery) -> nn.Module:
+    """Build the synthesized compact-BERT model for one verified query."""
+    if not query.model_dir.is_dir():
+        raise QueryIndexError(f"no compact BERT model directory {query.model_dir}")
+    if query.checkpoint_sha256 is not None:
+        verify_checkpoint_sha256(query)
+    examples = _load_query_examples(query.dataset, query.split, query.example_id)
+    try:
+        compact_specs = BertSpecCreator().create_compact_specs_for_examples(
+            query.dataset,
+            [examples[query.example_id]],
+            checkpoint_dir=query.model_dir,
+            epsilon=query.eps,
+            p_norm=query.p,
+            position_mode="sweep",
+            position=query.position,
+        )
+    except ValueError as error:
+        raise QueryIndexError(f"example {query.example_id}: {error}") from error
+    # Through importlib: synthesis loads the whole back end and imports this module itself.
+    synthesis = import_module("act.front_end.model_synthesis")
+    (model,) = synthesis.synthesize_models_from_specs(compact_specs).values()
+    logger.info(
+        "query %s d%d %s example %d position %d (p=%s, eps=%g)",
+        query.dataset, query.depth, query.split, query.example_id,
+        query.position, query.p, query.eps,
+    )
+    return model

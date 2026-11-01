@@ -37,7 +37,7 @@ from .core import Bounds, Con, ConSet, Fact, Layer, Net
 
 # Utilities
 from .utils import box_join, changed_or_maskdiff, update_cache, affine_bounds
-from .utils import pwl_meta, bound_var_interval, scale_interval
+from .utils import pwl_meta, scale_interval
 
 # Transfer function interface
 from .transfer_functions import (
@@ -87,7 +87,6 @@ __all__ = [
     "update_cache",
     "affine_bounds",
     "pwl_meta",
-    "bound_var_interval",
     "scale_interval",
     # Transfer function interface
     "TransferFunction",

@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Callable, Dict, List, Optional, Tuple, cast
 
 from act.back_end.core import Bounds, Layer, Net, topological_sort
 from act.back_end.layer_schema import LayerKind
@@ -248,6 +248,16 @@ def _cat_lanes(parts: List[LinearBound]) -> LinearBound:
     )
 
 
+def _run_lanes(
+    B: int, chunk: int, fn: Callable[[int, int], Optional[LinearBound]],
+) -> Optional[LinearBound]:
+    """Run ``fn(start, end)`` over lane chunks and reassemble; ``None`` if any chunk is ``None``."""
+    if chunk >= B:
+        return fn(0, B)
+    parts = [fn(start, min(start + chunk, B)) for start in range(0, B, chunk)]
+    return None if any(part is None for part in parts) else _cat_lanes(parts)
+
+
 def _concretize(lin: LinearBound, frame: Frame
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Concretize dual-track affine bounds over their actual symbolic frame.
@@ -419,6 +429,16 @@ def _int_param(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
 
 
+def _conv_args(layer: Layer) -> Tuple[int, int, int, int]:
+    """Scalar stride, padding, dilation and groups of a Conv2D layer."""
+    stride, padding, dilation = (
+        value[0] if isinstance(value, (list, tuple)) else value
+        for value in (layer.params.get("stride", 1), layer.params.get("padding", 0),
+                      layer.params.get("dilation", 1))
+    )
+    return stride, padding, dilation, layer.params.get("groups", 1)
+
+
 def _box_dense(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Interval DENSE as ``m = c Wᵀ + b``, ``rho = r |W|ᵀ``, ``[m-rho, m+rho]``.
 
@@ -503,6 +523,35 @@ def _reset_forward_box(lb: torch.Tensor, ub: torch.Tensor, device, dtype
     """Reset dual-track state on a concrete box."""
     lin, x_L, x_U = _reset_lin(lb, ub, device, dtype)
     return lin, Frame(Bounds(x_L, x_U))
+
+
+def _box_result(
+    lb: torch.Tensor, ub: torch.Tensor, device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Return a box-only forward result with a reset symbolic frame."""
+    out = Bounds(lb, ub)
+    lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    return out, out, lin, frame
+
+
+def _compose_forward(
+    new_lin: Optional[LinearBound], int_lb: torch.Tensor, int_ub: torch.Tensor,
+    parent_frame: Frame, pre_box: Optional[Bounds], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Intersect a symbolic result with its interval box or reset it."""
+    if new_lin is None:
+        out, _, lin, frame = _box_result(int_lb, int_ub, device, dtype)
+        stored = out if pre_box is None or post_activation else Bounds(pre_box.lb, pre_box.ub)
+        return stored, out, lin, frame
+    lin_lb, lin_ub = _concretize(new_lin, parent_frame)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
+    out = Bounds(lb, ub)
+    stored = out if pre_box is None or post_activation else Bounds(pre_box.lb, pre_box.ub)
+    if pre_box is not None and post_activation:
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+        return stored, out, lin, frame
+    return stored, out, new_lin, parent_frame
 
 
 def _sum_interval_bounds(boxes: List[Bounds]) -> Bounds:
@@ -777,63 +826,17 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         if missing:
             raise ValueError(f"compute_forward_bounds: layer {lid} missing predecessor state for {missing}")
 
-        if len(preds) >= 2 or kind in (LayerKind.ADD.value, LayerKind.CONCAT.value):
-            handler = DualTF._FORWARD_REGISTRY.get(kind)
-            if handler is None:
-                raise ValueError(
-                    f"compute_forward_bounds: unknown multi-pred layer kind '{kind}' "
-                    f"at layer {lid}. Registered kinds: "
-                    f"{sorted(DualTF._FORWARD_REGISTRY.keys())}"
-                )
-            pred_boxes  = [box_state[pid]   for pid in preds]
-            pred_lins   = [lin_state[pid]   for pid in preds]
-            pred_frames = [frame_dict[pid]  for pid in preds]
-            stored, out, lin, frame = handler(
-                layer, pred_boxes, pred_lins, pred_frames, preds,
-                post_activation, device, dtype,
-            )
-            _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
-                                 lid, stored, out, lin, frame)
-            continue
-
-        if kind == LayerKind.RELU.value and alphas is not None:
-            parent_box = box_state[preds[0]]
-            parent_lin = lin_state[preds[0]]
-            parent_frame = frame_dict[preds[0]]
-            pre_lb, pre_ub = parent_box.lb, parent_box.ub
-            alpha = alphas.get(lid)
-            new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub, alpha=alpha)
-            int_lb, int_ub = _box_relu(pre_lb, pre_ub)
-            if new_lin is None:
-                lb, ub = int_lb, int_ub
-                out = Bounds(lb, ub)
-                stored = out if post_activation else Bounds(pre_lb, pre_ub)
-                lin, frame = _reset_forward_box(lb, ub, device, dtype)
-            else:
-                lin = new_lin
-                lin_lb, lin_ub = _concretize(lin, parent_frame)
-                lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
-                out = Bounds(lb, ub)
-                stored = out if post_activation else Bounds(pre_lb, pre_ub)
-                frame = parent_frame
-                if post_activation:
-                    lin, frame = _reset_forward_box(lb, ub, device, dtype)
-            _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
-                                 lid, stored, out, lin, frame)
-            continue
-
         handler = DualTF._FORWARD_REGISTRY.get(kind)
         if handler is None:
             raise ValueError(
-                f"compute_forward_bounds: unknown layer kind '{kind}' at layer {lid}. "
+                f"compute_forward_bounds: unknown {'multi-pred ' if len(preds) >= 2 else ''}"
+                f"layer kind '{kind}' at layer {lid}. "
                 f"Registered kinds: {sorted(DualTF._FORWARD_REGISTRY.keys())}"
             )
-        pred_boxes  = [box_state[preds[0]]]
-        pred_lins   = [lin_state[preds[0]]]
-        pred_frames = [frame_dict[preds[0]]]
+        extra = {"alpha": alphas.get(lid)} if kind == LayerKind.RELU.value and alphas is not None else {}
         stored, out, lin, frame = handler(
-            layer, pred_boxes, pred_lins, pred_frames, preds,
-            post_activation, device, dtype,
+            layer, [box_state[pid] for pid in preds], [lin_state[pid] for pid in preds],
+            [frame_dict[pid] for pid in preds], preds, post_activation, device, dtype, **extra,
         )
         _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
                              lid, stored, out, lin, frame)
@@ -899,16 +902,8 @@ def _fwd_dense(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
                                   _LIN_BOUND_CHUNK_TRANSIENT_DENSE, layer.id, "dense")
     if chunk is None:
         return None
-    if chunk >= B:
-        return _fwd_dense_lanes(layer, lin)
-
-    parts: List[LinearBound] = []
-    for start in range(0, B, chunk):
-        part = _fwd_dense_lanes(layer, _lin_lanes(lin, start, min(start + chunk, B)))
-        if part is None:
-            return None
-        parts.append(part)
-    return _cat_lanes(parts)
+    return _run_lanes(
+        B, chunk, lambda start, end: _fwd_dense_lanes(layer, _lin_lanes(lin, start, end)))
 
 
 def _fwd_dense_lanes(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
@@ -978,27 +973,7 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor,
     (RELU after DENSE/CONV) hits the second branch with a materialized A_lb.
     """
     low_slope, up_slope, up_inter = _relu_relaxation(lb, ub, alpha)
-
-    if lin.A_lb is None or lin.A_ub is None:
-        B, n = lb.shape
-        if n > _DENSE_LIN_BOUND_MAX_DIM:
-            return None
-        eye = torch.eye(n, device=lb.device, dtype=lb.dtype).unsqueeze(0).expand(B, n, n)
-        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
-        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
-        return LinearBound(
-            A_lb=low_slope.unsqueeze(-1) * A_lb_in,
-            b_lb=low_slope * lin.b_lb,
-            A_ub=up_slope.unsqueeze(-1) * A_ub_in,
-            b_ub=up_slope * lin.b_ub + up_inter,
-        )
-
-    return LinearBound(
-        A_lb=low_slope.unsqueeze(-1) * lin.A_lb,
-        b_lb=low_slope * lin.b_lb,
-        A_ub=up_slope.unsqueeze(-1) * lin.A_ub,
-        b_ub=up_slope * lin.b_ub + up_inter,
-    )
+    return _diag_planes_lin(lin, low_slope, up_slope, up_inter)
 
 
 def _shared_explicit_frame(
@@ -1083,31 +1058,7 @@ def _fwd_scale(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     materialize a diagonal eye·a representation. Common case (SCALE after
     DENSE/CONV) hits the second branch with materialized A_lb.
     """
-    a = _align(layer.params["a"], lin.b_lb.shape[1])
-    a_pos = a.clamp(min=0)
-    a_neg = a.clamp(max=0)
-    a_pos_A = a_pos.view(1, -1, 1)
-    a_neg_A = a_neg.view(1, -1, 1)
-
-    if lin.A_lb is None or lin.A_ub is None:
-        B, n = lin.b_lb.shape
-        if n > _DENSE_LIN_BOUND_MAX_DIM:
-            return None
-        eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
-        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
-        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
-        return LinearBound(
-            A_lb=a_pos_A * A_lb_in + a_neg_A * A_ub_in,
-            b_lb=a_pos * lin.b_lb + a_neg * lin.b_ub,
-            A_ub=a_pos_A * A_ub_in + a_neg_A * A_lb_in,
-            b_ub=a_pos * lin.b_ub + a_neg * lin.b_lb,
-        )
-    return LinearBound(
-        A_lb=a_pos_A * lin.A_lb + a_neg_A * lin.A_ub,
-        b_lb=a_pos * lin.b_lb + a_neg * lin.b_ub,
-        A_ub=a_pos_A * lin.A_ub + a_neg_A * lin.A_lb,
-        b_ub=a_pos * lin.b_ub + a_neg * lin.b_lb,
-    )
+    return _signed_diag_lin(lin, _align(layer.params["a"], lin.b_lb.shape[1]))
 
 
 def _fwd_bn(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
@@ -1115,31 +1066,10 @@ def _fwd_bn(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
 
     Lazy identity: BN following INPUT (rare) materializes diagonal.
     """
-    A_bn = _align(layer.params["A"], lin.b_lb.shape[1])
-    c = _align(layer.params["c"], lin.b_lb.shape[1])
-    A_pos = A_bn.clamp(min=0)
-    A_neg = A_bn.clamp(max=0)
-    A_pos_A = A_pos.view(1, -1, 1)
-    A_neg_A = A_neg.view(1, -1, 1)
-
-    if lin.A_lb is None or lin.A_ub is None:
-        B, n = lin.b_lb.shape
-        if n > _DENSE_LIN_BOUND_MAX_DIM:
-            return None
-        eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
-        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
-        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
-        return LinearBound(
-            A_lb=A_pos_A * A_lb_in + A_neg_A * A_ub_in,
-            b_lb=A_pos * lin.b_lb + A_neg * lin.b_ub + c,
-            A_ub=A_pos_A * A_ub_in + A_neg_A * A_lb_in,
-            b_ub=A_pos * lin.b_ub + A_neg * lin.b_lb + c,
-        )
-    return LinearBound(
-        A_lb=A_pos_A * lin.A_lb + A_neg_A * lin.A_ub,
-        b_lb=A_pos * lin.b_lb + A_neg * lin.b_ub + c,
-        A_ub=A_pos_A * lin.A_ub + A_neg_A * lin.A_lb,
-        b_ub=A_pos * lin.b_ub + A_neg * lin.b_lb + c,
+    return _signed_diag_lin(
+        lin,
+        _align(layer.params["A"], lin.b_lb.shape[1]),
+        _align(layer.params["c"], lin.b_lb.shape[1]),
     )
 
 
@@ -1161,24 +1091,59 @@ def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: floa
     up_inter = torch.where(amb, alpha * lb - up_slope * lb, torch.zeros_like(lb))
     low_slope = torch.where(on, torch.ones_like(lb), alpha_tensor)
 
-    if lin.A_lb is None or lin.A_ub is None:
-        B, n = lb.shape
-        if n > _DENSE_LIN_BOUND_MAX_DIM:
-            return None
-        eye = torch.eye(n, device=lb.device, dtype=lb.dtype).unsqueeze(0).expand(B, n, n)
-        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
-        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
-        return LinearBound(
-            A_lb=low_slope.unsqueeze(-1) * A_lb_in,
-            b_lb=low_slope * lin.b_lb,
-            A_ub=up_slope.unsqueeze(-1) * A_ub_in,
-            b_ub=up_slope * lin.b_ub + up_inter,
-        )
+    return _diag_planes_lin(lin, low_slope, up_slope, up_inter)
+
+
+def _explicit_lin(lin: LinearBound) -> Optional[LinearBound]:
+    """Materialize the lazy identity relation when its width is tractable."""
+    if lin.A_lb is not None and lin.A_ub is not None:
+        return lin
+    B, n = lin.b_lb.shape
+    if n > _DENSE_LIN_BOUND_MAX_DIM:
+        return None
+    eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
     return LinearBound(
-        A_lb=low_slope.unsqueeze(-1) * lin.A_lb,
-        b_lb=low_slope * lin.b_lb,
-        A_ub=up_slope.unsqueeze(-1) * lin.A_ub,
-        b_ub=up_slope * lin.b_ub + up_inter,
+        A_lb=lin.A_lb if lin.A_lb is not None else eye,
+        b_lb=lin.b_lb,
+        A_ub=lin.A_ub if lin.A_ub is not None else eye,
+        b_ub=lin.b_ub,
+    )
+
+
+def _diag_planes_lin(
+    lin: LinearBound, lower: torch.Tensor, upper: torch.Tensor, upper_bias: torch.Tensor,
+) -> Optional[LinearBound]:
+    """Compose lower and upper diagonal elementwise planes."""
+    explicit = _explicit_lin(lin)
+    if explicit is None:
+        return None
+    return LinearBound(
+        A_lb=lower.unsqueeze(-1) * explicit.A_lb,
+        b_lb=lower * explicit.b_lb,
+        A_ub=upper.unsqueeze(-1) * explicit.A_ub,
+        b_ub=upper * explicit.b_ub + upper_bias,
+    )
+
+
+def _signed_diag_lin(
+    lin: LinearBound, scale: torch.Tensor, offset: Optional[torch.Tensor] = None,
+) -> Optional[LinearBound]:
+    """Compose a signed diagonal affine map with an optional offset."""
+    explicit = _explicit_lin(lin)
+    if explicit is None:
+        return None
+    positive, negative = scale.clamp(min=0), scale.clamp(max=0)
+    pos_a, neg_a = positive.view(1, -1, 1), negative.view(1, -1, 1)
+    b_lb = positive * explicit.b_lb + negative * explicit.b_ub
+    b_ub = positive * explicit.b_ub + negative * explicit.b_lb
+    if offset is not None:
+        b_lb = b_lb + offset
+        b_ub = b_ub + offset
+    return LinearBound(
+        A_lb=pos_a * explicit.A_lb + neg_a * explicit.A_ub,
+        b_lb=b_lb,
+        A_ub=pos_a * explicit.A_ub + neg_a * explicit.A_lb,
+        b_ub=b_ub,
     )
 
 
@@ -1191,16 +1156,7 @@ def _fwd_conv2d(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     """
     weight = cast(torch.Tensor, layer.params["weight"])
     bias = layer.params.get("bias")
-    stride = layer.params.get("stride", 1)
-    padding = layer.params.get("padding", 0)
-    dilation = layer.params.get("dilation", 1)
-    groups = layer.params.get("groups", 1)
-    if isinstance(stride, (list, tuple)):
-        stride = stride[0]
-    if isinstance(padding, (list, tuple)):
-        padding = padding[0]
-    if isinstance(dilation, (list, tuple)):
-        dilation = dilation[0]
+    stride, padding, dilation, groups = _conv_args(layer)
 
     out_c, in_c_per_g, _, _ = weight.shape
     in_c = in_c_per_g * groups
@@ -1221,11 +1177,7 @@ def _fwd_conv2d(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     in_h = in_w = 0
     input_shape = _shape_list(layer.params.get("input_shape"))
     if input_shape is not None and len(input_shape) >= 3:
-        shape = input_shape
-        if len(shape) == 4:
-            _, _, h, w = shape
-        else:
-            _, h, w = shape[-3], shape[-2], shape[-1]
+        _, h, w = input_shape[-3:]
         if h * w * in_c == curr_dim:
             in_h, in_w = h, w
 
@@ -1293,12 +1245,7 @@ def _fwd_conv2d(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
 
         return LinearBound(A_lb=A_lb_new, b_lb=b_lb_new, A_ub=A_ub_new, b_ub=b_ub_new)
 
-    if chunk >= B:
-        return compose(lin)
-    return _cat_lanes([
-        compose(_lin_lanes(lin, start, min(start + chunk, B)))
-        for start in range(0, B, chunk)
-    ])
+    return _run_lanes(B, chunk, lambda start, end: compose(_lin_lanes(lin, start, end)))
 
 
 def _fwd_conv2d_interval(layer: Layer, lb: torch.Tensor, ub: torch.Tensor
@@ -1318,27 +1265,14 @@ def _fwd_conv2d_interval(layer: Layer, lb: torch.Tensor, ub: torch.Tensor
     """
     weight = cast(torch.Tensor, layer.params["weight"])
     bias = layer.params.get("bias")
-    stride = layer.params.get("stride", 1)
-    padding = layer.params.get("padding", 0)
-    dilation = layer.params.get("dilation", 1)
-    groups = layer.params.get("groups", 1)
-    if isinstance(stride, (list, tuple)):
-        stride = stride[0]
-    if isinstance(padding, (list, tuple)):
-        padding = padding[0]
-    if isinstance(dilation, (list, tuple)):
-        dilation = dilation[0]
+    stride, padding, dilation, groups = _conv_args(layer)
 
     B = lb.shape[0]
     _, in_c_per_g, _, _ = weight.shape
     in_c = in_c_per_g * groups
     input_shape = _shape_list(layer.params.get("input_shape"))
     if input_shape is not None and len(input_shape) >= 3:
-        shape = input_shape
-        if len(shape) == 4:
-            _, _, in_h, in_w = shape
-        else:
-            _, in_h, in_w = shape[-3], shape[-2], shape[-1]
+        _, in_h, in_w = input_shape[-3:]
     else:
         spatial = lb.shape[1] // in_c if in_c > 0 else 0
         side = int(spatial ** 0.5) if spatial > 0 else 0
@@ -1380,11 +1314,7 @@ def _fwd_maxpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[to
             f"_fwd_maxpool2d: layer {layer.id} missing required 'input_shape' param"
         )
 
-    shape = input_shape
-    if len(shape) == 4:
-        _, c, h, w = shape
-    else:
-        c, h, w = shape[-3], shape[-2], shape[-1]
+    c, h, w = input_shape[-3:]
     B = lb.shape[0]
     lb_out = F.max_pool2d(lb.view(B, c, h, w), kernel_size, stride, padding, dilation)
     ub_out = F.max_pool2d(ub.view(B, c, h, w), kernel_size, stride, padding, dilation)
@@ -1438,11 +1368,7 @@ def _fwd_maxpool2d_lin(
         raise ValueError(
             f"_fwd_maxpool2d_lin: layer {layer.id} missing required 'input_shape' param"
         )
-    shape = input_shape
-    if len(shape) == 4:
-        _, c, h, w = shape
-    else:
-        c, h, w = shape[-3], shape[-2], shape[-1]
+    c, h, w = input_shape[-3:]
     B, n_in = lb.shape
     if n_in != c * h * w or lin.A_lb.shape[1] != n_in or lin.b_lb.shape[1] != n_in:
         return None
@@ -1511,13 +1437,7 @@ def _fwd_maxpool2d_lin(
         )
         return LinearBound(A_lb=A_lb_out, b_lb=b_lb_out, A_ub=A_ub_out, b_ub=b_ub_out)
 
-    if chunk >= B:
-        lin_out = gather_lanes(0, B)
-    else:
-        lin_out = _cat_lanes([
-            gather_lanes(start, min(start + chunk, B)) for start in range(0, B, chunk)
-        ])
-    return lin_out, idx_flat, dominant, lb_max, ub_max
+    return _run_lanes(B, chunk, gather_lanes), idx_flat, dominant, lb_max, ub_max
 
 
 def _fwd_avgpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1534,11 +1454,7 @@ def _fwd_avgpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[to
             f"_fwd_avgpool2d: layer {layer.id} missing required 'input_shape' param"
         )
 
-    shape = input_shape
-    if len(shape) == 4:
-        _, c, h, w = shape
-    else:
-        c, h, w = shape[-3], shape[-2], shape[-1]
+    c, h, w = input_shape[-3:]
     B = lb.shape[0]
     pool_kwargs = {
         "kernel_size": kernel_size,

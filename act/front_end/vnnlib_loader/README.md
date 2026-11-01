@@ -26,7 +26,7 @@ A comprehensive framework for downloading, managing, and loading VNNLIB benchmar
 
 ```
 act/front_end/vnnlib_loader/
-├── __init__.py              # Package exports and imports
+├── __init__.py              # Package marker; import from the submodules
 ├── __main__.py              # Entry point for python -m execution
 ├── cli.py                   # Command-line interface
 ├── category_mapping.py      # Core category mapping and API (34 categories)
@@ -56,9 +56,9 @@ act/front_end/vnnlib_loader/
 - Batch processing for multiple categories
 
 **`data_model_loader.py`**
-- Download functionality (`download_category`)
-- Load functionality with auto-download (`load_category_instance`)
-- Downloaded categories management (`list_downloaded_categories`)
+- Download functionality (`download_vnnlib_category`)
+- Load functionality with auto-download (`load_vnnlib_pair`)
+- Downloaded instances management (`list_downloaded_pairs`)
 - Instance file parsing (ONNX-VNNLIB mappings)
 - Directory size calculation and formatting
 
@@ -433,52 +433,43 @@ python -m act.front_end.vnnlib_loader --download soundnessbench
 ### Loading Category Instances
 
 ```python
-from act.front_end.vnnlib_loader import load_category_instance
+from act.front_end.vnnlib_loader.data_model_loader import load_vnnlib_pair
 
 # Load a specific instance (auto-downloads if not found)
-result = load_category_instance(
-    category_name='acasxu_2023',
-    instance_id=0,
+result = load_vnnlib_pair(
+    category='acasxu_2023',
+    onnx_model='onnx/ACASXU_run2a_1_1_batch_2000.onnx',
+    vnnlib_spec='vnnlib/prop_1.vnnlib',
     auto_download=True
 )
 
 # Access components
-onnx_model = result['onnx_model']        # ONNX model object
-pytorch_model = result['pytorch_model']  # Converted PyTorch model
-vnnlib_path = result['vnnlib_path']      # Path to VNNLIB file
-input_spec = result['input_spec']        # Parsed input constraints
-output_spec = result['output_spec']      # Parsed output properties
-metadata = result['metadata']            # Instance metadata
+pytorch_model = result['model']            # Converted PyTorch model
+labeled_tensor = result['labeled_tensor']  # Input tensor and optional label
+vnnlib_path = result['vnnlib_path']        # Path to VNNLIB file
+metadata = result['vnnlib_metadata']       # Parsed constraint information
 
 # Use the PyTorch model
-import torch
-input_tensor = torch.randn(1, 5)  # ACAS Xu input
-output = pytorch_model(input_tensor)
+output = pytorch_model(labeled_tensor.tensor)
 ```
 
 ### Downloading Categories
 
 ```python
-from act.front_end.vnnlib_loader import download_category
+from act.front_end.vnnlib_loader.data_model_loader import download_vnnlib_category
 
 # Download a complete category
-result = download_category(
-    category_name='cifar100_2024',
-    verify=True  # Verify downloaded files
-)
+result = download_vnnlib_category(category='cifar100_2024')
 
 if result['status'] == 'success':
     print(f"Downloaded to: {result['category_path']}")
-    print(f"ONNX models: {result['onnx_count']}")
-    print(f"VNNLIB files: {result['vnnlib_count']}")
-    print(f"Instances: {result['instance_count']}")
-    print(f"Size: {result['size_formatted']}")
+    print(f"Instances: {result['num_instances']}")
 ```
 
 ### Creating Verification Specs
 
 ```python
-from act.front_end.vnnlib_loader import VNNLibSpecCreator
+from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 
 # Create spec creator
 creator = VNNLibSpecCreator()
@@ -493,7 +484,7 @@ results = creator.create_specs_for_data_model_pairs(
 for category, instance_id, pytorch_model, input_tensors, spec_pairs in results:
     print(f"\n{category}/{instance_id}:")
     print(f"  Model: {pytorch_model}")
-    print(f"  Input shape: {input_tensors[0].shape}")
+    print(f"  Input shape: {input_tensors[0].tensor.shape}")
     print(f"  Spec pairs: {len(spec_pairs)}")
     
     for i, (input_spec, output_spec) in enumerate(spec_pairs):
@@ -504,7 +495,7 @@ for category, instance_id, pytorch_model, input_tensors, spec_pairs in results:
 ### Querying Categories
 
 ```python
-from act.front_end.vnnlib_loader import (
+from act.front_end.vnnlib_loader.category_mapping import (
     get_category_info,
     list_categories,
     search_categories,
@@ -538,32 +529,27 @@ print(f"Control categories: {control_categories}")
 ### Parsing VNNLIB Files
 
 ```python
-from act.front_end.vnnlib_loader import parse_vnnlib
+from pathlib import Path
 
-# Parse a VNNLIB file
-result = parse_vnnlib('data/vnnlib/acasxu_2023/vnnlib/prop_1.vnnlib')
+from act.front_end.vnnlib_loader.vnnlib_parser import parse_vnnlib_queries
 
-# Access parsed constraints
-input_bounds = result['input_bounds']      # List of (var, lb, ub)
-output_constraints = result['output_constraints']  # List of linear constraints
-variables = result['variables']            # All declared variables
+# Parse a VNNLIB 2.0 file into (InputSpec, OutputSpec) queries
+queries = parse_vnnlib_queries(Path('data/vnnlib/acasxu_2023/vnnlib/prop_1.vnnlib'))
 
-# Convert to ACT specs
-input_spec = result['input_spec']    # InputSpec with BOX constraints
-output_spec = result['output_spec']  # OutputSpec with LINEAR_LE constraints
-
-print(f"Input variables: {len(input_bounds)}")
-print(f"Output constraints: {len(output_constraints)}")
+for input_spec, output_spec in queries:
+    print(f"{input_spec.kind} -> {output_spec.kind}")
 ```
 
 ### Converting ONNX Models
 
 ```python
-from act.front_end.vnnlib_loader import convert_onnx_to_pytorch
+from pathlib import Path
+
+from act.front_end.vnnlib_loader.onnx_converter import convert_onnx_to_pytorch
 
 # Convert ONNX model to PyTorch
 pytorch_model = convert_onnx_to_pytorch(
-    onnx_path='data/vnnlib/acasxu_2023/onnx/model.onnx'
+    onnx_path=Path('data/vnnlib/acasxu_2023/onnx/model.onnx')
 )
 
 # Use the converted model
@@ -739,11 +725,13 @@ The ONNX → PyTorch converter supports:
 ### Conversion Example
 
 ```python
-from act.front_end.vnnlib_loader import convert_onnx_to_pytorch
+from pathlib import Path
+
+from act.front_end.vnnlib_loader.onnx_converter import convert_onnx_to_pytorch
 
 # Convert ONNX to PyTorch
 pytorch_model = convert_onnx_to_pytorch(
-    onnx_path='data/vnnlib/acasxu_2023/onnx/model.onnx'
+    onnx_path=Path('data/vnnlib/acasxu_2023/onnx/model.onnx')
 )
 
 # Model is ready to use
@@ -760,7 +748,7 @@ The VNNLIB creator integrates seamlessly with ACT's verification pipeline:
 ### Complete Verification Workflow
 
 ```python
-from act.front_end.vnnlib_loader import VNNLibSpecCreator
+from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 from act.front_end.model_synthesis import synthesize_models_from_specs
 from act.pipeline.verification.torch2act import TorchToACT
 from act.back_end.verifier import verify_once
@@ -816,7 +804,7 @@ for model_id, wrapped_model in wrapped_models.items():
 #### Step 1: Spec Creation
 
 ```python
-from act.front_end.vnnlib_loader import VNNLibSpecCreator
+from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 
 creator = VNNLibSpecCreator()
 results = creator.create_specs_for_data_model_pairs(
@@ -829,7 +817,7 @@ for category, instance_id, pytorch_model, input_tensors, spec_pairs in results:
     print(f"Category: {category}")
     print(f"Instance: {instance_id}")
     print(f"Model: {pytorch_model}")
-    print(f"Inputs: {[t.shape for t in input_tensors]}")
+    print(f"Inputs: {[t.tensor.shape for t in input_tensors]}")
     print(f"Specs: {len(spec_pairs)} pairs")
 ```
 
@@ -891,7 +879,7 @@ elif result.status == VerifyStatus.UNKNOWN:
 ### Batch Processing
 
 ```python
-from act.front_end.vnnlib_loader import VNNLibSpecCreator
+from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 from act.front_end.model_synthesis import synthesize_models_from_specs
 from act.pipeline.verification.torch2act import TorchToACT
 from act.back_end.verifier import verify_once
@@ -1052,12 +1040,13 @@ for node in model.graph.node:
 
 ```python
 # Debug VNNLIB parsing
-from act.front_end.vnnlib_loader import parse_vnnlib
+from pathlib import Path
+
+from act.front_end.vnnlib_loader.vnnlib_parser import parse_vnnlib_queries
 
 try:
-    result = parse_vnnlib('path/to/property.vnnlib')
-    print(f"Input vars: {len(result['input_bounds'])}")
-    print(f"Output constraints: {len(result['output_constraints'])}")
+    queries = parse_vnnlib_queries(Path('path/to/property.vnnlib'))
+    print(f"Queries: {len(queries)}")
 except Exception as e:
     print(f"Parse error: {e}")
     # Check VNNLIB file syntax

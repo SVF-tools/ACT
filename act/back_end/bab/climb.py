@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Dict, List, Optiona
 
 import torch
 
-from act.back_end.bab.bound_refresh import BoundSupport
 from act.back_end.bab.branching.bounding import TopKBounding
 from act.back_end.bab.branching.branching import BranchingScores
 from act.back_end.bab.node import (
@@ -31,7 +30,8 @@ from act.back_end.bab.node import (
     _state_spec_row_count,
     slice_bounds_dict,
 )
-from act.back_end.core import Bounds, Net
+from act.back_end.core import Bounds, Layer, Net
+from act.back_end.layer_schema import LayerKind
 from act.back_end.solver.solver_base import SolveStatus
 from act.back_end.solver.solver_dual import (
     DualBatchResult, MixedAlpha, certification_tolerance, unproven_spec_rows,
@@ -49,7 +49,7 @@ from act.front_end.specs import OutKind, OutputSpec
 from act.util.device_manager import get_default_device, get_default_dtype
 
 if TYPE_CHECKING:
-    from act.back_end.solver.terminal_lp import TerminalResult
+    from act.back_end.solver.solver_torchlp import TerminalResult
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +60,10 @@ if TYPE_CHECKING:
 _MERGE_PROBE_ROWS = 64
 _MERGE_GROUP_FANOUT = 64
 _SPLIT_REFRESH_MODES = ("split_refresh", "split_refresh_linear")
+_ENDPOINT_PRESERVING = frozenset({
+    LayerKind.ADD.value, LayerKind.BIAS.value, LayerKind.FLATTEN.value,
+    LayerKind.RELU.value, LayerKind.RESHAPE.value,
+})
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,112 @@ class LiteralCodec:
             variables - offsets.index_select(0, flat_indices).reshape_as(literals),
             literals.sign(),
         )
+
+
+@dataclass(frozen=True)
+class BoundSupport:
+    """Lower/upper dependencies [K,N,S] and provenance validity [K,N]."""
+
+    lower: torch.Tensor
+    upper: torch.Tensor
+    known: torch.Tensor
+
+
+def _lane_phase(split_signs: dict[int, torch.Tensor], lid: int) -> torch.Tensor | None:
+    """Return one layer's [K,N] phases after checking spec invariance."""
+    phase = split_signs.get(lid)
+    if phase is None or phase.dim() != 3:
+        return phase
+    if not torch.equal(phase, phase[:, :1].expand_as(phase)):
+        raise ValueError("split phases must be spec invariant")
+    return phase[:, 0]
+
+
+def _phase_bits(
+    phase: torch.Tensor, lid: int, layers: torch.Tensor, neurons: torch.Tensor,
+    signs: torch.Tensor, active: torch.Tensor,
+) -> torch.Tensor:
+    """Name the slot behind each phase; an unnamed phase needs its whole row."""
+    bits = torch.zeros(*phase.shape, active.shape[1], dtype=torch.bool, device=phase.device)
+    own = torch.zeros_like(phase, dtype=torch.bool)
+    lanes, slots = torch.where(active & (layers == lid))
+    indices = neurons[lanes, slots]
+    matching = signs[lanes, slots] == phase[lanes, indices]
+    own[lanes[matching], indices[matching]] = True
+    bits[lanes[matching], indices[matching], slots[matching]] = True
+    return bits | (((phase != 0) & ~own)[:, :, None] & active[:, None, :])
+
+
+def _root_valid_supports(
+    net: Net, base: dict[int, Bounds], split_signs: dict[int, torch.Tensor],
+    literals: torch.Tensor, codec: LiteralCodec,
+) -> dict[int, BoundSupport]:
+    """Supports of the split-free fallback: only a ReLU's own phase clamp."""
+    layers, neurons, signs = codec.decode_tensor(literals.masked_fill(literals == 0, 1))
+    active = literals != 0
+    supports = {}
+    for lid, box in base.items():
+        lb, ub = box.lb.flatten(1), box.ub.flatten(1)
+        lower = torch.zeros(*lb.shape, literals.shape[1], dtype=torch.bool, device=lb.device)
+        upper = lower.clone()
+        known = torch.ones_like(lb, dtype=torch.bool)
+        phase = _lane_phase(split_signs, lid) if net.by_id[lid].kind == LayerKind.RELU.value else None
+        if phase is not None:
+            bits = _phase_bits(phase, lid, layers, neurons, signs, active)
+            lower = bits & ((phase > 0) & (lb < 0))[:, :, None]
+            upper = bits & ((phase < 0) & (ub > 0))[:, :, None]
+            known &= ~(phase.ne(0).any(1) & ~active.any(1))[:, None]
+        supports[lid] = BoundSupport(lower, upper, known)
+    return supports
+
+
+def _inherited_support(
+    layer: Layer, preds: list[int], post_support: dict[int, BoundSupport],
+    shape: tuple[int, int], width: int, device: torch.device,
+) -> BoundSupport:
+    """Follow the operands each output endpoint used, per endpoint when known."""
+    k, n = shape
+    operands = [post_support[pid] for pid in preds]
+    if layer.kind in _ENDPOINT_PRESERVING and all(ps.known.shape == shape for ps in operands):
+        lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
+        upper = lower.clone()
+        known = torch.ones(shape, dtype=torch.bool, device=device)
+        for operand in operands:
+            lower |= operand.lower
+            upper |= operand.upper
+            known &= operand.known
+        return BoundSupport(lower, upper, known)
+    weight = layer.params.get("weight") if layer.kind == LayerKind.DENSE.value else None
+    lower = torch.zeros(k, n, width, dtype=torch.bool, device=device)
+    upper = lower.clone()
+    known = torch.ones(shape, dtype=torch.bool, device=device)
+    # Bound the temporary union by slots rather than materializing
+    # [K,N_parent,N_output,S] adjacency or broadcasting across specs.
+    if (isinstance(weight, torch.Tensor) and weight.dim() == 2 and weight.shape[0] == n
+            and operands[0].known.shape[1] == weight.shape[1]):
+        parent = operands[0]
+        positive = (weight > 0).T.to(device=device, dtype=torch.float32)
+        negative = (weight < 0).T.to(device=device, dtype=torch.float32)
+
+        def reaches(mask: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:
+            return (mask.transpose(1, 2).to(selector) @ selector).transpose(1, 2) > 0
+
+        for start in range(0, width, 64):
+            end = start + 64
+            low, high = parent.lower[..., start:end], parent.upper[..., start:end]
+            lower[..., start:end] = reaches(low, positive) | reaches(high, negative)
+            upper[..., start:end] = reaches(high, positive) | reaches(low, negative)
+        known = ((~parent.known).to(positive) @ (positive + negative)) == 0
+        return BoundSupport(lower, upper, known)
+    for start in range(0, width, 64):
+        end = start + 64
+        inherited = torch.zeros(k, min(end, width) - start, dtype=torch.bool, device=device)
+        for operand in operands:
+            inherited |= (operand.lower[..., start:end] | operand.upper[..., start:end]).any(1)
+        lower[..., start:end] = inherited[:, None, :]
+    for operand in operands:
+        known &= operand.known.all(1, keepdim=True)
+    return BoundSupport(lower, lower.clone(), known)
 
 
 def _canonical_rows(rows: torch.Tensor) -> torch.Tensor:
@@ -1836,7 +1946,7 @@ class ClimbSession:
         rows = torch.where(self._on_root_domain(batch))[0]
         if not self._terminal_cores or not rows.numel() or time.monotonic() >= deadline:
             return
-        from act.back_end.solver.terminal_lp import solve_terminal_batch
+        from act.back_end.solver.solver_torchlp import solve_terminal_batch
 
         def replay(candidate: torch.Tensor, *, prefer_affine: bool) -> TerminalResult:
             """Rebuild the LP without conditioned bounds."""
@@ -1901,7 +2011,7 @@ class ClimbSession:
         Float64 throughout: narrowing could round a tiny positive charge to an
         exact zero, which the deletion rule treats as free.
         """
-        from act.back_end.solver.terminal_lp import terminal_literal_costs
+        from act.back_end.solver.solver_torchlp import terminal_literal_costs
 
         rows = max(len(result.certificates[lane]) for lane in lanes)
         costs = torch.full((*literals.shape[:1], rows, literals.shape[1]), torch.inf,
@@ -2131,10 +2241,10 @@ if __name__ == "__main__":
     )
     from act.back_end.core import Layer
     from act.back_end.net_factory import LAYER_TESTING_SPECS, NetFactory
-    from act.back_end.solver.milp_escalate import solve_milp
+    from act.back_end.solver.solver_gurobi import solve_milp
     from act.back_end.solver.solver_dual import DualSolver
-    from act.back_end.solver import terminal_lp as terminal_module
-    from act.back_end.solver.terminal_lp import solve_terminal_batch, terminal_literal_costs
+    from act.back_end.solver import solver_torchlp as terminal_module
+    from act.back_end.solver.solver_torchlp import solve_terminal_batch, terminal_literal_costs
     from act.back_end.verifier import gather_input_spec_layers, seed_from_input_specs
     from act.config.config import BackendConfig, DualConfig
     from act.front_end.specs import InputGeometry, OutputSpec
@@ -2249,7 +2359,7 @@ if __name__ == "__main__":
         terminal_lane.split_signs = {terminal_lid: -upper.reshape(1, 1, 1).expand(1, 2, 1)}
         terminal_deadline = time.monotonic() + 60
         with patch(
-            "act.back_end.solver.terminal_lp.solve_terminal_batch",
+            "act.back_end.solver.solver_torchlp.solve_terminal_batch",
             wraps=solve_terminal_batch,
         ) as terminal_spy:
             terminal_session.learn_terminal(terminal_lane, deadline=terminal_deadline)
@@ -2288,7 +2398,7 @@ if __name__ == "__main__":
                 excluded.ub.zero_()
             learner = ClimbSession(terminal_config, terminal_net, OutKind.LINEAR_LE)
             with patch(
-                "act.back_end.solver.terminal_lp.solve_terminal_batch",
+                "act.back_end.solver.solver_torchlp.solve_terminal_batch",
                 wraps=solve_terminal_batch,
             ) as excluded_spy:
                 learner.learn_terminal(excluded, deadline=terminal_deadline)
@@ -2318,7 +2428,7 @@ if __name__ == "__main__":
         for coarsening, calls, core in ((True, 2, [[]]), (False, 1, [[-1]])):
             free = ClimbSession(replace(terminal_config, climb_recheck_k=0, climb_coarsening_enabled=coarsening),
                                 free_net, OutKind.LINEAR_LE)
-            with patch("act.back_end.solver.terminal_lp.solve_terminal_batch",
+            with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch",
                        wraps=solve_terminal_batch) as free_spy:
                 free.learn_terminal(terminal_lane, deadline=terminal_deadline)
             assert free_spy.call_count == calls and free.library.pack(upper.device).tolist() == core
@@ -2334,12 +2444,12 @@ if __name__ == "__main__":
             return result
 
         expired = ClimbSession(replace(terminal_config, climb_recheck_k=0), free_net, OutKind.LINEAR_LE)
-        with patch("act.back_end.solver.terminal_lp.solve_terminal_batch", side_effect=fail_second):
+        with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", side_effect=fail_second):
             expired.learn_terminal(terminal_lane, deadline=terminal_deadline)
         assert expired.library.pack(upper.device).tolist() == [[-1]]
         assert expired.metrics.coarsen_replay_fallbacks == 1
         unpriced = ClimbSession(replace(terminal_config, climb_recheck_k=0), free_net, OutKind.LINEAR_LE)
-        with patch("act.back_end.solver.terminal_lp.terminal_literal_costs", return_value=None):
+        with patch("act.back_end.solver.solver_torchlp.terminal_literal_costs", return_value=None):
             unpriced.learn_terminal(terminal_lane, deadline=terminal_deadline)
         assert unpriced.library.pack(upper.device).tolist() == [[-1]]
         # Farkas: the closed unsafe set is empty only under the inactive phase.
@@ -2369,7 +2479,7 @@ if __name__ == "__main__":
         ):
             assert not forged.has_lp_certificate(0)
             rejected = ClimbSession(terminal_config, terminal_net, OutKind.LINEAR_LE)
-            with patch("act.back_end.solver.terminal_lp.solve_terminal_batch", return_value=forged):
+            with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", return_value=forged):
                 rejected.learn_terminal(terminal_lane, deadline=terminal_deadline)
             assert rejected.library.core_count == 0
         for changes, calls in (
@@ -2379,10 +2489,10 @@ if __name__ == "__main__":
             ({"climb_recheck_k": 9}, 1),
         ):
             gated = ClimbSession(replace(terminal_config, **changes), terminal_net, OutKind.LINEAR_LE)
-            with patch("act.back_end.solver.terminal_lp.solve_terminal_batch", wraps=solve_terminal_batch) as gated_spy:
+            with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch", wraps=solve_terminal_batch) as gated_spy:
                 gated.learn_terminal(terminal_lane, deadline=terminal_deadline)
             assert gated_spy.call_count == calls
-        with patch("act.back_end.solver.terminal_lp.solve_terminal_batch") as expired_spy:
+        with patch("act.back_end.solver.solver_torchlp.solve_terminal_batch") as expired_spy:
             terminal_session.learn_terminal(terminal_lane, deadline=time.monotonic() - 1)
         expired_spy.assert_not_called()
         empty_session = ClimbSession(terminal_config, net, OutKind.LINEAR_LE)

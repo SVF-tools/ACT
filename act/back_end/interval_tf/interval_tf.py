@@ -13,8 +13,7 @@
 #
 #===---------------------------------------------------------------------===#
 
-import torch
-from typing import Dict, List
+from typing import Dict
 from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
 from act.back_end.transfer_functions import RegistryTF
 from act.back_end.layer_schema import LayerKind
