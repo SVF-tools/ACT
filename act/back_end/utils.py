@@ -14,7 +14,7 @@
 
 import torch
 from typing import Dict, Any, Tuple, Optional
-from act.back_end.core import Bounds, ConSet
+from act.back_end.core import Bounds
 from act.util.options import PerformanceOptions
 from act.util.format_utils import rule
 
@@ -179,10 +179,6 @@ def _affine_bounds_inf_safe(W_pos, W_neg, b, lo, hi) -> Bounds:
 
 def pwl_meta(l: torch.Tensor, u: torch.Tensor, K: int) -> Dict[str, Any]:
     return {"K": int(K), "mid": 0.5*(l+u)}
-
-def bound_var_interval(l: torch.Tensor, u: torch.Tensor) -> Tuple[float, float]:
-    r = 0.5*(u-l); v_hi = float(torch.mean((2*r)**2))
-    return (0.0, v_hi)
 
 def four_corner_envelope(xl, xu, yl, yu, sum_axis=None, keepdim=False, scale=1.0):
     """Four-corner McCormick envelope (lb, ub) of x*y over [xl,xu]x[yl,yu].

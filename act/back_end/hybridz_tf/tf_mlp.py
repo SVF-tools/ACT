@@ -865,29 +865,19 @@ def tf_sigmoid(L, bounds, tf):
     return fact
 
 
-def tf_erf(L, bounds, tf):
-    tf._hz_cache[L.id] = None
-    return interval.tf_erf(L, bounds)
+def _drop_hz_op(interval_fn):
+    """Build a TF that drops the cached zonotope and defers to interval_fn."""
+    def op(L, bounds, tf):
+        tf._hz_cache[L.id] = None
+        return interval_fn(L, bounds)
+    return op
 
 
-def tf_sqrt(L, bounds, tf):
-    tf._hz_cache[L.id] = None
-    return interval.tf_sqrt(L, bounds)
-
-
-def tf_sin(L, bounds, tf):
-    tf._hz_cache[L.id] = None
-    return interval.tf_sin(L, bounds)
-
-
-def tf_cos(L, bounds, tf):
-    tf._hz_cache[L.id] = None
-    return interval.tf_cos(L, bounds)
-
-
-def tf_quantize(L, bounds, tf):
-    tf._hz_cache[L.id] = None
-    return interval.tf_quantize(L, bounds)
+tf_erf = _drop_hz_op(interval.tf_erf)
+tf_sqrt = _drop_hz_op(interval.tf_sqrt)
+tf_sin = _drop_hz_op(interval.tf_sin)
+tf_cos = _drop_hz_op(interval.tf_cos)
+tf_quantize = _drop_hz_op(interval.tf_quantize)
 
 
 def tf_abs(L, bounds, tf):
@@ -1327,22 +1317,20 @@ def tf_sub(L, bounds, tf):
     return fact
 
 
-def tf_flatten(L, bounds, tf):
-    fact = interval_cnn.tf_flatten(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        tf._hz_cache[L.id] = _hz_rebind(hz_in)
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
+def _rebind_op(interval_fn):
+    """Build a TF that runs interval_fn and rebinds the cached zonotope unchanged."""
+    def op(L, bounds, tf):
+        fact = interval_fn(L, bounds)
+        hz_in = tf._hz_cache.get(L.id)
+        if hz_in is not None:
+            tf._hz_cache[L.id] = _hz_rebind(hz_in)
+            return _hz_fact(fact, tf._hz_cache[L.id])
+        return fact
+    return op
 
 
-def tf_reshape(L, bounds, tf):
-    fact = interval.tf_reshape(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        tf._hz_cache[L.id] = _hz_rebind(hz_in)
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
+tf_flatten = _rebind_op(interval_cnn.tf_flatten)
+tf_reshape = _rebind_op(interval.tf_reshape)
 
 
 def _hz_rebind(hz: HZono) -> HZono:
@@ -1374,22 +1362,8 @@ def _hz_gather_rows(hz: HZono, row_idx: torch.Tensor) -> HZono:
     )
 
 
-def tf_squeeze(L, bounds, tf):
-    fact = interval.tf_squeeze(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        tf._hz_cache[L.id] = _hz_rebind(hz_in)
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
-
-
-def tf_unsqueeze(L, bounds, tf):
-    fact = interval.tf_unsqueeze(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        tf._hz_cache[L.id] = _hz_rebind(hz_in)
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
+tf_squeeze = _rebind_op(interval.tf_squeeze)
+tf_unsqueeze = _rebind_op(interval.tf_unsqueeze)
 
 
 def tf_transpose(L, bounds, tf):
@@ -1406,40 +1380,24 @@ def tf_transpose(L, bounds, tf):
     return fact
 
 
-def tf_slice(L, bounds, tf):
-    fact = interval.tf_slice(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        rows = _row_indices_slice(L, hz_in.c.shape[0])
-        if rows is not None and rows.numel() == fact.bounds.lb.numel():
-            tf._hz_cache[L.id] = _hz_gather_rows(hz_in, rows)
-            return _hz_fact(fact, tf._hz_cache[L.id])
-        tf._hz_cache.pop(L.id, None)
-    return fact
+def _row_gather_op(interval_fn, row_fn):
+    """Build a TF that runs interval_fn and gathers zonotope rows chosen by row_fn."""
+    def op(L, bounds, tf):
+        fact = interval_fn(L, bounds)
+        hz_in = tf._hz_cache.get(L.id)
+        if hz_in is not None:
+            rows = row_fn(L, hz_in.c.shape[0])
+            if rows is not None and rows.numel() == fact.bounds.lb.numel():
+                tf._hz_cache[L.id] = _hz_gather_rows(hz_in, rows)
+                return _hz_fact(fact, tf._hz_cache[L.id])
+            tf._hz_cache.pop(L.id, None)
+        return fact
+    return op
 
 
-def tf_gather(L, bounds, tf):
-    fact = interval.tf_gather(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        rows = _row_indices_gather(L, hz_in.c.shape[0])
-        if rows is not None and rows.numel() == fact.bounds.lb.numel():
-            tf._hz_cache[L.id] = _hz_gather_rows(hz_in, rows)
-            return _hz_fact(fact, tf._hz_cache[L.id])
-        tf._hz_cache.pop(L.id, None)
-    return fact
-
-
-def tf_expand(L, bounds, tf):
-    fact = interval.tf_expand(L, bounds)
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        rows = _row_indices_expand(L, hz_in.c.shape[0])
-        if rows is not None and rows.numel() == fact.bounds.lb.numel():
-            tf._hz_cache[L.id] = _hz_gather_rows(hz_in, rows)
-            return _hz_fact(fact, tf._hz_cache[L.id])
-        tf._hz_cache.pop(L.id, None)
-    return fact
+tf_slice = _row_gather_op(interval.tf_slice, _row_indices_slice)
+tf_gather = _row_gather_op(interval.tf_gather, _row_indices_gather)
+tf_expand = _row_gather_op(interval.tf_expand, _row_indices_expand)
 
 
 # --- HZ activation encodings (zonotope domain) ---

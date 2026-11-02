@@ -10,6 +10,7 @@ License: AGPLv3+
 """
 
 import argparse
+from collections import defaultdict
 from typing import Any, Optional, cast
 
 from act.front_end.creator_registry import detect_creator, list_creators, get_creator
@@ -21,7 +22,7 @@ from act.util.download_utils import UNAVAILABLE, report_unavailable
 from act.front_end.torchvision_loader import data_model_mapping as tv_mapping
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.vnnlib_loader import category_mapping as vnnlib_mapping
-from act.front_end.bert_loader import data_loader as bert_loader
+from act.front_end.bert_loader import data_model_loader as bert_loader
 from act.config.config import VALID_BERT_METHODS
 
 
@@ -48,6 +49,9 @@ _FRONTEND_TEXTVERIFY_OVERRIDE_KEYS: tuple[str, ...] = (
     "num_verify_iters",
     "k",
     "alpha_opt_steps",
+    "checkpoint_dir",
+    "position_mode",
+    "conversion_route",
 )
 
 
@@ -340,11 +344,9 @@ def print_list_downloads(creator: Optional[str] = None):
             print(rule(100, "-"))
             
             # Group by category
-            categories = {}
+            categories = defaultdict(list)
             for item in vnnlib_downloads:
                 cat = item['category']
-                if cat not in categories:
-                    categories[cat] = []
                 categories[cat].append(item)
             
             for cat in sorted(categories.keys()):
@@ -712,6 +714,27 @@ Examples:
         default=None,
         dest="alpha_opt_steps",
         help="Optimized-alpha optimization steps.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        dest="checkpoint_dir",
+        help="Compact BERT model directory containing a checkpoint.",
+    )
+    parser.add_argument(
+        "--position-mode",
+        choices=("prefix", "sweep"),
+        default=None,
+        dest="position_mode",
+        help="Select prefix or eligible WordPiece sweep positions.",
+    )
+    parser.add_argument(
+        "--conversion-route",
+        choices=("a", "b"),
+        default=None,
+        dest="conversion_route",
+        help="Use manual route a or generic FX route b.",
     )
     
     # Add standard device/dtype arguments

@@ -21,7 +21,8 @@ dependencies:
   - pyyaml  # Config loading (specs, models)
   - psutil  # Memory monitoring in pipeline
   # ML frameworks (pipeline/llm_probe.py)
-  - transformers
+  # Compact BERT uses the Transformers 4 tokenizer and encoder interfaces.
+  - "transformers>=4.57.3,<5"
   - scikit-learn
   # Required for Mac OS X systems - `libopenblas` uses `llvm-openmp` by default,
   # which causes errors when using `pip`-installed PyTorch.

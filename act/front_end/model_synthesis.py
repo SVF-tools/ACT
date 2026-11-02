@@ -57,6 +57,24 @@ def infer_layout_from_tensor(x: torch.Tensor) -> str:
     return "FLAT"
 
 
+def _is_fixed_model_input(labeled: LabeledInputTensor, spec: InputSpec) -> bool:
+    """Identify one fixed model tensor carried inside one spec lane."""
+    seed = spec.lb if isinstance(spec.lb, torch.Tensor) else spec.center
+    return (
+        isinstance(seed, torch.Tensor)
+        and labeled.tensor.ndim >= 2 and labeled.tensor.shape[0] != 1
+        and tuple(seed.shape[1:]) == tuple(labeled.tensor.shape)
+    )
+
+
+def _assert_same_center_shape(in_specs: List[InputSpec]) -> None:
+    """Require every ball spec to carry a center of the first spec's shape."""
+    first_center = in_specs[0].center
+    assert first_center is not None
+    assert all(s.center is not None and s.center.shape == first_center.shape for s in in_specs), \
+        f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+
+
 def _merge_specs_to_batch(
     lts: List[LabeledInputTensor],
     in_specs: List[InputSpec],
@@ -104,6 +122,13 @@ def _merge_specs_to_batch(
     Returns:
         (batched_labeled_tensor, batched_input_spec, batched_output_spec)
     """
+    if len(lts) != 1 and any(
+        _is_fixed_model_input(labeled, spec) for labeled, spec in zip(lts, in_specs)
+    ):
+        raise ValueError(
+            "Fixed-shape model input cannot be merged into independent verifier lanes"
+        )
+
     # Assert all tensors have the same shape (guaranteed by grouping in gkey)
     if len(lts) > 1:
         first_shape = lts[0].tensor.shape
@@ -130,13 +155,7 @@ def _merge_specs_to_batch(
         ub = torch.cat([s.ub for s in in_specs], dim=0)
         center, eps = None, None
     elif in_kind == InKind.LINF_BALL:
-        # Assert all center tensors have the same shape
-        first_center = in_specs[0].center
-        assert first_center is not None
-        if len(in_specs) > 1:
-            first_center_shape = first_center.shape
-            assert all(s.center is not None and s.center.shape == first_center_shape for s in in_specs), \
-                f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+        _assert_same_center_shape(in_specs)
         
         centers: List[torch.Tensor] = []
         lbs: List[torch.Tensor] = []
@@ -144,23 +163,17 @@ def _merge_specs_to_batch(
         eps_values: List[torch.Tensor] = []
         for spec in in_specs:
             assert spec.center is not None and spec.eps is not None
-            eps_tensor = spec.eps if isinstance(spec.eps, torch.Tensor) else torch.tensor([float(spec.eps)])
             centers.append(spec.center)
-            lbs.append(torch.clamp(spec.center - eps_tensor, 0))
-            ubs.append(torch.clamp(spec.center + eps_tensor, 1))
-            eps_values.append(eps_tensor.reshape(-1)[0])
+            lbs.append(torch.clamp(spec.center - spec.eps, 0))
+            ubs.append(torch.clamp(spec.center + spec.eps, 1))
+            eps_values.append(spec.eps.reshape(-1)[0])
         center = torch.cat(centers, dim=0)
         lb = torch.cat(lbs, dim=0)
         ub = torch.cat(ubs, dim=0)
         eps = torch.stack(eps_values)
         eps = eps.reshape(center.shape[0], *([1] * (center.ndim - 1)))
     elif in_kind == InKind.LP_EMBEDDING:
-        first_center = in_specs[0].center
-        assert first_center is not None
-        if len(in_specs) > 1:
-            first_center_shape = first_center.shape
-            assert all(s.center is not None and s.center.shape == first_center_shape for s in in_specs), \
-                f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+        _assert_same_center_shape(in_specs)
 
         centers = []
         lbs = []
@@ -170,12 +183,11 @@ def _merge_specs_to_batch(
         p_norm_values = []
         for spec in in_specs:
             assert spec.center is not None and spec.eps is not None
-            eps_tensor = spec.eps if isinstance(spec.eps, torch.Tensor) else torch.tensor([float(spec.eps)])
             spec_lb, spec_ub = spec.materialize_box_seed()
             centers.append(spec.center)
             lbs.append(spec_lb)
             ubs.append(spec_ub)
-            eps_values.append(eps_tensor.reshape(-1)[0])
+            eps_values.append(spec.eps.reshape(-1)[0])
             position_masks.append((spec_lb != spec_ub).any(dim=-1))
             p_norm = spec.p_norm if isinstance(spec.p_norm, torch.Tensor) else torch.tensor([float(spec.p_norm)])
             p_norm_values.append(p_norm.reshape(-1)[0])
@@ -335,7 +347,7 @@ def synthesize_models_and_seeds_from_specs(
     groups: Dict[Tuple, List] = defaultdict(list)
     models: Dict[int, Tuple[nn.Module, str]] = {}  # id(model) -> (model, model's representative_name)
     
-    for data_source, model_name, pytorch_model, labeled_tensors, spec_pairs in spec_results:
+    for result_index, (data_source, model_name, pytorch_model, labeled_tensors, spec_pairs) in enumerate(spec_results):
         if not labeled_tensors or not spec_pairs:
             continue
         
@@ -364,6 +376,8 @@ def synthesize_models_and_seeds_from_specs(
                     d_sig,
                 )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
+            if _is_fixed_model_input(lt, in_spec):
+                gkey += (result_index, idx)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     
     # -------------------------------------------------------------------------
@@ -375,7 +389,7 @@ def synthesize_models_and_seeds_from_specs(
     ] = {}
     disjunct_counter: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     for gkey, grouped_specs in groups.items():
-        data_src, mid, in_kind, out_kind, _cd_sig = gkey
+        data_src, mid, in_kind, out_kind, _cd_sig = gkey[:5]
         pytorch_model, rep_name = models[mid]
         # Use representative model_name for the display key; if a single
         # (data_src, model_name) expands into multiple UNSAFE_LINEAR disjuncts
@@ -394,7 +408,7 @@ def synthesize_models_and_seeds_from_specs(
     # -------------------------------------------------------------------------
     # Summary: Print statistics and return results
     # -------------------------------------------------------------------------
-    total_specs = sum(vm.input_layer.input_tensor.shape[0] for vm in synthesis_models.values())
+    total_specs = sum(int(vm.input_spec.spec.lb.shape[0]) for vm in synthesis_models.values())
     
     print(f"\n🎉 Synthesis Complete:")
     print(f"   Total specs: {total_specs}")
@@ -523,11 +537,6 @@ def model_synthesis(
     print(f"✓ Successfully created specs using {creator.upper()} spec creator")
     print(f"  Found {len(spec_results)} dataset-model pair(s)")
     
-    # Calculate statistics from spec_results BEFORE synthesis
-    total_samples = sum(len(input_tensors) for _, _, _, input_tensors, _ in spec_results)
-    total_spec_pairs = sum(len(spec_pairs) for _, _, _, _, spec_pairs in spec_results)
-    specs_per_sample = total_spec_pairs // total_samples if total_samples else 0
-    
     # Synthesize wrapped models from spec results
     wrapped_models = synthesize_models_from_specs(spec_results)
     
@@ -557,34 +566,192 @@ def model_synthesis(
         unique_pairs.add((dataset, model))
     print(f"  • Unique dataset-model pairs: {len(unique_pairs)}")
     
-    # Print detailed breakdown (using pre-calculated stats)
-    if total_samples > 0 and total_spec_pairs > 0:
-        print(f"\n📊 Breakdown:")
-        print(f"  • Input samples: {total_samples}")
-        print(f"  • Spec pairs per sample: {specs_per_sample}")
-        print(f"    (= 2 input kinds × 4 epsilons × 3 output specs)")
-        print(f"    (= BOX, LINF_BALL × 0.01,0.03,0.05,0.1 × MARGIN_ROBUST(m=0.0,0.5), TOP1_ROBUST)")
-        print(f"  • Total spec pairs: {total_spec_pairs}")
-        print(f"  • Calculation: {total_samples} samples × {specs_per_sample} specs/sample = {total_spec_pairs} wrapped models")
-    
     return wrapped_models
 
 
+def _smoke_compact_bert() -> None:
+    """Check nonconstant compact routes, indexed queries and CLI Net round trips."""
+    import hashlib
+    from importlib import import_module
+    import json
+    from pathlib import Path
+    import sys
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from transformers import BertConfig, BertForSequenceClassification
+
+    from act.back_end.serialization import load_net_from_file, save_net_to_file
+    from act.front_end.bert_loader.compact_bert import (
+        CompactBertRouteBModel, NoVarLayerNorm, embedding_sum,
+        load_compact_bert, tokenize_act_tokens,
+    )
+    from act.front_end.bert_loader.create_specs import (
+        BertSpecCreator, build_query_model, read_query, verify_checkpoint_sha256,
+    )
+    from act.front_end.bert_loader.data_model_loader import QueryIndexError, yelp_partition_indices
+    from act.util import path_config
+    from act.util.device_manager import get_current_settings, initialize_device
+    from act.util.stats import VerifyStatus
+
+    # These clients import synthesis themselves; load them only for this smoke.
+    backend_cli = import_module("act.config.backend_cli")
+    frontend_cli = import_module("act.config.frontend_cli")
+    verify_once = import_module("act.back_end.verifier").verify_once
+    ACTToTorch = import_module("act.pipeline.verification.act2torch").ACTToTorch
+    TorchToACT = import_module("act.pipeline.verification.torch2act").TorchToACT
+
+    initialize_device(device="cpu", dtype="float64")
+    device, dtype = get_current_settings()
+    torch.manual_seed(42)
+    with TemporaryDirectory(prefix="act-compact-smoke-") as directory:
+        root = Path(directory)
+        with patch.object(path_config, "get_project_root", return_value=str(root)):
+            model_dir = Path(path_config.get_bert_artifact_root()) / "models" / "model_sst_1"
+            checkpoint = model_dir / "ckpt-7"
+            checkpoint.mkdir(parents=True)
+            config = BertConfig(
+                vocab_size=10, hidden_size=8, num_hidden_layers=1,
+                num_attention_heads=2, intermediate_size=16,
+                max_position_embeddings=32, type_vocab_size=2,
+                hidden_act="relu", num_labels=2,
+            )
+            source = BertForSequenceClassification(config).to(device=device, dtype=dtype)
+            source.bert.embeddings.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                device=device, dtype=dtype
+            )
+            for block in source.bert.encoder.layer:
+                block.attention.output.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                    device=device, dtype=dtype
+                )
+                block.output.LayerNorm = NoVarLayerNorm(config.hidden_size).to(
+                    device=device, dtype=dtype
+                )
+            with torch.no_grad():
+                source.classifier.bias.copy_(source.classifier.bias.new_tensor([-1.0, 1.0]))
+            source.eval()
+            (model_dir / "checkpoint").write_text("7\n", encoding="utf-8")
+            (checkpoint / "config.json").write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            (checkpoint / "vocab.txt").write_text(
+                "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nplay\n##ing\n!\n",
+                encoding="utf-8",
+            )
+            weights = checkpoint / "pytorch_model.bin"
+            torch.save(source.state_dict(), weights)
+            raw_sst = Path(path_config.get_data_root()) / "sst"
+            raw_sst.mkdir()
+            (raw_sst / "test.txt").write_text(
+                "(4 (4 hello) (4 playing) (4 world) (4 hello) (4 world) (4 hello))\n",
+                encoding="utf-8",
+            )
+            checksum = hashlib.sha256(weights.read_bytes()).hexdigest()
+            relative_weights = weights.relative_to(path_config.get_data_root()).as_posix()
+            (Path(path_config.get_bert_artifact_root()) / "SHA256SUMS").write_text(
+                f"{checksum}  {relative_weights}\n", encoding="utf-8"
+            )
+            index = root / "queries.csv"
+            index.write_text(
+                "dataset,split,depth,example_id,position,p,eps,checkpoint_sha256\n"
+                f"sst,test,1,0,1,inf,0.001,{checksum}\n"
+                "sst,test,1,0,3,1,0.001,\n",
+                encoding="utf-8",
+            )
+            relative_model = model_dir.relative_to(path_config.get_data_root())
+            loaded = load_compact_bert(relative_model)
+            tokens = tokenize_act_tokens(
+                ["hello", "playing", "world", "hello", "world", "hello"], loaded.tokenizer
+            )
+            assert tokens.wordpiece_tokens == [
+                "[CLS]", "hello", "play", "##ing", "world", "hello", "world", "hello", "[SEP]",
+            ]
+            seed = embedding_sum(loaded, tokens.input_ids, tokens.token_type_ids)
+            changed = seed.clone()
+            changed[:, 0, 0] += 0.25
+            route_b = CompactBertRouteBModel(loaded.model, seed.shape[1])
+            with torch.no_grad():
+                expected = loaded.model(seed)
+                changed_expected = loaded.model(changed)
+                assert (changed_expected - expected).abs().max() > 1e-7
+                torch.testing.assert_close(
+                    source(input_ids=tokens.input_ids.unsqueeze(0)).logits, expected,
+                    rtol=1e-9, atol=1e-10,
+                )
+                for inputs in (seed, changed):
+                    torch.testing.assert_close(route_b(inputs), loaded.model(inputs), rtol=1e-9, atol=1e-10)
+
+            creator = BertSpecCreator(config_dict={"checkpoint_dir": str(relative_model)})
+            with patch("act.front_end.bert_loader.create_specs.BertVocabulary") as vocabulary:
+                for route in ("a", "b"):
+                    results = creator.create_specs_for_data_model_pairs(conversion_route=route)
+                    assert results[0][1] == "compact_bert"
+                    assert results[0][4][0][0].perturbed_positions.tolist() == [0]
+                    (wrapped,) = synthesize_models_from_specs(results).values()
+                    net = TorchToACT(wrapped).run()
+                    path = root / f"route-{route}.json"
+                    save_net_to_file(net, str(path))
+                    for candidate in (net, load_net_from_file(str(path))):
+                        restored = ACTToTorch(candidate).run().eval()
+                        for inputs in (seed, changed):
+                            torch.testing.assert_close(
+                                restored(inputs)["output"], loaded.model(inputs),
+                                rtol=1e-8, atol=1e-9,
+                            )
+                vocabulary.assert_not_called()
+
+            query = read_query(index, 0)
+            assert verify_checkpoint_sha256(query) == weights
+            with patch.object(
+                BertSpecCreator, "_single_spec_pair", wraps=BertSpecCreator._single_spec_pair
+            ) as single:
+                wrapped_query = build_query_model(query)
+                assert single.call_count == 1
+            mask = wrapped_query.input_spec.spec.perturbed_positions
+            assert mask.shape == seed.shape[:2]
+            assert mask[0].nonzero().flatten().tolist() == [1]
+            try:
+                build_query_model(read_query(index, 1))
+            except QueryIndexError:
+                pass
+            else:
+                raise AssertionError("WordPiece continuation accepted as a query position")
+            partition = yelp_partition_indices(10)
+            assert len(partition["calibration"]) == 2
+            assert sorted(partition["calibration"] + partition["evaluation"]) == list(range(10))
+            assert not set(partition["calibration"]) & set(partition["evaluation"])
+
+            with patch.object(sys, "argv", [
+                "act.front_end", "--synthesis", "--creator", "bert",
+                "--checkpoint-dir", str(relative_model),
+                "--device", "cpu", "--dtype", "float64",
+            ]):
+                assert frontend_cli.main() in (None, 0)
+            saved = root / "verified.json"
+            for source_args in (
+                ["--query-index", str(index), "--query-id", "0", "--save-net", str(saved)],
+                ["--network", str(saved)],
+            ):
+                with patch.object(sys, "argv", [
+                    "act.back_end", "--verify", *source_args, "--solver", "torchlp",
+                    "--no-bab", "--timeout", "30", "--device", "cpu", "--dtype", "float64",
+                ]):
+                    assert backend_cli.main() == 0
+            restored_net = load_net_from_file(str(saved))
+            restored_query = ACTToTorch(restored_net).run().eval()
+            for inputs in (seed, changed):
+                torch.testing.assert_close(
+                    restored_query(inputs)["output"], loaded.model(inputs), rtol=1e-8, atol=1e-9,
+                )
+            assert all(result.status == VerifyStatus.CERTIFIED for result in verify_once(restored_net))
+    print("Compact BERT A/B/ACT/reload and query CLI smoke passed")
+
+
 if __name__ == "__main__":
-    from act.util.model_inference import model_inference
-    from act.util.device_manager import initialize_device
-    
-    # Initialize device/dtype before synthesis (models typically use float32)
-    initialize_device(device='cuda', dtype='float32')
-    
-    # Step 1: Synthesize all wrapped models using new spec creators
-    wrapped_models = model_synthesis()
-    
-    # Step 2: Test all models with inference (input data extracted from wrapped models)
-    successful_models = model_inference(wrapped_models)
-    
-    print(f"\n✅ Successfully inferred {len(successful_models)} out of {len(wrapped_models)} models")
-    print(f"\n🎯 NEW SPEC CREATOR INTEGRATION: COMPLETE ✅")
+    import sys
+
+    if "--compact-smoke" not in sys.argv:
+        sys.exit("usage: python -m act.front_end.model_synthesis --compact-smoke")
+    _smoke_compact_bert()
+    sys.exit(0)
 
 
 # Merge split-ReLUs: invert the ReluSplitter benchmark transformation.
@@ -650,35 +817,34 @@ def _certify_affine_collapse(l1: nn.Linear, l2: nn.Linear):
     n_merged = number of rows removed = sum over augmented-direction groups of
     (group_size - 1). Computation is in float64; the caller casts to model dtype.
     """
-    dev = l1.weight.device
-    W1 = l1.weight.detach().double()
+    # Exact host arithmetic: this decides per row, so GPU tensors would sync per pair.
+    dev = torch.device("cpu")
+    W1 = l1.weight.detach().double().to(dev)
     out1, in1 = W1.shape
-    b1 = l1.bias.detach().double() if l1.bias is not None else torch.zeros(out1, dtype=torch.float64, device=dev)
-    W2 = l2.weight.detach().double()
+    b1 = l1.bias.detach().double().to(dev) if l1.bias is not None else torch.zeros(out1, dtype=torch.float64, device=dev)
+    W2 = l2.weight.detach().double().to(dev)
     out2 = W2.shape[0]
-    b2 = l2.bias.detach().double() if l2.bias is not None else torch.zeros(out2, dtype=torch.float64, device=dev)
+    b2 = l2.bias.detach().double().to(dev) if l2.bias is not None else torch.zeros(out2, dtype=torch.float64, device=dev)
 
     aug = torch.cat([W1, b1.unsqueeze(1)], dim=1)
     norms = aug.norm(dim=1)
     unit = aug / norms.clamp_min(1e-30).unsqueeze(1)
+    usable = norms > 1e-30
 
-    visited = [False] * out1
+    visited = torch.zeros(out1, dtype=torch.bool, device=dev)
     groups: list[list[tuple[int, float]]] = []
     for i in range(out1):
         if visited[i]:
             continue
-        visited[i] = True
-        grp = [(i, 1.0)]
-        if norms[i] > 1e-30:
-            ui = unit[i]
-            for j in range(i + 1, out1):
-                if visited[j] or norms[j] <= 1e-30:
-                    continue
-                if abs(abs(float(ui @ unit[j])) - 1.0) <= _MERGE_RTOL:
-                    t = float(aug[j] @ aug[i] / (aug[i] @ aug[i]))
-                    grp.append((j, t))
-                    visited[j] = True
-        groups.append(grp)
+        members = torch.tensor([i], device=dev)
+        if usable[i]:
+            parallel = ((unit @ unit[i]).abs() - 1.0).abs() <= _MERGE_RTOL
+            parallel[:i + 1] = False
+            others = torch.where(parallel & usable & ~visited)[0]
+            members = torch.cat((members, others))
+        visited[members] = True
+        scales = (aug[members] @ aug[i] / (aug[i] @ aug[i])).tolist() if usable[i] else [1.0]
+        groups.append(list(zip(members.tolist(), scales)))
 
     thr = _MERGE_AFFINE_TOL * max(1.0, float(W2.abs().max()) if W2.numel() else 1.0)
     M = torch.zeros(out2, in1, dtype=torch.float64, device=dev)

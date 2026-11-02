@@ -14,10 +14,13 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 import logging
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from onnx import ModelProto
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +64,7 @@ def _register_qdq_converters() -> None:
             return -(2**31), 2**31 - 1, "int32"
         raise NotImplementedError(f"QuantizeLinear zero_point dtype {zero_point.dtype} is not supported")
 
-    class OnnxQuantizeLinear(nn.Module, OnnxToTorchModule):
+    class _OnnxQdqBase(nn.Module, OnnxToTorchModule):
         def __init__(self, scale, zero_point, axis=None):
             super().__init__()
             # Registered at the file's own dtype so the model-wide .to(dtype=...)
@@ -71,19 +74,13 @@ def _register_qdq_converters() -> None:
             self.axis = axis
             self.qmin, self.qmax, self.dtype_name = _qrange_from_zero_point(cast(torch.Tensor, self.zero_point))
 
+    class OnnxQuantizeLinear(_OnnxQdqBase):
         def forward(self, x, scale=None, zero_point=None):
             s = _reshape_axis_param(cast(torch.Tensor, self.scale).to(device=x.device, dtype=x.dtype), x, self.axis)
             zp = _reshape_axis_param(cast(torch.Tensor, self.zero_point).to(device=x.device, dtype=x.dtype), x, self.axis)
             return s * torch.clamp(torch.round(x / s), min=float(self.qmin) - zp, max=float(self.qmax) - zp)
 
-    class OnnxDequantizeLinear(nn.Module, OnnxToTorchModule):
-        def __init__(self, scale, zero_point, axis=None):
-            super().__init__()
-            self.register_buffer("scale", scale.detach().clone())
-            self.register_buffer("zero_point", zero_point.detach().clone())
-            self.axis = axis
-            self.qmin, self.qmax, self.dtype_name = _qrange_from_zero_point(cast(torch.Tensor, self.zero_point))
-
+    class OnnxDequantizeLinear(_OnnxQdqBase):
         def forward(self, q, scale=None, zero_point=None):
             # ONNX DequantizeLinear yields the scale's type; for an integral q
             # that is the only thing naming the working float precision.
@@ -104,23 +101,19 @@ def _register_qdq_converters() -> None:
             value = torch.as_tensor(value)
         return value
 
-    @add_converter(operation_type="QuantizeLinear", version=10)
-    @add_converter(operation_type="QuantizeLinear", version=13)
-    def _q(node: "OnnxNode", graph: "OnnxGraph") -> "OperationConverterResult":
-        return OperationConverterResult(
-            torch_module=OnnxQuantizeLinear(_const_tensor(node.input_values[1], graph),
-                                            _const_tensor(node.input_values[2], graph), _axis(node)),
-            onnx_mapping=onnx_mapping_from_node(node=node),
-        )
+    def _qdq_converter(module_class):
+        def convert(node: "OnnxNode", graph: "OnnxGraph") -> "OperationConverterResult":
+            return OperationConverterResult(
+                torch_module=module_class(_const_tensor(node.input_values[1], graph),
+                                          _const_tensor(node.input_values[2], graph), _axis(node)),
+                onnx_mapping=onnx_mapping_from_node(node=node),
+            )
+        return convert
 
-    @add_converter(operation_type="DequantizeLinear", version=10)
-    @add_converter(operation_type="DequantizeLinear", version=13)
-    def _dq(node: "OnnxNode", graph: "OnnxGraph") -> "OperationConverterResult":
-        return OperationConverterResult(
-            torch_module=OnnxDequantizeLinear(_const_tensor(node.input_values[1], graph),
-                                              _const_tensor(node.input_values[2], graph), _axis(node)),
-            onnx_mapping=onnx_mapping_from_node(node=node),
-        )
+    for operation_type, module_class in (("QuantizeLinear", OnnxQuantizeLinear),
+                                         ("DequantizeLinear", OnnxDequantizeLinear)):
+        for version in (13, 10):
+            add_converter(operation_type=operation_type, version=version)(_qdq_converter(module_class))
 
     _QDQ_REGISTERED = True
 
@@ -203,6 +196,43 @@ def _preprocess_onnx_for_onnx2torch(onnx_model):
     return onnx_model
 
 
+def _ensure_unique_node_names(onnx_model: ModelProto) -> ModelProto:
+    """Give graph nodes nonempty unique names without changing value edges."""
+    reserved = {node.name for node in onnx_model.graph.node if node.name}
+    seen: set[str] = set()
+    for index, node in enumerate(onnx_model.graph.node):
+        if node.name and node.name not in seen:
+            seen.add(node.name)
+            continue
+        base = f"act_{node.op_type}_{index}"
+        name = base
+        suffix = 1
+        while name in reserved:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        node.name = name
+        reserved.add(name)
+        seen.add(name)
+    return onnx_model
+
+
+def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
+    """Apply the same opset and graph preparation on main and raw retry."""
+    try:
+        from onnx import version_converter
+
+        current_opset = max(
+            (op.version for op in onnx_model.opset_import if not op.domain or op.domain == "ai.onnx"),
+            default=0,
+        )
+        if 0 < current_opset < 13:
+            logger.info("Upgrading ONNX opset %s → 13", current_opset)
+            onnx_model = version_converter.convert_version(onnx_model, 13)
+    except Exception as exc:
+        logger.warning("Opset upgrade failed (%s), proceeding with original opset", exc)
+    return _ensure_unique_node_names(_preprocess_onnx_for_onnx2torch(onnx_model))
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -233,17 +263,7 @@ def convert_onnx_to_pytorch(
         logger.info(f"Loading ONNX model from {onnx_path}")
         onnx_model = onnx.load(str(onnx_path))
         
-        # Upgrade old opsets for onnx2torch compatibility (e.g. ACAS Xu ships opset 8)
-        try:
-            from onnx import version_converter
-            current_opset = max((op.version for op in onnx_model.opset_import if not op.domain or op.domain == 'ai.onnx'), default=0)
-            if 0 < current_opset < 13:
-                logger.info(f"Upgrading ONNX opset {current_opset} → 13")
-                onnx_model = version_converter.convert_version(onnx_model, 13)
-        except Exception as e:
-            logger.warning(f"Opset upgrade failed ({e}), proceeding with original opset")
-        
-        onnx_model = _preprocess_onnx_for_onnx2torch(onnx_model)
+        onnx_model = _prepare_onnx_for_conversion(onnx_model)
 
         # Optionally simplify
         if simplify:
@@ -253,6 +273,7 @@ def convert_onnx_to_pytorch(
                 onnx_model, check = onnxsim.simplify(onnx_model)
                 if not check:
                     logger.warning("ONNX simplification check failed, using original model")
+                onnx_model = _ensure_unique_node_names(onnx_model)
             except ImportError:
                 logger.warning("onnxsim not available, skipping simplification")
             except Exception as e:
@@ -282,10 +303,7 @@ def convert_onnx_to_pytorch(
                     f"retrying with simplify=False"
                 )
                 raw_model = onnx.load(str(onnx_path))
-                # Apply the same preprocessing here too -- without it, the
-                # fallback can hit the very issues the main path's
-                # _preprocess_onnx_for_onnx2torch was added to fix.
-                raw_model = _preprocess_onnx_for_onnx2torch(raw_model)
+                raw_model = _prepare_onnx_for_conversion(raw_model)
                 try:
                     from onnx import shape_inference
                     raw_model = shape_inference.infer_shapes(raw_model)
@@ -329,7 +347,9 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
         onnx_path: Path to .onnx file
         
     Returns:
-        Input shape tuple WITH batch=1 (normalized to (1, C, H, W) format)
+        Declared input shape; only a dynamic leading dimension is normalized
+        to 1. Fixed leading extents remain model structure for the selected
+        supported conversion operators.
         
     Raises:
         ONNXConversionError: If shape extraction fails
@@ -356,13 +376,8 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
             shape = (1,) + tuple(shape[1:])
             logger.info(f"Normalized dynamic batch to 1: {shape}")
         else:
-            # Keep original batch dimension (whether 1, 32, etc.)
-            logger.info(f"Extracted input shape: {shape}")
-            if shape[0] != 1:
-                logger.warning(
-                    f"ONNX model has batch size {shape[0]}, but verification "
-                    f"assumes batch=1. Results may be incorrect."
-                )
+            # A fixed leading extent remains part of one model input.
+            logger.info("Extracted fixed ONNX input shape: %s", shape)
         
         return tuple(shape)
         
@@ -370,57 +385,6 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
         raise ONNXConversionError("onnx library not installed")
     except Exception as e:
         raise ONNXConversionError(f"Failed to extract shape from {onnx_path}: {str(e)}")
-
-
-def get_onnx_output_shape(onnx_path: Path) -> Tuple[int, ...]:
-    """
-    Extract output shape from ONNX model.
-    
-    Args:
-        onnx_path: Path to .onnx file
-        
-    Returns:
-        Output shape tuple WITH batch=1 (normalized to (1, num_classes) format)
-        
-    Raises:
-        ONNXConversionError: If shape extraction fails
-    """
-    try:
-        import onnx
-        
-        onnx_model = onnx.load(str(onnx_path))
-        graph = onnx_model.graph
-        
-        if not graph.output:
-            raise ONNXConversionError("ONNX model has no outputs")
-        
-        # Get first output tensor
-        output_tensor = graph.output[0]
-        shape = _extract_shape_from_tensor(output_tensor)
-        
-        # Handle batch dimension - keep original, but normalize dynamic batch
-        if not shape:
-            raise ONNXConversionError("Failed to extract valid shape from ONNX model")
-        
-        if shape[0] == -1:
-            # Dynamic batch: normalize to 1 for verification (requires concrete shape)
-            shape = (1,) + tuple(shape[1:])
-            logger.info(f"Normalized dynamic batch to 1: {shape}")
-        else:
-            # Keep original batch dimension
-            logger.info(f"Extracted output shape: {shape}")
-            if shape[0] != 1:
-                logger.warning(
-                    f"ONNX model has output batch size {shape[0]}, but verification "
-                    f"assumes batch=1. Results may be incorrect."
-                )
-        
-        return tuple(shape)
-        
-    except ImportError:
-        raise ONNXConversionError("onnx library not installed")
-    except Exception as e:
-        raise ONNXConversionError(f"Failed to extract output shape from {onnx_path}: {str(e)}")
 
 
 def _extract_shape_from_tensor(tensor) -> list:
@@ -446,75 +410,3 @@ def _extract_shape_from_tensor(tensor) -> list:
                     shape.append(-1)
     
     return shape
-
-
-def get_onnx_metadata(onnx_path: Path) -> dict:
-    """
-    Extract metadata from ONNX model.
-    
-    Args:
-        onnx_path: Path to .onnx file
-        
-    Returns:
-        Dict with model metadata (producer, version, shapes, etc.)
-    """
-    import onnx
-    
-    onnx_model = onnx.load(str(onnx_path))
-    
-    metadata = {
-        'producer_name': onnx_model.producer_name,
-        'producer_version': onnx_model.producer_version,
-        'ir_version': onnx_model.ir_version,
-        'opset_version': None,
-        'input_shapes': [],
-        'output_shapes': []
-    }
-    
-    # Get opset version
-    if onnx_model.opset_import:
-        metadata['opset_version'] = onnx_model.opset_import[0].version
-    
-    # Get input/output shapes
-    graph = onnx_model.graph
-    
-    for inp in graph.input:
-        shape = _extract_shape_from_tensor(inp)
-        metadata['input_shapes'].append({
-            'name': inp.name,
-            'shape': shape
-        })
-    
-    for out in graph.output:
-        shape = _extract_shape_from_tensor(out)
-        metadata['output_shapes'].append({
-            'name': out.name,
-            'shape': shape
-        })
-    
-    return metadata
-
-
-def validate_onnx_file(onnx_path: Path) -> bool:
-    """
-    Validate that an ONNX file is well-formed.
-    
-    Args:
-        onnx_path: Path to .onnx file
-        
-    Returns:
-        True if the model passes the ONNX checker, False if it is malformed.
-        Load errors (missing file, unreadable protobuf) are raised.
-    """
-    import onnx
-    
-    onnx_model = onnx.load(str(onnx_path))
-    try:
-        onnx.checker.check_model(onnx_model)
-    except onnx.checker.ValidationError as e:
-        logger.warning(f"ONNX validation failed for {onnx_path.name}: {e}")
-        return False
-    logger.info(f"ONNX model validated: {onnx_path.name}")
-    return True
-
-

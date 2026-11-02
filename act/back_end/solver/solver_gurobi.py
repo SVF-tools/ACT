@@ -1,18 +1,25 @@
 
 from __future__ import annotations
-from typing import Optional, TYPE_CHECKING
+
+import math
+import time
+from typing import Any, Optional, TYPE_CHECKING
 import numpy as np
+import torch
 import os
+from act.back_end.core import Net
 from act.back_end.solver.solver_base import (
     Solver,
     SolverCaps,
     SolveStatus,
 )
-from act.config.config import GurobiConfig
+from act.config.config import BaBConfig, GurobiConfig
+from act.front_end.specs import OutKind
 from act.util.path_config import get_project_root
+from act.util.stats import VerifyResult, VerifyStatus
 
 if TYPE_CHECKING:
-    from act.back_end.core import Bounds
+    from act.back_end.cons_exportor import TerminalExport
     from act.back_end.solver.solver_base import BatchLPProblem, BatchLPSolution
 
 try:
@@ -21,6 +28,8 @@ try:
     GUROBI_AVAILABLE = True
 except ImportError:
     print("Warning: Gurobi not available. Some operations will use alternative solvers.")
+    gp = None
+    GRB = None
     GUROBI_AVAILABLE = False
 
 
@@ -62,56 +71,6 @@ class GurobiSolver(Solver):
         self._cfg: GurobiConfig = config or GurobiConfig()
         if not GUROBI_AVAILABLE:
             raise RuntimeError("gurobipy is not available in this environment.")
-
-    def compute_bounds(self, domain_obj) -> 'Bounds':
-        from act.back_end.core import Bounds
-        import torch
-        hz = domain_obj
-        n = int(hz.c.shape[0])
-        p = int(hz.Gc.shape[1])
-        q = int(hz.Gb.shape[1])
-        c_np = hz.c.detach().cpu().numpy().astype("float64").reshape(-1)
-        Gc_np = hz.Gc.detach().cpu().numpy().astype("float64")
-        Gb_np = hz.Gb.detach().cpu().numpy().astype("float64")
-        Ac_np = hz.Ac.detach().cpu().numpy().astype("float64")
-        Ab_np = hz.Ab.detach().cpu().numpy().astype("float64")
-        b_np = hz.b.detach().cpu().numpy().astype("float64").reshape(-1)
-        nc = Ac_np.shape[0]
-        LB = np.empty((n,), dtype=np.float64)
-        UB = np.empty((n,), dtype=np.float64)
-        for i in range(n):
-            m = gp.Model(f"hz_dim_{i}")
-            m.Params.OutputFlag = self._cfg.output_flag
-            m.Params.MIPGap = self._cfg.mip_gap
-            m.Params.Threads = self._cfg.threads
-            if self._cfg.time_limit is not None:
-                m.Params.TimeLimit = float(self._cfg.time_limit)
-            xi_c = m.addMVar(p, lb=-1.0, ub=1.0, name="xi_c")
-            xi_b = m.addMVar(q, vtype=GRB.BINARY, name="xi_b") if q > 0 else None
-            if nc > 0:
-                if xi_b is not None:
-                    for r in range(nc):
-                        m.addConstr(Ac_np[r] @ xi_c + Ab_np[r] @ xi_b == b_np[r])
-                else:
-                    for r in range(nc):
-                        m.addConstr(Ac_np[r] @ xi_c == b_np[r])
-            obj_c = Gc_np[i]
-            obj_b = Gb_np[i] if q > 0 else np.zeros(0)
-            if xi_b is not None:
-                m.setObjective(obj_c @ xi_c + obj_b @ xi_b, GRB.MINIMIZE)
-            else:
-                m.setObjective(obj_c @ xi_c, GRB.MINIMIZE)
-            m.optimize()
-            LB[i] = c_np[i] + (m.ObjVal if m.Status == GRB.OPTIMAL else 0.0)
-            if xi_b is not None:
-                m.setObjective(obj_c @ xi_c + obj_b @ xi_b, GRB.MAXIMIZE)
-            else:
-                m.setObjective(obj_c @ xi_c, GRB.MAXIMIZE)
-            m.optimize()
-            UB[i] = c_np[i] + (m.ObjVal if m.Status == GRB.OPTIMAL else 0.0)
-        dtype, device = hz.c.dtype, hz.c.device
-        return Bounds(lb=torch.from_numpy(LB).to(device=device, dtype=dtype),
-                      ub=torch.from_numpy(UB).to(device=device, dtype=dtype))
 
     def solve_batch(
         self,
@@ -200,3 +159,147 @@ class GurobiSolver(Solver):
             x=x_val,
             max_viol=max_viol,
         )
+
+def _optimize(
+    exported: TerminalExport,
+    relus: list[tuple[int, int, float, float]],
+    stop_at: float,
+) -> tuple[str, torch.Tensor | None]:
+    """Build exact ReLUs over exported affine rows and solve within the deadline."""
+    if not GUROBI_AVAILABLE:
+        return "unavailable", None
+    assert gp is not None and GRB is not None
+    grb = GRB
+    problem = exported.problem
+    # Reuse the numerical owner's sparse lane; never densify exported blocks.
+    lane = exported._lanes[0]
+    upper_rows = set(exported.relu_upper_rows)
+    keep = [row for row in range(problem.m_le) if row not in upper_rows]
+    try:
+        with gp.Env(empty=True) as env:
+            env.setParam("OutputFlag", 0)
+            env.start()
+            with gp.Model("act_root_milp", env=env) as model:
+                model.Params.Threads = 1
+                model.Params.DualReductions = 0
+                x = model.addMVar(problem.nvars, lb=lane.lb, ub=lane.ub, name="x")
+                if problem.m_eq:
+                    model.addConstr(lane.eq @ x == lane.eq_rhs)
+                if keep:
+                    model.addConstr(lane.le[keep] @ x <= lane.le_rhs[keep])
+                for pre, post, lower, upper in relus:
+                    if lower >= 0.0:
+                        model.addConstr(x[post] <= x[pre])
+                    elif upper <= 0.0:
+                        model.addConstr(x[post] <= 0.0)
+                    else:
+                        active = model.addVar(vtype=grb.BINARY, name=f"relu_{post}")
+                        model.addConstr(x[post] <= upper * active)
+                        model.addConstr(x[post] <= x[pre] - lower * (1.0 - active))
+                # UNSAFE is a closed conjunction. Never shift its boundary to
+                # make a zero-margin unsafe point disappear from the MILP.
+                c = exported.spec_c[0].detach().cpu().numpy()
+                d = exported.spec_d[0].detach().cpu().numpy()
+                model.addConstr(c @ x[list(exported.output_ids)] <= d)
+                model.setObjective(0.0)
+                remaining = stop_at - time.monotonic()
+                if remaining <= 0.0:
+                    return "deadline", None
+                model.Params.TimeLimit = remaining
+                model.optimize()
+                if model.Status == grb.INFEASIBLE:
+                    return "infeasible", None
+                candidate = None
+                if model.SolCount > 0:
+                    candidate = torch.as_tensor(
+                        x.X[list(exported.input_ids)],
+                        device=exported.input_bounds.lb.device,
+                        dtype=exported.input_bounds.lb.dtype,
+                    ).reshape_as(exported.input_bounds.lb)
+                status = {
+                    grb.OPTIMAL: "optimal",
+                    grb.TIME_LIMIT: "time_limit",
+                    grb.INF_OR_UNBD: "infeasible_or_unbounded",
+                }.get(model.Status, f"solver_status_{model.Status}")
+                return status, candidate
+    except gp.GurobiError as error:
+        reason = "license_unavailable" if error.errno == grb.Error.NO_LICENSE else "solver_error"
+        return f"{reason}: {error}", None
+
+def solve_milp(net: Net, config: BaBConfig, *, deadline: float) -> VerifyResult:
+    """Attempt optional root escalation; preserve an explicit reason on every exit."""
+    started = time.monotonic()
+    details: dict[str, Any] = {"attempted": False}
+
+    def finish(
+        reason: str,
+        status: VerifyStatus = VerifyStatus.UNKNOWN,
+        candidate: torch.Tensor | None = None,
+    ) -> VerifyResult:
+        """Attach escalation provenance without admitting a CLIMB certificate."""
+        details.update(reason=reason, elapsed_s=time.monotonic() - started)
+        metadata: dict[str, Any] = {"milp_escalation": dict(details)}
+        if status == VerifyStatus.CERTIFIED:
+            metadata["certificate_kind"] = "milp_status_infeasible"
+        return VerifyResult(status, counterexample=candidate, metadata=metadata)
+
+    if not config.milp_escalation:
+        return finish("disabled")
+    if not math.isfinite(deadline) or not math.isfinite(config.milp_timeout) or config.milp_timeout <= 0:
+        return finish("invalid_time_budget")
+    stop_at = min(deadline, started + config.milp_timeout)
+    if started >= stop_at:
+        return finish("deadline")
+    from act.back_end.bab.violation import validate_terminal_candidates
+    from act.back_end.cons_exportor import export_terminal_problem
+    from act.back_end.verifier import gather_input_spec_layers, seed_from_input_specs
+
+    nvars = 1 + max((v for layer in net.layers for v in layer.out_vars), default=-1)
+    if nvars > config.milp_max_variables:
+        return finish("variable_limit")
+    try:
+        bounds = seed_from_input_specs(gather_input_spec_layers(net))
+        if bounds.lb.shape[0] != 1:
+            return finish("unsupported_batch")
+        exported = export_terminal_problem(net, bounds)
+    except ImportError as error:
+        return finish(f"unavailable_dependency: {error}")
+    except (NotImplementedError, ValueError) as error:
+        return finish(f"unsupported: {error}")
+    if exported.out_kind != OutKind.UNSAFE_LINEAR:
+        return finish("unsupported_output")
+    problem = exported.problem
+    finite = (
+        problem.lb, problem.ub, problem.b_eq, problem.b_le,
+        problem.A_eq_blockdiag.coalesce().values(),
+        problem.A_le_blockdiag.coalesce().values(), exported.spec_c, exported.spec_d,
+    )
+    if not all(bool(torch.isfinite(tensor).all()) for tensor in finite):
+        return finish("nonfinite_encoding")
+    relus = [
+        (pre, post, float(problem.lb[0, pre]), float(problem.ub[0, pre]))
+        for layer in exported.relu_layers
+        for pre, post in zip(layer.in_vars, layer.out_vars, strict=True)
+    ]
+    if len(exported.relu_upper_rows) != len(relus):
+        return finish("incomplete_relu_encoding")
+    unstable = sum(lower < 0.0 < upper for _, _, lower, upper in relus)
+    nvars = problem.nvars + unstable
+    ncons = problem.m_eq + problem.m_le + unstable + exported.spec_d.shape[1]
+    details.update(variables=nvars, constraints=ncons, binaries=unstable)
+    if nvars > config.milp_max_variables:
+        return finish("variable_limit")
+    if ncons > config.milp_max_constraints:
+        return finish("constraint_limit")
+    if time.monotonic() >= stop_at:
+        return finish("deadline")
+    details["attempted"] = True
+    solver_status, candidate = _optimize(exported, relus, stop_at)
+    details["solver_status"] = solver_status
+    if solver_status == "infeasible":
+        return finish("infeasible", VerifyStatus.CERTIFIED)
+    if candidate is not None:
+        if bool(validate_terminal_candidates(exported, candidate).all()):
+            return finish("validated_incumbent", VerifyStatus.FALSIFIED, candidate)
+        return finish("invalid_incumbent")
+    return finish(solver_status)

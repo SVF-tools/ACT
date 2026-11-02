@@ -13,7 +13,7 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 import logging
 import torch
 import torch.nn as nn
@@ -49,19 +49,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         ...     print(f"{data_source} + {model_name}: {len(spec_pairs)} spec pairs")
     """
     
-    def __init__(
-        self,
-        config_name: Optional[str] = "torchvision_classification",
-        config_dict: Optional[Dict] = None
-    ):
-        """
-        Initialize TorchVision spec creator.
-        
-        Args:
-            config_name: Name of YAML config file (without .yaml extension)
-            config_dict: Direct config dict (overrides config_name if provided)
-        """
-        super().__init__(config_name, config_dict)
+    DEFAULT_CONFIG = "torchvision_classification"
     
     def create_specs_for_data_model_pairs(
         self,

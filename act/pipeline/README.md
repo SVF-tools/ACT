@@ -108,7 +108,6 @@ A fast, GPU-accelerated fuzzer that uses:
 ## Logging and Diagnostics
 
 All execution logs, including detailed transfer function analysis, are stored in `act/pipeline/log/`.
-- `pipeline_tests.log`: General test execution logs.
 - `act_debug_tf.log`: Layer-by-layer transfer function analysis (enabled via `PerformanceOptions`).
 - `fuzzing_results/`: Summary and counterexamples from fuzzing runs.
 

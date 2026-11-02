@@ -24,7 +24,7 @@ A comprehensive framework for downloading, managing, and loading TorchVision dat
 
 ```
 act/front_end/torchvision_loader/
-├── __init__.py              # Package exports and imports
+├── __init__.py              # Package marker; import from the submodules
 ├── __main__.py              # Entry point for python -m execution
 ├── cli.py                   # Command-line interface and test functions
 ├── data_model_mapping.py    # Core dataset-model mapping and API
@@ -424,27 +424,24 @@ python -m act.front_end.torchvision_loader --download INaturalist vit_b_16
 
 ## Python API Usage
 
-### Import Options
+### Imports
 
 ```python
-# Package-level imports (recommended)
-from act.front_end.torchvision_loader import (
+from act.front_end.torchvision_loader.data_model_loader import (
     load_dataset_model_pair,
-    download_dataset_model_pair,
+    download_dataset_model_pair
+)
+from act.front_end.torchvision_loader.data_model_mapping import (
     get_dataset_info,
     validate_dataset_model_compatibility,
     DATASET_MODEL_MAPPING
 )
-
-# Direct module imports
-from act.front_end.torchvision_loader.data_model_loader import load_dataset_model_pair
-from act.front_end.torchvision_loader.data_model_mapping import get_dataset_info
 ```
 
 ### Loading Datasets Programmatically
 
 ```python
-from act.front_end.torchvision_loader import load_dataset_model_pair
+from act.front_end.torchvision_loader.data_model_loader import load_dataset_model_pair
 
 # Load a dataset-model pair (auto-downloads if not found)
 result = load_dataset_model_pair(
@@ -471,7 +468,7 @@ for images, labels in dataloader:
 ### Downloading Programmatically
 
 ```python
-from act.front_end.torchvision_loader import download_dataset_model_pair
+from act.front_end.torchvision_loader.data_model_loader import download_dataset_model_pair
 
 # Download a dataset-model pair
 try:
@@ -505,7 +502,7 @@ print(f"Inference passed: {inference_result}")
 ### Querying Dataset Information
 
 ```python
-from act.front_end.torchvision_loader import (
+from act.front_end.torchvision_loader.data_model_mapping import (
     get_dataset_info,
     list_datasets_by_category,
     validate_dataset_model_compatibility

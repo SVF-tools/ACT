@@ -27,23 +27,22 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import torch
 
 from act.config.config import BaBConfig, DualConfig
-from act.back_end.bab.branching.branching import SplitDecision
+from act.back_end.bab.branching.branching import BranchingScores, SplitDecision
 from act.back_end.bab.node import (
     SubproblemBatch,
     _gather_optional_dict,
     _layer_neuron_count,
+    _state_spec_row_count,
     split_neurons,
 )
 from act.back_end.core import Bounds, Layer, Net
-
-if TYPE_CHECKING:
-    from act.back_end.solver.solver_dual import DualBatchResult
-
+from act.back_end.solver.solver_base import BatchBoundResult
+from act.back_end.solver.solver_dual import AlphaState, _alpha_tree_repeat_lanes
 
 # ---------------------------------------------------------------------------
 # Joint multi-neuron splitting (verdict-boundary)
@@ -106,6 +105,7 @@ def _collect_neuron_candidates(
     branch_batch: SubproblemBatch,
     bounds_dict: Dict[int, Bounds],
     nu_per_layer: Dict[int, torch.Tensor],
+    steer: Optional[Callable[[BranchingScores], BranchingScores]] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Per-lane BaBSR scores (area x |nu|) over all splittable neurons.
 
@@ -129,10 +129,17 @@ def _collect_neuron_candidates(
         amb = (lb[:, :n] < 0) & (ub[:, :n] > 0)
         already = branch_batch.split_signs.get(lid) if branch_batch.split_signs else None
         if already is not None:
-            amb &= already[:, 0, :n].to(device) == 0
+            amb &= ~(already[:, :, :n].to(device) != 0).any(dim=1)
         area = (-lb[:, :n] * ub[:, :n] / (ub[:, :n] - lb[:, :n]).clamp(min=1e-12)).clamp(min=0)
         nv = nut.reshape(kb, -1, nut.shape[-1])[:, :, :n].abs().sum(dim=1)
-        sc = torch.where(amb, area * nv, torch.full_like(area, float("-inf")))
+        raw = area * nv
+        sc = torch.where(
+            amb & torch.isfinite(raw), raw, torch.full_like(area, float("-inf"))
+        )
+        if steer is not None:
+            steered = steer(BranchingScores(per_layer={lid: sc})).per_layer
+            assert steered is not None
+            sc = steered[lid]
         cand_scores.append(sc)
         cand_layers.append(torch.full((kb, n), lid, device=device, dtype=torch.long))
         cand_neurons.append(
@@ -144,6 +151,21 @@ def _collect_neuron_candidates(
         torch.cat(cand_scores, dim=1),
         torch.cat(cand_layers, dim=1),
         torch.cat(cand_neurons, dim=1),
+    )
+
+
+def lanes_with_relu_candidates(
+    branch_batch: SubproblemBatch,
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+) -> torch.Tensor:
+    """Identify lanes with a finite score on an unstable, unsplit ReLU."""
+    if bounds_dict is not None and nu_per_layer is not None:
+        candidates = _collect_neuron_candidates(branch_batch, bounds_dict, nu_per_layer)
+        if candidates is not None:
+            return torch.isfinite(candidates[0]).any(dim=1)
+    return torch.zeros(
+        branch_batch.batch_size, dtype=torch.bool, device=branch_batch.lb.device
     )
 
 
@@ -227,8 +249,9 @@ def gain_tested_decision(
     bounds_dict: Optional[Dict[int, Bounds]],
     nu_per_layer: Optional[Dict[int, torch.Tensor]],
     input_shape: tuple[int, ...],
-    solve_dual: Callable[..., DualBatchResult],
+    solve_dual: Callable[..., BatchBoundResult],
     n_candidates: int = 3,
+    steer: Optional[Callable[[BranchingScores], BranchingScores]] = None,
 ) -> Optional[SplitDecision]:
     """Pick each lane's split by measured child bounds, not by score proxy."""
     if bounds_dict is None or nu_per_layer is None:
@@ -237,26 +260,30 @@ def gain_tested_decision(
     device = branch_batch.lb.device
 
     candidates = _collect_neuron_candidates(
-        branch_batch, bounds_dict, nu_per_layer
+        branch_batch, bounds_dict, nu_per_layer, steer
     )
     if candidates is None:
         return None
     all_scores, all_layers, all_neurons = candidates
     n_selected = min(n_candidates, all_scores.shape[1])
+    if n_selected < 1:
+        return None
     top = torch.topk(all_scores, k=n_selected, dim=1).indices
+    top_valid = torch.isfinite(all_scores.gather(1, top))
+    if not bool(top_valid.any(dim=1).all().item()):
+        return None
+    # Pad short lanes with their best valid candidate, never a stable or
+    # already-fixed neuron. Mask these duplicate probes out of the ranking.
+    top = torch.where(top_valid, top, top[:, :1].expand_as(top))
     top_layers = all_layers.gather(1, top)
     top_neurons = all_neurons.gather(1, top)
 
     # Keep this probe builder separate: rows are lane-major, depth is unchanged,
-    # and M comes from alpha (else 1) because solve_dual reads the probe depth.
+    # and shared alpha leaves do not constrain the active spec-row count.
     repeated_indices = torch.arange(batch_size, device=device).repeat_interleave(
         2 * n_selected
     )
-    m_specs = 1
-    if branch_batch.incremental_alpha:
-        m_specs = int(
-            next(iter(branch_batch.incremental_alpha.values())).shape[1]
-        )
+    m_specs = _state_spec_row_count(branch_batch)
     signs = _gather_optional_dict(
         branch_batch.split_signs, repeated_indices
     ) or {}
@@ -286,8 +313,9 @@ def gain_tested_decision(
         lb=branch_batch.lb.index_select(0, repeated_indices),
         ub=branch_batch.ub.index_select(0, repeated_indices),
         depths=branch_batch.depths.index_select(0, repeated_indices),
-        incremental_alpha=_gather_optional_dict(
-            branch_batch.incremental_alpha, repeated_indices
+        incremental_alpha=cast(
+            Optional[AlphaState],
+            _alpha_tree_repeat_lanes(branch_batch.incremental_alpha, 2 * n_selected),
         ),
         incremental_eta=_gather_optional_dict(
             branch_batch.incremental_eta, repeated_indices
@@ -311,10 +339,13 @@ def gain_tested_decision(
         keep_rows=keep_rows,
         root_bounds_dict=root_bounds_dict,
     )
-    child_lbs = (-result.solution.max_viol).view(
+    child_lbs = result.lane_lower_bounds().view(
         batch_size, n_selected, 2
     )
     pair_gain = child_lbs.min(dim=2).values
+    pair_gain = pair_gain.masked_fill(
+        ~top_valid | ~torch.isfinite(pair_gain), float("-inf")
+    )
     best_candidate = pair_gain.argmax(dim=1)
     lane_indices = torch.arange(batch_size, device=device)
     return SplitDecision(
@@ -330,6 +361,7 @@ def _multi_split_from_decision(
     bounds_dict: Optional[Dict[int, Bounds]],
     nu_per_layer: Optional[Dict[int, torch.Tensor]],
     k_levels: int,
+    steer: Optional[Callable[[BranchingScores], BranchingScores]] = None,
 ) -> Optional[Tuple[SubproblemBatch, torch.Tensor]]:
     """Joint top-k neuron split: each lane emits all 2^k sign combinations.
 
@@ -349,11 +381,11 @@ def _multi_split_from_decision(
     take a plain 2-child split, and the two groups are concatenated. Returns
     None only when some lane has no splittable neuron at all, since neuron
     branching cannot cover such a lane and the caller must fall back to the
-    decision path (which can still split an input axis).
+    decision path (which can split an input axis, or retire the lane under CLIMB).
     """
     if bounds_dict is None or nu_per_layer is None:
         return None
-    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer)
+    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer, steer)
     if cand is None:
         return None
     all_scores, all_layers, all_neurons = cand

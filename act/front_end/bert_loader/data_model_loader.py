@@ -1,4 +1,4 @@
-#===- act/front_end/bert_loader/data_loader.py - BERT Data Loading ------====#
+#===- act/front_end/bert_loader/data_model_loader.py - BERT Data Loading ====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -18,13 +18,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import csv
 import hashlib
 import logging
 from pathlib import Path
+import random
 import re
-from typing import cast, override
+from typing import Any, override
 
 import torch
 import torch.nn as nn
@@ -40,6 +41,11 @@ BERT_DATASETS: dict[str, str] = {
 }
 
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+YELP_PARTITION_SEED = 20260928
+
+
+class QueryIndexError(ValueError):
+    """A query-index file, row, or named query is invalid."""
 
 
 @dataclass(frozen=True)
@@ -129,10 +135,6 @@ class BertVocabulary:
 class BertEmbeddingClassifier(nn.Module):
     """Tiny classifier whose public forward path consumes embeddings."""
 
-    def __init__(self) -> None:
-        """Initialize an embedding-space binary sentiment classifier."""
-        super().__init__()
-
     @override
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Classify directly from clean or perturbed embeddings.
@@ -199,12 +201,7 @@ def load_bert_dataset(dataset_name: str = "sst", split: str = "test") -> list[Be
     """
     dataset = find_bert_dataset_name(dataset_name)
     root = Path(get_data_root()) / dataset
-    if dataset == "sst":
-        examples = _load_sst(root, split)
-    elif dataset == "yelp":
-        examples = _load_yelp(root, split)
-    else:
-        raise ValueError(f"Unsupported BERT dataset '{dataset_name}'")
+    examples = _load_sst(split) if dataset == "sst" else _load_yelp(split)
 
     if examples:
         logger.info("Loaded %d %s examples from %s", len(examples), dataset, root)
@@ -217,67 +214,72 @@ def load_bert_dataset(dataset_name: str = "sst", split: str = "test") -> list[Be
 def sample_correctly_classified(
     examples: Sequence[BertExample],
     model: nn.Module,
-    vocabulary: BertVocabulary,
+    prepare: Callable[[BertExample], tuple[Any, torch.Tensor] | None],
     *,
     num_samples: int,
-    max_verify_length: int,
-) -> list[tuple[BertExample, torch.Tensor, int]]:
-    """Select correctly classified examples within the verification length cap.
+    sample_kind: str,
+) -> list[tuple[Any, torch.Tensor, int]]:
+    """Select correctly classified examples in file order.
 
     Args:
         examples: Candidate examples.
-        model: Embedding-space classifier.
-        vocabulary: Vocabulary used for embedding lookup.
+        model: Evaluation-mode classifier of the prepared embeddings.
+        prepare: Maps an example to ``(info, embeddings)``, or None when it is too long.
         num_samples: Number of examples to return.
-        max_verify_length: Maximum allowed embedding sequence length.
+        sample_kind: Name of the samples in the error message.
 
     Returns:
-        Tuples of ``(example, embedding_tensor, predicted_label)``.
+        Tuples of ``(info, embedding_tensor, predicted_label)``.
 
     Raises:
         ValueError: If no eligible examples can be found.
     """
-    selected: list[tuple[BertExample, torch.Tensor, int]] = []
-    _ = model.eval()
+    selected: list[tuple[Any, torch.Tensor, int]] = []
 
     with torch.no_grad():
         for example in examples:
-            embeddings = vocabulary.lookup(example.tokens)
-            if embeddings.shape[1] > max_verify_length:
+            prepared = prepare(example)
+            if prepared is None:
                 continue
-            logits = cast(torch.Tensor, model(embeddings))
-            predicted = int(logits.argmax(dim=-1).item())
+            info, embeddings = prepared
+            predicted = int(model(embeddings).argmax(dim=-1).item())
             if predicted != example.label:
                 continue
-            selected.append((example, embeddings, predicted))
+            selected.append((info, embeddings, predicted))
             if len(selected) >= num_samples:
                 break
 
     if not selected:
         raise ValueError(
-            "No correctly classified text samples found within max_verify_length"
+            f"No correctly classified {sample_kind} samples found within max_verify_length"
         )
     return selected
 
 
-def _load_sst(root: Path, split: str) -> list[BertExample]:
+def raw_dataset_file(dataset: str, split: str) -> Path:
+    """Return the expected raw source file without triggering fixture fallback."""
+    root = Path(get_data_root()) / dataset
+    if dataset == "sst":
+        return root / ("train-nodes.tsv" if split == "train" else f"{split}.txt")
+    if dataset == "yelp":
+        return root / f"{split}.csv"
+    raise ValueError(f"unsupported BERT dataset {dataset!r}")
+
+
+def _load_sst(split: str) -> list[BertExample]:
     """Load SST examples from the expected raw file layout."""
+    path = raw_dataset_file("sst", split)
+    if not path.exists():
+        return []
+
+    examples: list[BertExample] = []
     if split == "train":
-        path = root / "train-nodes.tsv"
-        if not path.exists():
-            return []
-        examples: list[BertExample] = []
         rows = path.read_text(encoding="utf-8").splitlines()[1:]
         for line in rows:
             text, label = line.split("\t")[:2]
             examples.append(BertExample(label=int(label), tokens=tokenize(text)))
         return examples
 
-    path = root / f"{split}.txt"
-    if not path.exists():
-        return []
-
-    examples = []
     for line in path.read_text(encoding="utf-8").splitlines():
         parsed = _parse_sst_tree_line(line)
         if parsed is not None:
@@ -285,9 +287,9 @@ def _load_sst(root: Path, split: str) -> list[BertExample]:
     return examples
 
 
-def _load_yelp(root: Path, split: str) -> list[BertExample]:
+def _load_yelp(split: str) -> list[BertExample]:
     """Load Yelp examples from ``label,text`` CSV files."""
-    path = root / f"{split}.csv"
+    path = raw_dataset_file("yelp", split)
     if not path.exists():
         return []
 
@@ -299,6 +301,38 @@ def _load_yelp(root: Path, split: str) -> list[BertExample]:
                 label -= 1
             text = row.get("text", "").replace("\\n", " ").replace('\\"', '"')
             examples.append(BertExample(label=label, tokens=tokenize(text)))
+    return examples
+
+
+def yelp_partition_indices(num_examples: int) -> dict[str, tuple[int, ...]]:
+    """Return the fixed 20/80 source-row partition of Yelp ``test.csv``."""
+    if num_examples < 0:
+        raise ValueError("num_examples must be >= 0")
+    shuffled = list(range(num_examples))
+    random.Random(YELP_PARTITION_SEED).shuffle(shuffled)
+    calibration_size = num_examples // 5
+    return {
+        "calibration": tuple(sorted(shuffled[:calibration_size])),
+        "evaluation": tuple(sorted(shuffled[calibration_size:])),
+    }
+
+
+def _load_query_examples(dataset: str, split: str, example_id: int) -> list[BertExample]:
+    """Load raw query data and enforce Yelp calibration/evaluation membership."""
+    partitioned_yelp = dataset == "yelp" and split in ("calibration", "evaluation")
+    source_split = "test" if partitioned_yelp else split
+    raw_file = raw_dataset_file(dataset, source_split)
+    if not raw_file.is_file():
+        raise QueryIndexError(f"no raw {dataset} data for split '{split}': expected {raw_file}")
+    examples = _load_sst(source_split) if dataset == "sst" else _load_yelp(source_split)
+    if not examples:
+        raise QueryIndexError(f"raw {dataset} data has no usable examples: {raw_file}")
+    if example_id >= len(examples):
+        raise QueryIndexError(
+            f"example_id {example_id} out of range for {dataset} {split} ({len(examples)} examples)"
+        )
+    if partitioned_yelp and example_id not in yelp_partition_indices(len(examples))[split]:
+        raise QueryIndexError(f"example_id {example_id} is not in Yelp {split} split")
     return examples
 
 

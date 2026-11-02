@@ -12,24 +12,21 @@
 #
 #===---------------------------------------------------------------------===#
 
+from __future__ import annotations
 import json
 import tempfile
 import os
 from pathlib import Path
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
+import torch
+from torch import Tensor
+from torch.nn import Module
 
-from act.back_end.core import Layer, Net
+from act.back_end.core import Net
 from act.util.format_utils import rule
 from act.back_end.serialization import (
     save_net_to_file, load_net_from_file, 
     save_net_to_string, load_net_from_string,
-    validate_json_schema,
     TensorEncoder, NetSerializer
 )
 
@@ -136,9 +133,6 @@ def test_file_io():
     """Test file input/output operations on all available networks."""
     print("🧪 Testing file I/O...")
     
-    if not HAS_TORCH:
-        print("⏭️  Skipping - PyTorch not available")
-        return
     
     # Test all available networks
     test_nets = create_test_networks()
@@ -184,82 +178,278 @@ def test_file_io():
     assert passed > 0, "No networks passed file I/O testing"
 
 
-def test_device_migration():
-    """Test device migration during serialization and deserialization on all networks."""
-    print("🧪 Testing device migration...")
-    test_nets = create_test_networks()
-    
-    passed = 0
-    failed = 0
-    
-    for net_name, net in test_nets.items():
-        print(f"  Testing device migration for '{net_name}'...")
-        
+
+def test_conversion_metadata_roundtrip():
+    """Exercise real Torch/ONNX lowering through JSON and reconstruction."""
+    import torch.nn as nn
+
+    from act.front_end.spec_creator_base import LabeledInputTensor
+    from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
+    from act.front_end.verifiable_model import (
+        InputLayer, InputSpecLayer, OutputSpecLayer, VerifiableModel,
+    )
+    from act.pipeline.verification.torch2act import TorchToACT
+    from act.pipeline.verification.act2torch import ACTToTorch
+
+    dtype = torch.get_default_dtype()
+
+    def check(model: Module, x: Tensor, expected: Tensor) -> Net:
+        width = expected[0].numel()
+        wrapped = VerifiableModel(
+            input_layer=InputLayer(
+                LabeledInputTensor(x, torch.arange(x.shape[0], dtype=torch.int64)),
+                tuple(x.shape), x.dtype,
+            ),
+            input_spec=InputSpecLayer(InputSpec(kind=InKind.BOX, lb=x - 0.1, ub=x + 0.1)),
+            model=model,
+            output_spec=OutputSpecLayer(OutputSpec(
+                kind=OutKind.RANGE,
+                lb=torch.full((width,), -100.0, dtype=dtype),
+                ub=torch.full((width,), 100.0, dtype=dtype),
+            )),
+        )
+        net = TorchToACT(wrapped).run()
+        net.layers[0].cache["nested"] = {
+            "shape": (1, 2, 3), "mask": torch.tensor([True, False]),
+        }
+        restored = load_net_from_string(save_net_to_string(net), target_device="cpu")
+        assert restored.layers[0].cache["nested"]["shape"] == (1, 2, 3)
+        assert restored.layers[0].cache["nested"]["mask"].dtype == torch.bool
+        labeled = restored.layers[0].params["labeled_input"]
+        assert isinstance(labeled, LabeledInputTensor)
+        assert labeled.label is not None and labeled.label.dtype == torch.int64
+        for candidate in (net, restored):
+            result = ACTToTorch(candidate).run()(x)["output"]
+            assert result.shape == expected.shape
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        return net
+
+    class TwoUses(nn.Module):
+        """Use a compact token-wise projection twice as one DAG operand."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = nn.Linear(3, 2, dtype=dtype)
+            with torch.no_grad():
+                self.projection.weight.copy_(
+                    torch.tensor([[1.0, -2.0, 3.0], [4.0, 1.0, -1.0]], dtype=dtype)
+                )
+                self.projection.bias.copy_(torch.tensor([0.5, -0.25], dtype=dtype))
+
+        def forward(self, x: Tensor) -> Tensor:
+            h = self.projection(x)
+            return h + h
+
+    x = torch.arange(1, 13, dtype=dtype).reshape(2, 2, 3)
+    native = TwoUses()
+    native_net = check(native, x, native(x))
+    add = next(layer for layer in native_net.layers if layer.kind == "ADD")
+    predecessor = native_net.preds[add.id][0]
+    for broken_preds in ([999, 999], [predecessor]):
+        malformed = Net(
+            layers=native_net.layers,
+            preds={key: list(value) for key, value in native_net.preds.items()},
+            succs={key: list(value) for key, value in native_net.succs.items()},
+        )
+        malformed.preds[add.id] = broken_preds
         try:
-            # Test serialization and deserialization
-            serialized = save_net_to_string(net)
-            net_restored = load_net_from_string(serialized)
-            
-            # Verify structure
-            assert len(net.layers) == len(net_restored.layers), f"Layer count mismatch for {net_name}"
-            
-            print(f"    {net_name} passed")
-            passed += 1
-            
-        except Exception as e:
-            print(f"    ❌ {net_name} failed: {e}")
-            failed += 1
-    
-    print(f"✅ Device migration test completed: {passed} passed, {failed} failed")
-    assert passed > 0, "No networks passed device migration testing"
+            ACTToTorch(malformed).run()(x)
+        except (ValueError, RuntimeError):
+            continue
+        raise AssertionError(f"ADD accepted malformed predecessors {broken_preds}")
 
+    class GRUOutput(nn.Module):
+        """Select the output tensor from a recurrent module's result tuple."""
 
-def test_schema_validation():
-    """Test JSON schema validation."""
-    print("🧪 Testing schema validation...")
-    
-    # Test valid schema
-    valid_json = {
-        "format_version": "1.0",
-        "act_net": {
-            "layers": [
-                {
-                    "id": 0,
-                    "kind": "INPUT",
-                    "params": {},
-                    "meta": {"shape": [1, 784]},
-                    "in_vars": [0],
-                    "out_vars": [0],
-                    "cache": {}
-                }
-            ],
-            "graph": {"preds": {}, "succs": {}},
-            "metadata": {}
-        }
-    }
-    
-    errors = validate_json_schema(valid_json)
-    assert len(errors) == 0, f"Valid schema failed validation: {errors}"
-    
-    # Test invalid schema
-    invalid_json = {
-        "act_net": {
-            "layers": [
-                {
-                    "id": 0,
-                    "kind": "INPUT",
-                    # Missing required fields
-                }
+        def __init__(self) -> None:
+            super().__init__()
+            self.gru = nn.GRU(3, 4, batch_first=True)
+            self.fc = nn.Linear(8, 2, dtype=dtype)
+
+        def forward(self, values: Tensor) -> Tensor:
+            output, _hidden = self.gru(values)
+            return self.fc(output.flatten(1))
+
+    recurrent = GRUOutput()
+    recurrent_x = torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
+    recurrent = recurrent.to(dtype=dtype)
+    check(recurrent, recurrent_x, recurrent(recurrent_x))
+
+    class LSTMOutput(nn.Module):
+        """Unused nested hidden-state unpacking must not block output conversion."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lstm = nn.LSTM(3, 4, batch_first=True)
+            self.fc = nn.Linear(8, 2)
+
+        def forward(self, values: Tensor) -> Tensor:
+            output, (_hidden, _cell) = self.lstm(values)
+            return self.fc(output.flatten(1))
+
+    lstm = LSTMOutput().to(dtype=dtype)
+    check(lstm, recurrent_x, lstm(recurrent_x))
+
+    from act.back_end.serialization.serialization import LayerSerializer
+    legacy_weight = torch.tensor([[1.0, -2.0, 3.0]], dtype=dtype)
+    legacy = LayerSerializer.deserialize_layer({
+        "id": 0, "kind": "DENSE",
+        "params": {
+            "weight": TensorEncoder.encode_tensor(legacy_weight),
+            "input_shape": [1, 3], "output_shape": [1, 1],
+            "in_features": 3, "out_features": 1,
+        },
+        "in_vars": [0, 1, 2], "out_vars": [3], "cache": {},
+    }, target_device="cpu")
+    torch.testing.assert_close(legacy.params["weight"], legacy_weight)
+    assert legacy.params["input_shape"] == [1, 3]
+
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
+    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
+    from act.back_end.verifier import verify_lp_batched
+    from act.util.stats import VerifyStatus
+
+    torch.manual_seed(42)
+    cnn = nn.Sequential(
+        nn.Conv2d(1, 2, 3), nn.ReLU(), nn.Flatten(), nn.Linear(8, 2),
+    ).to(dtype=dtype)
+    image = torch.arange(1, 17, dtype=dtype).reshape(1, 1, 4, 4) / 32
+    cnn_wrapped = VerifiableModel(
+        input_layer=InputLayer(LabeledInputTensor(image, None), tuple(image.shape), dtype),
+        input_spec=InputSpecLayer(InputSpec(
+            kind=InKind.BOX, lb=image - 0.05, ub=image + 0.05,
+        )),
+        model=cnn,
+        output_spec=OutputSpecLayer(OutputSpec(
+            kind=OutKind.LINEAR_LE,
+            c=torch.tensor([1.0, 0.0], dtype=dtype),
+            d=torch.tensor(-1_000.0, dtype=dtype),
+        )),
+    )
+    set_solver_mode("torchlp")
+    set_transfer_function_mode("interval")
+    lp_results = verify_lp_batched(TorchToACT(cnn_wrapped).run(), TorchLPSolver)
+    assert len(lp_results) == 1 and lp_results[0].status is VerifyStatus.FALSIFIED
+    assert lp_results[0].counterexample is not None
+    assert lp_results[0].counterexample.shape == (1, 4, 4)
+
+    try:
+        from onnx import TensorProto, helper
+        from onnx2torch import convert
+    except ImportError:
+        print("  ONNX conversion roundtrip skipped: optional onnx/onnx2torch unavailable")
+        return
+
+    tensor_dtype = TensorProto.FLOAT if dtype == torch.float32 else TensorProto.DOUBLE
+    x = torch.arange(1, 7, dtype=dtype).reshape(1, 2, 3)
+    for op, constant, expected in (
+        ("Gather", helper.make_tensor("index", TensorProto.INT64, [], [1]), x[:, 1, :]),
+        ("Split", helper.make_tensor("sizes", TensorProto.INT64, [2], [1, 1]), 2 * x[:, :1, :]),
+    ):
+        if op == "Gather":
+            nodes = [helper.make_node("Gather", ["input", "index"], ["output"], axis=1)]
+            output_shape = [1, 3]
+        else:
+            nodes = [
+                helper.make_node("Split", ["input", "sizes"], ["a", "b"], axis=1),
+                helper.make_node("Add", ["a", "a"], ["output"]),
             ]
-        }
-        # Missing format_version
-    }
-    
-    errors = validate_json_schema(invalid_json)
-    assert len(errors) > 0, "Invalid schema passed validation"
-    
-    print(f"Schema validation caught {len(errors)} errors as expected")
-    print("✅ Schema validation test passed")
+            output_shape = [1, 1, 3]
+        graph = helper.make_graph(
+            nodes, f"serialization-{op}",
+            [helper.make_tensor_value_info("input", tensor_dtype, [1, 2, 3])],
+            [helper.make_tensor_value_info("output", tensor_dtype, output_shape)],
+            initializer=[constant],
+        )
+        converted = convert(helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        ))
+        torch.testing.assert_close(converted(x), expected, rtol=0, atol=0)
+        check(converted, x, expected)
+
+
+
+def test_direct_vnnlib_export_roundtrip():
+    """Verify and reload a deterministic direct ONNX/VNNLIB instance."""
+    if torch is None:
+        return
+    try:
+        from onnx import TensorProto, helper, save
+    except ImportError:
+        return
+
+    import subprocess
+    import sys
+
+    from act.back_end.serialization.serialization import load_net_from_file
+    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
+    from act.back_end.verifier import verify_once
+    from act.front_end.vnnlib_loader.data_model_loader import load_vnncomp_instance
+    from act.pipeline.verification.act2torch import ACTToTorch
+    from act.util.device_manager import initialize_device
+    from act.util.path_config import get_project_root
+    from act.util.stats import VerifyStatus
+
+    dtype = torch.get_default_dtype()
+    dtype_name = "float32" if dtype == torch.float32 else "float64"
+    onnx_dtype = TensorProto.FLOAT if dtype == torch.float32 else TensorProto.DOUBLE
+    initialize_device("cpu", dtype_name)
+
+    with tempfile.TemporaryDirectory(prefix="act-serialization-vnnlib-") as directory:
+        root = Path(directory)
+        onnx_path = root / "net.onnx"
+        vnnlib_path = root / "property.vnnlib"
+        export_path = root / "verified.json"
+        graph = helper.make_graph(
+            [helper.make_node("Add", ["X", "offset"], ["Y"])],
+            "serialization-direct-instance",
+            [helper.make_tensor_value_info("X", onnx_dtype, [1, 2])],
+            [helper.make_tensor_value_info("Y", onnx_dtype, [1, 2])],
+            [helper.make_tensor("offset", onnx_dtype, [2], [1.0, -2.0])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        save(model, onnx_path)
+        vnnlib_path.write_text(
+            "(vnnlib-version 2.0)\n(declare-network Net)\n"
+            "(declare-input X Real [1,2])\n(declare-output Y Real [1,2])\n"
+            "(assert (>= X[0,0] -1))\n(assert (<= X[0,0] 1))\n"
+            "(assert (>= X[0,1] -1))\n(assert (<= X[0,1] 1))\n"
+            "(assert (or (>= Y[0,0] 4) (<= Y[0,1] -5)))\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable, "-B", "-m", "act.back_end", "--verify",
+                "--onnx", str(onnx_path), "--vnnlib", str(vnnlib_path),
+                "--save-net", str(export_path), "--solver", "torchlp",
+                "--timeout", "12", "--device", "cpu", "--dtype", dtype_name,
+            ],
+            cwd=get_project_root(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        set_transfer_function_mode("interval")
+        set_solver_mode("torchlp")
+        exported = sorted(root.glob("verified.d*.json"))
+        instance = load_vnncomp_instance(onnx_path, vnnlib_path)
+
+        assert result.returncode == 0
+        assert len(exported) == len(instance.models) == 2
+        for path, seeds in zip(exported, instance.seeds, strict=True):
+            sample = seeds[0].tensor
+            restored = load_net_from_file(str(path), target_device="cpu")
+            torch.testing.assert_close(
+                ACTToTorch(restored).run()(sample)["output"],
+                instance.raw_model(sample),
+                rtol=0,
+                atol=0,
+            )
+            assert all(
+                verification.status is VerifyStatus.CERTIFIED
+                for verification in verify_once(restored)
+            )
 
 
 def run_all_tests():
@@ -270,8 +460,8 @@ def run_all_tests():
     tests = [
         test_basic_serialization,
         test_file_io, 
-        test_device_migration,
-        test_schema_validation,
+        test_conversion_metadata_roundtrip,
+        test_direct_vnnlib_export_roundtrip,
     ]
     
     passed = 0
@@ -300,7 +490,7 @@ def run_all_tests():
 
 
 def main():
-    """Main function with options for testing and demo."""
+    """Run the serialization test suite and exit with its status."""
     import sys
     
     print("🧪 Running ACT Serialization Test Suite")

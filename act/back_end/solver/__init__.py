@@ -12,14 +12,20 @@
 #
 #===---------------------------------------------------------------------===#
 
-from .solver_base import Solver, SolverCaps, SolveStatus
+from .solver_base import (
+    BatchBoundResult,
+    BoundResult,
+    Solver,
+    SolverCaps,
+    SolveStatus,
+)
 from .solver_torchlp import TorchLPSolver
 from .solver_gurobi import GurobiSolver
 from .solver_hz import HZSolver, HZono, hz_compute_bounds
 from .solver_dual import DualSolver, expand_bounds_dict
 
 __all__ = [
-    'Solver', 'SolverCaps', 'SolveStatus',
+    'Solver', 'SolverCaps', 'SolveStatus', 'BoundResult', 'BatchBoundResult',
     'TorchLPSolver', 'GurobiSolver',
     'HZSolver', 'HZono', 'hz_compute_bounds',
     'DualSolver', 'expand_bounds_dict',

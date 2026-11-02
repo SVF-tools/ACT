@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterable
 
 import torch
 from dataclasses import dataclass, replace
@@ -12,7 +13,7 @@ from act.front_end.specs import OutKind
 from act.util.stats import VerifyResult, VerifyStatus
 
 if TYPE_CHECKING:
-    from act.back_end.solver.solver_base import BatchLPProblem, BatchLPSolution
+    from scipy.sparse import csr_matrix
     from act.front_end.specs import OutputSpec
 
 logger = logging.getLogger(__name__)
@@ -20,8 +21,6 @@ logger = logging.getLogger(__name__)
 try:
     import numpy as np
     import scipy.sparse as sp
-    from scipy.optimize import Bounds as SciPyBounds
-    from scipy.optimize import LinearConstraint, linprog, milp
 
     _HAS_SCIPY = True
 except ImportError:
@@ -1416,6 +1415,8 @@ def _softmax_value_cross_radius(
     score_differences,
     groups,
 ):
+    from scipy.optimize import linprog
+
     width = int(probability_lower.shape[1])
     if width > 8:
         positive = np.maximum(probability_upper - reference, 0.0)
@@ -1650,7 +1651,48 @@ def sparse_hz_softmax_value_relaxation(
     )
 
 
-def sparse_hz_concat(parts) -> SparseHZono:
+def _sparse_concat_batch_rows(
+    mats: list[csr_matrix], batch_size: int, n_cols: int
+) -> csr_matrix:
+    """Assemble batch-major CSR rows without a stacked matrix or row gather."""
+    import numpy as np
+    from scipy.sparse import csr_matrix
+
+    widths = [(mat.indptr.size - 1) // batch_size for mat in mats]
+    width = sum(widths)
+    nnz = sum(mat.nnz for mat in mats)
+    index_dtype = np.result_type(*(mat.indptr.dtype for mat in mats))
+    if nnz > np.iinfo(index_dtype).max:
+        index_dtype = np.dtype(np.int64)
+    counts = [np.diff(mat.indptr) for mat in mats]
+    row_counts = np.concatenate(
+        [count.reshape(batch_size, size) for count, size in zip(counts, widths)],
+        axis=1,
+    ).reshape(-1)
+    indptr = np.empty(row_counts.size + 1, dtype=index_dtype)
+    indptr[0] = 0
+    np.cumsum(row_counts, out=indptr[1:])
+    data = np.empty(nnz, dtype=mats[0].data.dtype)
+    indices = np.empty(nnz, dtype=index_dtype)
+    starts = indptr[:-1].reshape(batch_size, width)
+    offset = 0
+    for mat, size, count in zip(mats, widths, counts):
+        # Shift each nonzero by its row's new start; columns retain frame IDs.
+        shift = starts[:, offset:offset + size].reshape(-1) - mat.indptr[:-1]
+        positions = np.repeat(shift, count)
+        positions += np.arange(mat.nnz, dtype=index_dtype)
+        data[positions] = mat.data
+        indices[positions] = mat.indices
+        offset += size
+    return csr_matrix(
+        (data, indices, indptr), shape=(batch_size * width, n_cols)
+    )
+
+
+def sparse_hz_concat(
+    parts: Iterable[SparseHZono], *, batch_size: int = 1
+) -> SparseHZono:
+    """Concatenate per-batch value rows, retaining the shared generator frame."""
     parts = list(parts)
     if not parts:
         raise ValueError("sparse_hz_concat requires at least one part")
@@ -1660,9 +1702,20 @@ def sparse_hz_concat(parts) -> SparseHZono:
     n_bin = max(p.n_bin for p in parts)
     padded = [sparse_hz_pad_frame(p, n_cont, n_bin) for p in parts]
     return SparseHZono(
-        c=np.concatenate([p.c for p in padded]),
-        Gc=sp.vstack([p.Gc for p in padded], format="csr"),
-        Gb=sp.vstack([p.Gb for p in padded], format="csr"),
+        c=np.concatenate(
+            [p.c.reshape(batch_size, p.n_out // batch_size) for p in padded],
+            axis=1,
+        ).reshape(-1),
+        Gc=(
+            sp.vstack([p.Gc for p in padded], format="csr")
+            if batch_size == 1
+            else _sparse_concat_batch_rows([p.Gc for p in padded], batch_size, n_cont)
+        ),
+        Gb=(
+            sp.vstack([p.Gb for p in padded], format="csr")
+            if batch_size == 1
+            else _sparse_concat_batch_rows([p.Gb for p in padded], batch_size, n_bin)
+        ),
         Ac=_sparse_vstack([p.Ac for p in padded], n_cont),
         Ab=_sparse_vstack([p.Ab for p in padded], n_bin),
         b=_sparse_concat_arrays([p.b for p in padded]),
@@ -1866,19 +1919,23 @@ def hz_sub(hz_x: HZono, hz_y: HZono) -> HZono:
     return hz_sgm_add(hz_x, hz_negate(hz_y))
 
 
-def hz_concat(parts) -> "HZono | None":
+def hz_concat(
+    parts: Iterable[HZono | None], *, batch_size: int = 1
+) -> HZono | None:
+    """Concatenate per-batch value rows; the default preserves flat stacking."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
     if len(parts) == 1:
         return parts[0]
-    if any(p.col_ids is None for p in parts):
-        return _hz_concat_independent(parts)
+    part_ids = [p.col_ids.tolist() for p in parts if p.col_ids is not None]
+    if len(part_ids) != len(parts):
+        return _hz_concat_independent(parts, batch_size=batch_size)
     dtype, device = parts[0].c.dtype, parts[0].c.device
     cpos: dict[int, int] = {}
     cids: list[int] = []
-    for p in parts:
-        for idv in p.col_ids.tolist():
+    for ids in part_ids:
+        for idv in ids:
             if idv not in cpos:
                 cpos[idv] = len(cids)
                 cids.append(idv)
@@ -1894,8 +1951,8 @@ def hz_concat(parts) -> "HZono | None":
                 bids.append(idv)
     ngm, nbm = len(cids), len(bids)
     cs, Gcs, Gbs, Acs, Abs, bs, eqs = [], [], [], [], [], [], []
-    for p in parts:
-        cmap = torch.tensor([cpos[v] for v in p.col_ids.tolist()], dtype=torch.long, device=device)
+    for p, ids in zip(parts, part_ids):
+        cmap = torch.tensor([cpos[v] for v in ids], dtype=torch.long, device=device)
         pb = p.bcol_ids if p.bcol_ids is not None else torch.zeros(
             0, dtype=torch.long, device=device
         )
@@ -1912,17 +1969,18 @@ def hz_concat(parts) -> "HZono | None":
         Ab_p = p.Ab.new_zeros(p.Ab.shape[0], nbm)
         if p.Ab.shape[1] and nbm:
             Ab_p[:, bmap] = p.Ab.to(dtype=dtype, device=device)
-        cs.append(p.c.to(dtype=dtype, device=device))
-        Gcs.append(Gc_p)
-        Gbs.append(Gb_p)
+        width = p.c.shape[0] // batch_size
+        cs.append(p.c.to(dtype=dtype, device=device).reshape(batch_size, width, 1))
+        Gcs.append(Gc_p.reshape(batch_size, width, ngm))
+        Gbs.append(Gb_p.reshape(batch_size, width, nbm))
         Acs.append(Ac_p)
         Abs.append(Ab_p)
         bs.append(p.b.to(dtype=dtype, device=device))
         eqs.append(_constraint_mask(p).to(device))
     return HZono(
-        c=torch.cat(cs, 0),
-        Gc=torch.cat(Gcs, 0),
-        Gb=torch.cat(Gbs, 0),
+        c=torch.cat(cs, 1).flatten(0, 1),
+        Gc=torch.cat(Gcs, 1).flatten(0, 1),
+        Gb=torch.cat(Gbs, 1).flatten(0, 1),
         Ac=torch.cat(Acs, 0),
         Ab=torch.cat(Abs, 0),
         b=torch.cat(bs, 0),
@@ -1932,7 +1990,10 @@ def hz_concat(parts) -> "HZono | None":
     )
 
 
-def _hz_concat_independent(parts) -> HZono:
+def _hz_concat_independent(
+    parts: list[HZono], *, batch_size: int = 1
+) -> HZono:
+    """Concatenate batches with separate generator columns for each part."""
     dtype, device = parts[0].c.dtype, parts[0].c.device
     ng_tot = sum(int(p.Gc.shape[1]) for p in parts)
     nb_tot = sum(int(p.Gb.shape[1]) for p in parts)
@@ -1948,9 +2009,10 @@ def _hz_concat_independent(parts) -> HZono:
         Gc_p[:, goff:goff + ng_p] = p.Gc.to(dtype=dtype, device=device)
         Gb_p = torch.zeros(n_p, nb_tot, dtype=dtype, device=device)
         Gb_p[:, boff:boff + nb_p] = p.Gb.to(dtype=dtype, device=device)
-        cs.append(p.c.to(dtype=dtype, device=device))
-        Gcs.append(Gc_p)
-        Gbs.append(Gb_p)
+        width = n_p // batch_size
+        cs.append(p.c.to(dtype=dtype, device=device).reshape(batch_size, width, 1))
+        Gcs.append(Gc_p.reshape(batch_size, width, ng_tot))
+        Gbs.append(Gb_p.reshape(batch_size, width, nb_tot))
         if nc_p:
             Ac[roff:roff + nc_p, goff:goff + ng_p] = p.Ac.to(dtype=dtype, device=device)
             Ab[roff:roff + nc_p, boff:boff + nb_p] = p.Ab.to(dtype=dtype, device=device)
@@ -1960,9 +2022,9 @@ def _hz_concat_independent(parts) -> HZono:
         boff += nb_p
         roff += nc_p
     return HZono(
-        c=torch.cat(cs, 0),
-        Gc=torch.cat(Gcs, 0),
-        Gb=torch.cat(Gbs, 0),
+        c=torch.cat(cs, 1).flatten(0, 1),
+        Gc=torch.cat(Gcs, 1).flatten(0, 1),
+        Gb=torch.cat(Gbs, 1).flatten(0, 1),
         Ac=Ac,
         Ab=Ab,
         b=torch.cat(bs, 0) if bs else torch.zeros(0, 1, dtype=dtype, device=device),
@@ -2002,6 +2064,8 @@ def _hz_bounds_unconstrained(hz: HZono) -> Bounds:
 
 
 def _hz_compute_bounds_scipy(hz: HZono) -> Optional[Bounds]:
+    from scipy.optimize import Bounds as SciPyBounds, LinearConstraint, milp
+
     model = _lower_hz_milp(hz)
     if model.n_var == 0:
         LB = UB = model.value_center.copy()
@@ -2287,6 +2351,8 @@ def _solve_hz_feasibility(
     remaining = deadline - time.monotonic()
     if remaining <= 0.0:
         return _MILPResult("unknown", None)
+    from scipy.optimize import Bounds as SciPyBounds, LinearConstraint, milp
+
     constraints = (
         LinearConstraint(A, row_lb, row_ub) if A.shape[0] else None
     )
@@ -2843,18 +2909,3 @@ class HZSolver(Solver):
         for result in results:
             result.metadata.update(self.last_stats)
         return results
-
-    def solve_batch(
-        self,
-        problem: "BatchLPProblem",
-        timelimit: Optional[float] = None,
-    ) -> "BatchLPSolution":
-        """HZSolver does not accept BatchLPProblem inputs.
-
-        HZSolver operates on HZono domains via compute_bounds() and
-        evaluate_spec(), not on LP/CSP batch problems. Callers that
-        need batch LP solving should use TorchLPSolver or GurobiSolver.
-        """
-        raise NotImplementedError(
-            "HZSolver does not accept BatchLPProblem; use evaluate_spec()."
-        )

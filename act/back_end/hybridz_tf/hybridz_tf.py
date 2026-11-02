@@ -37,10 +37,15 @@ from act.back_end.solver.solver_hz import (
 
 import act.back_end.hybridz_tf.tf_mlp as hz_mlp
 import act.back_end.hybridz_tf.tf_cnn as hz_cnn
-import act.back_end.hybridz_tf.tf_rnn as hz_rnn
 import act.back_end.hybridz_tf.tf_transformer as hz_transformer
 import act.back_end.interval_tf.tf_mlp as interval_mlp
 import act.back_end.interval_tf.tf_cnn as interval_cnn
+from act.back_end.interval_tf.tf_rnn import (
+    tf_embedding_hybridz,
+    tf_gru_hybridz,
+    tf_lstm_hybridz,
+    tf_rnn_hybridz,
+)
 
 
 class HybridzTF(RegistryTF):
@@ -153,11 +158,11 @@ class HybridzTF(RegistryTF):
         LayerKind.SLICE.value: lambda L, b, tf: hz_mlp.tf_slice(L, b, tf),
         LayerKind.GATHER.value: lambda L, b, tf: hz_mlp.tf_gather(L, b, tf),
         # RNN
-        LayerKind.LSTM.value: lambda L, b, tf: hz_rnn.tf_lstm(L, b, tf),
-        LayerKind.GRU.value: lambda L, b, tf: hz_rnn.tf_gru(L, b, tf),
-        LayerKind.RNN.value: lambda L, b, tf: hz_rnn.tf_rnn(L, b, tf),
-        LayerKind.EMBEDDING.value: lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
-        LayerKind.EMBEDDING_TF.value: lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
+        LayerKind.LSTM.value: lambda L, b, tf: tf_lstm_hybridz(L, b),
+        LayerKind.GRU.value: lambda L, b, tf: tf_gru_hybridz(L, b),
+        LayerKind.RNN.value: lambda L, b, tf: tf_rnn_hybridz(L, b),
+        LayerKind.EMBEDDING.value: lambda L, b, tf: tf_embedding_hybridz(L, b),
+        LayerKind.EMBEDDING_TF.value: lambda L, b, tf: tf_embedding_hybridz(L, b),
         # Transformer
         LayerKind.POSENC.value: lambda L, b, tf: hz_transformer.tf_posenc(L, b, tf),
         LayerKind.LAYERNORM.value: lambda L, b, tf: hz_transformer.tf_layernorm(L, b, tf),

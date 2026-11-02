@@ -33,9 +33,11 @@ NO_REFINEMENT_MODE: Final[str] = "none"
 #   ---------------|------------------------------|----------------------------
 #   none           | no (children re-propagate)   | n/a
 #   plain          | yes, untouched               | no
-#   split_refresh  | yes                          | _interval_refresh_bounds +
+#   split_refresh  | yes                          | tf_forward.refresh_bounds +
 #                  |                              | per_subproblem_refine
-VALID_ROOT_BOUNDS_REUSE: Final[tuple[str, ...]] = ("none", "plain", "split_refresh")
+VALID_ROOT_BOUNDS_REUSE: Final[tuple[str, ...]] = (
+    "none", "plain", "split_refresh", "split_refresh_linear",
+)
 # BaB subproblem-pool selection strategies (``--bab-bounding``).
 #
 #   value                | pool class          | order function                       | --bab-top-k | reference
@@ -80,43 +82,28 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
-@dataclass(frozen=True)
-class BertMethodSelection:
-    """Resolved attention-relaxation BERT verification method."""
-
-    method: str
-    internal_method: str
-    baf: bool
-    alpha_mode: str
-    solver_tier: str
-    use_bab: bool = True
-
-
-_BERT_METHOD_SELECTIONS: Final[dict[str, BertMethodSelection]] = {
-    "planar": BertMethodSelection("planar", "planar", True, "fixed", "dual"),
-    "rule": BertMethodSelection("rule", "rule", True, "rule", "dual"),
-    "alpha": BertMethodSelection("alpha", "alpha", True, "optimized", "dual_alpha"),
-    "ibp": BertMethodSelection("ibp", "ibp", False, "none", "dual"),
-    "discrete": BertMethodSelection("discrete", "discrete", False, "none", "dual"),
-}
-
 BERT_METHOD_TIERS: Final[dict[str, str]] = {
-    key: value.solver_tier for key, value in _BERT_METHOD_SELECTIONS.items()
+    "planar": "dual",
+    "rule": "dual",
+    "alpha": "dual_alpha",
+    "ibp": "dual",
+    "discrete": "dual",
 }
 
 
 def normalize_bert_method(method: str) -> str:
     """Normalize a public BERT method name."""
     key = method.strip().lower().replace("-", "_")
-    if key not in _BERT_METHOD_SELECTIONS:
+    if key not in BERT_METHOD_TIERS:
         valid = ", ".join(name.replace("_", "-") for name in VALID_BERT_METHODS)
         raise ConfigError(f"Invalid bert method {method!r}; expected one of: {valid}")
     return key
 
 
-def select_bert_method(method: str) -> BertMethodSelection:
+def select_bert_method(method: str) -> tuple[str, str]:
     """Resolve a user-facing SST/Yelp method into ACT back-end settings."""
-    return _BERT_METHOD_SELECTIONS[normalize_bert_method(method)]
+    normalized = normalize_bert_method(method)
+    return normalized, BERT_METHOD_TIERS[normalized]
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +118,15 @@ class BaBConfig:
     Construction::
 
         BaBConfig()                     # programmatic defaults
-        BaBConfig.from_yaml()           # load from act/config/backend.yaml
-        BaBConfig.from_yaml(path, **kw) # custom YAML + overrides
     """
 
     max_depth: int = 20
     max_nodes: int = 2000
     frontier_cap: int = 0
+    frontier_mem_safety: float = 0.0
+    """CUDA managed-memory fraction; zero preserves the existing unplanned path."""
+    frontier_offload: bool = True
+    """Allow host frontier storage when the CUDA memory planner is enabled."""
     top_k: int = 0
     """Cap on how many pooled subproblems a single BaB wave may pop, independently
     of the batch size. 0 = unbounded. Honoured by the TopKBounding family
@@ -163,16 +152,42 @@ class BaBConfig:
     """Solver tier for BaB bound computation.
     Valid: 'lp', 'dual', 'dual_alpha', 'dual_alpha_eta'."""
 
+    terminal_lp_enabled: bool = False
+    """Solve candidate-less lanes with independently checked terminal LP evidence."""
+    climb_terminal_cores: bool = True
+    """Publish root-box terminal LP cores; theta-budget subsets need their own LP proof."""
+    milp_escalation: bool = False
+    """Try a bounded exact ReLU MILP after unresolved root tiers, before BaB."""
+    milp_max_variables: int = 2000
+    """Maximum variables, including ReLU binaries, in the optional MILP."""
+    milp_max_constraints: int = 2000
+    """Maximum linear constraints in the optional MILP."""
+    milp_timeout: float = 60.0
+    """MILP seconds, additionally capped by the shared remaining deadline."""
+
     climb_enabled: bool = False
     """Enable query-local CLIMB certificate replay and core propagation."""
+    climb_coarsening_enabled: bool = True
+    """Apply literal-budget coarsening before admitting replay-certified cores."""
+    climb_propagation_enabled: bool = True
+    """Apply learned cores to pending and active subproblems; false also disables merging."""
+    climb_merge_enabled: bool = False
+    climb_merge_min_proof_rate: float = 0.05
+    """Merge complementary root-domain rows to a fixed point on an unseen core, then rebound."""
+    climb_complement_bounding: bool = False
+    """Bound each new core's deepest-decision complement once on the root domain."""
+    climb_steer: bool = False
+    """Bias finite BranchingScores by core frequency without changing conditions."""
+    climb_presplit_propagation_enabled: bool = True
+    """Run propagation and merge before splitting; false defers both to the next pre-bound step."""
     climb_theta: float = 0.0
-    """Fraction of replay slack available to the vector deletion budget."""
+    """Fraction of slack available to the vector deletion budget; exact zero costs need none."""
     climb_delta_abs: float = 1e-9
     """Absolute deletion-budget margin: delta = climb_delta_abs + climb_delta_rel * |slack|."""
     climb_delta_rel: float = 1e-7
     """Relative deletion-budget margin: delta = climb_delta_abs + climb_delta_rel * |slack|."""
     climb_recheck_k: int = 0
-    """Maximum lanes given one extra direct replay after budget coarsening."""
+    """Maximum dual lanes given one extra direct replay after budget coarsening."""
     climb_max_cores: int = 1024
     """Maximum retained cores after subsumption and deterministic eviction."""
     climb_propagate_core_chunk: int = 4096
@@ -202,10 +217,12 @@ class BaBConfig:
 
     intermediate_refine_ratio: float = 10.0
     """Width-blowup threshold multiplier for intermediate_refine='auto'."""
+    intermediate_refine_max_tensor_mib: float = 0.0
+    """Extra refinement tensor budget in MiB; zero leaves existing chunks unchanged."""
 
     root_bounds_reuse: str = "none"
     """Reuse of the root box's forward bounds by descendants (dual tiers).
-    Valid: 'none', 'plain', 'split_refresh'.
+    Valid: 'none', 'plain', 'split_refresh', 'split_refresh_linear'.
 
     Sound by monotonicity: a child box is contained in the root box, so the
     root's per-layer bounds remain valid over-approximations. Children only
@@ -219,7 +236,13 @@ class BaBConfig:
     'plain' stops there, while 'split_refresh' additionally hardens the dict
     with the split-derived interval refresh plus per_subproblem_refine. So
     'plain' is the split-independent reference: it skips only the
-    split-derived tightening, not the per-lane input override."""
+    split-derived tightening, not the per-lane input override.
+    'split_refresh_linear' additionally uses affine/ReLU-chain halfspaces;
+    unsupported graphs retain the conservative interval refresh."""
+
+    climb_lin_support_refinement: bool = True
+    """Keep only sufficient winning halfspace supports in linear refresh.
+    False retains all same-frame halfspace dependencies conservatively."""
 
     per_subproblem_refine: str = NO_REFINEMENT_MODE
     """Per-subproblem sparse backward refinement of intermediate bounds in the
@@ -238,12 +261,20 @@ class BaBConfig:
     """Max refined neurons per layer per batch (top-cap by interval width);
     bounds the K x 2*cap backward cost."""
 
+    presolve_time_fraction: float = 0.0
+    """Root work window as a fraction of the BaB timeout, measured from BaB
+    entry. 0.0 means the root may use the remaining total timeout."""
+
+    child_n_iters: int = 0
+    """Alpha/eta iterations for optimized all-child batches. 0 uses
+    ``DualConfig.n_iters`` on every batch."""
+
     auto_batch_safety: float = 0.55
     """Fraction of GPU memory the auto batch sizer (max_batch_size='auto') may
     target; lowered on a shared GPU. The sizer also never exceeds 90% of the
     currently-reclaimable memory (free + this process's reserved cache)."""
 
-    auto_batch_cap: int = 2048
+    auto_batch_cap: int = 1024
     """Hard upper bound on the auto-sized batch (also the CPU fallback)."""
 
     auto_batch_floor: int = 8
@@ -256,6 +287,13 @@ class BaBConfig:
     constraining k neurons together exceeds the sum of the k individual
     split gains, because the split multipliers are optimized jointly
     against all constraints.     1 = single-split behavior."""
+
+    ramp_split_levels: int = 1
+    """Joint splits per step while a convolutional frontier is narrow. A wave's
+    cost there barely depends on K, so widening early spends fewer waves."""
+
+    ramp_split_lanes: int = 0
+    """Branching lanes below which ``ramp_split_levels`` applies; 0 disables it."""
 
     llm_probe_enabled: bool = False
     llm_probe_backend: str = "mock"
@@ -277,18 +315,7 @@ class BaBConfig:
     dimension to bisect and its fanout, input-domain-splitting BaB only)."""
     llm_probe_log: bool = False
 
-    verbose: bool = False
-
     method: Optional[str] = None
-    baf: bool = True
-    alpha_mode: str = "fixed"
-    p: float = 2.0
-    perturbed_words: int = 1
-    eps: float = 1e-5
-    max_eps: float = 0.01
-    num_verify_iters: int = 5
-    k: int = 1
-    alpha_opt_steps: int = 1000
 
     def __post_init__(self) -> None:
         if self.solver_tier not in VALID_SOLVER_TIERS:
@@ -306,6 +333,17 @@ class BaBConfig:
             )
         if self.top_k < 0:
             raise ConfigError(f"top_k must be non-negative, got {self.top_k}")
+        if not math.isfinite(self.frontier_mem_safety) or not 0.0 <= self.frontier_mem_safety <= 1.0:
+            raise ConfigError("frontier_mem_safety must be finite and in [0, 1]")
+        if (not math.isfinite(self.intermediate_refine_max_tensor_mib)
+                or self.intermediate_refine_max_tensor_mib < 0.0):
+            raise ConfigError("intermediate_refine_max_tensor_mib must be finite and non-negative")
+        for name in ("milp_max_variables", "milp_max_constraints"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(f"{name} must be a positive integer")
+        if not math.isfinite(self.milp_timeout) or self.milp_timeout <= 0.0:
+            raise ConfigError("milp_timeout must be finite and positive")
         if not math.isfinite(self.climb_theta) or not 0.0 <= self.climb_theta <= 1.0:
             raise ConfigError("climb_theta must be finite and in [0, 1]")
         if not math.isfinite(self.climb_delta_abs) or self.climb_delta_abs < 0.0:
@@ -314,57 +352,33 @@ class BaBConfig:
             raise ConfigError("climb_delta_rel must be finite and non-negative")
         if self.climb_recheck_k < 0:
             raise ConfigError("climb_recheck_k must be non-negative")
+        if not 0.0 <= self.climb_merge_min_proof_rate <= 1.0:
+            raise ConfigError("climb_merge_min_proof_rate must be in [0, 1]")
         if self.climb_max_cores < 1:
             raise ConfigError("climb_max_cores must be positive")
         if self.climb_propagate_core_chunk < 1:
             raise ConfigError("climb_propagate_core_chunk must be positive")
+        if (
+            not math.isfinite(self.presolve_time_fraction)
+            or not 0.0 <= self.presolve_time_fraction <= 1.0
+        ):
+            raise ConfigError(
+                "presolve_time_fraction must be finite and in [0, 1], got "
+                f"{self.presolve_time_fraction}"
+            )
+        if self.child_n_iters < 0:
+            raise ConfigError(
+                f"child_n_iters must be non-negative, got {self.child_n_iters}"
+            )
         if self.top_k > 0 and self.bounding in TOP_K_INCOMPATIBLE_BOUNDINGS:
             raise ConfigError(
                 f"top_k={self.top_k} is not supported by bounding={self.bounding!r}; "
                 f"it applies only to the order-ranked pools {TOP_K_BOUNDINGS}"
             )
         if self.method is not None:
-            selection = select_bert_method(self.method)
-            self.method = selection.method
+            self.method, solver_tier = select_bert_method(self.method)
             if self.solver_tier == "lp":
-                self.solver_tier = selection.solver_tier
-        if self.perturbed_words not in (1, 2):
-            raise ConfigError("perturbed_words must be 1 or 2")
-        if self.num_verify_iters < 0:
-            raise ConfigError("num_verify_iters must be non-negative")
-        if self.max_eps < 0 or self.eps < 0:
-            raise ConfigError("eps and max_eps must be non-negative")
-
-    @classmethod
-    def from_yaml(
-        cls,
-        config_path: Optional[Union[str, Path]] = None,
-        **overrides,
-    ) -> BaBConfig:
-        """Load BaB settings from YAML with optional keyword overrides.
-
-        Reads from ``backend.bab`` in the unified backend config, falling
-        back to a top-level ``bab`` key for standalone BaB YAML files.
-        """
-        path = Path(config_path) if config_path else _BACKEND_YAML
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Backend config not found: {path}\nExpected: act/config/backend.yaml"
-            )
-
-        with open(path) as f:
-            yaml_data = yaml.safe_load(f) or {}
-
-        # Support both nested (backend.bab) and flat (bab) YAML layouts.
-        backend_section = yaml_data.get("backend", {})
-        yaml_config: dict[str, Any] = backend_section.get("bab", yaml_data.get("bab", {}))
-
-        valid_keys = {fld.name for fld in fields(cls)}
-        merged = {k: v for k, v in yaml_config.items() if k in valid_keys}
-        merged.update({k: v for k, v in overrides.items() if k in valid_keys})
-
-        return cls(**merged)
+                self.solver_tier = solver_tier
 
 
 def _validate_bab_presets(
@@ -494,6 +508,18 @@ class DualConfig:
     lr_decay: float = 0.98
     """Multiplicative learning-rate decay applied each Adam iteration."""
 
+    stagnation_patience: int = 0
+    """Stop after this many non-improving iterations; zero disables stopping."""
+
+    stagnation_tol: float = 1e-5
+    """Minimum bound improvement that resets the stagnation counter."""
+
+    stop_when_verified: bool = False
+    """Stop once every lane is certified; disabled by default."""
+
+    max_time: float = 0.0
+    """Optimization time limit in seconds; zero disables the limit."""
+
     per_class_alpha: bool = True
     """Allocate separate α tensors per output class rather than sharing one α."""
 
@@ -505,6 +531,10 @@ class DualConfig:
     keeps an explicit linear bound; above it, interval-only."""
 
     def __post_init__(self) -> None:
+        for name in ("stagnation_patience", "stagnation_tol", "max_time"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ConfigError(f"{name} must be finite and non-negative, got {value}")
         if self.forward_lin_max_perturbed < 0:
             raise ConfigError(
                 "forward_lin_max_perturbed must be non-negative, got "
@@ -528,6 +558,19 @@ class TorchLPConfig:
     stagnation_patience: int = 300
     stagnation_tol: float = 1e-5
     feas_check_stride: int = 5
+
+
+_BACKEND_SUBCONFIGS: Final[dict[str, tuple[type[Any], str]]] = {
+    "bab": (BaBConfig, "bab_"),
+    "generation": (GenerationConfig, "gen_"),
+    "hybridz": (HybridZConfig, "hybridz_"),
+    "gurobi": (GurobiConfig, "gurobi_"),
+    "torchlp": (TorchLPConfig, "torchlp_"),
+    "dual": (DualConfig, "dual_"),
+}
+_BACKEND_SUBCONFIG_PREFIX: Final[dict[str, str]] = {
+    name: prefix for name, (_, prefix) in _BACKEND_SUBCONFIGS.items()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -570,11 +613,12 @@ class BackendConfig:
     see commit af797ff / C6).
     """
 
-    bab_max_batch_size: int = 8
+    bab_max_batch_size: Union[int, str] = 8
     """Maximum K for BaB sub-problem batching (tier 3).
 
     BaB dispatches up to K sub-problems per solve_batch call.  Set to 1 to
     disable batching inside BaB (equivalent to the legacy sequential loop).
+    "auto" chooses K from the existing adaptive batch policy.
     Must be 1 when solver='gurobi' (same N=1 restriction as lp_enabled).
     """
 
@@ -585,13 +629,6 @@ class BackendConfig:
     dual: DualConfig = field(default_factory=DualConfig)
 
     method: Optional[str] = None
-    p: float = 2.0
-    perturbed_words: int = 1
-    eps: float = 1e-5
-    max_eps: float = 0.01
-    num_verify_iters: int = 5
-    k: int = 1
-    alpha_opt_steps: int = 1000
 
     # -- validation ---------------------------------------------------------
 
@@ -600,6 +637,12 @@ class BackendConfig:
             raise ConfigError(
                 f"Invalid solver {self.solver!r}; expected one of {_VALID_SOLVERS}"
             )
+        if self.bab_max_batch_size != "auto" and (
+            isinstance(self.bab_max_batch_size, bool)
+            or not isinstance(self.bab_max_batch_size, int)
+            or self.bab_max_batch_size < 1
+        ):
+            raise ConfigError("bab_max_batch_size must be a positive integer or 'auto'")
         if self.device not in _VALID_DEVICES:
             raise ConfigError(
                 f"Invalid device {self.device!r}; expected one of {_VALID_DEVICES}"
@@ -609,17 +652,9 @@ class BackendConfig:
                 f"Invalid dtype {self.dtype!r}; expected one of {_VALID_DTYPES}"
             )
         if self.method is not None:
-            selection = select_bert_method(self.method)
-            self.method = selection.method
-            self.bab.method = selection.method
-            self.bab.solver_tier = selection.solver_tier
-            self.bab.p = float(self.p)
-            self.bab.perturbed_words = int(self.perturbed_words)
-            self.bab.eps = float(self.eps)
-            self.bab.max_eps = float(self.max_eps)
-            self.bab.num_verify_iters = int(self.num_verify_iters)
-            self.bab.k = int(self.k)
-            self.bab.alpha_opt_steps = int(self.alpha_opt_steps)
+            self.method, solver_tier = select_bert_method(self.method)
+            self.bab.method = self.method
+            self.bab.solver_tier = solver_tier
         # Gurobi solve_batch is restricted to N=1 (commit af797ff / C6).
         # Fail loud at config-load time rather than at the first batched call.
         if self.solver == "gurobi":
@@ -631,10 +666,10 @@ class BackendConfig:
                     "varying constraint matrices; see commit af797ff).  "
                     "Either set lp_enabled=False or switch to solver='torchlp'."
                 )
-            if self.bab_max_batch_size > 1:
+            if self.bab_max_batch_size != 1:
                 raise ConfigError(
                     f"BackendConfig: solver='gurobi' is incompatible with "
-                    f"bab_max_batch_size={self.bab_max_batch_size} > 1.  "
+                    f"bab_max_batch_size={self.bab_max_batch_size!r}; expected 1.  "
                     f"GurobiSolver.solve_batch raises for N>1.  "
                     f"Either set bab_max_batch_size=1 or switch to solver='torchlp'."
                 )
@@ -676,71 +711,39 @@ class BackendConfig:
         bab_presets = load_bab_presets()
 
         backend_raw: dict[str, Any] = raw.get("backend", {})
-        bab_raw: dict[str, Any] = backend_raw.pop("bab", {})
-        gen_raw: dict[str, Any] = _load_yaml(_NETGEN_YAML) if _NETGEN_YAML.exists() else {}
-        hz_raw: dict[str, Any] = backend_raw.pop("hybridz", {})
-        gurobi_raw: dict[str, Any] = backend_raw.pop("gurobi", {})
-        torchlp_raw: dict[str, Any] = backend_raw.pop("torchlp", {})
-        dual_raw: dict[str, Any] = backend_raw.pop("dual", {})
-
-        # Extract "enabled" from bab section → top-level bab_enabled
-        bab_enabled = bab_raw.pop("enabled", None)
-
-        # Route prefixed overrides to the right sub-config
-        bab_fields = {fld.name for fld in fields(BaBConfig)}
-        gen_fields = {fld.name for fld in fields(GenerationConfig)}
-        hz_fields = {fld.name for fld in fields(HybridZConfig)}
-        gurobi_fields = {fld.name for fld in fields(GurobiConfig)}
-        torchlp_fields = {fld.name for fld in fields(TorchLPConfig)}
-        dual_fields = {fld.name for fld in fields(DualConfig)}
-        bab_overrides: dict[str, Any] = {}
-        gen_overrides: dict[str, Any] = {}
-        hz_overrides: dict[str, Any] = {}
-        gurobi_overrides: dict[str, Any] = {}
-        torchlp_overrides: dict[str, Any] = {}
-        dual_overrides: dict[str, Any] = {}
+        subconfig_raw = {
+            name: (
+                _load_yaml(_NETGEN_YAML) if _NETGEN_YAML.exists() else {}
+            ) if name == "generation" else backend_raw.pop(name, {})
+            for name in _BACKEND_SUBCONFIGS
+        }
+        bab_enabled = subconfig_raw["bab"].pop("enabled", None)
+        subconfig_fields = {
+            name: {fld.name for fld in fields(subconfig_type)}
+            for name, (subconfig_type, _) in _BACKEND_SUBCONFIGS.items()
+        }
+        subconfig_overrides = {
+            name: {} for name in _BACKEND_SUBCONFIGS
+        }
         top_overrides: dict[str, Any] = {}
         for k, v in overrides.items():
-            if k.startswith("bab_") and k[4:] in bab_fields:
-                bab_overrides[k[4:]] = v
-            elif k.startswith("gen_") and k[4:] in gen_fields:
-                gen_overrides[k[4:]] = v
-            elif k.startswith("hybridz_") and k[8:] in hz_fields:
-                hz_overrides[k[8:]] = v
-            elif k.startswith("gurobi_") and k[7:] in gurobi_fields:
-                gurobi_overrides[k[7:]] = v
-            elif k.startswith("torchlp_") and k[8:] in torchlp_fields:
-                torchlp_overrides[k[8:]] = v
-            elif k.startswith("dual_") and k[5:] in dual_fields:
-                dual_overrides[k[5:]] = v
+            for name, (_, prefix) in _BACKEND_SUBCONFIGS.items():
+                field_name = k.removeprefix(prefix)
+                if k.startswith(prefix) and field_name in subconfig_fields[name]:
+                    subconfig_overrides[name][field_name] = v
+                    break
             else:
                 top_overrides[k] = v
 
-        # Build BaBConfig
-        bab_merged = {k: v for k, v in bab_raw.items() if k in bab_fields}
-        bab_merged.update(bab_overrides)
-        bab_config = BaBConfig(**bab_merged)
-
-        # Build GenerationConfig
-        gen_merged = {k: v for k, v in gen_raw.items() if k in gen_fields}
-        gen_merged.update(gen_overrides)
-        gen_config = GenerationConfig(**gen_merged)
-
-        hz_merged = {k: v for k, v in hz_raw.items() if k in hz_fields}
-        hz_merged.update(hz_overrides)
-        hz_config = HybridZConfig(**hz_merged)
-
-        gurobi_config = GurobiConfig(
-            **{k: v for k, v in gurobi_raw.items() if k in gurobi_fields} | gurobi_overrides
-        )
-
-        torchlp_merged = {k: v for k, v in torchlp_raw.items() if k in torchlp_fields}
-        torchlp_merged.update(torchlp_overrides)
-        torchlp_config = TorchLPConfig(**torchlp_merged)
-
-        dual_merged = {k: v for k, v in dual_raw.items() if k in dual_fields}
-        dual_merged.update(dual_overrides)
-        dual_config = DualConfig(**dual_merged)
+        subconfigs = {}
+        for name, (subconfig_type, _) in _BACKEND_SUBCONFIGS.items():
+            merged = {
+                key: value
+                for key, value in subconfig_raw[name].items()
+                if key in subconfig_fields[name]
+            }
+            merged.update(subconfig_overrides[name])
+            subconfigs[name] = subconfig_type(**merged)
 
         # Build top-level config
         top_fields = {fld.name for fld in fields(cls)} - {
@@ -762,12 +765,7 @@ class BackendConfig:
         top_merged.update({k: v for k, v in top_overrides.items() if k in top_fields})
 
         config = cls(
-            bab=bab_config,
-            generation=gen_config,
-            hybridz=hz_config,
-            gurobi=gurobi_config,
-            torchlp=torchlp_config,
-            dual=dual_config,
+            **subconfigs,
             **top_merged,
         )
         if config.bab_preset is not None:
@@ -777,49 +775,6 @@ class BackendConfig:
     def bab_preset_values(self, name: str) -> dict[str, Any]:
         """Return a validated named preset from the canonical backend YAML."""
         return load_bab_preset(name)
-
-
-if __name__ == "__main__":
-    import sys
-
-    def _check(label: str, fn) -> None:  # pragma: no cover
-        fn()
-        print(f"  PASS  {label}")
-
-    print("BackendConfig.__post_init__ rejection tests")
-
-    def _t1():  # pragma: no cover
-        try:
-            BackendConfig(solver="gurobi", lp_enabled=True)
-            raise AssertionError("expected ValueError not raised")
-        except ValueError as e:
-            assert "lp_enabled" in str(e), f"wrong message: {e}"
-
-    def _t2():  # pragma: no cover
-        try:
-            BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=2)
-            raise AssertionError("expected ValueError not raised")
-        except ValueError as e:
-            assert "bab_max_batch_size" in str(e), f"wrong message: {e}"
-
-    def _t3():  # pragma: no cover
-        cfg = BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=1)
-        assert cfg.solver == "gurobi"
-        assert not cfg.lp_enabled
-        assert cfg.bab_max_batch_size == 1
-
-    def _t4():  # pragma: no cover
-        cfg = BackendConfig()
-        assert cfg.lp_enabled is True
-        assert cfg.bab_max_batch_size == 8
-
-    _check("gurobi + lp_enabled=True raises ValueError", _t1)
-    _check("gurobi + bab_max_batch_size=2 raises ValueError", _t2)
-    _check("gurobi + lp_enabled=False + bab_max_batch_size=1 succeeds", _t3)
-    _check("default config has lp_enabled=True, bab_max_batch_size=8", _t4)
-
-    sys.exit(0)
-
 
 def build_vnncomp_bab_config(
     config_label: str,

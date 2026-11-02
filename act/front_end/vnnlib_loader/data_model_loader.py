@@ -14,12 +14,13 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple
 import ast
 import os
 import logging
-import json
 import csv
 import urllib.request
 import shutil
@@ -82,6 +83,15 @@ def _parse_onnx_field(onnx_field: str) -> List[Tuple[Optional[str], str]]:
         ]
         return [(role, _normalize_rel_path(model_path)) for role, model_path in entries]
     return [(None, _normalize_rel_path(onnx_field))]
+
+
+def _read_instance_rows(instances_file: Path) -> List[Tuple[str, str, str]]:
+    """Read instances.csv as (onnx, vnnlib, timeout) rows, without its optional header."""
+    with open(instances_file, 'r') as f:
+        rows = list(csv.reader(f))
+    if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
+        rows = rows[1:]
+    return [(row[0], row[1], row[2]) for row in rows if len(row) >= 3]
 
 
 class _CombinedDualModel(nn.Module):
@@ -150,20 +160,11 @@ def download_vnnlib_category(
     if category_dir.exists() and instances_file.exists() and not force_redownload:
         logger.info(f"Category '{category}' already downloaded at {category_dir}")
         
-        # Count existing instances
-        num_instances = 0
-        if instances_file.exists():
-            with open(instances_file, 'r') as f:
-                rows = list(csv.reader(f))
-                if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
-                    rows = rows[1:]
-                num_instances = sum(1 for row in rows if len(row) >= 3)
-        
         return {
             'status': 'success',
             'message': f"Category '{category}' already exists",
             'category_path': str(category_dir),
-            'num_instances': num_instances
+            'num_instances': len(_read_instance_rows(instances_file))
         }
     
     # Create directories
@@ -202,25 +203,17 @@ def download_vnnlib_category(
     instances: List[Dict[str, Any]] = []
     onnx_files: set[str] = set()
     vnnlib_files: set[str] = set()
-    with open(instances_file, 'r') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
-        if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
-            rows = rows[1:]
-        
-        for row in rows:
-            if len(row) >= 3:
-                onnx_field, vnnlib_field, timeout = row[0], row[1], row[2]
-                onnx_entries = _parse_onnx_field(onnx_field)
-                vnnlib_file = _normalize_rel_path(vnnlib_field)
-                for _, onnx_file in onnx_entries:
-                    onnx_files.add(onnx_file)
-                vnnlib_files.add(vnnlib_file)
-                instances.append({
-                    'onnx': onnx_entries,
-                    'vnnlib': vnnlib_file,
-                    'timeout': timeout
-                })
+    for onnx_field, vnnlib_field, timeout in _read_instance_rows(instances_file):
+        onnx_entries = _parse_onnx_field(onnx_field)
+        vnnlib_file = _normalize_rel_path(vnnlib_field)
+        for _, onnx_file in onnx_entries:
+            onnx_files.add(onnx_file)
+        vnnlib_files.add(vnnlib_file)
+        instances.append({
+            'onnx': onnx_entries,
+            'vnnlib': vnnlib_file,
+            'timeout': timeout
+        })
     
     logger.info(f"Found {len(instances)} instances in category '{category}'")
     
@@ -274,27 +267,6 @@ def download_vnnlib_category(
         if not success and all(is_source_unreachable(e) for e in file_errors):
             return _unavailable_category(category, category_dir, category_is_new, file_errors[-1])
         assert success, f"Failed to download {rel_path} from any of {tried_urls}"
-    
-    # Create metadata
-    metadata = {
-        'category': category,
-        'repo_name': repo_name,
-        'version': version,
-        'num_instances': len(instances),
-        'num_onnx_models': len(downloaded_onnx),
-        'num_vnnlib_specs': len(downloaded_vnnlib),
-        'source': successful_base_url,
-        'paths': {
-            'onnx': str(onnx_dir),
-            'vnnlib': str(vnnlib_dir),
-            'instances': str(instances_file)
-        }
-    }
-    
-    # Save metadata
-    metadata_path = category_dir / "info.json"
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
     
     logger.info(
         f"Successfully downloaded category '{category}': "
@@ -350,40 +322,32 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[Dict[str, Any]
         if not instances_file.exists():
             continue
         
-        with open(instances_file, 'r') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-            if rows and len(rows[0]) >= 2 and rows[0][0].strip().lower() == 'onnx':
-                rows = rows[1:]
+        for onnx_field, vnnlib_file, timeout in _read_instance_rows(instances_file):
+            onnx_entries = _parse_onnx_field(onnx_field)
+            vnnlib_rel = _normalize_rel_path(vnnlib_file)
             
-            for row in rows:
-                if len(row) >= 3:
-                    onnx_field, vnnlib_file, timeout = row[0], row[1], row[2]
-                    onnx_entries = _parse_onnx_field(onnx_field)
-                    vnnlib_rel = _normalize_rel_path(vnnlib_file)
-                    
-                    onnx_paths = [category_dir / onnx_rel for _, onnx_rel in onnx_entries]
-                    vnnlib_path = category_dir / vnnlib_rel
-                    
-                    # Only include if all referenced files exist
-                    if all(onnx_path.exists() for onnx_path in onnx_paths) and vnnlib_path.exists():
-                        first_onnx_rel = onnx_entries[0][1]
-                        paths: Dict[str, Any] = {
-                            'onnx': str(onnx_paths[0]),
-                            'vnnlib': str(vnnlib_path)
-                        }
-                        if len(onnx_entries) > 1:
-                            paths['onnx_models'] = [str(onnx_path) for onnx_path in onnx_paths]
-                        
-                        all_instances.append({
-                            'category': category_dir.name,
-                            'onnx_model': first_onnx_rel,
-                            'onnx_models': onnx_entries,
-                            'vnnlib_spec': vnnlib_rel,
-                            'timeout': float(timeout) if timeout else None,
-                            'is_dual_model': len(onnx_entries) > 1,
-                            'paths': paths
-                        })
+            onnx_paths = [category_dir / onnx_rel for _, onnx_rel in onnx_entries]
+            vnnlib_path = category_dir / vnnlib_rel
+            
+            # Only include if all referenced files exist
+            if all(onnx_path.exists() for onnx_path in onnx_paths) and vnnlib_path.exists():
+                first_onnx_rel = onnx_entries[0][1]
+                paths: Dict[str, Any] = {
+                    'onnx': str(onnx_paths[0]),
+                    'vnnlib': str(vnnlib_path)
+                }
+                if len(onnx_entries) > 1:
+                    paths['onnx_models'] = [str(onnx_path) for onnx_path in onnx_paths]
+                
+                all_instances.append({
+                    'category': category_dir.name,
+                    'onnx_model': first_onnx_rel,
+                    'onnx_models': onnx_entries,
+                    'vnnlib_spec': vnnlib_rel,
+                    'timeout': float(timeout) if timeout else None,
+                    'is_dual_model': len(onnx_entries) > 1,
+                    'paths': paths
+                })
     
     return all_instances
 
@@ -721,79 +685,44 @@ def model_inference_with_vnnlib(
         }
 
 
-def list_available_categories() -> List[str]:
-    """
-    List available benchmark categories from VNN-COMP repository.
-    
-    Note: This is a static list of common categories. For the complete
-    and up-to-date list, visit:
-    https://github.com/ChristopherBrix/vnncomp_benchmarks
-    
-    Returns:
-        List of category names
-    """
-    # Common VNN-COMP benchmark categories (static list)
-    common_categories = [
-        'mnist_fc',
-        'mnist_conv',
-        'cifar10_resnet',
-        'cifar10_cnn',
-        'acasxu',
-        'collins_yolo',
-        'nn4sys',
-        'oval',
-        'reach_prob',
-        'sri_resnet',
-        'tllverifybench'
-    ]
-    
-    return common_categories
+@dataclass(frozen=True)
+class VnncompInstance:
+    """Original model and synthesized disjuncts with their aligned seeds."""
+
+    raw_model: nn.Module
+    models: tuple[nn.Module, ...]
+    seeds: tuple[tuple[LabeledInputTensor, ...], ...]
+    inputs: tuple[LabeledInputTensor, ...]
+    merged_relus: int
 
 
-def list_local_categories(root_dir: Optional[str] = None) -> List[str]:
-    """
-    List locally downloaded benchmark categories.
-    
-    Args:
-        root_dir: Root directory for VNNLIB data (default: from path_config)
-        
-    Returns:
-        List of category names that have been downloaded
-    """
-    if root_dir is None:
-        root_dir = get_vnnlib_data_root()
-    
-    root_path = Path(root_dir)
-    if not root_path.exists():
-        return []
-    
-    categories = []
-    for item in root_path.iterdir():
-        if item.is_dir() and (item / "instances.csv").exists():
-            categories.append(item.name)
-    
-    return sorted(categories)
+def load_vnncomp_instance(
+    onnx_path: str | Path,
+    vnnlib_path: str | Path,
+    *,
+    merge_relus: bool = False,
+) -> VnncompInstance:
+    """Load and synthesize all properties without choosing a solver policy."""
+    # Through importlib: create_specs imports this module, and synthesis loads the whole back end.
+    synthesis = import_module("act.front_end.model_synthesis")
+    create_specs = import_module("act.front_end.vnnlib_loader.create_specs")
 
-
-def get_category_info(category: str, root_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Get metadata for a downloaded benchmark category.
-    
-    Args:
-        category: Category name
-        root_dir: Root directory for VNNLIB data (default: from path_config)
-        
-    Returns:
-        Dict with category metadata, or None if not found
-    """
-    if root_dir is None:
-        root_dir = get_vnnlib_data_root()
-    
-    category_dir = Path(root_dir) / category
-    info_path = category_dir / "info.json"
-    
-    if not info_path.exists():
-        return None
-    
-    with open(info_path, 'r') as f:
-        return json.load(f)
+    for path in (Path(onnx_path), Path(vnnlib_path)):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    source, name, raw_model, inputs, specs = create_specs.create_specs_from_paths(
+        onnx_path, vnnlib_path,
+    )
+    model, merged = synthesis.merge_split_relus(raw_model) if merge_relus else (raw_model, 0)
+    models, seeds = synthesis.synthesize_models_and_seeds_from_specs(
+        [(source, name, model, inputs, specs)],
+    )
+    if not models:
+        raise ValueError("Instance has no synthesized verification models")
+    return VnncompInstance(
+        raw_model=raw_model,
+        models=tuple(models.values()),
+        seeds=tuple(tuple(seeds[key]) for key in models),
+        inputs=tuple(inputs),
+        merged_relus=merged,
+    )

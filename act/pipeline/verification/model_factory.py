@@ -247,6 +247,22 @@ class ModelFactory:
         dtype = get_default_dtype()
         device = get_default_device()
         
+        geometry = act_net.input_geometry
+        if geometry is not None:
+            center = geometry.center.to(device=device, dtype=dtype)
+            match test_case:
+                case "center":
+                    tensor = center.clone()
+                case "boundary":
+                    direction = torch.zeros_like(center)
+                    direction[..., 0] = 1.0
+                    tensor = center + direction * geometry.radii.to(center)
+                case "random":
+                    tensor = center + (2 * torch.rand_like(center) - 1) * geometry.radii.to(center)
+                case _:
+                    raise ValueError(f"Unknown test_case '{test_case}'")
+            return geometry.project(tensor)
+
         # Get INPUT_SPEC constraints if present
         if input_spec_layer is not None:
             spec_params = input_spec_layer.params or {}

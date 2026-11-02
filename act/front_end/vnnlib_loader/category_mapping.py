@@ -9,7 +9,7 @@ Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from act.util.format_utils import rule
 

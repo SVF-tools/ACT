@@ -36,7 +36,8 @@ ipywidgets>=8.0.0
 tensorflow>=2.13.0
 
 # ML frameworks (for pipeline/llm_probe.py) - REQUIRED
-transformers>=4.30.0
+# Keep compact BERT's tokenizer/encoder API compatible with the CI torch 2.5 lane.
+transformers>=4.57.3,<5
 scikit-learn>=1.0.0
 
 # Note: The following are transitive dependencies (auto-installed):

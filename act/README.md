@@ -300,7 +300,7 @@ All ACT modules now have unified CLI architecture with consistent device/dtype h
   - **`pipeline.yaml`**: Pipeline testing and fuzzing defaults
   - **`frontend.yaml`**: Loader and spec creation defaults
   - **`backend_cli.py`**, **`pipeline_cli.py`**, **`frontend_cli.py`**: Implementation of tier CLIs
-  - `get_project_root()`, `get_data_root()`, `get_config_root()`
+  - `get_project_root()`, `get_data_root()`
   - `get_pipeline_log_dir()`: Returns absolute path to `act/pipeline/log/`
   - `ensure_gurobi_license()`: Automatic Gurobi license detection
   - Centralized path management for all ACT modules
@@ -311,7 +311,6 @@ All ACT modules now have unified CLI architecture with consistent device/dtype h
     - `validate_constraints`: Enable/disable constraint validation (default: True)
     - `debug_output_file`: Path to debug log (default: `act/pipeline/log/act_debug_tf.log`)
     - `debug_tf_max_constraints`: Max constraints to log per layer (default: 50)
-    - Methods: `enable_debug_tf()`, `disable_all()`, `set_debug_output_file()`
   - Note: CLI argument parsing moved to individual module CLIs and cli_utils
 
 - **`stats.py`**: Statistics and performance tracking

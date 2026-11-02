@@ -12,14 +12,26 @@
 #
 #===---------------------------------------------------------------------===#
 
+from __future__ import annotations
+
 import logging
+from importlib import import_module
+import math
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
+from functools import cached_property
 
 import numpy as np
 import torch
-from typing import Any, List, Optional, Tuple
-from act.back_end.core import Bounds, ConSet
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from act.back_end.core import Bounds, ConSet, Fact, Layer, Net, get_topo_order
+from act.back_end.interval_tf.tf_mlp import _quantize_params_flat
 from act.back_end.solver.solver_base import BatchLPProblem
 from act.back_end.layer_util import validate_conset_ops
+from act.front_end.specs import InKind, OutKind, OutputSpec
+
+if TYPE_CHECKING:
+    from act.back_end.solver.solver_torchlp import _SparseLP
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -260,29 +272,19 @@ def _build_box_tensors_batched(
         n_vars = len(var_ids)
         lb_raw = con.meta["lb"]
         ub_raw = con.meta["ub"]
-        # Box meta tensors are stored flat per add_box (ConSet.add_box reshapes
-        # to (-1,)); however when bounds are batched [B, n] the underlying
-        # reshape collapses to (B*n,) or the upstream
-        # pipeline stores [B, n] directly. Normalise:
-        if isinstance(lb_raw, torch.Tensor) and lb_raw.numel() == n_vars:
-            lb_b = lb_raw.to(device=device, dtype=dtype).reshape(n_vars)
-            lb_b = lb_b.unsqueeze(0).expand(N, -1)
-        elif isinstance(lb_raw, torch.Tensor) and lb_raw.numel() == N * n_vars:
-            lb_b = lb_raw.to(device=device, dtype=dtype).reshape(N, n_vars)
-        else:
+        def norm(raw: Any, name: str) -> torch.Tensor:
+            """Normalise one box endpoint to ``[N, n_vars]``."""
+            if isinstance(raw, torch.Tensor) and raw.numel() == n_vars:
+                return raw.to(device=device, dtype=dtype).reshape(n_vars).unsqueeze(0).expand(N, -1)
+            if isinstance(raw, torch.Tensor) and raw.numel() == N * n_vars:
+                return raw.to(device=device, dtype=dtype).reshape(N, n_vars)
             raise ValueError(
-                f"box: lb has unexpected numel={getattr(lb_raw, 'numel', lambda: '?')()}, "
+                f"box: {name} has unexpected numel={getattr(raw, 'numel', lambda: '?')()}, "
                 f"expected {n_vars} or {N * n_vars} for tag {tag!r}"
             )
-        if isinstance(ub_raw, torch.Tensor) and ub_raw.numel() == n_vars:
-            ub_b = ub_raw.to(device=device, dtype=dtype).reshape(n_vars)
-            ub_b = ub_b.unsqueeze(0).expand(N, -1)
-        elif isinstance(ub_raw, torch.Tensor) and ub_raw.numel() == N * n_vars:
-            ub_b = ub_raw.to(device=device, dtype=dtype).reshape(N, n_vars)
-        else:
-            raise ValueError(
-                f"box: ub has unexpected numel for tag {tag!r}"
-            )
+
+        lb_b = norm(lb_raw, "lb")
+        ub_b = norm(ub_raw, "ub")
         vid_idx = torch.tensor(var_ids, device=device, dtype=torch.long)
         lb_global[:, vid_idx] = torch.maximum(lb_global[:, vid_idx], lb_b)
         ub_global[:, vid_idx] = torch.minimum(ub_global[:, vid_idx], ub_b)
@@ -313,25 +315,57 @@ def _emit_dense(
     b_t = _as_td(b, device, dtype)
     n_out, n_in = W_t.shape
     var_ids_all = list(con.var_ids)
-    y = var_ids_all[:n_out]
-    x = var_ids_all[n_out:]
-    if len(x) != n_in:
+    token_count = int(con.meta["token_count"]) if con.meta.get("token_wise", False) else 1
+    total_out, total_in = n_out * token_count, n_in * token_count
+    y = var_ids_all[:total_out]
+    x = var_ids_all[total_out:]
+    if len(x) != total_in:
         raise ValueError(
             f"dense: var_ids length mismatch: {len(x)} input vars vs "
-            f"W.shape[1]={n_in}"
+            f"expected {total_in} ({token_count} x W.shape[1]={n_in})"
         )
-    m = n_out
+    m = total_out
     col_block = torch.empty((m, 1 + n_in), device=device, dtype=torch.long)
     col_block[:, 0] = torch.tensor(y, device=device, dtype=torch.long)
-    col_block[:, 1:] = torch.tensor(
-        x, device=device, dtype=torch.long
-    ).unsqueeze(0).expand(m, -1)
+    x_rows = torch.tensor(x, device=device, dtype=torch.long).reshape(token_count, n_in)
+    col_block[:, 1:] = x_rows[:, None, :].expand(token_count, n_out, n_in).reshape(m, n_in)
     val_per_row = torch.empty((m, 1 + n_in), device=device, dtype=dtype)
     val_per_row[:, 0] = 1.0
-    val_per_row[:, 1:] = -W_t
+    val_per_row[:, 1:] = -W_t.repeat(token_count, 1)
     val_block = val_per_row.unsqueeze(0).expand(N, m, 1 + n_in).contiguous()
-    rhs_block = b_t.reshape(m).unsqueeze(0).expand(N, m).contiguous()
+    rhs_block = b_t.reshape(n_out).repeat(token_count).unsqueeze(0).expand(N, m).contiguous()
     eq.add_block(col_block, val_block, rhs_block)
+
+
+def _emit_affine_pairs(
+    y: List[int],
+    x: List[int],
+    a: torch.Tensor,
+    c: torch.Tensor,
+    eq: _RowAcc,
+    N: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Emit ``y_i - a_i*x_i = c_i`` equalities."""
+    if len(y) != len(x) or a.numel() != len(y) or c.numel() != len(y):
+        raise ValueError("affine pairs: incompatible variable and coefficient counts")
+    n = len(y)
+    col_block = torch.stack(
+        [
+            torch.tensor(y, device=device, dtype=torch.long),
+            torch.tensor(x, device=device, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    val_per_row = torch.empty((n, 2), device=device, dtype=dtype)
+    val_per_row[:, 0] = 1.0
+    val_per_row[:, 1] = -a.reshape(n)
+    eq.add_block(
+        col_block,
+        val_per_row.unsqueeze(0).expand(N, n, 2).contiguous(),
+        c.reshape(n).unsqueeze(0).expand(N, n).contiguous(),
+    )
 
 
 def _emit_bias(
@@ -349,17 +383,9 @@ def _emit_bias(
     c_t = _as_td(c_raw, device, dtype).reshape(-1)
     if c_t.numel() != n:
         raise ValueError(f"bias: c length {c_t.numel()} != n {n}")
-    m = n
-    col_block = torch.stack([
-        torch.tensor(y, device=device, dtype=torch.long),
-        torch.tensor(x, device=device, dtype=torch.long),
-    ], dim=1)
-    val_per_row = torch.tensor(
-        [1.0, -1.0], device=device, dtype=dtype
-    ).unsqueeze(0).expand(m, -1)
-    val_block = val_per_row.unsqueeze(0).expand(N, m, 2).contiguous()
-    rhs_block = c_t.reshape(m).unsqueeze(0).expand(N, m).contiguous()
-    eq.add_block(col_block, val_block, rhs_block)
+    _emit_affine_pairs(
+        y, x, torch.ones(n, device=device, dtype=dtype), c_t, eq, N, device, dtype
+    )
 
 
 def _emit_scale(
@@ -377,17 +403,9 @@ def _emit_scale(
     a_t = _as_td(a_raw, device, dtype).reshape(-1)
     if a_t.numel() != n:
         raise ValueError(f"scale: a length {a_t.numel()} != n {n}")
-    m = n
-    col_block = torch.stack([
-        torch.tensor(y, device=device, dtype=torch.long),
-        torch.tensor(x, device=device, dtype=torch.long),
-    ], dim=1)
-    val_per_row = torch.empty((m, 2), device=device, dtype=dtype)
-    val_per_row[:, 0] = 1.0
-    val_per_row[:, 1] = -a_t.reshape(m)
-    val_block = val_per_row.unsqueeze(0).expand(N, m, 2).contiguous()
-    rhs_block = torch.zeros((N, m), device=device, dtype=dtype)
-    eq.add_block(col_block, val_block, rhs_block)
+    _emit_affine_pairs(
+        y, x, a_t, torch.zeros(n, device=device, dtype=dtype), eq, N, device, dtype
+    )
 
 
 def _emit_bn(
@@ -409,17 +427,7 @@ def _emit_bn(
         raise ValueError(
             f"bn: A.numel={A_t.numel()} c.numel={c_t.numel()} != n {n}"
         )
-    m = n
-    col_block = torch.stack([
-        torch.tensor(y, device=device, dtype=torch.long),
-        torch.tensor(x, device=device, dtype=torch.long),
-    ], dim=1)
-    val_per_row = torch.empty((m, 2), device=device, dtype=dtype)
-    val_per_row[:, 0] = 1.0
-    val_per_row[:, 1] = -A_t.reshape(m)
-    val_block = val_per_row.unsqueeze(0).expand(N, m, 2).contiguous()
-    rhs_block = c_t.reshape(m).unsqueeze(0).expand(N, m).contiguous()
-    eq.add_block(col_block, val_block, rhs_block)
+    _emit_affine_pairs(y, x, A_t, c_t, eq, N, device, dtype)
 
 
 def _emit_add_sub(
@@ -473,17 +481,7 @@ def _emit_flatten(
         raise ValueError(f"flatten: n_out {n_out} != n_in {n_in}")
     y = list(con.var_ids[:n_out])
     x = list(con.var_ids[n_out:])
-    m = n_out
-    col_block = torch.stack([
-        torch.tensor(y, device=device, dtype=torch.long),
-        torch.tensor(x, device=device, dtype=torch.long),
-    ], dim=1)
-    val_per_row = torch.tensor(
-        [1.0, -1.0], device=device, dtype=dtype
-    ).unsqueeze(0).expand(m, -1)
-    val_block = val_per_row.unsqueeze(0).expand(N, m, 2).contiguous()
-    rhs_block = torch.zeros((N, m), device=device, dtype=dtype)
-    eq.add_block(col_block, val_block, rhs_block)
+    _emit_copy_rows(y, x, eq, N, device, dtype)
 
 
 def _emit_transpose(
@@ -533,13 +531,7 @@ def _emit_transpose(
     x = torch.tensor(
         con.var_ids[n:], device=device, dtype=torch.long
     ).index_select(0, idx)
-    col_block = torch.stack([y, x], dim=1)
-    val_per_row = torch.tensor(
-        [1.0, -1.0], device=device, dtype=dtype
-    ).unsqueeze(0).expand(n, -1)
-    val_block = val_per_row.unsqueeze(0).expand(N, n, 2).contiguous()
-    rhs_block = torch.zeros((N, n), device=device, dtype=dtype)
-    eq.add_block(col_block, val_block, rhs_block)
+    _emit_copy_rows(y.tolist(), x.tolist(), eq, N, device, dtype)
 
 
 def _emit_mask_add(
@@ -764,19 +756,15 @@ def _emit_relu_canonical(
     # Final slope/shift selectors.
     slope = torch.where(on, torch.ones_like(gap), torch.where(off, torch.zeros_like(gap), slope_amb))
     shift = torch.where(on, torch.zeros_like(gap), torch.where(off, torch.zeros_like(gap), shift_amb))
-    # Emit per-neuron 3 ineq rows.
     for i in range(n):
-        # Row (a): -z_i <= 0
         vals_a = torch.full((N, 1), -1.0, device=device, dtype=dtype)
         rhs_a = torch.zeros((N,), device=device, dtype=dtype)
         le.add([z[i]], vals_a, rhs_a)
-        # Row (b): y_i - z_i <= 0
         vals_b = torch.tensor(
             [[1.0, -1.0]], device=device, dtype=dtype
         ).expand(N, -1).contiguous()
         rhs_b = torch.zeros((N,), device=device, dtype=dtype)
         le.add([y[i], z[i]], vals_b, rhs_b)
-        # Row (c): z_i - slope_i * y_i <= shift_i
         vals_c = torch.empty((N, 2), device=device, dtype=dtype)
         vals_c[:, 0] = 1.0
         vals_c[:, 1] = -slope[:, i]
@@ -847,6 +835,50 @@ def _emit_lrelu_canonical(
         vals_c[:, 1] = -slope[:, i]
         rhs_c = shift[:, i].clone()
         le.add([z[i], y[i]], vals_c, rhs_c)
+
+
+def _emit_envelope_rows(
+    le: _RowAcc,
+    z: List[int],
+    y: List[int],
+    row_lo: torch.Tensor,
+    row_hi: torch.Tensor,
+    slope_lo: torch.Tensor,
+    b_lo: torch.Tensor,
+    slope_hi: torch.Tensor,
+    b_hi: torch.Tensor,
+    N: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Emit four lower and upper envelope rows for ``z`` over ``y``."""
+    n = len(z)
+    z_cols = torch.tensor(z, device=device, dtype=torch.long)[:, None]
+    zy_cols = torch.stack(
+        [
+            torch.tensor(z, device=device, dtype=torch.long),
+            torch.tensor(y, device=device, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    le.add_block(
+        z_cols,
+        -torch.ones((N, n, 1), device=device, dtype=dtype),
+        -row_lo,
+    )
+    le.add_block(
+        z_cols,
+        torch.ones((N, n, 1), device=device, dtype=dtype),
+        row_hi,
+    )
+    vals_lo = torch.empty((N, n, 2), device=device, dtype=dtype)
+    vals_lo[:, :, 0] = -1.0
+    vals_lo[:, :, 1] = slope_lo
+    le.add_block(zy_cols, vals_lo, -b_lo)
+    vals_hi = torch.empty((N, n, 2), device=device, dtype=dtype)
+    vals_hi[:, :, 0] = 1.0
+    vals_hi[:, :, 1] = -slope_hi
+    le.add_block(zy_cols, vals_hi, b_hi)
 
 
 def _emit_tanh_canonical(
@@ -981,27 +1013,9 @@ def _emit_tanh_canonical(
             ),
         ),
     )
-    for i in range(n):
-        # (a) z >= tanh(lo)  ⇒  -z <= -f_lo
-        vals_a = torch.full((N, 1), -1.0, device=device, dtype=dtype)
-        rhs_a = -f_lo[:, i]
-        le.add([z[i]], vals_a, rhs_a)
-        # (b) z <= tanh(hi)
-        vals_b = torch.full((N, 1), 1.0, device=device, dtype=dtype)
-        rhs_b = f_hi[:, i]
-        le.add([z[i]], vals_b, rhs_b)
-        # (c) z >= slope_lo*y + b_lo  ⇒  -z + slope_lo*y <= -b_lo
-        vals_c = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_c[:, 0] = -1.0
-        vals_c[:, 1] = slope_lo[:, i]
-        rhs_c = -b_lo[:, i]
-        le.add([z[i], y[i]], vals_c, rhs_c)
-        # (d) z <= slope_hi*y + b_hi  ⇒  z - slope_hi*y <= b_hi
-        vals_d = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_d[:, 0] = 1.0
-        vals_d[:, 1] = -slope_hi[:, i]
-        rhs_d = b_hi[:, i]
-        le.add([z[i], y[i]], vals_d, rhs_d)
+    _emit_envelope_rows(
+        le, z, y, f_lo, f_hi, slope_lo, b_lo, slope_hi, b_hi, N, device, dtype
+    )
 
 
 def _emit_sigmoid_canonical(
@@ -1014,61 +1028,10 @@ def _emit_sigmoid_canonical(
     dtype: torch.dtype,
 ) -> None:
     """Canonical 4-ineq SIGMOID envelope, mirroring TANH by curvature."""
-    n = len(con.var_ids) // 2
-    z = list(con.var_ids[:n])
-    y = list(con.var_ids[n:])
-    y_idx = torch.tensor(y, device=device, dtype=torch.long)
-    lo = lb_global[:, y_idx]
-    hi = ub_global[:, y_idx]
-    big = 1e30
-    lo_s = torch.where(torch.isfinite(lo), lo, torch.full_like(lo, -big))
-    hi_s = torch.where(torch.isfinite(hi), hi, torch.full_like(hi, big))
-    hi_s = torch.maximum(hi_s, lo_s)
-    f_lo = torch.sigmoid(lo_s)
-    f_hi = torch.sigmoid(hi_s)
-    df_lo = f_lo * (1.0 - f_lo)
-    df_hi = f_hi * (1.0 - f_hi)
-    gap = hi_s - lo_s
-    safe_gap = torch.where(gap > _TANH_LIN_EPS, gap, torch.ones_like(gap))
-    secant_slope = (f_hi - f_lo) / safe_gap
-    secant_intercept = f_lo - secant_slope * lo_s
-    tang_lo_intercept = f_lo - df_lo * lo_s
-    tang_hi_intercept = f_hi - df_hi * hi_s
-    point_bounds = gap <= _TANH_LIN_EPS
-    convex_seg = ~point_bounds & (hi_s <= -_TANH_LIN_EPS)
-    concave_seg = ~point_bounds & (lo_s >= _TANH_LIN_EPS)
-    mid = 0.5 * (lo_s + hi_s)
-    f_mid = torch.sigmoid(mid)
-    zero = torch.zeros_like(lo_s)
-    slope_lo = torch.where(
-        point_bounds, zero,
-        torch.where(convex_seg, df_hi, torch.where(concave_seg, secant_slope, zero)),
+    _emit_scurve(
+        con, le, lb_global, ub_global, N, device, dtype,
+        torch.sigmoid, lambda value: torch.sigmoid(value) * (1.0 - torch.sigmoid(value)),
     )
-    b_lo = torch.where(
-        point_bounds, f_mid,
-        torch.where(convex_seg, tang_hi_intercept, torch.where(concave_seg, secant_intercept, f_lo)),
-    )
-    slope_hi = torch.where(
-        point_bounds, zero,
-        torch.where(convex_seg, secant_slope, torch.where(concave_seg, df_lo, zero)),
-    )
-    b_hi = torch.where(
-        point_bounds, f_mid,
-        torch.where(convex_seg, secant_intercept, torch.where(concave_seg, tang_lo_intercept, f_hi)),
-    )
-    for i in range(n):
-        vals_a = torch.full((N, 1), -1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_a, -f_lo[:, i])
-        vals_b = torch.full((N, 1), 1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_b, f_hi[:, i])
-        vals_c = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_c[:, 0] = -1.0
-        vals_c[:, 1] = slope_lo[:, i]
-        le.add([z[i], y[i]], vals_c, -b_lo[:, i])
-        vals_d = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_d[:, 0] = 1.0
-        vals_d[:, 1] = -slope_hi[:, i]
-        le.add([z[i], y[i]], vals_d, b_hi[:, i])
 
 
 def _emit_erf_canonical(
@@ -1081,6 +1044,24 @@ def _emit_erf_canonical(
     dtype: torch.dtype,
 ) -> None:
     """Canonical 4-ineq ERF envelope, mirroring SIGMOID by curvature."""
+    _emit_scurve(
+        con, le, lb_global, ub_global, N, device, dtype,
+        torch.erf, lambda value: (2.0 / float(np.sqrt(np.pi))) * torch.exp(-value * value),
+    )
+
+
+def _emit_scurve(
+    con: Any,
+    le: _RowAcc,
+    lb_global: torch.Tensor,
+    ub_global: torch.Tensor,
+    N: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    dfn: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """Emit the shared sigmoid-like curvature envelope."""
     n = len(con.var_ids) // 2
     z = list(con.var_ids[:n])
     y = list(con.var_ids[n:])
@@ -1091,10 +1072,10 @@ def _emit_erf_canonical(
     lo_s = torch.where(torch.isfinite(lo), lo, torch.full_like(lo, -big))
     hi_s = torch.where(torch.isfinite(hi), hi, torch.full_like(hi, big))
     hi_s = torch.maximum(hi_s, lo_s)
-    f_lo = torch.erf(lo_s)
-    f_hi = torch.erf(hi_s)
-    df_lo = (2.0 / float(np.sqrt(np.pi))) * torch.exp(-lo_s * lo_s)
-    df_hi = (2.0 / float(np.sqrt(np.pi))) * torch.exp(-hi_s * hi_s)
+    f_lo = fn(lo_s)
+    f_hi = fn(hi_s)
+    df_lo = dfn(lo_s)
+    df_hi = dfn(hi_s)
     gap = hi_s - lo_s
     safe_gap = torch.where(gap > _TANH_LIN_EPS, gap, torch.ones_like(gap))
     secant_slope = (f_hi - f_lo) / safe_gap
@@ -1105,7 +1086,7 @@ def _emit_erf_canonical(
     convex_seg = ~point_bounds & (hi_s <= -_TANH_LIN_EPS)
     concave_seg = ~point_bounds & (lo_s >= _TANH_LIN_EPS)
     mid = 0.5 * (lo_s + hi_s)
-    f_mid = torch.erf(mid)
+    f_mid = fn(mid)
     zero = torch.zeros_like(lo_s)
     slope_lo = torch.where(
         point_bounds, zero,
@@ -1123,19 +1104,9 @@ def _emit_erf_canonical(
         point_bounds, f_mid,
         torch.where(convex_seg, secant_intercept, torch.where(concave_seg, tang_lo_intercept, f_hi)),
     )
-    for i in range(n):
-        vals_a = torch.full((N, 1), -1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_a, -f_lo[:, i])
-        vals_b = torch.full((N, 1), 1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_b, f_hi[:, i])
-        vals_c = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_c[:, 0] = -1.0
-        vals_c[:, 1] = slope_lo[:, i]
-        le.add([z[i], y[i]], vals_c, -b_lo[:, i])
-        vals_d = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_d[:, 0] = 1.0
-        vals_d[:, 1] = -slope_hi[:, i]
-        le.add([z[i], y[i]], vals_d, b_hi[:, i])
+    _emit_envelope_rows(
+        le, z, y, f_lo, f_hi, slope_lo, b_lo, slope_hi, b_hi, N, device, dtype
+    )
 
 
 
@@ -1173,19 +1144,9 @@ def _emit_sqrt_canonical(
     b_lo = torch.where(degenerate, mid_val, b_lo)
     slope_hi = torch.where(degenerate, zero, slope_hi)
     b_hi = torch.where(degenerate, mid_val, b_hi)
-    for i in range(n):
-        vals_a = torch.full((N, 1), -1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_a, -f_lo[:, i])
-        vals_b = torch.full((N, 1), 1.0, device=device, dtype=dtype)
-        le.add([z[i]], vals_b, f_hi[:, i])
-        vals_c = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_c[:, 0] = -1.0
-        vals_c[:, 1] = slope_lo[:, i]
-        le.add([z[i], y[i]], vals_c, -b_lo[:, i])
-        vals_d = torch.empty((N, 2), device=device, dtype=dtype)
-        vals_d[:, 0] = 1.0
-        vals_d[:, 1] = -slope_hi[:, i]
-        le.add([z[i], y[i]], vals_d, b_hi[:, i])
+    _emit_envelope_rows(
+        le, z, y, f_lo, f_hi, slope_lo, b_lo, slope_hi, b_hi, N, device, dtype
+    )
 
 
 def _emit_periodic_box_canonical(
@@ -1242,24 +1203,6 @@ def _emit_cos_canonical(
 
 
 
-def _quantize_params_flat(con: Any, n: int, device: torch.device, dtype: torch.dtype):
-    scale = con.meta["scale"].to(device=device, dtype=dtype).flatten()
-    zero_point = con.meta["zero_point"].to(device=device, dtype=dtype).flatten()
-    if scale.numel() == 1:
-        scale = scale.expand(n)
-    elif scale.numel() != n:
-        raise NotImplementedError(f"quantize: scale with {scale.numel()} entries cannot broadcast to flat size {n}")
-    if zero_point.numel() == 1:
-        zero_point = zero_point.expand(n)
-    elif zero_point.numel() != n:
-        raise NotImplementedError(f"quantize: zero_point with {zero_point.numel()} entries cannot broadcast to flat size {n}")
-    if torch.any(scale <= 0):
-        raise ValueError("quantize: scale must be positive")
-    qmin = torch.full((n,), float(con.meta["qmin"]), device=device, dtype=dtype)
-    qmax = torch.full((n,), float(con.meta["qmax"]), device=device, dtype=dtype)
-    return scale, zero_point, qmin, qmax
-
-
 def _quantize_qdq_value(x: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor, qmin: torch.Tensor, qmax: torch.Tensor) -> torch.Tensor:
     return scale * torch.clamp(torch.round(x / scale), min=qmin - zero_point, max=qmax - zero_point)
 
@@ -1282,7 +1225,7 @@ def _emit_quantize_canonical(
     hi = torch.maximum(ub_global[:, y_idx], lo)
     if not torch.all(torch.isfinite(lo) & torch.isfinite(hi)):
         raise ValueError("quantize: finite input bounds are required")
-    scale_1d, zp_1d, qmin_1d, qmax_1d = _quantize_params_flat(con, n, device, dtype)
+    scale_1d, zp_1d, qmin_1d, qmax_1d = _quantize_params_flat(con.meta, "quantize", n, device, dtype)
     scale = scale_1d.unsqueeze(0).expand(N, n)
     zp = zp_1d.unsqueeze(0).expand(N, n)
     qmin = qmin_1d.unsqueeze(0).expand(N, n)
@@ -1689,6 +1632,84 @@ def _emit_slice_gather(
         eq.add([ov, iv], vals, rhs)
 
 
+def _emit_copy_rows(
+    y: List[int], x: List[int], eq: _RowAcc, N: int,
+    device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Emit ``y_i - x_i = 0`` for one operator's resolved operand mapping."""
+    col_block = torch.tensor(list(zip(y, x)), device=device, dtype=torch.long)
+    val_block = torch.tensor([1.0, -1.0], device=device, dtype=dtype).expand(N, len(y), 2).contiguous()
+    eq.add_block(col_block, val_block, torch.zeros((N, len(y)), device=device, dtype=dtype))
+
+
+def _emit_concat(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Axis-1 concatenation lists every operand's variables in output order."""
+    n = len(con.var_ids) // 2
+    _emit_copy_rows(list(con.var_ids[:n]), list(con.var_ids[n:]), eq, N, device, dtype)
+
+
+def _emit_expand(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Each broadcast output copies its source element."""
+    input_shape = tuple(int(v) for v in con.meta["input_shape"])
+    mapped = np.broadcast_to(
+        np.arange(int(np.prod(input_shape))).reshape(input_shape),
+        tuple(int(v) for v in con.meta["output_shape"]),
+    ).ravel()
+    n_out = mapped.size
+    if len(con.var_ids) != n_out + int(np.prod(input_shape)):
+        raise ValueError(f"expand: {len(con.var_ids)} variables for {n_out} outputs")
+    x = con.var_ids[n_out:]
+    _emit_copy_rows(list(con.var_ids[:n_out]), [x[int(j)] for j in mapped], eq, N, device, dtype)
+
+
+def _emit_constant(
+    con: Any, eq: _RowAcc, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """Fix each output: ``y_i = value_i``."""
+    value = _as_td(con.meta["value"], device, dtype).reshape(-1)
+    if value.numel() != len(con.var_ids):
+        raise ValueError(f"constant: {value.numel()} values for {len(con.var_ids)} outputs")
+    eq.add_block(
+        torch.tensor(con.var_ids, device=device, dtype=torch.long)[:, None],
+        torch.ones((N, value.numel(), 1), device=device, dtype=dtype),
+        value.expand(N, -1).contiguous(),
+    )
+
+
+def _emit_reduction(
+    con: Any, eq: _RowAcc, mean: bool, N: int, device: torch.device, dtype: torch.dtype,
+) -> None:
+    """``group*y_j - sum(x_i) = 0`` for a mean, ``y_j - sum(x_i) = 0`` for a sum.
+
+    Multiplying out the integer group size keeps a mean's coefficients exact
+    instead of rounding ``1/group`` in the proof.
+    """
+    input_shape = tuple(int(v) for v in con.meta["input_shape"])
+    axes = tuple(int(v) for v in con.meta["axes"])
+    n_in = int(np.prod(input_shape))
+    kept = tuple(1 if axis in axes else size for axis, size in enumerate(input_shape))
+    n_out = int(np.prod(kept))
+    if len(con.var_ids) != n_out + n_in:
+        raise ValueError(f"reduction: {len(con.var_ids)} variables for {n_out}+{n_in}")
+    group = n_in // n_out
+    # Moving the reduced axes last leaves the kept axes in output order.
+    members = np.moveaxis(
+        np.arange(n_in).reshape(input_shape), axes, tuple(range(-len(axes), 0)),
+    ).reshape(n_out, group)
+    y, x = con.var_ids[:n_out], con.var_ids[n_out:]
+    col_block = torch.tensor(
+        [[y[j], *(x[int(i)] for i in owned)] for j, owned in enumerate(members)],
+        device=device, dtype=torch.long,
+    )
+    values = torch.full((N, n_out, group + 1), -1.0, device=device, dtype=dtype)
+    values[:, :, 0] = float(group) if mean else 1.0
+    eq.add_block(col_block, values, torch.zeros((N, n_out), device=device, dtype=dtype))
+
+
 def _emit_in_linpoly(
     con: Any,
     le: _RowAcc,
@@ -1809,6 +1830,19 @@ def _emit_assert_canonical(
             le.add(list(out_ids), vals, rhs)
         return
 
+    def per_batch(raw: Any, value_dtype: torch.dtype, name: str) -> torch.Tensor:
+        """Normalise a scalar or tensor ASSERT field to one value per batch."""
+        values = (
+            raw.to(device=device, dtype=value_dtype).reshape(-1)
+            if isinstance(raw, torch.Tensor)
+            else torch.tensor([raw], device=device, dtype=value_dtype)
+        )
+        if values.numel() == 1 and N > 1:
+            values = values.expand(N)
+        if values.numel() != N:
+            raise ValueError(f"{kind}: {name} length {values.numel()} != N {N}")
+        return values
+
     if kind == OutKind.TOP1_ROBUST:
         # Slack v at slot nvars_net (per §K). K rows: for j in 0..K-1:
         #   v - y_j + y_{t_b} >= 0   ⇒   -v + y_j - y_{t_b} <= 0
@@ -1819,37 +1853,12 @@ def _emit_assert_canonical(
                 f"vs nvars_net={nvars_net}"
             )
         slack_id = nvars_net
-        y_true_raw = assert_layer.params["y_true"]
-        y_true_b = (
-            y_true_raw.to(device=device, dtype=torch.long).reshape(-1)
-            if isinstance(y_true_raw, torch.Tensor)
-            else torch.tensor(
-                [int(y_true_raw)], device=device, dtype=torch.long
-            )
-        )
-        if y_true_b.numel() == 1 and N > 1:
-            y_true_b = y_true_b.expand(N)
-        if y_true_b.numel() != N:
-            raise ValueError(
-                f"TOP1_ROBUST: y_true length {y_true_b.numel()} != N {N}"
-            )
+        y_true_b = per_batch(assert_layer.params["y_true"], torch.long, "y_true")
         k_classes = n_out
         # For each j, vars referenced are [slack, y_j, y_{t_b}]. y_{t_b}
         # differs per instance, so we emit per-j rows where vars include
         # y_{t_b} as the third var, but indexed per N.
         for j in range(k_classes):
-            # We need to model "v - y_j + y_{t_b} <= 0" per instance. The
-            # third var index differs per instance ⇒ structure isn't uniform
-            # across N for j != t. Workaround: when j == t_b, the row reduces
-            # to v <= 0... wait actually y_j == y_{t_b} so it cancels to v <= 0.
-            # For j != t_b, the row uses two distinct y vars per instance.
-            # We re-encode by listing ALL K output vars on each row with
-            # per-N coefficients, plus the slack.
-            #   vals[n] on y_k = (+1 if k == j else 0) - (+1 if k == t_b[n] else 0)
-            #   ⇒ for k=j: vals[n] = 1 - delta_{j, t_b[n]}
-            #   ⇒ for k=t_b[n]: vals[n] = -1 (if k != j) or 0 (if k == j)
-            #   ⇒ for k != j, k != t_b[n]: 0
-            # vals on slack v: -1.0
             row_vars = [slack_id] + list(out_ids)
             vals = torch.zeros((N, 1 + k_classes), device=device, dtype=dtype)
             vals[:, 0] = -1.0  # coeff on slack v
@@ -1873,8 +1882,6 @@ def _emit_assert_canonical(
         vals_v = torch.full((N, 1), -1.0, device=device, dtype=dtype)
         rhs_v = torch.zeros((N,), device=device, dtype=dtype)
         le.add([slack_id], vals_v, rhs_v)
-        # Also tighten the slack's lower bound in lb_global (helps Adam solver
-        # initialise well). Upper bound stays +inf.
         return
 
     if kind == OutKind.MARGIN_ROBUST:
@@ -1883,32 +1890,8 @@ def _emit_assert_canonical(
         # easy reasoning); the j == t_b row degenerates to 0 <= -margin + eps
         # (trivially satisfied when margin > 0, or strict when margin <= 0).
         k_classes = n_out
-        y_true_raw = assert_layer.params["y_true"]
-        y_true_b = (
-            y_true_raw.to(device=device, dtype=torch.long).reshape(-1)
-            if isinstance(y_true_raw, torch.Tensor)
-            else torch.tensor(
-                [int(y_true_raw)], device=device, dtype=torch.long
-            )
-        )
-        if y_true_b.numel() == 1 and N > 1:
-            y_true_b = y_true_b.expand(N)
-        if y_true_b.numel() != N:
-            raise ValueError(
-                f"MARGIN_ROBUST: y_true length {y_true_b.numel()} != N {N}"
-            )
-        margin_raw = assert_layer.params["margin"]
-        margin_b = (
-            margin_raw.to(device=device, dtype=dtype).reshape(-1)
-            if isinstance(margin_raw, torch.Tensor)
-            else torch.tensor([float(margin_raw)], device=device, dtype=dtype)
-        )
-        if margin_b.numel() == 1 and N > 1:
-            margin_b = margin_b.expand(N)
-        if margin_b.numel() != N:
-            raise ValueError(
-                f"MARGIN_ROBUST: margin length {margin_b.numel()} != N {N}"
-            )
+        y_true_b = per_batch(assert_layer.params["y_true"], torch.long, "y_true")
+        margin_b = per_batch(assert_layer.params["margin"], dtype, "margin")
         for j in range(k_classes):
             row_vars = list(out_ids)
             vals = torch.zeros((N, k_classes), device=device, dtype=dtype)
@@ -1949,9 +1932,7 @@ def _emit_assert_canonical(
         slack_id = nvars_net
         lb_raw = assert_layer.params.get("lb")
         ub_raw = assert_layer.params.get("ub")
-        # When one side is missing, materialise both sides with sentinel infinity; for
-        # uniform structure we materialise both sides with sentinel infinity
-        # so the missing side becomes a trivial constraint.
+        # Missing bounds become trivial rows to preserve a uniform structure.
         if lb_raw is not None:
             lb_b = _coerce_b_tensor(lb_raw, N, n_out, device, dtype, "lb")
         else:
@@ -2176,16 +2157,23 @@ def export_to_batch_problem(
             _emit_slice_gather(con, eq, is_gather=False, N=N, device=device, dtype=dtype)
         elif tag.startswith("gather:"):
             _emit_slice_gather(con, eq, is_gather=True, N=N, device=device, dtype=dtype)
+        elif tag.startswith("concat:"):
+            _emit_concat(con, eq, N, device, dtype)
+        elif tag.startswith("expand:"):
+            _emit_expand(con, eq, N, device, dtype)
+        elif tag.startswith("constant:"):
+            _emit_constant(con, eq, N, device, dtype)
+        elif tag.startswith("reduce_sum:"):
+            _emit_reduction(con, eq, False, N, device, dtype)
+        elif tag.startswith("mean:"):
+            _emit_reduction(con, eq, True, N, device, dtype)
         elif tag == "in:linpoly":
             _emit_in_linpoly(con, le, N, device, dtype)
         elif tag.startswith(("max:", "min:", "div:", "clip:")):
-            # Currently unsupported by the canonical batched form; fail loud
-            # rather than silently produce a wrong LP.
             raise NotImplementedError(
                 f"export_to_batch_problem: tag {tag!r} not implemented"
             )
         else:
-            # Unknown tag: fail loud per directive (A).
             raise NotImplementedError(
                 f"export_to_batch_problem: unsupported tag {tag!r}"
             )
@@ -2234,3 +2222,431 @@ def export_to_batch_problem(
         obj_const=obj_const,
     )
 
+# Terminal network export support.
+TERMINAL_LAYER_KINDS = frozenset({
+    "INPUT", "INPUT_SPEC", "ASSERT", "DENSE", "CONV2D", "BIAS", "SCALE",
+    "ADD", "SUB", "FLATTEN", "RESHAPE", "TRANSPOSE", "SLICE", "GATHER", "RELU",
+    "BN", "CONSTANT", "CONCAT", "EXPAND", "REDUCE_SUM", "MEAN",
+})
+_EXACT_TAGS = frozenset({
+    "box", "dense", "conv2d", "bias", "scale", "add", "sub", "flatten",
+    "reshape", "transpose", "slice", "gather", "relu", "in",
+    "bn", "constant", "concat", "expand", "reduce_sum", "mean",
+})
+_LANE_BASE_CACHE = 64
+
+
+@dataclass(frozen=True)
+class _PhaseRows:
+    """Where one literal's sign and phase-equality rows live in its lane LP."""
+    layer_id: int
+    neuron: int
+    sign: int
+    pre_var: int
+    post_var: int
+    le_row: int
+    eq_row: int
+
+
+@dataclass
+class TerminalExport:
+    """CPU sparse lanes with a Torch representation materialized on demand."""
+    input_ids: tuple[int, ...]
+    output_ids: tuple[int, ...]
+    spec_c: torch.Tensor
+    spec_d: torch.Tensor
+    out_kind: str
+    net: Net
+    input_bounds: Bounds
+    split_signs: dict[int, torch.Tensor]
+    relu_upper_rows: tuple[int, ...]
+    relu_layers: tuple[Layer, ...]
+    _lanes: tuple[Any, ...] = field(repr=False)
+    _phase_rows: tuple[tuple[_PhaseRows, ...], ...] = field(repr=False)
+
+    @cached_property
+    def problem(self) -> BatchLPProblem:
+        """Pack corrected lanes only when a consumer needs BatchLPProblem."""
+        from scipy import sparse
+
+        lanes = self._lanes
+        n = len(lanes[0].lb)
+        me = max(p.eq.shape[0] for p in lanes)
+        ml = max(p.le.shape[0] for p in lanes)
+        ref = self.spec_c
+
+        def tensor(arrays: list[np.ndarray]) -> torch.Tensor:
+            """Move a stacked numeric block to the export device."""
+            return torch.as_tensor(np.stack(arrays), device=ref.device, dtype=ref.dtype)
+
+        # Pad the public batched view without mutating the solver's CPU lanes.
+        eqs = [sparse.vstack((p.eq, sparse.csr_matrix((me - p.eq.shape[0], n))),
+                             format="csr") for p in lanes]
+        les = [sparse.vstack((p.le, sparse.csr_matrix((ml - p.le.shape[0], n))),
+                             format="csr") for p in lanes]
+        return BatchLPProblem(
+            n, me, ml, tensor([p.lb for p in lanes]), tensor([p.ub for p in lanes]),
+            _torch_blocks(eqs, ref),
+            tensor([np.pad(p.eq_rhs, (0, me - p.eq.shape[0])) for p in lanes]),
+            _torch_blocks(les, ref),
+            tensor([np.pad(p.le_rhs, (0, ml - p.le.shape[0])) for p in lanes]),
+            ref.new_zeros((len(lanes), n)), ref.new_zeros(len(lanes)),
+        )
+
+
+def _scipy_blocks(matrix: torch.Tensor, rows: int, cols: int, count: int) -> list[Any]:
+    """Convert COO once, then slice sparse lane blocks without densifying."""
+    from scipy import sparse
+    matrix = matrix.detach().coalesce().cpu()
+    indices = matrix.indices().numpy()
+    whole = sparse.coo_matrix((matrix.values().double().numpy(), indices),
+                              shape=matrix.shape).tocsr()
+    return [whole[k * rows:(k + 1) * rows, k * cols:(k + 1) * cols]
+            for k in range(count)]
+
+
+def _torch_blocks(blocks: list[Any], reference: torch.Tensor) -> torch.Tensor:
+    """Pack CPU sparse blocks in the existing BatchLPProblem convention."""
+    from scipy import sparse
+    whole = sparse.block_diag(blocks, format="coo")
+    indices = torch.as_tensor(np.stack((whole.row, whole.col)), device=reference.device)
+    values = torch.as_tensor(whole.data, device=reference.device, dtype=reference.dtype)
+    return torch.sparse_coo_tensor(indices, values, whole.shape).coalesce()
+
+
+def _derive_boxes(p: _SparseLP, input_ids: tuple[int, ...],
+                  relus: tuple[Layer, ...]) -> None:
+    """Recover interval boxes from exported equations, with directed rounding.
+
+    Interval TF boxes are only exporter scaffolding, never proof premises.
+    It never assumes the nearest-rounded interval TF boxes are sound.
+    """
+    solver_torchlp = import_module("act.back_end.solver.solver_torchlp")
+    _add, _fraction_float, _mul = (
+        solver_torchlp._add, solver_torchlp._fraction_float, solver_torchlp._mul,
+    )
+
+    known = set(input_ids)
+    pending = set(range(p.eq.shape[0]))
+    relu_pending = [(x, z) for layer in relus for x, z in zip(layer.in_vars, layer.out_vars)]
+    while pending or relu_pending:
+        progress = False
+        for row in tuple(pending):
+            start, end = p.eq.indptr[row:row + 2]
+            terms = list(zip(p.eq.indices[start:end], p.eq.data[start:end]))
+            unknown = [int(j) for j, a in terms if a != 0 and j not in known]
+            if not unknown:
+                pending.remove(row)
+                continue
+            if len(unknown) != 1:
+                continue
+            pivot = unknown[0]
+            a = next(float(a) for j, a in terms if j == pivot)
+            lower = upper = float(p.eq_rhs[row])
+            for j, v in terms:
+                if j == pivot or v == 0:
+                    continue
+                lower = _add(lower, -max(_mul(v, float(p.lb[j]), True), _mul(v, float(p.ub[j]), True)))
+                upper = _add(upper, -min(_mul(v, float(p.lb[j])), _mul(v, float(p.ub[j]))))
+            if abs(a) == 1:
+                values = (lower / a, upper / a)
+                p.lb[pivot], p.ub[pivot] = min(values), max(values)
+            else:
+                values = (Fraction(lower) / Fraction(a), Fraction(upper) / Fraction(a))
+                p.lb[pivot] = _fraction_float(min(values), False)
+                p.ub[pivot] = _fraction_float(max(values), True)
+            known.add(pivot)
+            pending.remove(row)
+            progress = True
+        for x, z in tuple(relu_pending):
+            if x in known:
+                p.lb[z], p.ub[z] = max(0.0, p.lb[x]), max(0.0, p.ub[x])
+                known.add(z)
+                relu_pending.remove((x, z))
+                progress = True
+        if not progress and (pending or relu_pending):
+            raise NotImplementedError("unsupported_nontriangular_affine_equations")
+    if len(known) != len(p.lb) or not np.isfinite(p.lb).all() or not np.isfinite(p.ub).all():
+        raise NotImplementedError("unsupported_unbounded_variable_schema")
+
+
+@dataclass(frozen=True)
+class _TerminalHeader:
+    """A supported model's validated literals and property; no lane LP yet."""
+    entry: Layer
+    assertion: Layer
+    specs: list[Layer]
+    input_ids: tuple[int, ...]
+    output_ids: tuple[int, ...]
+    signs: dict[int, torch.Tensor]
+    spec_c: torch.Tensor
+    spec_d: torch.Tensor
+    out_kind: str
+
+
+def export_terminal_problem(
+    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]] = None,
+    *, reference_bounds: Optional[dict[int, Bounds]] = None,
+    lane_bases: Optional[dict[tuple[bytes, bytes], Any]] = None,
+) -> TerminalExport:
+    """Export all K lanes once, without trusting supplied intermediate boxes.
+
+    ``reference_bounds`` is accepted for caller symmetry but deliberately not
+    used: root replay of a core cannot inherit conditioned lane bounds.
+    Signs have shape [K,n] or identical [K,M,n] copies. Unsupported inputs or
+    incomplete affine encodings raise ``NotImplementedError`` explicitly.
+    The LP lives on the host, so the export is built there too, whatever the
+    default device; only candidate validation returns to the input's device.
+    ``lane_bases`` caches one split-free LP per input box across calls.
+    """
+    with torch.device("cpu"):
+        return _export_on_host(net, input_bounds, split_signs, lane_bases)
+
+
+def _terminal_header(
+    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]],
+) -> _TerminalHeader:
+    """Reject unsupported models and encode the literals and property, without any lane LP."""
+    from act.back_end.verifier import gather_input_spec_layers
+
+    if input_bounds.lb.ndim < 2 or input_bounds.lb.shape != input_bounds.ub.shape:
+        raise ValueError("terminal input bounds require matching [K,*shape]")
+    if not (torch.isfinite(input_bounds.lb).all() and torch.isfinite(input_bounds.ub).all()):
+        raise ValueError("nonfinite_input_bounds")
+    if bool((input_bounds.lb > input_bounds.ub).any()):
+        raise ValueError("inverted_input_bounds")
+    unsupported = {layer.kind for layer in net.layers} - TERMINAL_LAYER_KINDS
+    if unsupported:
+        raise NotImplementedError(f"unsupported_layers:{','.join(sorted(unsupported))}")
+    # Concrete execution follows predecessor edges, while the exporter uses
+    # variable IDs (and explicit binary operand metadata). Both descriptions
+    # must encode the same complete operation before any proof is trusted.
+    defined: set[int] = set()
+    for lid in get_topo_order(net):
+        layer = net.by_id[lid]
+        predecessors = net.preds.get(layer.id, [])
+        arity = (0 if layer.kind == "INPUT" else 2 if layer.kind in {"ADD", "SUB"}
+                 else len(predecessors) if layer.kind == "CONCAT" else 1)
+        operands = [net.by_id[lid].out_vars for lid in predecessors]
+        # A CONSTANT reads no operand, whatever routing edges its importer left.
+        if layer.kind != "CONSTANT" and (
+            len(predecessors) != arity
+            or layer.in_vars != [variable for operand in operands for variable in operand]
+        ):
+            raise NotImplementedError(f"unsupported_operand_mapping:{layer.id}")
+        if layer.kind in {"ADD", "SUB"} and (
+            layer.params.get("x_vars") != operands[0]
+            or layer.params.get("y_vars") != operands[1]
+            or any(len(operand) != len(layer.out_vars) for operand in operands)
+        ):
+            raise NotImplementedError(f"unsupported_operand_mapping:{layer.id}")
+        # A proof variable denotes one scalar value, not a mutable storage
+        # slot. Only coordinate-preserving wrappers may reuse an existing ID.
+        identity = (layer.kind in {"INPUT_SPEC", "FLATTEN", "RESHAPE", "ASSERT"}
+                    and len(layer.out_vars) == len(layer.in_vars))
+        if (len(set(layer.out_vars)) != len(layer.out_vars)
+                or any(v in defined and not (identity and v == layer.in_vars[j])
+                       for j, v in enumerate(layer.out_vars))):
+            raise NotImplementedError(f"unsupported_variable_alias:{layer.id}")
+        defined.update(layer.out_vars)
+    specs = gather_input_spec_layers(net)
+    for layer in specs:
+        kind = layer.params["kind"]
+        if kind not in {InKind.BOX, InKind.LINF_BALL, InKind.LIN_POLY, InKind.LP_EMBEDDING}:
+            raise NotImplementedError(f"unsupported_input:{kind}")
+        if kind == InKind.LP_EMBEDDING and (layer.input_geometry is None
+                                          or layer.input_geometry.p != math.inf):
+            raise NotImplementedError("unsupported_finite_p_input")
+    entry, = (layer for layer in net.layers if layer.kind == "INPUT")
+    assertion = net.layers[-1]
+    if assertion.kind != "ASSERT":
+        raise ValueError("terminal network must end in ASSERT")
+    k_count = input_bounds.lb.shape[0]
+    input_ids, output_ids = tuple(entry.out_vars), tuple(assertion.in_vars)
+    signs: dict[int, torch.Tensor] = {}
+    for lid, value in (split_signs or {}).items():
+        layer = net.by_id[lid]
+        if layer.kind != "RELU":
+            raise NotImplementedError(f"unsupported_split_layer:{lid}")
+        if value.ndim == 3:
+            if not bool((value == value[:, :1, :]).all()):
+                raise ValueError("spec_rows_have_different_lane_phases")
+            value = value[:, 0, :]
+        if value.shape != (k_count, len(layer.in_vars)) or not bool(((value == 0) | (value.abs() == 1)).all()):
+            raise ValueError("invalid_split_signs")
+        signs[lid] = value.to(device=input_bounds.lb.device)
+    ref = input_bounds.lb.double().cpu()
+    params = assertion.params
+    if "C" in params and "thresholds" in params:
+        m = int(params["M"])
+        c = torch.as_tensor(params["C"], device=ref.device, dtype=ref.dtype).reshape(-1, m, len(output_ids))
+        d = torch.as_tensor(params["thresholds"], device=ref.device, dtype=ref.dtype).reshape(-1, m)
+        c, d = c.expand(k_count, -1, -1), d.expand(k_count, -1)
+    else:
+        spec = OutputSpec(kind=params["kind"], **{key: params.get(key)
+                          for key in ("c", "d", "y_true", "margin", "lb", "ub")})
+        encoded = spec.encode_linear(k_count, len(output_ids), ref.device, ref.dtype)
+        c = encoded["C"].reshape(k_count, -1, len(output_ids))
+        d = encoded["thresholds"]
+    if not torch.isfinite(c).all() or not torch.isfinite(d).all():
+        raise ValueError("nonfinite_output_spec")
+    return _TerminalHeader(entry, assertion, specs, input_ids, output_ids, signs, c, d, params["kind"])
+
+
+@dataclass(frozen=True)
+class _LaneBase:
+    """Split-free exported LP of one input box; literals only append rows to it."""
+    lp: Any
+    relus: tuple[Layer, ...]
+    upper_rows: tuple[int, ...]
+    pre_vars: np.ndarray
+    post_vars: np.ndarray
+
+
+def _lane_base(net: Net, head: _TerminalHeader, lower: torch.Tensor, upper: torch.Tensor) -> _LaneBase:
+    """Export one ``[1,*shape]`` box, with outward boxes and repaired ReLU upper rows."""
+    from act.back_end.interval_tf.interval_tf import IntervalTF
+    solver_torchlp = import_module("act.back_end.solver.solver_torchlp")
+    _SparseLP, _fraction_float = solver_torchlp._SparseLP, solver_torchlp._fraction_float
+    from act.back_end.verifier import add_all_input_specs
+
+    entry, assertion, specs = head.entry, head.assertion, head.specs
+    input_ids = head.input_ids
+    k_count = 1
+    seed = Bounds(lower.double().cpu(), upper.double().cpu())
+    before: dict[int, Fact] = {}
+    after: dict[int, Fact] = {}
+    constraints = ConSet()
+    tf = IntervalTF()
+    for lid in get_topo_order(net):
+        original_layer = net.by_id[lid]
+        layer = replace(original_layer, params={
+            key: value.to(seed.lb) if isinstance(value, torch.Tensor) and value.is_floating_point() else value
+            for key, value in original_layer.params.items()
+        }, cache={})
+        preds = net.preds.get(lid, [])
+        box = after[preds[0]].bounds if preds else Bounds(seed.lb.flatten(1), seed.ub.flatten(1))
+        before[lid] = Fact(box, ConSet())
+        fact = tf.apply(layer, box, net, before, after)
+        after[lid] = fact
+        for con in fact.cons:
+            if con.meta.get("tag", "").split(":")[0] not in _EXACT_TAGS:
+                raise NotImplementedError(f"unsupported_constraint:{con.meta.get('tag')}")
+            constraints.replace(con)
+    add_all_input_specs(constraints, list(entry.out_vars), specs)
+    # Reuse the canonical exporter but remove its deliberately trivial ASSERT
+    # row. Property negation belongs below, one ordinary row or one unsafe set.
+    dummy_params = OutputSpec(kind=OutKind.LINEAR_LE,
+        c=seed.lb.new_zeros(len(assertion.in_vars)), d=seed.lb.new_tensor(-1.0)
+    ).encode_linear(k_count, len(assertion.in_vars), seed.lb.device, seed.lb.dtype)
+    dummy = Layer(assertion.id, "ASSERT", dummy_params,
+                  list(assertion.in_vars), list(assertion.out_vars))
+    problem = export_to_batch_problem(net, constraints, dummy, seed)
+    n = problem.nvars
+    eqs = _scipy_blocks(problem.A_eq_blockdiag, problem.m_eq, n, k_count)
+    les = _scipy_blocks(problem.A_le_blockdiag, problem.m_le, n, k_count)
+    eq_rhs, le_rhs = problem.b_eq.cpu().numpy(), problem.b_le.cpu().numpy()
+    relus = tuple(net.by_id[int(con.meta["tag"].split(":")[1])]
+                  for con in constraints if con.meta.get("tag", "").startswith("relu:"))
+    # Only RELU and original linear input constraints emit inequality rows.
+    upper_rows = tuple(3 * j + 2 for j in range(sum(len(l.out_vars) for l in relus)))
+    p = _SparseLP(eqs[0], eq_rhs[0].copy(), les[0][:-1].tocsr(), le_rhs[0, :-1].copy(),
+                  np.full(n, -np.inf), np.full(n, np.inf))
+    p.lb[list(input_ids)] = problem.lb[0, list(input_ids)].cpu().numpy()
+    p.ub[list(input_ids)] = problem.ub[0, list(input_ids)].cpu().numpy()
+    _derive_boxes(p, input_ids, relus)
+    le, rhs = p.le.tolil(), list(p.le_rhs)
+    count = 0
+    for layer in relus:
+        for x, z in zip(layer.in_vars, layer.out_vars):
+            row = upper_rows[count]
+            count += 1
+            # Replace EVERY upper row. A float slope is safe only when
+            # its intercept covers BOTH exact endpoints of the chord.
+            le.rows[row], le.data[row] = [z], [1.0]
+            rhs[row] = max(0.0, p.ub[x])
+            if p.lb[x] < 0 < p.ub[x]:
+                lower, upper = Fraction(float(p.lb[x])), Fraction(float(p.ub[x]))
+                slope = float(upper / (upper - lower))
+                intercept = max(-Fraction(slope) * lower, (1 - Fraction(slope)) * upper)
+                le.rows[row], le.data[row] = [z, x], [1.0, -slope]
+                rhs[row] = _fraction_float(intercept, True)
+    p.le, p.le_rhs = le.tocsr(), np.asarray(rhs)
+    pre_vars = np.array([x for layer in relus for x in layer.in_vars], dtype=np.int64)
+    post_vars = np.array([z for layer in relus for z in layer.out_vars], dtype=np.int64)
+    return _LaneBase(p, relus, upper_rows, pre_vars, post_vars)
+
+
+def _lane_with_literals(
+    base: _LaneBase, literals: np.ndarray, layers: list[int], neurons: list[int],
+) -> tuple[_SparseLP, tuple[_PhaseRows, ...]]:
+    """Append this lane's fixed-phase equations and sign rows to its base LP."""
+    from scipy import sparse
+    _SparseLP = import_module("act.back_end.solver.solver_torchlp")._SparseLP
+
+    p = base.lp
+    width = len(p.lb)
+    lower, upper = p.lb[base.pre_vars], p.ub[base.pre_vars]
+    active = (literals > 0) | (lower >= 0)
+    fixed = active | (literals < 0) | (upper <= 0)
+    fixed_rows = np.cumsum(fixed) - 1
+    rows = np.concatenate((fixed_rows[fixed], fixed_rows[active]))
+    columns = np.concatenate((base.post_vars[fixed], base.pre_vars[active]))
+    values = np.concatenate((np.ones(int(fixed.sum())), -np.ones(int(active.sum()))))
+    equations = sparse.csr_matrix((values, (rows, columns)), shape=(int(fixed.sum()), width))
+    chosen = np.nonzero(literals)[0]
+    signs = sparse.csr_matrix(
+        (-literals[chosen], (np.arange(chosen.size), base.pre_vars[chosen])), shape=(chosen.size, width),
+    )
+    phases = tuple(
+        _PhaseRows(layers[j], neurons[j], int(literals[j]), int(base.pre_vars[j]), int(base.post_vars[j]),
+                   len(p.le_rhs) + index, p.eq.shape[0] + int(fixed_rows[j]))
+        for index, j in enumerate(chosen.tolist())
+    )
+    return _SparseLP(
+        sparse.vstack((p.eq, equations), format="csr"), np.concatenate((p.eq_rhs, np.zeros(equations.shape[0]))),
+        sparse.vstack((p.le, signs), format="csr"), np.concatenate((p.le_rhs, np.zeros(chosen.size))),
+        p.lb, p.ub,
+    ), phases
+
+
+def _export_on_host(
+    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]],
+    lane_bases: Optional[dict[tuple[bytes, bytes], _LaneBase]] = None,
+) -> TerminalExport:
+    """Build one TerminalExport with host tensors and sparse matrices."""
+    head = _terminal_header(net, input_bounds, split_signs)
+    input_ids, output_ids, signs = head.input_ids, head.output_ids, head.signs
+    k_count = input_bounds.lb.shape[0]
+    flat_lower = input_bounds.lb.detach().double().cpu().flatten(1)
+    flat_upper = input_bounds.ub.detach().double().cpu().flatten(1)
+    bases = {} if lane_bases is None else lane_bases
+    lanes: list[_SparseLP] = []
+    phase_rows: list[tuple[_PhaseRows, ...]] = []
+    base: Optional[_LaneBase] = None
+    literal_matrix = None
+    for k in range(k_count):
+        key = (flat_lower[k].numpy().tobytes(), flat_upper[k].numpy().tobytes())
+        base = bases.get(key)
+        if base is None:
+            if len(bases) >= _LANE_BASE_CACHE:
+                bases.clear()
+            base = bases[key] = _lane_base(net, head, input_bounds.lb[k:k + 1], input_bounds.ub[k:k + 1])
+        if literal_matrix is None:
+            # Every base of one network orders the same neurons.
+            layers = [layer.id for layer in base.relus for _ in layer.in_vars]
+            neurons = [j for layer in base.relus for j in range(len(layer.in_vars))]
+            literal_matrix = (
+                torch.cat([
+                    signs[layer.id].cpu().double() if layer.id in signs
+                    else torch.zeros(k_count, len(layer.in_vars), dtype=torch.float64)
+                    for layer in base.relus
+                ], 1).numpy() if base.relus else np.zeros((k_count, 0))
+            )
+        lane, lane_phases = _lane_with_literals(base, literal_matrix[k], layers, neurons)
+        lanes.append(lane)
+        phase_rows.append(lane_phases)
+    assert base is not None
+    upper_rows, relus = base.upper_rows, base.relus
+    return TerminalExport(input_ids, output_ids, head.spec_c, head.spec_d, head.out_kind, net, input_bounds,
+                          signs, upper_rows, relus, tuple(lanes), tuple(phase_rows))

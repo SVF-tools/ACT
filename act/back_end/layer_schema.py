@@ -62,7 +62,6 @@ InputLayer → InputSpecLayer → Model → OutputSpecLayer
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from typing import Dict, Any, override
 import enum
 
@@ -70,7 +69,7 @@ import enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .core import Layer
+    pass
 
 import torch
 import torch.nn as nn
@@ -197,18 +196,6 @@ TRANSFORMER_KINDS: frozenset[str] = frozenset(
     }
 )
 
-# Activations with a 1:1 standard torch module surface (hook-traceable).
-HOOKABLE_ACTIVATION_KINDS: frozenset[str] = frozenset(
-    {
-        LayerKind.RELU.value,
-        LayerKind.SIGMOID.value,
-        LayerKind.TANH.value,
-        LayerKind.SILU.value,
-        LayerKind.LRELU.value,
-    }
-)
-
-
 # -------------------------------------------
 # Strict schema: flat registry (easy to edit)
 # -------------------------------------------
@@ -259,6 +246,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "b",
             "eps",
             "p_norm",
+            "embed_dim",
             "perturbed_positions",
             "lb_val",
             "ub_val",
@@ -286,6 +274,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "weight_pos",
             "weight_neg",
             "activation",
+            "token_wise",
             "input_shape",
             "output_shape",
         ],
@@ -787,7 +776,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SOFTMAX.value: {
         "params_required": ["axis"],
-        "params_optional": ["input_shape", "output_shape"],
+        "params_optional": ["input_shape", "output_shape", "rowsize"],
     },
     LayerKind.MHA.value: {
         "params_required": ["num_heads"],

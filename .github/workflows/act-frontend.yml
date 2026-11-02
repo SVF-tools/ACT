@@ -43,7 +43,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil "transformers>=4.57.3,<5" scikit-learn
 
       - name: Run VNNLIB Data-Model and Synthesis
         run: |
@@ -81,6 +81,8 @@ jobs:
           coverage run -p -m act.front_end --help
           coverage run -p -m act.front_end --list-creators
           coverage run -p -m act.front_end --info-creator vnnlib
+          coverage run -p -m act.front_end --info-creator bert
+          coverage run -p -m act.front_end.model_synthesis --compact-smoke
 
       - name: Generate Networks for Testing
         run: |

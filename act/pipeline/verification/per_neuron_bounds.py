@@ -290,6 +290,9 @@ def sample_inputs_from_spec(
     for _ in range(1, num_samples):
         rand = torch.rand(lb.shape, device=lb.device, dtype=lb.dtype, generator=generator)
         samples.append(lb + rand * (ub - lb))
+    geometry = act_net.input_geometry
+    if geometry is not None:
+        samples = [geometry.project(x) for x in samples]
     return samples
 
 
