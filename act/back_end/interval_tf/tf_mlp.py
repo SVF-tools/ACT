@@ -15,7 +15,8 @@
 
 import torch
 import math
-from typing import Any, List, Mapping
+from typing import Any
+from collections.abc import Mapping
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
 from act.back_end.utils import affine_bounds, four_corner_envelope, pwl_meta
 
@@ -84,6 +85,14 @@ def _sin_interval(lo: torch.Tensor, hi: torch.Tensor) -> Bounds:
 def _cos_interval(lo: torch.Tensor, hi: torch.Tensor) -> Bounds:
     return _periodic_interval(torch.cos, lo, hi, 0.0, math.pi)
 
+
+def _fact(L: Layer, B: Bounds, con_kind: str, meta: dict[str, Any]) -> Fact:
+    """Fact of B with one con_kind constraint over out_vars + in_vars, then the box."""
+    C = ConSet()
+    C.replace(Con(con_kind, tuple(L.out_vars + L.in_vars), meta))
+    C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
 # -------- MLP Basics --------
 def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     # Parameter names aligned with PyTorch: weight, bias, weight_pos, weight_neg
@@ -112,33 +121,27 @@ def tf_dense(L: Layer, Bin: Bounds) -> Fact:
             (lower @ positive.T + upper @ negative.T + bias).reshape(batch, -1),
             (upper @ positive.T + lower @ negative.T + bias).reshape(batch, -1),
         )
-        constraints = ConSet()
-        constraints.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+        return _fact(L, box, "EQ", {
             "tag": f"dense:{L.id}", "W": weight, "b": bias,
             "token_wise": True, "token_count": tokens,
-        }))
-        constraints.add_box(L.id, L.out_vars, box)
-        return Fact(box, constraints)
+        })
     W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
     W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
     b = L.params.get("bias", torch.zeros(W.shape[0]))
     
     B = affine_bounds(W_pos, W_neg, b, Bin)
-    C = ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"dense:{L.id}", "W": W, "b": b}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B,C)
+    return _fact(L, B, "EQ", {"tag": f"dense:{L.id}", "W": W, "b": b})
 
 def tf_bias(L: Layer, Bin: Bounds) -> Fact:
     c=L.params["c"]
     B=Bounds(Bin.lb+c, Bin.ub+c)
-    C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"bias:{L.id}", "c": c}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B,C)
+    return _fact(L, B, "EQ", {"tag": f"bias:{L.id}", "c": c})
 
 def tf_scale(L: Layer, Bin: Bounds) -> Fact:
     # Bounds are [B, n], but SCALE parameters can retain spatial axes.
     a=L.params["a"].reshape(-1)
     lb=torch.where(a>=0, a*Bin.lb, a*Bin.ub); ub=torch.where(a>=0, a*Bin.ub, a*Bin.lb)
-    B=Bounds(lb,ub); C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"scale:{L.id}", "a": a}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B,C)
+    return _fact(L, Bounds(lb,ub), "EQ", {"tag": f"scale:{L.id}", "a": a})
 
 def tf_relu(L: Layer, Bin: Bounds) -> Fact:
     l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
@@ -149,13 +152,11 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
         s=torch.where(finite, ua/torch.clamp(gap,min=1e-12), torch.ones_like(gap))
         t=torch.where(finite, -s*la, torch.zeros_like(gap))
     else: s=t=torch.empty(0)
-    B=Bounds(lb,ub); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"relu:{L.id}",
+    return _fact(L, Bounds(lb,ub), "INEQ", {"tag":f"relu:{L.id}",
         "idx_on": torch.nonzero(on,as_tuple=True)[0],
         "idx_off": torch.nonzero(off,as_tuple=True)[0],
         "idx_amb": torch.nonzero(amb,as_tuple=True)[0],
-        "slope": s, "shift": t}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+        "slope": s, "shift": t})
 
 def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     a=float(L.params["negative_slope"])
@@ -170,29 +171,24 @@ def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
         s=torch.where(finite, (ua-a*la)/torch.clamp(gap,min=1e-12), torch.full_like(gap,max(a,1.0)))
         t=torch.where(finite, a*la-s*la, torch.zeros_like(gap))
     else: s=t=torch.empty(0)
-    B=Bounds(lb,ub); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"lrelu:{L.id}","alpha":a,
+    return _fact(L, Bounds(lb,ub), "INEQ", {"tag":f"lrelu:{L.id}","alpha":a,
         "idx_on": torch.nonzero(on,as_tuple=True)[0],
         "idx_off": torch.nonzero(off,as_tuple=True)[0],
         "idx_amb": torch.nonzero(amb,as_tuple=True)[0],
-        "slope": s, "shift": t}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+        "slope": s, "shift": t})
 
 def tf_abs(L: Layer, Bin: Bounds) -> Fact:
     l,u=Bin.lb,Bin.ub; pos=l>=0; neg=u<=0; amb=~(pos|neg)
     lb=torch.minimum(torch.zeros_like(l), torch.minimum(torch.abs(l), torch.abs(u)))
     ub=torch.maximum(torch.abs(l), torch.abs(u))
-    B=Bounds(lb,ub); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"abs:{L.id}",
+    return _fact(L, Bounds(lb,ub), "INEQ", {"tag":f"abs:{L.id}",
         "idx_pos": torch.nonzero(pos,as_tuple=True)[0],
         "idx_neg": torch.nonzero(neg,as_tuple=True)[0],
-        "idx_amb": torch.nonzero(amb,as_tuple=True)[0]}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+        "idx_amb": torch.nonzero(amb,as_tuple=True)[0]})
 
 def tf_clip(L: Layer, Bin: Bounds) -> Fact:
     a,b=L.params["a"],L.params["b"]; B=Bounds(torch.clamp(Bin.lb,a,b), torch.clamp(Bin.ub,a,b))
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"clip:{L.id}","a":a,"b":b}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, B, "INEQ", {"tag":f"clip:{L.id}","a":a,"b":b})
 
 def tf_add(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     B=Bounds(Bx.lb+By.lb, Bx.ub+By.ub); C=ConSet()
@@ -285,7 +281,7 @@ def tf_scatter_nd(L: Layer, Bdata: Bounds, Bidx: Bounds, Bupdates: Bounds) -> Fa
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
     return Fact(Bout, C)
 
-def tf_concat(L: Layer, Bs: List[Bounds]) -> Fact:
+def tf_concat(L: Layer, Bs: list[Bounds]) -> Fact:
     """Concatenates tensors on dim=-1 (feature axis)."""
     B=Bounds(torch.cat([b.lb for b in Bs], dim=-1), torch.cat([b.ub for b in Bs], dim=-1))
     C=ConSet(); C.add_box(L.id,L.out_vars,B)
@@ -426,16 +422,14 @@ def tf_mean(L: Layer, Bin: Bounds) -> Fact:
 def tf_bn(L: Layer, Bin: Bounds) -> Fact:
     A,c=L.params["A"],L.params["c"]
     lb=torch.where(A>=0, A*Bin.lb+c, A*Bin.ub+c); ub=torch.where(A>=0, A*Bin.ub+c, A*Bin.lb+c)
-    B=Bounds(lb,ub); C=ConSet(); C.replace(Con("EQ", tuple(L.out_vars+L.in_vars), {"tag":f"bn:{L.id}","A":A,"c":c}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, Bounds(lb,ub), "EQ", {"tag":f"bn:{L.id}","A":A,"c":c})
 
 # -------- Less-common MLP-ish --------
 def _monotone_pwl(name: str, f):
     """Build a TF for an increasing activation f: endpoint bounds plus a 2-segment PWL INEQ."""
     def tf(L: Layer, Bin: Bounds) -> Fact:
         B=Bounds(f(Bin.lb), f(Bin.ub))
-        C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"{name}:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,2)}))
-        C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+        return _fact(L, B, "INEQ", {"tag":f"{name}:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,2)})
     return tf
 
 tf_sigmoid = _monotone_pwl("sigmoid", lambda x: 1/(1+torch.exp(-x)))
@@ -447,18 +441,15 @@ def tf_sqrt(L: Layer, Bin: Bounds) -> Fact:
     lo_e = torch.clamp(Bin.lb, min=0.0)
     hi_e = torch.clamp(Bin.ub, min=0.0)
     B=_sanitize_smooth_bounds(torch.sqrt(lo_e), torch.sqrt(hi_e))
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"sqrt:{L.id}"}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, B, "INEQ", {"tag":f"sqrt:{L.id}"})
 
 def tf_sin(L: Layer, Bin: Bounds) -> Fact:
     B=_sin_interval(Bin.lb, Bin.ub)
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"sin:{L.id}"}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, B, "INEQ", {"tag":f"sin:{L.id}"})
 
 def tf_cos(L: Layer, Bin: Bounds) -> Fact:
     B=_cos_interval(Bin.lb, Bin.ub)
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"cos:{L.id}"}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, B, "INEQ", {"tag":f"cos:{L.id}"})
 
 def tf_quantize(L: Layer, Bin: Bounds) -> Fact:
     n = Bin.lb.numel()
@@ -468,18 +459,15 @@ def tf_quantize(L: Layer, Bin: Bounds) -> Fact:
     z_lo = _quantize_qdq_value(lo, scale, zero_point, qmin, qmax)
     z_hi = _quantize_qdq_value(hi, scale, zero_point, qmin, qmax)
     B=_sanitize_smooth_bounds(torch.minimum(z_lo, z_hi).reshape_as(Bin.lb), torch.maximum(z_lo, z_hi).reshape_as(Bin.ub))
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"quantize:{L.id}", "scale": L.params["scale"], "zero_point": L.params["zero_point"], "qmin": L.params["qmin"], "qmax": L.params["qmax"]}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, B, "INEQ", {"tag":f"quantize:{L.id}", "scale": L.params["scale"], "zero_point": L.params["zero_point"], "qmin": L.params["qmin"], "qmax": L.params["qmax"]})
 
 
 def tf_silu(L: Layer, Bin: Bounds) -> Fact:
     s_lb, s_ub = 1/(1+torch.exp(-Bin.lb)), 1/(1+torch.exp(-Bin.ub))
     lb,ub=four_corner_envelope(Bin.lb, Bin.ub, s_lb, s_ub)
-    B=Bounds(lb,ub)
-    C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"silu:{L.id}","s_lb":s_lb,"s_ub":s_ub}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, Bounds(lb,ub), "INEQ", {"tag":f"silu:{L.id}","s_lb":s_lb,"s_ub":s_ub})
 
-def tf_max(L: Layer, By_list: List[Bounds]) -> Fact:
+def tf_max(L: Layer, By_list: list[Bounds]) -> Fact:
     lb = torch.stack([b.lb for b in By_list], dim=0).amax(dim=0)
     ub = torch.stack([b.ub for b in By_list], dim=0).amax(dim=0)
     B=Bounds(lb,ub)
@@ -488,7 +476,7 @@ def tf_max(L: Layer, By_list: List[Bounds]) -> Fact:
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"max:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
-def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
+def tf_min(L: Layer, By_list: list[Bounds]) -> Fact:
     lb = torch.stack([b.lb for b in By_list], dim=0).amin(dim=0)
     ub = torch.stack([b.ub for b in By_list], dim=0).amin(dim=0)
     B=Bounds(lb,ub)
@@ -500,14 +488,12 @@ def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
 def tf_square(L: Layer, Bin: Bounds) -> Fact:
     l,u=Bin.lb,Bin.ub
     lb=torch.where((l<=0)&(u>=0), 0.0, torch.minimum(l*l, u*u)); ub=torch.maximum(l*l, u*u)
-    B=Bounds(lb,ub); C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"square:{L.id}","segs":pwl_meta(l,u,2)}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    return _fact(L, Bounds(lb,ub), "INEQ", {"tag":f"square:{L.id}","segs":pwl_meta(l,u,2)})
 
 def tf_power(L: Layer, Bin: Bounds) -> Fact:
     p=float(L.params["p"]); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
-    B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(Bin.lb,Bin.ub,2)}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    B=Bounds(f(Bin.lb), f(Bin.ub))
+    return _fact(L, B, "INEQ", {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(Bin.lb,Bin.ub,2)})
 
 # -------- Additional Activations --------
 def tf_relu6(L: Layer, Bin: Bounds) -> Fact:
@@ -515,9 +501,7 @@ def tf_relu6(L: Layer, Bin: Bounds) -> Fact:
     l, u = Bin.lb, Bin.ub
     lb = torch.clamp(l, min=0.0, max=6.0)
     ub = torch.clamp(u, min=0.0, max=6.0)
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"relu6:{L.id}"}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"relu6:{L.id}"})
 
 def tf_hardtanh(L: Layer, Bin: Bounds) -> Fact:
     """HardTanh: clamp(x, min_val, max_val)"""
@@ -526,9 +510,7 @@ def tf_hardtanh(L: Layer, Bin: Bounds) -> Fact:
     l, u = Bin.lb, Bin.ub
     lb = torch.clamp(l, min=min_val, max=max_val)
     ub = torch.clamp(u, min=min_val, max=max_val)
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"hardtanh:{L.id}", "min_val": min_val, "max_val": max_val}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"hardtanh:{L.id}", "min_val": min_val, "max_val": max_val})
 
 def tf_hardsigmoid(L: Layer, Bin: Bounds) -> Fact:
     """HardSigmoid: clamp(alpha * x + beta, 0, 1)"""
@@ -540,9 +522,7 @@ def tf_hardsigmoid(L: Layer, Bin: Bounds) -> Fact:
     u_linear = alpha * u + beta
     lb = torch.clamp(l_linear, min=0.0, max=1.0)
     ub = torch.clamp(u_linear, min=0.0, max=1.0)
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"hardsigmoid:{L.id}", "alpha": alpha, "beta": beta}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"hardsigmoid:{L.id}", "alpha": alpha, "beta": beta})
 
 def tf_hardswish(L: Layer, Bin: Bounds) -> Fact:
     """HardSwish: x * clamp(x+3, 0, 6) / 6.
@@ -558,9 +538,7 @@ def tf_hardswish(L: Layer, Bin: Bounds) -> Fact:
     contains_min = (Bin.lb <= HS_MIN_X) & (Bin.ub >= HS_MIN_X)
     lb = torch.where(contains_min, torch.full_like(f_lb, HS_MIN_Y), torch.minimum(f_lb, f_ub))
     ub = torch.maximum(f_lb, f_ub)
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"hardswish:{L.id}"}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"hardswish:{L.id}"})
 
 def tf_mish(L: Layer, Bin: Bounds) -> Fact:
     """Mish: x * tanh(softplus(x)).
@@ -576,9 +554,7 @@ def tf_mish(L: Layer, Bin: Bounds) -> Fact:
     contains_min = (Bin.lb <= MISH_MIN_X) & (Bin.ub >= MISH_MIN_X)
     lb = torch.where(contains_min, torch.full_like(f_lb, MISH_MIN_Y), torch.minimum(f_lb, f_ub))
     ub = torch.maximum(f_lb, f_ub)
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"mish:{L.id}"}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"mish:{L.id}"})
 
 def tf_softsign(L: Layer, Bin: Bounds) -> Fact:
     """SoftSign: x / (1 + |x|)"""
@@ -586,18 +562,14 @@ def tf_softsign(L: Layer, Bin: Bounds) -> Fact:
     # SoftSign is bounded between -1 and 1
     lb = l / (1 + torch.abs(l))
     ub = u / (1 + torch.abs(u))
-    B = Bounds(lb, ub); C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"softsign:{L.id}"}))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    return _fact(L, Bounds(lb, ub), "INEQ", {"tag": f"softsign:{L.id}"})
 
 # -------- Tensor Operations --------
 def _identity_eq(name: str, param_key: str):
     """Build a TF for a shape-only op: bounds pass through, EQ Con carries param_key."""
     def tf(L: Layer, Bin: Bounds) -> Fact:
         B = Bounds(Bin.lb.clone(), Bin.ub.clone())
-        C = ConSet()
-        C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"{name}:{L.id}", param_key: L.params.get(param_key)}))
-        C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+        return _fact(L, B, "EQ", {"tag": f"{name}:{L.id}", param_key: L.params.get(param_key)})
     return tf
 
 tf_reshape = _identity_eq("reshape", "target_shape")
@@ -669,13 +641,11 @@ def tf_transpose(L: Layer, Bin: Bounds) -> Fact:
                 Bin.lb.reshape(Bin.lb.shape[0], width).index_select(1, rows),
                 Bin.ub.reshape(Bin.ub.shape[0], width).index_select(1, rows),
             )
-    C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+    return _fact(L, B, "EQ", {
         "tag": f"transpose:{L.id}",
         "perm": perm_raw,
         "input_shape": input_shape,
-    }))
-    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
+    })
 
 def tf_expand(L: Layer, Bin: Bounds) -> Fact:
     batch_size = Bin.lb.shape[0]
@@ -732,17 +702,14 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
 
     Bout = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
 
-    C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+    return _fact(L, Bout, "EQ", {
         "tag": f"slice:{L.id}",
         "starts": starts,
         "ends": ends,
         "axes": axes,
         "steps": steps,
         "input_shape": inp_shape,
-    }))
-    C.add_box(L.id, L.out_vars, Bout)
-    return Fact(Bout, C)
+    })
 
 
 def tf_gather(L: Layer, Bin: Bounds) -> Fact:
@@ -764,13 +731,10 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
     Bout = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
 
-    C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
+    return _fact(L, Bout, "EQ", {
         "tag": f"gather:{L.id}",
         "axis": axis,
         "indices": indices.detach().cpu().tolist(),
         "input_shape": inp_shape,
         "output_shape": list(out_lb.shape),
-    }))
-    C.add_box(L.id, L.out_vars, Bout)
-    return Fact(Bout, C)
+    })

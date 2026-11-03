@@ -23,7 +23,8 @@ from functools import cached_property
 
 import numpy as np
 import torch
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
 from act.back_end.core import Bounds, ConSet, Fact, Layer, Net, get_topo_order
 from act.back_end.interval_tf.tf_mlp import _quantize_params_flat
 from act.back_end.solver.solver_base import BatchLPProblem
@@ -123,11 +124,11 @@ class _RowAcc:
         self.n_batch = n_batch
         self.device = device
         self.dtype = dtype
-        self._rows: List[Tuple[List[int], torch.Tensor, torch.Tensor]] = []
+        self._rows: list[tuple[list[int], torch.Tensor, torch.Tensor]] = []
 
     def add(
         self,
-        var_ids: List[int],
+        var_ids: list[int],
         vals: torch.Tensor,
         rhs: torch.Tensor,
     ) -> None:
@@ -182,7 +183,7 @@ class _RowAcc:
 
     def build_sparse(
         self, nvars_total: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Materialise block-diagonal sparse A and stacked b.
 
         Returns:
@@ -207,10 +208,10 @@ class _RowAcc:
             return A_empty, b_empty
 
         # Build row/col index tensors and values for every entry.
-        row_chunks: List[torch.Tensor] = []
-        col_chunks: List[torch.Tensor] = []
-        val_chunks: List[torch.Tensor] = []
-        rhs_chunks: List[torch.Tensor] = []
+        row_chunks: list[torch.Tensor] = []
+        col_chunks: list[torch.Tensor] = []
+        val_chunks: list[torch.Tensor] = []
+        rhs_chunks: list[torch.Tensor] = []
         batch_ids = torch.arange(n_batch, device=self.device, dtype=torch.long)
         for row_idx, (var_ids, vals, rhs) in enumerate(self._rows):
             k = len(var_ids)
@@ -245,12 +246,12 @@ class _RowAcc:
 
 
 def _build_box_tensors_batched(
-    templates: List[Any],
+    templates: list[Any],
     nvars_total: int,
     N: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge every ``box:`` template into ``[N, nvars_total]`` lb/ub tensors.
 
     Box tensors may be ``[n]`` (broadcast across N) or ``[N, n]``. Multiple
@@ -338,8 +339,8 @@ def _emit_dense(
 
 
 def _emit_affine_pairs(
-    y: List[int],
-    x: List[int],
+    y: list[int],
+    x: list[int],
     a: torch.Tensor,
     c: torch.Tensor,
     eq: _RowAcc,
@@ -839,8 +840,8 @@ def _emit_lrelu_canonical(
 
 def _emit_envelope_rows(
     le: _RowAcc,
-    z: List[int],
-    y: List[int],
+    z: list[int],
+    y: list[int],
     row_lo: torch.Tensor,
     row_hi: torch.Tensor,
     slope_lo: torch.Tensor,
@@ -946,7 +947,6 @@ def _emit_tanh_canonical(
     point_bounds = ~identity_band & (gap <= _TANH_LIN_EPS)
     convex_seg = ~identity_band & ~point_bounds & (hi_s <= -_TANH_LIN_EPS)
     concave_seg = ~identity_band & ~point_bounds & (lo_s >= _TANH_LIN_EPS)
-    cross_zero = ~(identity_band | point_bounds | convex_seg | concave_seg)
     # Identity-band: |tanh(x) - x| is bounded by tanh(0.25) - 0.25 ~ 0.005.
     delta_band = torch.maximum(
         torch.maximum((f_lo - lo_s).abs(), (f_hi - hi_s).abs()),
@@ -1176,31 +1176,6 @@ def _emit_periodic_box_canonical(
         le.add([z[i]], vals_c, -lo[:, i])
         vals_d = torch.full((N, 1), 1.0, device=device, dtype=dtype)
         le.add([z[i]], vals_d, hi[:, i])
-
-
-def _emit_sin_canonical(
-    con: Any,
-    le: _RowAcc,
-    lb_global: torch.Tensor,
-    ub_global: torch.Tensor,
-    N: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    _emit_periodic_box_canonical(con, le, lb_global, ub_global, N, device, dtype, "sin")
-
-
-def _emit_cos_canonical(
-    con: Any,
-    le: _RowAcc,
-    lb_global: torch.Tensor,
-    ub_global: torch.Tensor,
-    N: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    _emit_periodic_box_canonical(con, le, lb_global, ub_global, N, device, dtype, "cos")
-
 
 
 def _quantize_qdq_value(x: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor, qmin: torch.Tensor, qmax: torch.Tensor) -> torch.Tensor:
@@ -1633,7 +1608,7 @@ def _emit_slice_gather(
 
 
 def _emit_copy_rows(
-    y: List[int], x: List[int], eq: _RowAcc, N: int,
+    y: list[int], x: list[int], eq: _RowAcc, N: int,
     device: torch.device, dtype: torch.dtype,
 ) -> None:
     """Emit ``y_i - x_i = 0`` for one operator's resolved operand mapping."""
@@ -1741,7 +1716,7 @@ def _emit_in_linpoly(
 
 def _emit_assert_canonical(
     assert_layer: Any,
-    out_ids: List[int],
+    out_ids: list[int],
     le: _RowAcc,
     *,
     N: int,
@@ -1986,7 +1961,7 @@ def export_to_batch_problem(
     assert_layer: Any,
     input_box_per_b: Bounds,
     *,
-    objective: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    objective: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> BatchLPProblem:
     """[BATCHED-API] Build a BatchLPProblem from analyze() output.
 
@@ -2077,75 +2052,67 @@ def export_to_batch_problem(
     eq = _RowAcc(N, device, dtype)
     le = _RowAcc(N, device, dtype)
 
+    def linear(emit: Callable[..., None]) -> Callable[[Any], None]:
+        """Bind an equality emitter ``emit(con, eq, N, device, dtype)``."""
+        return lambda con: emit(con, eq, N, device, dtype)
+
+    def relaxed(emit: Callable[..., None]) -> Callable[[Any], None]:
+        """Bind a relaxation emitter ``emit(con, le, lb_global, ub_global, N, device, dtype)``."""
+        return lambda con: emit(con, le, lb_global, ub_global, N, device, dtype)
+
+    # Unconditional tag prefixes; skipped, conditional and rejected tags stay explicit below.
+    rules: dict[str, Callable[[Any], None]] = {
+        "dense:": linear(_emit_dense),
+        "conv2d:": linear(_emit_conv2d),
+        "bias:": linear(_emit_bias),
+        "scale:": linear(_emit_scale),
+        "bn:": linear(_emit_bn),
+        "add:": lambda con: _emit_add_sub(con, eq, +1.0, N, device, dtype),
+        "sub:": lambda con: _emit_add_sub(con, eq, -1.0, N, device, dtype),
+        "flatten:": linear(_emit_flatten),
+        "reshape:": linear(_emit_flatten),
+        "transpose:": linear(_emit_transpose),
+        "relu:": relaxed(_emit_relu_canonical),
+        "lrelu:": relaxed(_emit_lrelu_canonical),
+        "relu6:": lambda con: _emit_clipped_affine_hull(
+            con, le, lb_global, ub_global, 1.0, 0.0, 0.0, 6.0, N, device, dtype),
+        "tanh:": relaxed(_emit_tanh_canonical),
+        "sigmoid:": relaxed(_emit_sigmoid_canonical),
+        "erf:": relaxed(_emit_erf_canonical),
+        "sqrt:": relaxed(_emit_sqrt_canonical),
+        "sin:": lambda con: _emit_periodic_box_canonical(
+            con, le, lb_global, ub_global, N, device, dtype, "sin"),
+        "cos:": lambda con: _emit_periodic_box_canonical(
+            con, le, lb_global, ub_global, N, device, dtype, "cos"),
+        "quantize:": relaxed(_emit_quantize_canonical),
+        "hardtanh:": lambda con: _emit_clipped_affine_hull(
+            con, le, lb_global, ub_global, 1.0, 0.0,
+            float(con.meta.get("min_val", -1.0)), float(con.meta.get("max_val", 1.0)), N, device, dtype),
+        "hardsigmoid:": lambda con: _emit_clipped_affine_hull(
+            con, le, lb_global, ub_global, float(con.meta.get("alpha", 1.0 / 6.0)),
+            float(con.meta.get("beta", 0.5)), 0.0, 1.0, N, device, dtype),
+        "abs:": relaxed(_emit_abs_canonical),
+        "square:": relaxed(_emit_square_canonical),
+        "power:": relaxed(_emit_relu_power_canonical),
+        "layernorm:": relaxed(_emit_layernorm_box),
+        "att_dual_planar:": relaxed(_emit_attn_dual_planar),
+        "mask:": lambda con: _emit_mask_add(con, eq, lb_global, ub_global, N, device, dtype),
+        "slice:": lambda con: _emit_slice_gather(con, eq, is_gather=False, N=N, device=device, dtype=dtype),
+        "gather:": lambda con: _emit_slice_gather(con, eq, is_gather=True, N=N, device=device, dtype=dtype),
+        "concat:": linear(_emit_concat),
+        "expand:": linear(_emit_expand),
+        "constant:": linear(_emit_constant),
+        "reduce_sum:": lambda con: _emit_reduction(con, eq, False, N, device, dtype),
+        "mean:": lambda con: _emit_reduction(con, eq, True, N, device, dtype),
+    }
+
     for con in templates:
         tag = str(con.meta.get("tag", ""))
-        if tag.startswith("box:"):
-            continue
-        if tag.startswith("dense:"):
-            _emit_dense(con, eq, N, device, dtype)
-        elif tag.startswith("conv2d:"):
-            _emit_conv2d(con, eq, N, device, dtype)
-        elif tag.startswith("bias:"):
-            _emit_bias(con, eq, N, device, dtype)
-        elif tag.startswith("scale:"):
-            _emit_scale(con, eq, N, device, dtype)
-        elif tag.startswith("bn:"):
-            _emit_bn(con, eq, N, device, dtype)
-        elif tag.startswith("add:"):
-            _emit_add_sub(con, eq, +1.0, N, device, dtype)
-        elif tag.startswith("sub:"):
-            _emit_add_sub(con, eq, -1.0, N, device, dtype)
-        elif tag.startswith(("flatten:", "reshape:")):
-            _emit_flatten(con, eq, N, device, dtype)
-        elif tag.startswith("transpose:"):
-            _emit_transpose(con, eq, N, device, dtype)
-        elif tag.startswith("relu:"):
-            _emit_relu_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("lrelu:"):
-            _emit_lrelu_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("relu6:"):
-            _emit_clipped_affine_hull(con, le, lb_global, ub_global, 1.0, 0.0, 0.0, 6.0, N, device, dtype)
-        elif tag.startswith("tanh:"):
-            _emit_tanh_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("sigmoid:"):
-            _emit_sigmoid_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("erf:"):
-            _emit_erf_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("sqrt:"):
-            _emit_sqrt_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("sin:"):
-            _emit_sin_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("cos:"):
-            _emit_cos_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("quantize:"):
-            _emit_quantize_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("hardtanh:"):
-            _emit_clipped_affine_hull(
-                con, le, lb_global, ub_global, 1.0, 0.0,
-                float(con.meta.get("min_val", -1.0)),
-                float(con.meta.get("max_val", 1.0)),
-                N, device, dtype,
-            )
-        elif tag.startswith("hardsigmoid:"):
-            _emit_clipped_affine_hull(
-                con, le, lb_global, ub_global,
-                float(con.meta.get("alpha", 1.0 / 6.0)),
-                float(con.meta.get("beta", 0.5)),
-                0.0, 1.0, N, device, dtype,
-            )
-        elif tag.startswith("abs:"):
-            _emit_abs_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("square:"):
-            _emit_square_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("power:"):
-            _emit_relu_power_canonical(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("layernorm:"):
-            _emit_layernorm_box(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("att_dual_planar:"):
-            _emit_attn_dual_planar(con, le, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith("mask:"):
-            _emit_mask_add(con, eq, lb_global, ub_global, N, device, dtype)
-        elif tag.startswith(("att_scores:", "att_mix:")):
+        head, colon, _ = tag.partition(":")
+        emit = rules.get(head + colon)
+        if emit is not None:
+            emit(con)
+        elif tag.startswith(("box:", "att_scores:", "att_mix:")):
             continue
         elif tag.startswith("mcc:"):
             if len(con.var_ids) % 3 != 0:
@@ -2153,20 +2120,6 @@ def export_to_batch_problem(
             _emit_mcc(con, le, lb_global, ub_global, N, device, dtype)
         elif tag.startswith("softmax:simplex:"):
             _emit_softmax_simplex(con, eq, le, N, device, dtype)
-        elif tag.startswith("slice:"):
-            _emit_slice_gather(con, eq, is_gather=False, N=N, device=device, dtype=dtype)
-        elif tag.startswith("gather:"):
-            _emit_slice_gather(con, eq, is_gather=True, N=N, device=device, dtype=dtype)
-        elif tag.startswith("concat:"):
-            _emit_concat(con, eq, N, device, dtype)
-        elif tag.startswith("expand:"):
-            _emit_expand(con, eq, N, device, dtype)
-        elif tag.startswith("constant:"):
-            _emit_constant(con, eq, N, device, dtype)
-        elif tag.startswith("reduce_sum:"):
-            _emit_reduction(con, eq, False, N, device, dtype)
-        elif tag.startswith("mean:"):
-            _emit_reduction(con, eq, True, N, device, dtype)
         elif tag == "in:linpoly":
             _emit_in_linpoly(con, le, N, device, dtype)
         elif tag.startswith(("max:", "min:", "div:", "clip:")):
@@ -2385,9 +2338,9 @@ class _TerminalHeader:
 
 
 def export_terminal_problem(
-    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]] = None,
-    *, reference_bounds: Optional[dict[int, Bounds]] = None,
-    lane_bases: Optional[dict[tuple[bytes, bytes], Any]] = None,
+    net: Net, input_bounds: Bounds, split_signs: dict[int, torch.Tensor] | None = None,
+    *, reference_bounds: dict[int, Bounds] | None = None,
+    lane_bases: dict[tuple[bytes, bytes], Any] | None = None,
 ) -> TerminalExport:
     """Export all K lanes once, without trusting supplied intermediate boxes.
 
@@ -2404,7 +2357,7 @@ def export_terminal_problem(
 
 
 def _terminal_header(
-    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]],
+    net: Net, input_bounds: Bounds, split_signs: dict[int, torch.Tensor] | None,
 ) -> _TerminalHeader:
     """Reject unsupported models and encode the literals and property, without any lane LP."""
     from act.back_end.verifier import gather_input_spec_layers
@@ -2611,8 +2564,8 @@ def _lane_with_literals(
 
 
 def _export_on_host(
-    net: Net, input_bounds: Bounds, split_signs: Optional[dict[int, torch.Tensor]],
-    lane_bases: Optional[dict[tuple[bytes, bytes], _LaneBase]] = None,
+    net: Net, input_bounds: Bounds, split_signs: dict[int, torch.Tensor] | None,
+    lane_bases: dict[tuple[bytes, bytes], _LaneBase] | None = None,
 ) -> TerminalExport:
     """Build one TerminalExport with host tensors and sparse matrices."""
     head = _terminal_header(net, input_bounds, split_signs)
@@ -2623,7 +2576,7 @@ def _export_on_host(
     bases = {} if lane_bases is None else lane_bases
     lanes: list[_SparseLP] = []
     phase_rows: list[tuple[_PhaseRows, ...]] = []
-    base: Optional[_LaneBase] = None
+    base: _LaneBase | None = None
     literal_matrix = None
     for k in range(k_count):
         key = (flat_lower[k].numpy().tobytes(), flat_upper[k].numpy().tobytes())
