@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, cast
+from typing import Any, cast
 
 import torch
 
@@ -78,8 +78,10 @@ def _as_batched_index(
 # Without this, every check_violations_batched call rebuilds the module from
 # scratch via ACTToTorch.run() — costly under K-batched BaB which can invoke
 # CE validation dozens of times for a single net.  Cleared per top-level
-# verify-all dispatch via clear_violation_check_module_cache().
-_VIOLATION_CHECK_MODULE_CACHE: dict[int, torch.nn.Module] = {}
+# verify-all dispatch via clear_violation_check_module_cache().  Entries keep
+# their Net and a hit requires ``is`` identity, so a recycled id() rebuilds
+# instead of returning another net's module.
+_VIOLATION_CHECK_MODULE_CACHE: dict[int, tuple[Net, torch.nn.Module]] = {}
 
 
 def clear_violation_check_module_cache() -> None:
@@ -102,16 +104,17 @@ def _forward_for_violation_check(net: object, x_batch: torch.Tensor) -> torch.Te
     else:
         key = id(net)
         cached = _VIOLATION_CHECK_MODULE_CACHE.get(key)
-        if cached is None:
+        if cached is None or cached[0] is not net:
             from act.pipeline.verification.act2torch import ACTToTorch
 
-            cached = ACTToTorch(cast(Net, net)).run()
+            module = ACTToTorch(cast(Net, net)).run()
             # ACTToTorch emits mixed float32 weights + float64 buffers; unify to
             # the analysis dtype or the internal forward clashes float32/float64.
             if x_batch.is_floating_point():
-                cached = cached.to(dtype=x_batch.dtype)
-            _VIOLATION_CHECK_MODULE_CACHE[key] = cached
-        module = cached
+                module = module.to(dtype=x_batch.dtype)
+            _VIOLATION_CHECK_MODULE_CACHE[key] = (cast(Net, net), module)
+        else:
+            module = cached[1]
     _ = module.eval()
     target_dtype = _module_float_dtype(module, x_batch.dtype)
     if x_batch.dtype != target_dtype:
@@ -275,7 +278,7 @@ def check_violations_batched(net: object, x_batch: torch.Tensor, assert_layer: L
     raise NotImplementedError(f"ASSERT kind not supported: {kind}")
 
 
-def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: List[Layer]) -> torch.Tensor:
+def _check_input_specs_batched(x_batch: torch.Tensor, spec_layers: list[Layer]) -> torch.Tensor:
     result = torch.ones(x_batch.shape[0], device=x_batch.device, dtype=torch.bool)
     tol = 1e-7
     for layer in spec_layers:
@@ -334,10 +337,12 @@ def validate_terminal_candidates(export: Any, candidates: torch.Tensor) -> torch
     safe = torch.where(valid.reshape(-1, *([1] * (candidates.ndim - 1))),
                        candidates, box.lb)
     key = id(export.net)
-    module = _VIOLATION_CHECK_MODULE_CACHE.get(key)
-    if module is None:
+    cached = _VIOLATION_CHECK_MODULE_CACHE.get(key)
+    if cached is None or cached[0] is not export.net:
         module = ACTToTorch(export.net).run().to(device=safe.device, dtype=safe.dtype)
-        _VIOLATION_CHECK_MODULE_CACHE[key] = module
+        _VIOLATION_CHECK_MODULE_CACHE[key] = (export.net, module)
+    else:
+        module = cached[1]
     observed, handles = {}, []
     try:
         for graph in module.modules():

@@ -64,7 +64,8 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from copy import copy
 from dataclasses import fields, replace
-from typing import Callable, Dict, Iterator, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Protocol
+from collections.abc import Callable, Iterator, Sequence
 
 import torch
 
@@ -138,12 +139,12 @@ class BoundingStrategy(ABC):
         return len(self) == 0
 
     @abstractmethod
-    def _resident_batch(self) -> Optional[SubproblemBatch]:
+    def _resident_batch(self) -> SubproblemBatch | None:
         """Expose resident references without gathering any tensor."""
         ...
 
     @abstractmethod
-    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+    def _assign(self, batch: SubproblemBatch | None) -> None:
         """Publish a fully allocated replacement without further tensor allocation."""
         ...
 
@@ -209,7 +210,7 @@ class RandomBounding(BoundingStrategy):
     """
 
     def __init__(self) -> None:
-        self._batch: Optional[SubproblemBatch] = None
+        self._batch: SubproblemBatch | None = None
 
     # -- BoundingStrategy interface -----------------------------------------
 
@@ -252,10 +253,10 @@ class RandomBounding(BoundingStrategy):
     def __len__(self) -> int:
         return 0 if self._batch is None else self._batch.batch_size
 
-    def _resident_batch(self) -> Optional[SubproblemBatch]:
+    def _resident_batch(self) -> SubproblemBatch | None:
         return self._batch
 
-    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+    def _assign(self, batch: SubproblemBatch | None) -> None:
         self._batch = batch
 
 
@@ -363,8 +364,8 @@ class TopKBounding(BoundingStrategy):
 
     def __init__(
         self,
-        order: Optional[OrderFunction] = None,
-        select_probe: Optional[Callable[[SubproblemBatch], None]] = None,
+        order: OrderFunction | None = None,
+        select_probe: Callable[[SubproblemBatch], None] | None = None,
         *,
         k: int = 0,
     ) -> None:
@@ -373,19 +374,19 @@ class TopKBounding(BoundingStrategy):
         self.order: OrderFunction = order if order is not None else DepthLowerBoundOrder()
         self.k = int(k)
         self.select_probe = select_probe
-        self._lb: Optional[torch.Tensor] = None
-        self._ub: Optional[torch.Tensor] = None
-        self._depths: Optional[torch.Tensor] = None
-        self._lower_bound: Optional[torch.Tensor] = None
-        self._parent_margins: Optional[torch.Tensor] = None
-        self._node_id: Optional[torch.Tensor] = None
-        self._parent_id: Optional[torch.Tensor] = None
-        self._incremental_alpha: Optional[AlphaState] = None
-        self._incremental_eta: Optional[Dict[int, torch.Tensor]] = None
-        self._split_signs: Optional[Dict[int, torch.Tensor]] = None
-        self._decision_literals: Optional[torch.Tensor] = None
-        self._warm_state_present: Optional[torch.Tensor] = None
-        self._propagation_revision: Optional[torch.Tensor] = None
+        self._lb: torch.Tensor | None = None
+        self._ub: torch.Tensor | None = None
+        self._depths: torch.Tensor | None = None
+        self._lower_bound: torch.Tensor | None = None
+        self._parent_margins: torch.Tensor | None = None
+        self._node_id: torch.Tensor | None = None
+        self._parent_id: torch.Tensor | None = None
+        self._incremental_alpha: AlphaState | None = None
+        self._incremental_eta: dict[int, torch.Tensor] | None = None
+        self._split_signs: dict[int, torch.Tensor] | None = None
+        self._decision_literals: torch.Tensor | None = None
+        self._warm_state_present: torch.Tensor | None = None
+        self._propagation_revision: torch.Tensor | None = None
 
     def push(self, batch: SubproblemBatch) -> None:
         if not batch.batch_size:
@@ -409,6 +410,7 @@ class TopKBounding(BoundingStrategy):
         self._assert_push_transition(size_before, n_new)
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
+        """Pop a capped wave using this pool's ordered-index selection."""
         lb = self._lb
         if lb is None:
             raise IndexError("pop from empty pool")
@@ -418,11 +420,10 @@ class TopKBounding(BoundingStrategy):
             n = min(n, self.k)
         if n >= total:
             selected = torch.arange(total, device=lb.device)
-            remaining: Optional[torch.Tensor] = None
+            remaining: torch.Tensor | None = None
         else:
             order = torch.argsort(self._priority_scores(next_wave=True), descending=True)
-            selected = order[:n]
-            remaining = order[n:]
+            selected, remaining = self._select_indices(order, n)
 
         result = self._build(selected)
         kept = self._build(remaining) if remaining is not None and remaining.numel() else None
@@ -432,6 +433,12 @@ class TopKBounding(BoundingStrategy):
         _advance_order_schedule(self.order)
         self._assert_pop_transition(total, result.batch_size)
         return result
+
+    def _select_indices(
+        self, order: torch.Tensor, n: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select the highest-priority lanes and retain the remaining order."""
+        return order[:n], order[n:]
 
     def _assert_push_transition(self, size_before: int, added: int) -> None:
         size_after = len(self)
@@ -458,11 +465,11 @@ class TopKBounding(BoundingStrategy):
         indices = torch.arange(self._lb.shape[0], device=self._lb.device)
         return self._build(indices)
 
-    def checkpoint(self) -> Optional[SubproblemBatch]:
+    def checkpoint(self) -> SubproblemBatch | None:
         """Retain resident references without copying the frontier payload."""
         return self._resident_batch()
 
-    def restore(self, state: Optional[SubproblemBatch]) -> None:
+    def restore(self, state: SubproblemBatch | None) -> None:
         """Restore a pre-commit frontier without allocating tensor storage."""
         self._assign(state)
 
@@ -472,7 +479,7 @@ class TopKBounding(BoundingStrategy):
         staged.push(batch)
         self._assign(staged._resident_batch())
 
-    def propagation_batch(self, revision: int) -> Optional[Tuple[torch.Tensor, SubproblemBatch]]:
+    def propagation_batch(self, revision: int) -> tuple[torch.Tensor, SubproblemBatch] | None:
         """Return rows not yet at a fixed point with ``revision``, without warm state.
 
         A row with no decision provenance is always included, since its first
@@ -542,14 +549,14 @@ class TopKBounding(BoundingStrategy):
         assert batch is not None
         return batch.select(idx)
 
-    def _resident_batch(self) -> Optional[SubproblemBatch]:
+    def _resident_batch(self) -> SubproblemBatch | None:
         if self._lb is None:
             return None
         return SubproblemBatch(**{
             field.name: getattr(self, "_" + field.name) for field in fields(SubproblemBatch)
         })
 
-    def _assign(self, batch: Optional[SubproblemBatch]) -> None:
+    def _assign(self, batch: SubproblemBatch | None) -> None:
         for field in fields(SubproblemBatch):
             setattr(self, "_" + field.name, None if batch is None else getattr(batch, field.name))
 
@@ -581,48 +588,30 @@ class DiverseTopKBounding(TopKBounding):
 
     def __init__(
         self,
-        order: Optional[OrderFunction] = None,
-        select_probe: Optional[Callable[[SubproblemBatch], None]] = None,
+        order: OrderFunction | None = None,
+        select_probe: Callable[[SubproblemBatch], None] | None = None,
         *,
         k: int = 0,
     ) -> None:
         super().__init__(order, select_probe=select_probe, k=k)
 
-    def pop(self, batch_size: int = 1) -> SubproblemBatch:
-        lb = self._lb
-        if lb is None:
-            raise IndexError("pop from empty pool")
-        total = lb.shape[0]
-        n = min(batch_size, total)
-        if self.k > 0:
-            n = min(n, self.k)
-        if n >= total:
-            selected = torch.arange(total, device=lb.device)
-            remaining: Optional[torch.Tensor] = None
-        else:
-            order = torch.argsort(self._priority_scores(next_wave=True), descending=True)
-            selected = self._dedup_select(order, n)
-            selected_mask = torch.zeros(total, dtype=torch.bool, device=lb.device)
-            selected_mask[selected] = True
-            remaining = order[~selected_mask.index_select(0, order)]
-
-        result = self._build(selected)
-        kept = self._build(remaining) if remaining is not None and remaining.numel() else None
-        if self.select_probe is not None:
-            self.select_probe(result)
-        self._assign(kept)
-        _advance_order_schedule(self.order)
-        self._assert_pop_transition(total, result.batch_size)
-        return result
+    def _select_indices(
+        self, order: torch.Tensor, n: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select diverse lanes and retain the remaining priority order."""
+        selected = self._dedup_select(order, n)
+        selected_mask = torch.zeros(order.numel(), dtype=torch.bool, device=order.device)
+        selected_mask[selected] = True
+        return selected, order[~selected_mask.index_select(0, order)]
 
     def _dedup_select(self, order: torch.Tensor, n: int) -> torch.Tensor:
         signatures = self._split_sign_signatures()
         if signatures is None:
             return order[:n]
 
-        selected: List[int] = []
-        selected_set: Set[int] = set()
-        seen: Set[Tuple[int, ...]] = set()
+        selected: list[int] = []
+        selected_set: set[int] = set()
+        seen: set[tuple[int, ...]] = set()
         ordered_indices = [int(i) for i in order.detach().cpu().tolist()]
 
         for idx in ordered_indices:
@@ -646,12 +635,12 @@ class DiverseTopKBounding(TopKBounding):
 
         return torch.tensor(selected, dtype=torch.long, device=order.device)
 
-    def _split_sign_signatures(self) -> Optional[List[Tuple[int, ...]]]:
+    def _split_sign_signatures(self) -> list[tuple[int, ...]] | None:
         split_signs = self._split_signs
         if not split_signs:
             return None
 
-        pieces: List[torch.Tensor] = []
+        pieces: list[torch.Tensor] = []
         for layer_id in sorted(split_signs):
             value = split_signs[layer_id]
             if value.shape[0] == 0:
@@ -671,11 +660,11 @@ ROOT_PARENT = -1
 
 
 def _mcts_visit_accounting_valid(
-    parent: Dict[int, int], visits: Dict[int, int], n_tot: int
+    parent: dict[int, int], visits: dict[int, int], n_tot: int
 ) -> bool:
     if n_tot < 0 or any(count < 0 for count in visits.values()):
         return False
-    child_visit_sums: Dict[int, int] = {}
+    child_visit_sums: dict[int, int] = {}
     for node, count in visits.items():
         parent_id = parent.get(node, ROOT_PARENT)
         if parent_id != ROOT_PARENT:
@@ -691,9 +680,9 @@ def _mcts_visit_accounting_valid(
 
 
 def _mcts_visit_diagnostics(
-    parent: Dict[int, int], visits: Dict[int, int]
+    parent: dict[int, int], visits: dict[int, int]
 ) -> tuple[int, int, int]:
-    child_visit_sums: Dict[int, int] = {}
+    child_visit_sums: dict[int, int] = {}
     for node, count in visits.items():
         parent_id = parent.get(node, ROOT_PARENT)
         if parent_id != ROOT_PARENT:
@@ -726,8 +715,8 @@ class MCTSBounding(TopKBounding):
 
     def __init__(
         self,
-        order: Optional[OrderFunction] = None,
-        select_probe: Optional[Callable[[SubproblemBatch], None]] = None,
+        order: OrderFunction | None = None,
+        select_probe: Callable[[SubproblemBatch], None] | None = None,
         *,
         exploration: float = 1.0,
         lambda_: float = 0.5,
@@ -737,9 +726,9 @@ class MCTSBounding(TopKBounding):
         self.exploration: float = float(exploration)
         self.lambda_: float = float(lambda_)
         self.virtual_loss: float = float(virtual_loss)
-        self.parent: Dict[int, int] = {}
-        self.N: Dict[int, int] = {}
-        self.Q: Dict[int, float] = {}
+        self.parent: dict[int, int] = {}
+        self.N: dict[int, int] = {}
+        self.Q: dict[int, float] = {}
         self.n_tot: int = 0
 
     def push(self, batch: SubproblemBatch) -> None:
@@ -797,7 +786,7 @@ class MCTSBounding(TopKBounding):
             f"max_child_excess={_mcts_visit_diagnostics(self.parent, self.N)[2]})"
         )
 
-    def frontier_parent_visit_histogram(self) -> Dict[int, int]:
+    def frontier_parent_visit_histogram(self) -> dict[int, int]:
         parent_ids = self._parent_id
         if parent_ids is None:
             return {}
