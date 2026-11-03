@@ -13,7 +13,7 @@ License: AGPLv3+
 import json
 import shutil
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
 import torch
 
@@ -171,7 +171,7 @@ def _download_dataset(
 def download_dataset_model_pair(
     dataset_name: str,
     model_name: str,
-    root_dir: Optional[str] = None,
+    root_dir: str | None = None,
     split: str = "test"
 ) -> dict:
     """
@@ -410,7 +410,7 @@ print(f"Parameters: {{sum(p.numel() for p in model.parameters()):,}}")
     }
 
 
-def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
+def list_downloaded_pairs(root_dir: str | None = None) -> list[dict]:
     """
     List all downloaded dataset-model pairs with size information.
 
@@ -485,7 +485,7 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
 def load_dataset_model_pair(
     dataset_name: str,
     model_name: str,
-    root_dir: Optional[str] = None,
+    root_dir: str | None = None,
     split: str = "test",
     batch_size: int = 1,
     shuffle: bool = False,
@@ -708,7 +708,7 @@ def model_inference_with_dataset(
     dataset_name: str,
     model_name: str,
     split: str = "test",
-    root_dir: Optional[str] = None,
+    root_dir: str | None = None,
     verbose: bool = True
 ) -> dict:
     """
@@ -774,56 +774,32 @@ def model_inference_with_dataset(
             input_tensor = batch
         break  # Only need first batch
     
-    if input_tensor is None:
-        error_msg = 'Empty dataloader'
+    def finish(status: str, **outcome: Any) -> dict:
+        """Print the status line (when verbose) and build the result dict."""
         if verbose:
-            print(f"  ✗ FAILED - {error_msg}")
+            if status == 'success':
+                print(f"  ✓ SUCCESS - Output shape: {outcome['output_shape']}")
+            else:
+                print(f"  ✗ FAILED - {outcome['error']}")
         return {
             'dataset': dataset_name,
             'model': model_name,
             'split': split,
-            'status': 'failed',
-            'error': error_msg,
+            'status': status,
+            **outcome,
             'num_samples': num_samples
         }
     
+    if input_tensor is None:
+        return finish('failed', error='Empty dataloader')
+
     # Verify we have a tensor
     if not isinstance(input_tensor, torch.Tensor):
-        error_msg = f'Input type {type(input_tensor).__name__}, expected torch.Tensor'
-        if verbose:
-            print(f"  ✗ FAILED - {error_msg}")
-        return {
-            'dataset': dataset_name,
-            'model': model_name,
-            'split': split,
-            'status': 'failed',
-            'error': error_msg,
-            'num_samples': num_samples
-        }
+        return finish('failed', error=f'Input type {type(input_tensor).__name__}, expected torch.Tensor')
     
     # Run inference
     success, output, error_msg = infer_single_model(combo_id, model, input_tensor)
     
     if success:
-        output_shape = tuple(output.shape) if output is not None else None
-        if verbose:
-            print(f"  ✓ SUCCESS - Output shape: {output_shape}")
-        return {
-            'dataset': dataset_name,
-            'model': model_name,
-            'split': split,
-            'status': 'success',
-            'output_shape': output_shape,
-            'num_samples': num_samples
-        }
-    else:
-        if verbose:
-            print(f"  ✗ FAILED - {error_msg}")
-        return {
-            'dataset': dataset_name,
-            'model': model_name,
-            'split': split,
-            'status': 'failed',
-            'error': error_msg,
-            'num_samples': num_samples
-        }
+        return finish('success', output_shape=tuple(output.shape) if output is not None else None)
+    return finish('failed', error=error_msg)

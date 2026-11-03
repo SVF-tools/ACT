@@ -80,7 +80,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -89,6 +89,7 @@ from act.back_end.layer_schema import (
     TRANSFORMER_KINDS,
     LayerKind,
 )
+from act.pipeline.verification.utils import _prod
 
 
 _ACT_KIND_TO_MODULE = {
@@ -177,7 +178,7 @@ assert (
 ) == frozenset(_ACT_KIND_TO_MODULE)
 
 
-def check_hookable_alignment(act_net, model: torch.nn.Module) -> Optional[str]:
+def check_hookable_alignment(act_net, model: torch.nn.Module) -> str | None:
     """Return a Level-2 skip reason for structurally un-alignable models.
 
     Ordinary mismatches intentionally return ``None`` so the strict hookable-order
@@ -220,8 +221,8 @@ def check_hookable_alignment(act_net, model: torch.nn.Module) -> Optional[str]:
     return None
 
 
-def bounds_from_facts(act_net, after) -> Tuple[Dict[int, Bounds], List[str]]:
-    raw_bounds: Dict[int, Bounds] = {}
+def bounds_from_facts(act_net, after) -> tuple[dict[int, Bounds], list[str]]:
+    raw_bounds: dict[int, Bounds] = {}
     for lid, fact_or_bounds in after.items():
         raw_bounds[int(lid)] = (
             fact_or_bounds
@@ -233,11 +234,11 @@ def bounds_from_facts(act_net, after) -> Tuple[Dict[int, Bounds], List[str]]:
 
 def _validate_bounds_by_layer(
     act_net,
-    raw_bounds: Dict[int, Bounds],
-) -> Tuple[Dict[int, Bounds], List[str]]:
+    raw_bounds: dict[int, Bounds],
+) -> tuple[dict[int, Bounds], list[str]]:
     """Apply the common layer-presence, shape, and finite checks to bounds."""
-    errors: List[str] = []
-    bounds_by_layer: Dict[int, Bounds] = {}
+    errors: list[str] = []
+    bounds_by_layer: dict[int, Bounds] = {}
 
     for layer in getattr(act_net, "layers", []):
         lid = layer.id
@@ -267,7 +268,7 @@ def sample_inputs_from_spec(
     device,
     dtype,
     seed: int = 42,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     """Sample deterministic concrete inputs from ACT INPUT_SPEC layers."""
     from act.back_end.verifier import gather_input_spec_layers, seed_from_input_specs
 
@@ -279,7 +280,7 @@ def sample_inputs_from_spec(
         lb = lb.unsqueeze(0)
         ub = ub.unsqueeze(0)
 
-    samples: List[torch.Tensor] = []
+    samples: list[torch.Tensor] = []
     if num_samples <= 0:
         return samples
 
@@ -303,14 +304,14 @@ def collect_concrete_activations(
     *,
     strict_single_call_per_module: bool = False,
     pre_activation: bool = False,
-) -> Tuple[Dict[int, torch.Tensor], List[str], List[str], Dict[str, Any]]:
+) -> tuple[dict[int, torch.Tensor], list[str], list[str], dict[str, Any]]:
     """
     Collect concrete activations and align them to ACT layer IDs.
     """
-    errors: List[str] = []
-    warnings: List[str] = []
-    call_counts: Dict[int, int] = {}
-    hookable_events: List[Tuple[str, Any, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    call_counts: dict[int, int] = {}
+    hookable_events: list[tuple[str, Any, Any]] = []
     hooks = []
 
     def _hook(module, inputs, output):
@@ -347,16 +348,10 @@ def collect_concrete_activations(
             f"Hookable count mismatch: events={len(hookable_events)} layers={len(hookable_layers)}"
         )
 
-    def _numel(shape: Tuple[int, ...]) -> int:
-        prod = 1
-        for s in shape:
-            prod *= int(s)
-        return int(prod)
-
     def _drop_batch_if_and_only_if_batch1(
-        raw_shape: Tuple[int, ...],
-        expected_shape: Tuple[int, ...] | None,
-    ) -> Tuple[Tuple[int, ...], bool, str]:
+        raw_shape: tuple[int, ...],
+        expected_shape: tuple[int, ...] | None,
+    ) -> tuple[tuple[int, ...], bool, str]:
         """Match per-sample shape: raw and expected may carry any leading
         batch dim (B=1 or B>1). Comparison strips the leading dim from both
         sides if their per-sample ranks line up."""
@@ -375,7 +370,7 @@ def collect_concrete_activations(
             return raw_shape, False, "per_sample_shape_mismatch"
         return raw_shape, False, "rank_mismatch"
 
-    mapping: Dict[int, torch.Tensor] = {}
+    mapping: dict[int, torch.Tensor] = {}
 
     for idx, layer in enumerate(hookable_layers):
         if idx >= len(hookable_events):
@@ -416,8 +411,8 @@ def collect_concrete_activations(
                 expected_shape,
             )
             if not dropped:
-                ev_numel = _numel(raw_shape)
-                exp_numel = _numel(expected_shape)
+                ev_numel = _prod(raw_shape)
+                exp_numel = _prod(expected_shape)
                 if ev_numel != exp_numel:
                     errors.append(
                         f"Shape mismatch at layer_id={layer.id}: "
@@ -443,22 +438,22 @@ def _is_finite(t: torch.Tensor) -> bool:
 
 def compare_bounds_per_neuron(
     *,
-    bounds_by_layer: Dict[int, Bounds],
-    concrete_by_layer: Dict[int, torch.Tensor],
-    layer_by_id: Dict[int, Layer],
+    bounds_by_layer: dict[int, Bounds],
+    concrete_by_layer: dict[int, torch.Tensor],
+    layer_by_id: dict[int, Layer],
     topk: int = 10,
     nan_policy: str = "error",
     tol_abs: float = 0.0,
     tol_rel: float = 0.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Compare per-neuron concrete activations against abstract bounds. Zero
     tolerance by default; a nonzero tol_abs/tol_rel must be passed explicitly.
     """
-    errors: List[str] = []
-    warnings: List[str] = []
-    violations_topk: List[Dict[str, Any]] = []
-    layerwise_stats: List[Dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    violations_topk: list[dict[str, Any]] = []
+    layerwise_stats: list[dict[str, Any]] = []
     violations_total = 0
 
     if set(bounds_by_layer.keys()) != set(concrete_by_layer.keys()):
@@ -476,7 +471,7 @@ def compare_bounds_per_neuron(
             "warnings": warnings,
         }
 
-    candidates: List[Dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
     for layer_id, bounds in bounds_by_layer.items():
         concrete = concrete_by_layer[layer_id]
@@ -604,14 +599,14 @@ def run_per_neuron_bounds_check(
     model: torch.nn.Module,
     input_tensor: torch.Tensor,
     config: PerNeuronCheckConfig = PerNeuronCheckConfig(),
-    precomputed_bounds: Dict[int, Bounds],
+    precomputed_bounds: dict[int, Bounds],
     pre_activation: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Full per-neuron bounds validation pipeline for a single input sample.
     """
-    errors: List[str] = []
-    warnings: List[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
 
     bounds_by_layer = precomputed_bounds
 

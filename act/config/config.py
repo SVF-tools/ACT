@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, fields
 from importlib import import_module
 import math
 from pathlib import Path
-from typing import Any, Final, List, Optional, Union
+from typing import Any, Final
 
 import yaml
 
@@ -80,6 +80,25 @@ VALID_BERT_METHODS: Final[tuple[str, ...]] = (
 def _load_yaml(path: Path) -> dict[str, Any]:
     with open(path) as handle:
         return yaml.safe_load(handle) or {}
+
+
+_PIPELINE_YAML_MISSING: Final[str] = "Pipeline config not found: {path}\nExpected: act/config/pipeline.yaml"
+
+
+def _read_config_yaml(
+    config_path: str | Path | None,
+    default_path: Path,
+    missing: str,
+) -> dict[str, Any]:
+    """Read a config YAML, ``default_path`` when no path is given.
+
+    Raises:
+        FileNotFoundError: ``missing`` formatted with the resolved ``path``.
+    """
+    path = Path(config_path) if config_path else default_path
+    if not path.exists():
+        raise FileNotFoundError(missing.format(path=path))
+    return _load_yaml(path)
 
 
 BERT_METHOD_TIERS: Final[dict[str, str]] = {
@@ -315,7 +334,7 @@ class BaBConfig:
     dimension to bisect and its fanout, input-domain-splitting BaB only)."""
     llm_probe_log: bool = False
 
-    method: Optional[str] = None
+    method: str | None = None
 
     def __post_init__(self) -> None:
         if self.solver_tier not in VALID_SOLVER_TIERS:
@@ -411,7 +430,7 @@ def _validate_bab_presets(
 
 
 def load_bab_presets(
-    config_path: Optional[Union[str, Path]] = None,
+    config_path: str | Path | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Load and validate named BaB presets from a backend YAML file."""
     path = Path(config_path) if config_path else _BACKEND_YAML
@@ -434,7 +453,7 @@ def _select_bab_preset(
 
 def load_bab_preset(
     name: str,
-    config_path: Optional[Union[str, Path]] = None,
+    config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Load one named BaB preset, listing available names on failure."""
     return _select_bab_preset(name, load_bab_presets(config_path))
@@ -456,7 +475,7 @@ class GenerationConfig:
     num_instances: int = 15
     base_seed: int = 42
     name_prefix: str = "cfg_seed"
-    tf_targets: Optional[List[str]] = None
+    tf_targets: list[str] | None = None
     registry_mode: str = "intersection"
     coverage_mode: str = "basic"
     coverage_max_attempts: int = 1000
@@ -479,7 +498,7 @@ class GenerationConfig:
 
 @dataclass
 class HybridZConfig:
-    timeout: Optional[float] = None
+    timeout: float | None = None
     tolerance: float = 1e-7
     max_input_dim: int = 1024
     sigmoid_segments: int = 2
@@ -488,7 +507,7 @@ class HybridZConfig:
 
 @dataclass
 class GurobiConfig:
-    time_limit: Optional[float] = None
+    time_limit: float | None = None
     mip_gap: float = 1e-4
     threads: int = 0
     output_flag: int = 0
@@ -599,7 +618,7 @@ class BackendConfig:
     verbose: bool = False
     timeout: float = 300.0
 
-    bab_preset: Optional[str] = None
+    bab_preset: str | None = None
 
     bab_enabled: bool = False
     bab: BaBConfig = field(default_factory=BaBConfig)
@@ -613,7 +632,7 @@ class BackendConfig:
     see commit af797ff / C6).
     """
 
-    bab_max_batch_size: Union[int, str] = 8
+    bab_max_batch_size: int | str = 8
     """Maximum K for BaB sub-problem batching (tier 3).
 
     BaB dispatches up to K sub-problems per solve_batch call.  Set to 1 to
@@ -628,7 +647,7 @@ class BackendConfig:
     torchlp: TorchLPConfig = field(default_factory=TorchLPConfig)
     dual: DualConfig = field(default_factory=DualConfig)
 
-    method: Optional[str] = None
+    method: str | None = None
 
     # -- validation ---------------------------------------------------------
 
@@ -679,7 +698,7 @@ class BackendConfig:
     @classmethod
     def from_yaml(
         cls,
-        config_path: Optional[Union[str, Path]] = None,
+        config_path: str | Path | None = None,
         **overrides,
     ) -> BackendConfig:
         """Load backend YAML and apply keyword overrides.
@@ -703,11 +722,7 @@ class BackendConfig:
           - ``dual_<field>`` → ``DualConfig.<field>``
           - ``bab_enabled`` → top-level ``bab_enabled``
         """
-        path = Path(config_path) if config_path else _BACKEND_YAML
-        if not path.exists():
-            raise FileNotFoundError(f"Backend config not found: {path}")
-
-        raw = _load_yaml(path)
+        raw = _read_config_yaml(config_path, _BACKEND_YAML, "Backend config not found: {path}")
         bab_presets = load_bab_presets()
 
         backend_raw: dict[str, Any] = raw.get("backend", {})
@@ -849,7 +864,7 @@ class ValidationConfig:
     samples: int
     per_neuron_topk: int
     bounds_tolerance: str
-    batch_sizes: Optional[list[Optional[int]]]
+    batch_sizes: list[int | None] | None
 
 
 @dataclass
@@ -862,19 +877,11 @@ class PipelineConfig:
     @classmethod
     def from_yaml(
         cls,
-        config_path: Optional[str | Path] = None,
+        config_path: str | Path | None = None,
         **overrides: Any,
     ) -> "PipelineConfig":
-        path = Path(config_path) if config_path else _PIPELINE_YAML
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Pipeline config not found: {path}\nExpected: act/config/pipeline.yaml"
-            )
-
+        yaml_data = _read_config_yaml(config_path, _PIPELINE_YAML, _PIPELINE_YAML_MISSING)
         FuzzingConfig = import_module("act.pipeline.fuzzing.actfuzzer").FuzzingConfig
-
-        with open(path) as f:
-            yaml_data = yaml.safe_load(f) or {}
 
         fuzz_overrides = _strip_prefixed_overrides(overrides, "fuzz_")
         bab_overrides = _strip_prefixed_overrides(overrides, "bab_")
@@ -916,20 +923,13 @@ def _merge_dataclass_fields(
     return merged
 
 
-def read_fuzzing_section(config_path: Optional[str | Path] = None) -> dict[str, Any]:
+def read_fuzzing_section(config_path: str | Path | None = None) -> dict[str, Any]:
     """Read the ``fuzzing`` section of the pipeline YAML.
 
     config.py is the single reader of the config YAML files; FuzzingConfig (in
     act.pipeline.fuzzing.actfuzzer) routes its YAML access through here.
     """
-    path = Path(config_path) if config_path else _PIPELINE_YAML
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Pipeline config not found: {path}\nExpected: act/config/pipeline.yaml"
-        )
-    with open(path) as f:
-        yaml_data = yaml.safe_load(f) or {}
-    return yaml_data.get("fuzzing") or {}
+    return _read_config_yaml(config_path, _PIPELINE_YAML, _PIPELINE_YAML_MISSING).get("fuzzing") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -945,15 +945,10 @@ class FrontEndConfig:
     @classmethod
     def from_yaml(
         cls,
-        config_path: Optional[Union[str, Path]] = None,
+        config_path: str | Path | None = None,
         **overrides: Any,
     ) -> "FrontEndConfig":
-        path = Path(config_path) if config_path else _FRONTEND_YAML
-        if not path.exists():
-            raise FileNotFoundError(f"Front-end config not found: {path}")
-
-        with open(path) as f:
-            raw = yaml.safe_load(f) or {}
+        raw = _read_config_yaml(config_path, _FRONTEND_YAML, "Front-end config not found: {path}")
 
         specs = deepcopy(raw.get("specs", {}))
         text_verification = deepcopy(raw.get("text_verification", {}))
@@ -962,7 +957,7 @@ class FrontEndConfig:
         )
         return cls(specs=specs, text_verification=text_verification)
 
-    def spec_config(self, name: Optional[str]) -> dict[str, Any]:
+    def spec_config(self, name: str | None) -> dict[str, Any]:
         key = name or "default"
         if key not in self.specs:
             raise KeyError(f"Unknown front-end spec config: {key}")
