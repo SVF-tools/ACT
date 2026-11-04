@@ -33,7 +33,7 @@ from typing import Dict, Any, List, Literal, Tuple, Optional
 
 # Import ACT components
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
-from act.front_end.spec_creator_base import LabeledInputTensor
+from act.front_end.spec_creator_base import LabeledInputTensor, SpecTuple
 from act.front_end.verifiable_model import (
     InputLayer,
     InputSpecLayer,
@@ -417,10 +417,10 @@ def synthesize_models_and_seeds_from_specs(
 
 
 def synthesize_models_from_specs(
-    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]],
+    spec_results: list[SpecTuple],
     *,
     cd_group: Literal["value", "shape"] = "value",
-) -> Dict[Tuple[str, str, str, str], nn.Module]:
+) -> dict[tuple[str, str, str, str], nn.Module]:
     """Synthesize wrapped models with automatic batching."""
     synthesis_models, _ = synthesize_models_and_seeds_from_specs(
         spec_results, cd_group=cd_group

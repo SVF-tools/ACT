@@ -17,10 +17,8 @@ from pathlib import Path
 from typing import Any, List, Tuple, Dict, Optional, override
 import logging
 import torch
-import torch.nn as nn
 
-from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
-from act.front_end.specs import InputSpec, OutputSpec
+from act.front_end.spec_creator_base import BaseSpecCreator, SpecTuple
 from act.front_end.vnnlib_loader.data_model_loader import (
     list_downloaded_pairs,
     load_vnnlib_pair
@@ -62,7 +60,7 @@ class VNNLibSpecCreator(BaseSpecCreator):
         categories: Optional[List[str]] = None,
         max_instances: Optional[int] = None,
         validate_shapes: bool = True
-    ) -> List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
+    ) -> List[SpecTuple]:
         """
         Create specs for VNNLIB benchmark instances.
         
@@ -207,7 +205,7 @@ class VNNLibSpecCreator(BaseSpecCreator):
         instance_id: str,
         instance_data: Dict[str, Any],
         validate_shapes: bool
-    ) -> Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]:
+    ) -> SpecTuple:
         """
         Create specs for a single VNNLIB instance.
         

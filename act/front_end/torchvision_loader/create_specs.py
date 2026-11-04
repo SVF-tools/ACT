@@ -13,12 +13,12 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Optional
 import logging
 import torch
 import torch.nn as nn
 
-from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
+from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor, SpecTuple
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
 from act.front_end.torchvision_loader.data_model_loader import (
     list_downloaded_pairs,
@@ -59,7 +59,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         start_index: int = 0,
         split: str = "test",
         validate_shapes: bool = True
-    ) -> List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
+    ) -> List[SpecTuple]:
         """
         Create specs for TorchVision dataset-model pairs.
         
@@ -186,7 +186,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         num_samples: int,
         start_index: int,
         validate_shapes: bool
-    ) -> Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]:
+    ) -> SpecTuple:
         """
         Create specs for a single dataset-model pair.
         

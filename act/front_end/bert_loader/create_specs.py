@@ -39,7 +39,7 @@ from act.front_end.bert_loader.compact_bert import (
     resolve_checkpoint,
     tokenize_act_tokens,
 )
-from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor
+from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor, SpecTuple
 from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
 from act.front_end.bert_loader.data_model_loader import (
     BertEmbeddingClassifier,
@@ -80,7 +80,7 @@ class BertSpecCreator(BaseSpecCreator):
         checkpoint_dir: str | Path | None = None,
         position_mode: str | None = None,
         conversion_route: str | None = None,
-    ) -> list[tuple[str, str, nn.Module, list[torch.Tensor], list[tuple[InputSpec, OutputSpec]]]]:
+    ) -> list[SpecTuple]:
         """Create embedding-space specs for BERT datasets.
 
         Args:
@@ -195,10 +195,7 @@ class BertSpecCreator(BaseSpecCreator):
                     validate_shapes=validate_shapes,
                 ))
 
-        return cast(
-            list[tuple[str, str, nn.Module, list[torch.Tensor], list[tuple[InputSpec, OutputSpec]]]],
-            results,
-        )
+        return cast(list[SpecTuple], results)
 
     def create_compact_specs_for_examples(
         self,
