@@ -307,7 +307,7 @@ def _build_batched_model(
 
 
 def synthesize_models_and_seeds_from_specs(
-    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]],
+    spec_results: list[SpecTuple],
     *,
     cd_group: Literal["value", "shape"] = "value",
 ) -> Tuple[

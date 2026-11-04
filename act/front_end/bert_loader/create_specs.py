@@ -126,9 +126,7 @@ class BertSpecCreator(BaseSpecCreator):
         models = model_names or [
             "compact_bert" if checkpoint_dir is not None else "embedding_classifier"
         ]
-        results: list[
-            tuple[str, str, nn.Module, list[LabeledInputTensor], list[tuple[InputSpec, OutputSpec]]]
-        ] = []
+        results: list[SpecTuple] = []
 
         for dataset in datasets:
             examples = load_bert_dataset(dataset, split)
@@ -212,7 +210,7 @@ class BertSpecCreator(BaseSpecCreator):
         position: int | None = None,
         conversion_route: str | None = None,
         validate_shapes: bool = True,
-    ) -> list[tuple[str, str, nn.Module, list[LabeledInputTensor], list[tuple[InputSpec, OutputSpec]]]]:
+    ) -> list[SpecTuple]:
         """Build compact models and specs, optionally for one eligible sweep position."""
         route = conversion_route or str(self.config.get("conversion_route", "b"))
         if route not in _VALID_CONVERSION_ROUTES:
