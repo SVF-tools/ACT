@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 import torch
 
-from act.back_end.bab.violation import validate_terminal_candidates
+from act.util.counterexample import validate_counterexamples
 from act.back_end.core import Bounds, Net
 from act.back_end.solver.solver_dual import unproven_spec_rows
 from act.config.config import TorchLPConfig
@@ -995,7 +995,10 @@ def solve_terminal_batch(
                     statuses[k], reasons[k] = VerifyStatus.TIMEOUT, "terminal_deadline"
             break
         try:
-            valid = validate_terminal_candidates(exported, batch)
+            valid = validate_counterexamples(
+                exported.net, batch, box=exported.input_bounds,
+                split_signs=exported.split_signs, tolerance=0.0,
+            )
         except (ValueError, RuntimeError, NotImplementedError) as error:
             for k in range(count):
                 if statuses[k] == VerifyStatus.UNKNOWN:

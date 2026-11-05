@@ -77,7 +77,7 @@ from act.back_end.bab.branching.bounding import (
 from act.back_end.core import Bounds, Layer, Net
 from act.back_end.dual_tf.tf_forward import compute_forward_bounds, refresh_bounds
 from act.back_end.layer_schema import LayerKind
-from act.back_end.bab.violation import _check_input_specs_batched, check_violations_batched
+from act.util.counterexample import validate_counterexamples
 from act.back_end.solver.solver_base import Solver, SolveStatus
 from act.back_end.solver.solver_dual import (
     DualBatchResult,
@@ -486,7 +486,7 @@ def verify_bab_batched(
         sol     = setup_and_solve_batch(net, [K,*input_shape] bounds, solver_factory())
         # decode per-lane:
         #   UNSAT       -> prune (region certified)
-        #   SAT + violation (check_violations_batched) -> FALSIFIED (terminate)
+        #   SAT + validated counterexample -> FALSIFIED (terminate)
         #   SAT spurious / UNKNOWN -> branch (or drop at max_depth)
 
     Soundness: returns CERTIFIED only when the pool drains via UNSAT pruning
@@ -1160,8 +1160,7 @@ def verify_bab_batched(
                     if input_shape
                     else x_input_flat
                 )
-                in_region = _check_input_specs_batched(x_input_shaped, spec_layers)
-                violations = check_violations_batched(net, x_input_shaped, assert_layer) & in_region
+                violations = validate_counterexamples(net, x_input_shaped)
                 for j, lane in enumerate(sat_lane_idx):
                     if bool(violations[j].item()):
                         if trace is not None:
@@ -2416,7 +2415,7 @@ if __name__ == "__main__":
 
         # Concrete ADD supports three operands, but the reused exporter is
         # binary. A valid Net must not certify a different, truncated graph.
-        from act.back_end.bab.violation import _forward_for_violation_check
+        from act.util.counterexample import concrete_forward
         from act.back_end.solver.solver_gurobi import solve_milp
 
         add_box = Bounds(upper.new_zeros((1, 1)), upper.new_ones((1, 1)))
@@ -2435,7 +2434,7 @@ if __name__ == "__main__":
         add_preds = {0: [], 1: [0], 2: [1], 3: [1], 4: [1], 5: [2, 3, 4], 6: [5]}
         add_succs = {0: [1], 1: [2, 3, 4], 2: [5], 3: [5], 4: [5], 5: [6], 6: []}
         add_net = Net(add_layers, add_preds, add_succs)
-        assert _forward_for_violation_check(add_net, add_box.ub).item() == 3.
+        assert concrete_forward(add_net, add_box.ub).item() == 3.
         for prefer_affine in (False, True):
             rejected_add = solve_terminal_batch(add_net, add_box, prefer_affine=prefer_affine)
             assert rejected_add.statuses == (VerifyStatus.UNKNOWN,), rejected_add.statuses
@@ -2459,7 +2458,7 @@ if __name__ == "__main__":
             binary_preds = {**add_preds, 5: predecessors}
             binary_succs = {**add_succs, 2: [5], 3: [5] if 3 in predecessors else [], 4: []}
             binary_net = Net(binary_layers, binary_preds, binary_succs)
-            assert _forward_for_violation_check(binary_net, add_box.ub).item() == 2.
+            assert concrete_forward(binary_net, add_box.ub).item() == 2.
             for prefer_affine in (False, True):
                 assert solve_terminal_batch(
                     binary_net, add_box, prefer_affine=prefer_affine,
