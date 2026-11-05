@@ -2,6 +2,8 @@
 
 A testing and verification framework for AI models based on neural networks, built on a three-tier architecture (front-end, back-end, and pipeline), with native PyTorch support and an ACT intermediate representation (IR) that enables refinement-based precision and supports diverse model architectures, input formats, and specification types.
 
+**Online (v0.1):** ACT now supports online use through ACT-GUI at [https://act-online.au](https://act-online.au).
+
 ## Quick Start
 
 
