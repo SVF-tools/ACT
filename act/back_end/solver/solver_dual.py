@@ -18,6 +18,7 @@ from typing import Any, TypeAlias, cast
 from collections.abc import Callable, Iterator
 
 import torch
+from act.pipeline.gui import verifier_gui as _obs
 from act.back_end.core import Bounds, Layer, Net, get_topo_order
 from act.back_end.layer_schema import LayerKind
 from act.back_end.dual_tf.tf_forward import (
@@ -1935,6 +1936,23 @@ class DualSolver(Solver):
             )
         return fresh_bounds, result.nu_per_layer
 
+    def _observe_backward(self, net, bounds_dict, result, M):
+        """Report the alpha used by the final backward evaluation, without copying."""
+        for layer in net.layers:
+            if layer.kind != LayerKind.RELU.value or layer.id not in bounds_dict:
+                continue
+            pre = bounds_dict[layer.id]
+            alpha = None if result.alpha_state is None else result.alpha_state.get(layer.id)
+            if alpha is None:
+                lb = pre.lb.flatten(1)
+                ub = pre.__dict__.get("_repaired_ub", pre.ub.flatten(1))
+                alpha = (ub / (ub - lb).clamp(min=1e-12)).clamp(0.0, 1.0).unsqueeze(1).expand(-1, M, -1)
+            key = _obs.RecordKey("dual", "backward", layer.id, "pre")
+            _obs.emit(_obs.DualBackward(key, alpha, self.last_alpha_iterations > 0))
+            if _obs.wants_relaxation():
+                _obs.emit(_obs.DESCRIBERS["dual"](key, pre, alpha=alpha))
+
+    @_obs.observed_phase("DualSolver.evaluate_spec")
     def evaluate_spec(
         self, net: Net,
         out_spec: OutputSpec,
@@ -1980,6 +1998,8 @@ class DualSolver(Solver):
                 missing / unbatched.
         """
         forward_frame: ForwardFrame | None = None
+        self.last_alpha_iterations = 0
+        self.last_alpha_stop_reason = "n_iters" if self.n_iters <= 0 else "fixed"
         if bounds_dict is None:
             from act.back_end.dual_tf.tf_forward import compute_forward_bounds
             from act.back_end.verifier import (
@@ -2065,7 +2085,12 @@ class DualSolver(Solver):
                     result = self.compute_certified_bound(
                         net, bounds_dict, C, M=N, enable_grad=enable_grad,
                         forward_frame=forward_frame,
+                        optimize=self.n_iters > 0, n_iters=self.n_iters,
+                        return_optimized=self.n_iters > 0,
+                        refresh_forward=False,
                     )
+                    if _obs.enabled:
+                        self._observe_backward(net, bounds_dict, result, N)
                     margins_flat = result.margins
                 else:
                     margins_flat = self._chunked_eval(
@@ -2078,6 +2103,11 @@ class DualSolver(Solver):
                     slack, torch.maximum(margins.abs(), thresholds.abs())
                 ) & active_mask).any(dim=-1)
 
+            if _obs.enabled:
+                _obs.emit(_obs.SpecBound(
+                    _obs.RecordKey("dual", "backward", assert_layer.id),
+                    margins, slack, self.last_alpha_iterations, self.last_alpha_stop_reason,
+                ))
             return SpecBatchResult(
                 margins=margins,
                 slack=slack,
@@ -2096,7 +2126,12 @@ class DualSolver(Solver):
                 result = self.compute_certified_bound(
                     net, bounds_dict, C_neg, M=M, enable_grad=enable_grad,
                     forward_frame=forward_frame,
+                    optimize=self.n_iters > 0, n_iters=self.n_iters,
+                    return_optimized=self.n_iters > 0,
+                    refresh_forward=False,
                 )
+                if _obs.enabled:
+                    self._observe_backward(net, bounds_dict, result, M)
                 margins_flat = result.margins
             else:
                 margins_flat = self._chunked_eval(
@@ -2112,6 +2147,11 @@ class DualSolver(Solver):
             ) & active_mask
             certified = ~violations.any(dim=-1)
 
+        if _obs.enabled:
+            _obs.emit(_obs.SpecBound(
+                _obs.RecordKey("dual", "backward", assert_layer.id),
+                margins, slack, self.last_alpha_iterations, self.last_alpha_stop_reason,
+            ))
         return SpecBatchResult(
             margins=margins,
             slack=slack,
@@ -2137,6 +2177,8 @@ class DualSolver(Solver):
         """
         C_view = C_neg.view(B, M, n_out)
         chunks: list[torch.Tensor] = []
+        if _obs.enabled:
+            alpha_chunks = {}
         for start in range(0, M, chunk_size):
             end = min(start + chunk_size, M)
             m_chunk = end - start
@@ -2145,9 +2187,22 @@ class DualSolver(Solver):
             result = self.compute_certified_bound(
                 net, bounds_dict, C_chunk, M=m_chunk, enable_grad=enable_grad,
                 forward_frame=forward_frame,
+                optimize=self.n_iters > 0, n_iters=self.n_iters,
+                return_optimized=self.n_iters > 0,
+                refresh_forward=False,
             )
+            if _obs.enabled and result.alpha_state is not None:
+                for lid, alpha in result.alpha_state.items():
+                    if net.by_id[lid].kind == LayerKind.RELU.value:
+                        alpha_chunks.setdefault(lid, []).append(alpha)
             chunks.append(result.margins.view(B, m_chunk))
-        return torch.cat(chunks, dim=1).reshape(B * M)
+        margins = torch.cat(chunks, dim=1).reshape(B * M)
+        if _obs.enabled:
+            self._observe_backward(net, bounds_dict, DualResult(
+                margins=margins,
+                alpha_state={lid: torch.cat(parts, dim=1) for lid, parts in alpha_chunks.items()},
+            ), M)
+        return margins
 
     def compute_robust_bound(
         self, net: Net, bounds_dict: dict[int, Bounds],

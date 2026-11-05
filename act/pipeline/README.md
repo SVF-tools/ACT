@@ -25,6 +25,8 @@ act/pipeline/
 ├── fuzzing/              # Whitebox fuzzing framework
 │   ├── actfuzzer.py      # Main fuzzing engine
 │   └── ...
+├── gui/                  # ACT-side support for ACT-GUI
+│   └── verifier_gui.py   # Propagation observer API and ReLU describers
 └── log/                  # Centralized execution logs
 ```
 
@@ -103,7 +105,21 @@ Implements multi-level validation:
 A fast, GPU-accelerated fuzzer that uses:
 - **Gradient Mutations**: FGSM/PGD-style perturbations.
 - **Coverage Tracking**: DeepXplore-style neuron coverage.
-- **Property Checking**: Automated detection of `OutputSpec` violations.
+- **Property Checking**: `OutputSpec` violations through `act/util/counterexample.py`, the
+  same check verification uses.
+
+### GUI support (`gui/`)
+All ACT code that exists for ACT-GUI lives here. `gui.verifier_gui.observe(sink)` exposes phase
+events, committed layer bounds, and dual backward/specification records during
+`verify_once`. Set the sink's `wants_relaxation = True` attribute to request ReLU
+descriptions (`verifier_gui.DESCRIBERS`, one per domain). Callbacks receive read-only live
+tensors and must copy retained values; a callback exception logs a warning and detaches
+that sink. With no sink registered, tensor work is unchanged and hot emission sites only
+check the module's `enabled` flag.
+
+Interval and HybridZ report each layer's committed output (stage `out`); dual forward
+reports activation inputs as `pre` and other layers as `out`; dual backward records
+(alpha `[B, M, n]`, margins and slack `[B, M]`) use pass `backward`.
 
 ## Logging and Diagnostics
 

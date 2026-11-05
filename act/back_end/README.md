@@ -186,6 +186,21 @@ This forms a **refinement loop**: false CEs drive further splitting → tighter 
 
 ## Performance Tips
 
+### Propagation observation
+
+`act.back_end.observe.observe(sink)` exposes phase events, committed layer bounds,
+and dual backward/specification records during `verify_once`. Set the sink's
+`wants_relaxation = True` attribute to request ReLU descriptions. Callbacks receive
+read-only live tensors and must copy retained values; a callback exception logs
+a warning and detaches that sink. With no sink registered, tensor work is
+unchanged and hot emission sites check the module's `enabled` flag.
+
+`verify_once(..., dual_iters=0)` preserves the fixed dual default. A positive
+budget optimizes alpha against the same forward bounds. Interval and HybridZ
+report each layer's committed output (stage `out`); dual forward reports
+activation inputs as `pre` and other layers as `out`; dual backward records
+(alpha `[B, M, n]`, margins and slack `[B, M]`) use pass `backward`.
+
 - Set a **global device** (CPU/GPU) and dtype up front.
 - Use `@torch.no_grad()` in analysis & CE validation.
 - Batch BaB nodes for large networks (optional extension).

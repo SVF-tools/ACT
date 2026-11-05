@@ -48,6 +48,7 @@ from __future__ import annotations
 from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, Tuple, Literal, overload
 
 import torch
+from act.pipeline.gui import verifier_gui as _obs
 import copy
 
 # ACT backend imports
@@ -477,6 +478,7 @@ def verify_once(
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[False] = False,
+    dual_iters: int = 0,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult]:
@@ -489,18 +491,21 @@ def verify_once(
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[True],
+    dual_iters: int = 0,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
     ...
 
 
+@_obs.observed_phase("verify_once")
 @torch.no_grad()
 def verify_once(
     net,
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: bool = False,
+    dual_iters: int = 0,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult] | Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
@@ -535,6 +540,8 @@ def verify_once(
             dual path.
         timelimit: optional HybridZ verdict-solver wall-clock limit in seconds.
         hybridz_tolerance: optional HybridZ MILP feasibility/spec tolerance.
+        dual_iters: optional dual alpha iterations over fixed forward bounds; zero
+            preserves the fixed-slope single-pass default.
 
     Returns:
         ``List[VerifyResult]`` of length ``B`` (one per input lane), or
@@ -590,7 +597,7 @@ def verify_once(
         num_classes = len(output_ids)
         # DualSolver is now self-contained: no tf parameter, evaluate_spec
         # computes its own pre-activation forward bounds internally from the net.
-        solver = DualSolver()
+        solver = DualSolver(n_iters=dual_iters)
         result = solver.evaluate_spec(
             net,
             out_spec,
