@@ -19,7 +19,7 @@ import argparse
 from contextlib import contextmanager
 import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 import sys
 import torch
 
@@ -35,6 +35,7 @@ from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
 from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.model_synthesis import synthesize_models_and_seeds_from_specs
+from act.front_end.spec_creator_base import SpecTuple
 from act.config.frontend_cli import (
     print_unified_list, print_unified_search, print_unified_info,
     handle_unified_download, print_list_downloads,
@@ -317,7 +318,7 @@ def cmd_fuzz(args) -> int:
     print(f"STEP 1: Loading Data-Model Pairs")
     print(f"{rule()}\n")
 
-    spec_results = []
+    spec_results: list[SpecTuple] = []
     try:
         if creator == "vnnlib":
             spec_creator = VNNLibSpecCreator()
@@ -429,7 +430,7 @@ def cmd_fuzz(args) -> int:
 
     try:
         wrapped_models, synthesized_seeds = synthesize_models_and_seeds_from_specs(
-            cast(Any, spec_results), cd_group="shape"
+            spec_results, cd_group="shape"
         )
     except Exception as e:
         print(f"❌ Model synthesis failed: {e}")
@@ -631,7 +632,7 @@ def _select_verify_mode(args) -> tuple[str, str, str]:
     return solver, tf_mode, _apply_verify_mode(solver, tf_mode)
 
 
-def _wrap_spec_results(spec_results) -> dict:
+def _wrap_spec_results(spec_results: list[SpecTuple]) -> dict[tuple[str, str, str, str], torch.nn.Module]:
     """Synthesize the VerifiableModels of ``spec_results``; raise when there are none."""
     from act.front_end.model_synthesis import synthesize_models_from_specs
 
@@ -711,12 +712,12 @@ def _run_vnnlib_verify(args) -> bool:
     if getattr(args, "merge_split_relus", False):
         from act.front_end.model_synthesis import merge_split_relus
 
-        merged_results = []
+        merged_results: list[SpecTuple] = []
         for sr in spec_results:
             merged_model, n_merged = merge_split_relus(sr[2])
             if n_merged:
                 print(f"[merge] fused {n_merged} split-ReLU neurons in {sr[1]}")
-                sr = tuple(merged_model if i == 2 else v for i, v in enumerate(sr))
+                sr = (sr[0], sr[1], merged_model, sr[3], sr[4])
             merged_results.append(sr)
         spec_results = merged_results
 
