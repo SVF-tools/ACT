@@ -2125,8 +2125,8 @@ if __name__ == "__main__":
         _entry_lin_frame, _identical_forward_lanes, compute_forward_bounds,
         forward_frame_row_lower_bounds,
     )
-    from act.back_end.bab.violation import (
-        _forward_for_violation_check, clear_violation_check_module_cache,
+    from act.util.counterexample import (
+        concrete_forward, clear_violation_check_module_cache,
     )
     from act.back_end.core import Layer
     from act.back_end.net_factory import LAYER_TESTING_SPECS, NetFactory
@@ -2180,7 +2180,7 @@ if __name__ == "__main__":
             alias_box = Bounds(
                 alias_net.layers[1].params["lb"], alias_net.layers[1].params["ub"],
             )
-            concrete = _forward_for_violation_check(alias_net, alias_box.lb)
+            concrete = concrete_forward(alias_net, alias_box.lb)
             assert alias_box.lb.item() == -1. and concrete.item() == 1.
             assert torch.equal(concrete, torch.relu(alias_box.lb) - alias_box.lb)
             for affine in (False, True):
@@ -2214,7 +2214,7 @@ if __name__ == "__main__":
                 else:
                     assert exact.status == VerifyStatus.FALSIFIED, exact
                     assert exact.counterexample is not None
-                    assert (_forward_for_violation_check(alias_net, exact.counterexample) >= .5).all()
+                    assert (concrete_forward(alias_net, exact.counterexample) >= .5).all()
 
     # INPUT_SPEC and FLATTEN may preserve variable IDs; SUB(x, x) is supported.
     clear_violation_check_module_cache()
@@ -2222,7 +2222,7 @@ if __name__ == "__main__":
     identity_box = Bounds(
         identity_net.layers[1].params["lb"], identity_net.layers[1].params["ub"],
     )
-    assert _forward_for_violation_check(identity_net, identity_box.lb).item() == 0.
+    assert concrete_forward(identity_net, identity_box.lb).item() == 0.
     for affine in (False, True):
         identity_result = solve_terminal_batch(identity_net, identity_box, prefer_affine=affine)
         assert identity_result.statuses == (VerifyStatus.CERTIFIED,), identity_result

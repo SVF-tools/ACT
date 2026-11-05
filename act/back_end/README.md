@@ -186,20 +186,26 @@ This forms a **refinement loop**: false CEs drive further splitting → tighter 
 
 ## Performance Tips
 
-### Propagation observation
+### Propagation observation and counterexamples
 
-`act.back_end.observe.observe(sink)` exposes phase events, committed layer bounds,
-and dual backward/specification records during `verify_once`. Set the sink's
-`wants_relaxation = True` attribute to request ReLU descriptions. Callbacks receive
-read-only live tensors and must copy retained values; a callback exception logs
-a warning and detaches that sink. With no sink registered, tensor work is
-unchanged and hot emission sites check the module's `enabled` flag.
+Engine hot paths emit propagation records through `act.pipeline.gui.verifier_gui`
+(see `act/pipeline/README.md`); with no sink registered they only read its
+`enabled` flag.
 
 `verify_once(..., dual_iters=0)` preserves the fixed dual default. A positive
-budget optimizes alpha against the same forward bounds. Interval and HybridZ
-report each layer's committed output (stage `out`); dual forward reports
-activation inputs as `pre` and other layers as `out`; dual backward records
-(alpha `[B, M, n]`, margins and slack `[B, M]`) use pass `backward`.
+budget optimizes alpha against the same forward bounds. The dual path also
+checks the dual witness of UNKNOWN lanes on the concrete model and reports
+FALSIFIED with that counterexample.
+
+`act/util/counterexample.py` is the only counterexample check in ACT.
+Candidates from fuzzing, dual, interval, hybridz, LP, MILP and BaB all go through it:
+`validate_counterexamples` checks input constraints, finite outputs, and the
+canonical `OutputSpec` boundary semantics together while preserving batch
+lanes; `box=` and `split_signs=` add a BaB node box and ReLU split phases.
+`VerifiableModel`'s input/output spec layers and the fuzzer's property checker
+use its `input_constraint_satisfied` and `output_violations`. Candidate
+selection and verdict assembly stay with the caller. Inference errors
+propagate rather than being reported as an ordinary inconclusive result.
 
 - Set a **global device** (CPU/GPU) and dtype up front.
 - Use `@torch.no_grad()` in analysis & CE validation.

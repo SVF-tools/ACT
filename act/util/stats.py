@@ -96,6 +96,7 @@ class SpecBatchResult:
     slack: torch.Tensor
     active_mask: torch.Tensor
     certified: torch.Tensor
+    witness: Optional[torch.Tensor] = None  # [B, M, n_in] dual-minimizing inputs, when requested
 
     def __post_init__(self) -> None:
         assert self.margins.dim() == 2, f"margins must be [B, M], got {self.margins.shape}"
@@ -112,27 +113,41 @@ class SpecBatchResult:
         masked = torch.where(self.active_mask, self.slack, inf_fill)
         return masked.min(dim=-1).values
 
-    def to_verify_results(self, *, source: str = "dual_bound") -> List["VerifyResult"]:
-        """Convert per-sample to ``List[VerifyResult]``.
+    def to_verify_results(
+        self, *, source: str = "dual_bound",
+        counterexamples: Optional[torch.Tensor] = None,
+        falsified: Optional[torch.Tensor] = None,
+        counterexample_metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> List["VerifyResult"]:
+        """Assemble results from certification and already-validated evidence.
 
-        Maps ``certified[b] -> CERTIFIED``, else ``UNKNOWN``. Counterexample
-        is None for all (batched solver paths do not extract concrete CEs;
-        FALSIFIED requires inline concrete-falsification in the caller).
+        Callers own candidate generation and concrete validation. Certification
+        takes precedence; absent evidence leaves an unresolved lane UNKNOWN.
         """
         results: List[VerifyResult] = []
         min_slack_vals = self.min_slack
         B = self.margins.shape[0]
+        certified = self.certified.tolist()
+        violations = falsified.tolist() if falsified is not None else [False] * B
+        witnesses = counterexamples.detach().cpu() if counterexamples is not None else None
         for b in range(B):
-            status = (VerifyStatus.CERTIFIED if bool(self.certified[b].item())
-                      else VerifyStatus.UNKNOWN)
-            results.append(VerifyResult(
-                status=status,
-                counterexample=None,
-                metadata={
-                    "margins": self.margins[b].detach().cpu().tolist(),
-                    "slack": self.slack[b].detach().cpu().tolist(),
-                    "min_slack": float(min_slack_vals[b].item()),
-                    "source": source,
-                },
-            ))
+            metadata = {
+                "margins": self.margins[b].detach().cpu().tolist(),
+                "slack": self.slack[b].detach().cpu().tolist(),
+                "min_slack": float(min_slack_vals[b].item()),
+                "source": source,
+            }
+            counterexample = None
+            if certified[b]:
+                status = VerifyStatus.CERTIFIED
+            elif violations[b]:
+                if witnesses is None:
+                    raise ValueError("FALSIFIED requires a concrete counterexample")
+                status = VerifyStatus.FALSIFIED
+                counterexample = witnesses[b].clone()
+                if counterexample_metadata is not None:
+                    metadata.update(counterexample_metadata[b])
+            else:
+                status = VerifyStatus.UNKNOWN
+            results.append(VerifyResult(status, counterexample, metadata))
         return results

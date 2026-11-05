@@ -1961,8 +1961,14 @@ class DualSolver(Solver):
         chunk_size: int | None = None,
         enable_grad: bool = False,
         collect_bounds: bool = False,
+        return_witness: bool = False,
     ) -> SpecBatchResult:
         """Dual bound evaluation for any OutputSpec — self-contained entry point.
+
+        ``return_witness`` also returns, per lane and spec row, the input that
+        minimizes the dual bound (``SpecBatchResult.witness``); callers check it
+        concretely before calling it a counterexample. Chunked evaluation does
+        not return witnesses.
 
         Refactor note: ``bounds_dict`` is optional. When omitted (the typical
         case), the solver gathers the net's INPUT_SPEC seed bounds and computes
@@ -2088,15 +2094,18 @@ class DualSolver(Solver):
                         optimize=self.n_iters > 0, n_iters=self.n_iters,
                         return_optimized=self.n_iters > 0,
                         refresh_forward=False,
+                        return_sce=return_witness,
                     )
                     if _obs.enabled:
                         self._observe_backward(net, bounds_dict, result, N)
                     margins_flat = result.margins
+                    witness = result.sce
                 else:
                     margins_flat = self._chunked_eval(
                         net, bounds_dict, C, B, N, n_out, chunk_size, enable_grad,
                         forward_frame=forward_frame,
                     )
+                    witness = None
                 margins = margins_flat.view(B, N)
                 slack = margins - thresholds
                 certified = (escaping_spec_rows(
@@ -2113,6 +2122,7 @@ class DualSolver(Solver):
                 slack=slack,
                 active_mask=active_mask,
                 certified=certified,
+                witness=witness.reshape(B, N, -1) if return_witness and witness is not None else None,
             )
 
         fe_params = out_spec.encode_linear(B=B, n_out=n_out, device=device, dtype=dtype)
@@ -2129,15 +2139,18 @@ class DualSolver(Solver):
                     optimize=self.n_iters > 0, n_iters=self.n_iters,
                     return_optimized=self.n_iters > 0,
                     refresh_forward=False,
+                    return_sce=return_witness,
                 )
                 if _obs.enabled:
                     self._observe_backward(net, bounds_dict, result, M)
                 margins_flat = result.margins
+                witness = result.sce
             else:
                 margins_flat = self._chunked_eval(
                     net, bounds_dict, C_neg, B, M, n_out, chunk_size, enable_grad,
                     forward_frame=forward_frame,
                 )
+                witness = None
 
             margins = margins_flat.view(B, M)
             slack = margins - thresholds_neg
@@ -2157,6 +2170,7 @@ class DualSolver(Solver):
             slack=slack,
             active_mask=active_mask,
             certified=certified,
+            witness=witness.reshape(B, M, -1) if return_witness and witness is not None else None,
         )
 
     def _chunked_eval(
