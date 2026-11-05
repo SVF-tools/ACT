@@ -545,23 +545,36 @@ class OutputSpec:
         elif self.kind == OutKind.UNSAFE_LINEAR:
             if self.c is None or self.d is None:
                 raise ValueError("UNSAFE_LINEAR requires both c and d")
-            c_mat = self.c.to(device=device, dtype=dtype)
-            if c_mat.dim() == 1:
-                c_mat = c_mat.unsqueeze(0)
-            N = c_mat.shape[0]
-            if c_mat.shape[1] != n_out:
+            # c is [N, n_out] (or [n_out]) shared by every lane, or [B, N, n_out]
+            # per lane; d is [N] shared or [B, N] per lane. Model synthesis with
+            # cd_group="shape" stacks lanes whose rows or thresholds differ.
+            c_full = self.c.to(device=device, dtype=dtype)
+            per_lane_c = c_full.dim() == 3
+            if per_lane_c:
+                c_lanes = c_full.expand(B, -1, -1) if c_full.shape[0] == 1 else c_full
+            else:
+                c_mat = c_full.unsqueeze(0) if c_full.dim() == 1 else c_full
+                c_lanes = c_mat.unsqueeze(0).expand(B, -1, -1)
+            if c_lanes.shape[0] != B or c_lanes.shape[2] != n_out:
                 raise ValueError(
-                    f"UNSAFE_LINEAR: c cols {c_mat.shape[1]} != n_out {n_out}"
+                    f"UNSAFE_LINEAR: c shape {tuple(self.c.shape)} incompatible "
+                    f"with B {B} and n_out {n_out}"
                 )
-            d_vec = self.d.to(device=device, dtype=dtype).flatten()
-            if d_vec.shape[0] != N:
-                raise ValueError(
-                    f"UNSAFE_LINEAR: d length {d_vec.shape[0]} != N {N}. A d of "
-                    f"shape {tuple(self.d.shape)} means this model was synthesized "
-                    f'with cd_group="shape", which batches per-lane d for fuzzing '
-                    f"and is not consumable by the verifier."
-                )
-            params["c"], params["d"], c_rows, thresholds = _expand_rows(c_mat, d_vec, B)
+            N = c_lanes.shape[1]
+            d_full = self.d.to(device=device, dtype=dtype)
+            if d_full.shape == (B, N) and (B > 1 or per_lane_c):
+                d_lanes = d_full
+            else:
+                d_vec = d_full.flatten()
+                if d_vec.shape[0] != N:
+                    raise ValueError(
+                        f"UNSAFE_LINEAR: d shape {tuple(self.d.shape)} is neither "
+                        f"({N},) shared by every lane nor ({B}, {N}) per lane"
+                    )
+                d_lanes = d_vec.unsqueeze(0).expand(B, -1)
+            params["c"], params["d"] = c_lanes.contiguous(), d_lanes.contiguous()
+            c_rows = c_lanes.reshape(B * N, n_out).contiguous()
+            thresholds = d_lanes.contiguous()
             m_specs = N
 
         elif self.kind in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):

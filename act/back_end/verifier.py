@@ -568,7 +568,14 @@ def verify_once(
         def _unbatch(val: Any) -> Any:
             # ASSERT params are pre-batchified; OutputSpec expects the
             # canonical unbroadcasted property while y_true remains per lane.
+            # Lane 0 stands for every lane only when all lanes agree.
             if isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[0] == B:
+                if not torch.equal(val, val[:1].expand_as(val)):
+                    raise NotImplementedError(
+                        "dual/hybridz verify_once takes one output property shared by "
+                        "every batch lane; this net carries per-lane property parameters "
+                        "(use the interval domain or verify the lanes separately)"
+                    )
                 return val[0]
             return val
 

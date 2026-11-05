@@ -231,13 +231,12 @@ def _merge_specs_to_batch(
     if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
         c_vec = out_specs[0].c
         if c_vec is not None:
-            c_ref = c_vec.detach().cpu().reshape(-1).numpy().tobytes()
-            assert all(
-                s.c is not None
-                and s.c.shape == c_vec.shape
-                and s.c.detach().cpu().reshape(-1).numpy().tobytes() == c_ref
-                for s in out_specs
-            ), f"{out_kind.name}: grouped lanes must share one c matrix"
+            assert all(s.c is not None and s.c.shape == c_vec.shape for s in out_specs), (
+                f"{out_kind}: grouped lanes must share one c shape"
+            )
+            if not all(torch.equal(s.c, c_vec) for s in out_specs):
+                # Lanes grouped by shape (cd_group="shape") keep their own rows: [B, N, n_out].
+                c_vec = torch.stack([s.c.reshape(-1, s.c.shape[-1]) for s in out_specs])
         d_all = [s.d for s in out_specs]
         if (
             len(d_all) > 1
@@ -361,18 +360,20 @@ def synthesize_models_and_seeds_from_specs(
             lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)]
             cd_sig: Any = None
             if out_spec.kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
-                merge_d = (
+                # "shape" merges UNSAFE_LINEAR lanes whose c and d differ in value only;
+                # each lane keeps its own rows and thresholds.
+                merge_cd = (
                     cd_group == "shape" and out_spec.kind is OutKind.UNSAFE_LINEAR
                 )
                 if out_spec.d is None:
                     d_sig: Any = None
-                elif merge_d:
+                elif merge_cd:
                     d_sig = tuple(out_spec.d.shape)
                 else:
                     d_sig = out_spec.d.detach().cpu().reshape(-1).numpy().tobytes()
                 cd_sig = (
                     tuple(out_spec.c.shape),
-                    out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
+                    None if merge_cd else out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
                     d_sig,
                 )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
