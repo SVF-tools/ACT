@@ -2,14 +2,19 @@
 # Simplified device/dtype management using PyTorch global defaults.
 # Now with explicit initialization API (no argparse dependency).
 
+import threading
+from typing import Optional, Tuple
+
 import torch
-from typing import Tuple
 
 if hasattr(torch.sparse, "check_sparse_tensor_invariants"):
     torch.sparse.check_sparse_tensor_invariants.disable()
 
 # Global initialization state
 _INITIALIZED = False
+# torch.set_default_device is thread-local: keep the process default and apply it once per thread.
+_DEFAULT_DEVICE: Optional[torch.device] = None
+_THREAD_STATE = threading.local()
 
 
 def _apply_precision_policy() -> str:
@@ -62,7 +67,7 @@ def initialize_device(device: str, dtype: str) -> None:
         # For testing with specific settings:
         initialize_device(device='cpu', dtype='float32')
     """
-    global _INITIALIZED
+    global _INITIALIZED, _DEFAULT_DEVICE
     
     # Handle gpu/cuda aliasing
     if device == 'gpu':
@@ -100,6 +105,8 @@ def initialize_device(device: str, dtype: str) -> None:
     torch.set_default_dtype(target_dtype)
     if hasattr(torch, 'set_default_device'):
         torch.set_default_device(target_device)
+        _DEFAULT_DEVICE = target_device
+        _THREAD_STATE.applied = True
 
     precision = _apply_precision_policy()
 
@@ -163,7 +170,7 @@ def _ensure_initialized():
     - Device: CUDA if available, else CPU
     - Dtype: float64
     """
-    global _INITIALIZED
+    global _INITIALIZED, _DEFAULT_DEVICE
     
     if not _INITIALIZED:
         # Auto-detect best device
@@ -176,6 +183,14 @@ def _ensure_initialized():
         torch.set_default_dtype(target_dtype)
         if hasattr(torch, 'set_default_device'):
             torch.set_default_device(target_device)
+            _DEFAULT_DEVICE = target_device
+            _THREAD_STATE.applied = True
 
         _apply_precision_policy()
         _INITIALIZED = True
+
+    # A thread that has not seen the process default device yet (e.g. a server
+    # worker thread) gets it now; later per-thread changes are left alone.
+    if _DEFAULT_DEVICE is not None and not getattr(_THREAD_STATE, "applied", False):
+        torch.set_default_device(_DEFAULT_DEVICE)
+    _THREAD_STATE.applied = True
