@@ -9,9 +9,10 @@ License: AGPLv3+
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Sequence, Tuple, Dict, Any, Optional
 import logging
 import torch
+from torch import nn
 
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
 from act.config.config import FrontEndConfig
@@ -19,6 +20,7 @@ from act.config.config import FrontEndConfig
 
 logger = logging.getLogger(__name__)
 
+type SpecTuple = tuple[str, str, nn.Module, list[LabeledInputTensor], Sequence[tuple[InputSpec, OutputSpec]]]
 
 @dataclass
 class LabeledInputTensor:
@@ -333,7 +335,7 @@ class BaseSpecCreator(ABC):
         self,
         *args: Any,
         **kwargs: Any,
-    ) -> Any:
+    ) -> list[SpecTuple]:
         """
         Create specs for data-model pairs (must be implemented by subclasses).
 
