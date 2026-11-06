@@ -26,7 +26,8 @@ act/pipeline/
 │   ├── actfuzzer.py      # Main fuzzing engine
 │   └── ...
 ├── gui/                  # ACT-side support for ACT-GUI
-│   └── verifier_gui.py   # Propagation observer API and ReLU describers
+│   ├── verifier_gui.py   # Observer sink registry, propagation records, ReLU describers
+│   └── fuzzer_gui.py     # ACTFuzzer options, lifecycle records, and run control
 └── log/                  # Centralized execution logs
 ```
 
@@ -120,6 +121,26 @@ check the module's `enabled` flag.
 Interval and HybridZ report each layer's committed output (stage `out`); dual forward
 reports activation inputs as `pre` and other layers as `out`; dual backward records
 (alpha `[B, M, n]`, margins and slack `[B, M]`) use pass `backward`.
+
+`gui.fuzzer_gui` covers the whole `ACTFuzzer` lifecycle:
+
+- **Options**: `fuzzing_options()` lists every tunable `FuzzingConfig` field with its
+  pipeline.yaml default, kind, admissible values, and whether it may change during a run
+  (`FUZZING_OPTIONS` in `fuzzing/actfuzzer.py`).
+- **Records** (to the same sinks): `FuzzStart` (resolved config, normalized strategy
+  weights, batch size, device); `FuzzStep` per fuzzed batch (seeds, mutated inputs,
+  strategy, the lanes ACT's property checker accepted with their `Counterexample`
+  objects, coverage, corpus size); `FuzzConfigChange` per applied or rejected update;
+  `FuzzEnd` (report and stop reason).
+- **Control**: `ACTFuzzer(..., control=FuzzControl())`. `request_stop()`, `pause()` /
+  `resume()` (paused time is excluded from the timeout), and `update(**changes)` for live
+  fields, validated at once and applied between batches through
+  `ACTFuzzer.update_config`, which scripts can call directly.
+
+Fuzzing results are unchanged by observation, and a run without a control never checks one.
+
+`python -m act.pipeline.gui` is the self-check of this contract (run in CI): `verify_once` in
+every domain under a sink, and one fuzzing run through live update, pause, resume, and stop.
 
 ## Logging and Diagnostics
 

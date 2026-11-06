@@ -142,7 +142,7 @@ class Sink(Protocol):
     """Receives records. ``wants_relaxation`` (optional attribute, default False) asks producers to
     compute ``Relaxation`` records, which cost extra work and are skipped otherwise."""
 
-    def __call__(self, record: Record) -> None: ...
+    def __call__(self, record: Any) -> None: ...
 
 
 def now_ns() -> int:
@@ -173,7 +173,7 @@ def observe(sink: Sink) -> Iterator[Sink]:
         _refresh()
 
 
-def emit(record: Record) -> None:
+def emit(record: Any) -> None:
     """Deliver ``record`` to every sink. A sink that raises is detached; verification is never affected."""
     for sink in tuple(_SINKS):
         try:
@@ -239,13 +239,21 @@ def describe_hybridz(key: RecordKey, pre: Any, post: Any, *, tf: Any) -> Relaxat
     )
 
 
+def dual_relu_box(pre: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The [B, n] pre-activation box the dual backward pass used (its repaired upper bound if any)."""
+    return pre.lb.flatten(1), pre.__dict__.get("_repaired_ub", pre.ub.flatten(1))
+
+
+def chord_slope(lb: torch.Tensor, ub: torch.Tensor) -> torch.Tensor:
+    return ub / (ub - lb).clamp(min=1e-12)
+
+
 def describe_dual(key: RecordKey, pre: Any, post: Any = None, *,
                   alpha: Optional[torch.Tensor] = None, **_: Any) -> Relaxation:
-    lb = pre.lb.flatten(1)
-    ub = pre.__dict__.get("_repaired_ub", pre.ub.flatten(1))
+    lb, ub = dual_relu_box(pre)
     status = relu_status(lb, ub)
     unstable = (lb < 0) & (ub > 0)
-    chord = ub / (ub - lb).clamp(min=1e-12)
+    chord = chord_slope(lb, ub)
     upper = torch.where(unstable, chord, (lb >= 0).to(lb))
     upper = torch.where(ub <= 0, torch.zeros_like(upper), upper)
     intercept = torch.where(unstable, -upper * lb, torch.zeros_like(lb))

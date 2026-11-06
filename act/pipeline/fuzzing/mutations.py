@@ -72,7 +72,7 @@ License: AGPLv3+
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, cast
 import torch
 import torch.nn as nn
 import numpy as np
@@ -87,6 +87,9 @@ if TYPE_CHECKING:
 
 
 LOGIT_GUIDED_KINDS = frozenset({OutKind.TOP1_ROBUST})
+
+PERTURB_MODES = ("adaptive_scalar", "adaptive_perdim", "fixed")
+MUTATION_STRATEGIES = ("gradient", "pgd", "activation", "boundary", "random")
 
 SIGN_STE_TIGHT_EPS = 0.1
 SIGN_STE_LOOSE_EPS = 5.0
@@ -672,55 +675,26 @@ class MutationEngine:
         )
         self.input_spec = input_spec
         self.device = get_default_device()
-        self.perturb_mode = perturb_mode
-        self.perturb_scale = perturb_scale
-        
-        valid_perturb_modes = {"adaptive_scalar", "adaptive_perdim", "fixed"}
-        if self.perturb_mode not in valid_perturb_modes:
-            raise ValueError(
-                f"Unknown perturb_mode: {self.perturb_mode}. "
-                "Valid options: 'adaptive_scalar', 'adaptive_perdim', 'fixed'"
-            )
 
-        # Adaptive modes replace this placeholder with the dynamic per-seed
-        # schedule before the selected strategy is used. Fixed mode retains its
-        # range-aware baseline; without an InputSpec, 0.01 remains the fallback.
-        perturb_size = (
-            self._compute_fixed_perturb_size()
-            if self.perturb_mode == "fixed" or self.input_spec is None
-            else 0.0
-        )
-        
-        # Initialize strategies with computed perturb_size
         self.strategies = {
             "gradient": FGSMMutation(
                 self.output_spec,
-                perturb_size=perturb_size,
+                perturb_size=0.0,
                 logit_sink=self.logit_sink,
             ),
             "pgd": PGDMutation(
                 self.output_spec,
-                perturb_size=perturb_size,
+                perturb_size=0.0,
                 restarts=pgd_restarts,
                 restarts_binarized=pgd_restarts_binarized,
                 logit_sink=self.logit_sink,
             ),
-            "activation": ActivationMutation(perturb_size=perturb_size),
-            "boundary": BoundaryMutation(perturb_size=perturb_size),
-            "random": RandomMutation(perturb_size=perturb_size),
+            "activation": ActivationMutation(perturb_size=0.0),
+            "boundary": BoundaryMutation(perturb_size=0.0),
+            "random": RandomMutation(perturb_size=0.0),
         }
-
-        # Validate and normalize weights
-        unknown = set(weights.keys()) - set(self.strategies.keys())
-        if unknown:
-            raise ValueError(
-                f"Unknown mutation strategy keys in weights: {sorted(unknown)}. "
-                f"Valid options: {sorted(self.strategies.keys())}"
-            )
-        total = sum(float(v) for v in weights.values())
-        if total <= 0.0:
-            raise ValueError(f"Mutation weights must sum to > 0. Got total={total}.")
-        self.weights = {k: float(v) / total for k, v in weights.items()}
+        self.set_perturbation(perturb_mode, perturb_scale)
+        self.set_weights(weights)
         
         # Statistics
         self.total_mutations = 0
@@ -736,6 +710,38 @@ class MutationEngine:
         self._setup_hooks()
         self._setup_feasibility_hooks()
     
+    def set_weights(self, weights: Dict[str, float]) -> None:
+        """Validate and normalize the strategy selection weights."""
+        unknown = set(weights.keys()) - set(MUTATION_STRATEGIES)
+        if unknown:
+            raise ValueError(
+                f"Unknown mutation strategy keys in weights: {sorted(unknown)}. "
+                f"Valid options: {sorted(MUTATION_STRATEGIES)}"
+            )
+        total = sum(float(v) for v in weights.values())
+        if total <= 0.0:
+            raise ValueError(f"Mutation weights must sum to > 0. Got total={total}.")
+        self.weights = {k: float(v) / total for k, v in weights.items()}
+
+    def set_perturbation(self, mode: str, scale: float) -> None:
+        """Set how perturbation sizes are computed (see FuzzingConfig.perturb_mode)."""
+        if mode not in PERTURB_MODES:
+            raise ValueError(f"Unknown perturb_mode: {mode}. Valid options: {list(PERTURB_MODES)}")
+        self.perturb_mode = mode
+        self.perturb_scale = scale
+        # Adaptive modes set each strategy's size per seed in mutate(). Fixed
+        # mode keeps a range-aware baseline; without an InputSpec, 0.01.
+        if mode == "fixed" or self.input_spec is None:
+            size = self._compute_fixed_perturb_size()
+            for strategy in self.strategies.values():
+                strategy.perturb_size = size
+
+    def set_pgd_restarts(self, restarts: int, restarts_binarized: int) -> None:
+        """Set PGD random starts per mutation (ordinary and binarized networks)."""
+        pgd = cast(PGDMutation, self.strategies["pgd"])
+        pgd.restarts = max(int(restarts), 1)
+        pgd.restarts_binarized = max(int(restarts_binarized), 1)
+
     @staticmethod
     def _resolve_attack_target(
         model: nn.Module,
