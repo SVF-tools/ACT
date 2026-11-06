@@ -44,6 +44,7 @@ from act.back_end.bab.node import (
     tensor_storage_bytes,
 )
 from act.back_end.bab.climb import ClimbSession
+from act.back_end.bab.progress_events import BaBProgressEmitter
 from act.back_end.bab.frontier_memory import (
     FrontierMemoryPlanner, allow_per_class_alpha, allow_warm_state,
     auto_initial_batch, auto_recalibrate_batch,
@@ -476,6 +477,7 @@ def verify_bab_batched(
     time_budget_s: Optional[float] = None,
     dual_config: Optional[DualConfig] = None,
     trace: Optional[List[Dict[str, Any]]] = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> VerifyResult:
     """[BATCHED-API] K-batched Branch-and-Bound verification (single instance).
 
@@ -510,10 +512,13 @@ def verify_bab_batched(
         trace: if a list is supplied, one dict per iteration is appended with
             keys iter, K, pool_before, pool_after, pruned_unsat, branched,
             falsified_lane, max_depth, spec_rows_kept, elapsed_s.
+        on_progress: optional observer called after each committed wave and on
+            termination with JSON-friendly search state.
     """
     run_started = _monotonic()
     if config is None:
         config = BaBConfig()
+    progress_emitter = BaBProgressEmitter(on_progress) if on_progress is not None else None
     budget_s = time_budget_s if time_budget_s is not None else 300.0
     if not math.isfinite(budget_s) or budget_s < 0.0:
         raise ValueError(
@@ -620,13 +625,17 @@ def verify_bab_batched(
         from act.pipeline.verification import llm_probe as _llm
         llm_probe = _llm.build_llm_probe(config)
 
-    provenance = bool(config.provenance_enabled or (climb is not None and config.climb_merge_enabled)) or isinstance(
-        pool, MCTSBounding
+    # Progress events need stable IDs even when the configured search does not.
+    provenance = (
+        on_progress is not None
+        or config.provenance_enabled
+        or (climb is not None and config.climb_merge_enabled)
+        or isinstance(pool, MCTSBounding)
     )
-    if provenance and not isinstance(pool, (TopKBounding, MCTSBounding)):
+    if provenance and not isinstance(pool, (RandomBounding, TopKBounding, MCTSBounding)):
         raise ValueError(
             "provenance_enabled requires a bounding that preserves node_id/parent_id, "
-            "not 'random'"
+            f"not '{config.bounding}'"
         )
     if isinstance(pool, MCTSBounding) and config.presplit_levels > 0:
         raise ValueError(
@@ -750,6 +759,13 @@ def verify_bab_batched(
             ).any(dim=0)
             total_rows = int(unproven.numel())
             if not bool(unproven.any().item()):
+                if progress_emitter is not None:
+                    progress_emitter.finish_terminal(
+                        wave=0, status=VerifyStatus.CERTIFIED.name,
+                        reason="root_presolve", frontier_size=0,
+                        node_id=int(root_batch.node_id[0]) if root_batch.node_id is not None else None,
+                        parent_id=-1, depth=0,
+                    )
                 return VerifyResult(
                     VerifyStatus.CERTIFIED,
                     metadata={
@@ -864,6 +880,8 @@ def verify_bab_batched(
                 node_counter, node_counter + nc, device=children.lb.device, dtype=torch.long,
             )
             node_counter += nc
+        if progress_emitter is not None:
+            progress_emitter.record_children(parents, children, parent_index)
         # Commit terminal fallback and ordinary children together. A later
         # allocation failure must never requeue parents of already-pushed rows.
         if planner.active:
@@ -873,7 +891,10 @@ def verify_bab_batched(
             if climb is not None:
                 climb.after_children(children.batch_size, len(pool))
             if frontier_cap > 0 and len(pool) > frontier_cap:
+                before_ids = pool.node_ids() if progress_emitter is not None else []
                 dropped = pool.evict_to(frontier_cap)
+                if progress_emitter is not None:
+                    progress_emitter.record_eviction(before_ids, pool.node_ids())
                 dropped_frontier_cap_nodes += dropped
                 any_dropped_frontier_cap |= dropped > 0
 
@@ -995,6 +1016,8 @@ def verify_bab_batched(
         iteration_before = iteration
         trace_before = len(trace) if trace is not None else 0
         pending_children.clear()
+        if progress_emitter is not None:
+            progress_emitter.begin_wave()
         # Optimizer output may mutate warm state, never domain geometry.
         counter_before: int = node_counter
         retirement_before: tuple[bool, bool, bool, int] = (
@@ -1168,6 +1191,14 @@ def verify_bab_batched(
                             trace.append(_trace_row(
                                 k_actual, _pool_before, n_unsat, 0, lane, batch_max_depth,
                             ))
+                        if progress_emitter is not None:
+                            progress_emitter.finish_terminal(
+                                wave=iteration, status=VerifyStatus.FALSIFIED.name,
+                                reason="counterexample", frontier_size=len(pool),
+                                node_id=int(batch.node_id[lane]) if batch.node_id is not None else None,
+                                parent_id=int(batch.parent_id[lane]) if batch.parent_id is not None else None,
+                                depth=int(batch.depths[lane]),
+                            )
                         return VerifyResult(
                             VerifyStatus.FALSIFIED,
                             counterexample=x_input_shaped[j].detach().cpu().clone(),
@@ -1253,6 +1284,10 @@ def verify_bab_batched(
                         )
                         n_unsat += int(proved.sum())
                         terminal_stats["terminal_lp_certified"] += int(proved.sum())
+                        if progress_emitter is not None and bool(proved.any()):
+                            progress_emitter.mark_outcome(
+                                terminal_batch.select(torch.where(proved)[0]), "proved_terminal",
+                            )
                         for local, status in enumerate(terminal_result.statuses):
                             if status == VerifyStatus.FALSIFIED:
                                 lane = int(unresolved_idx[terminal_rows[local]])
@@ -1292,6 +1327,11 @@ def verify_bab_batched(
                             branched_lanes += fallback_batch.batch_size
                             terminal_stats["terminal_input_fallback_lanes"] += fallback_batch.batch_size
                         for local in torch.where(~proved & ~fallback)[0].tolist():
+                            if progress_emitter is not None:
+                                progress_emitter.mark_outcome(
+                                    terminal_batch.select(torch.tensor([local], device=terminal_batch.lb.device)),
+                                    "retired_terminal",
+                                )
                             any_retired_terminal = True
                             terminal_stats["terminal_retired_lanes"] += 1
                             failure = terminal_result.reasons[local] or "unproved_terminal"
@@ -1312,6 +1352,10 @@ def verify_bab_batched(
                 if bool((~branch_mask).any().item()):
                     any_dropped_max_depth = True
                     dropped_max_depth_nodes += int((~branch_mask).sum().item())
+                    if progress_emitter is not None:
+                        progress_emitter.mark_outcome(
+                            unresolved.select(torch.where(~branch_mask)[0]), "retired_max_depth",
+                        )
                 branch_idx = torch.where(branch_mask)[0]
                 if int(branch_idx.numel()) > 0:
                     branch_batch = unresolved.select(branch_idx)
@@ -1543,7 +1587,10 @@ def verify_bab_batched(
                     climb.after_children(incoming.batch_size, len(pool))
                 pending_children.clear()
             if frontier_cap > 0 and len(pool) > frontier_cap:
+                before_ids = pool.node_ids() if progress_emitter is not None else []
                 dropped = pool.evict_to(frontier_cap)
+                if progress_emitter is not None:
+                    progress_emitter.record_eviction(before_ids, pool.node_ids())
                 dropped_frontier_cap_nodes += dropped
                 any_dropped_frontier_cap |= dropped > 0
 
@@ -1566,6 +1613,13 @@ def verify_bab_batched(
                 trace.append(_trace_row(
                     k_actual, _pool_before, n_unsat, branched_lanes, None, batch_max_depth,
                 ))
+
+            if progress_emitter is not None:
+                progress_emitter.finish_wave(
+                    iteration, batch, solution, node_lower_bound,
+                    dual_solve_result.reference_bounds if dual_solve_result is not None else None,
+                    solver_tier, len(pool), pool.node_ids(),
+                )
 
             if isinstance(pool, MCTSBounding):
                 log.info(
@@ -1657,6 +1711,11 @@ def verify_bab_batched(
         and planner.evicted_nodes == 0
         and pool_remaining == 0
     ):
+        if progress_emitter is not None:
+            progress_emitter.finish_terminal(
+                wave=iteration, status=VerifyStatus.CERTIFIED.name,
+                reason="all_resolved_unsat", frontier_size=0,
+            )
         return VerifyResult(
             VerifyStatus.CERTIFIED,
             metadata={
@@ -1672,6 +1731,11 @@ def verify_bab_batched(
             },
         )
 
+    if progress_emitter is not None:
+        progress_emitter.finish_terminal(
+            wave=iteration, status=VerifyStatus.UNKNOWN.name,
+            reason="search_incomplete", frontier_size=pool_remaining,
+        )
     return VerifyResult(
         VerifyStatus.UNKNOWN,
         metadata={
