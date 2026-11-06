@@ -13,7 +13,7 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Any
 import difflib
 import logging
 
@@ -49,16 +49,16 @@ Tensor = torch.Tensor
 # ------------------------------
 # Strict validation & helpers
 # ------------------------------
-def _missing(required: List[str], got: Dict[str, Any]) -> List[str]:
+def _missing(required: list[str], got: dict[str, Any]) -> list[str]:
     return [k for k in required if k not in got]
 
-def _unknown(allowed: List[str], got: Dict[str, Any]) -> List[str]:
+def _unknown(allowed: list[str], got: dict[str, Any]) -> list[str]:
     return [k for k in got.keys() if k not in allowed]
 
-def _suggest(key: str, candidates: List[str]) -> List[str]:
+def _suggest(key: str, candidates: list[str]) -> list[str]:
     return difflib.get_close_matches(key, candidates, n=3, cutoff=0.6)
 
-def _format_unknown(kind: str, category: str, unknowns: List[str], allowed: List[str]) -> str:
+def _format_unknown(kind: str, category: str, unknowns: list[str], allowed: list[str]) -> str:
     parts = []
     for u in unknowns:
         sugg = _suggest(u, allowed)
@@ -128,7 +128,7 @@ def validate_layer(layer: "Layer") -> None:
 
     unk_p = _unknown(allowed_p, layer.params)
 
-    errs: List[str] = []
+    errs: list[str] = []
     if miss_p:
         errs.append(f"Missing required PARAMS: {miss_p}. Add them or relax schema in REGISTRY['{kind}']['params_required'].")
     if unk_p:
@@ -143,7 +143,7 @@ def validate_layer(layer: "Layer") -> None:
     if errs:
         raise ValueError(f"Layer(id={layer.id}, kind={kind}) schema violation:\n- " + "\n- ".join(errs))
 
-def validate_graph(layers: List["Layer"]) -> None:
+def validate_graph(layers: list["Layer"]) -> None:
     seen = set()
     for ly in layers:
         if ly.id in seen:
@@ -155,7 +155,7 @@ def validate_graph(layers: List["Layer"]) -> None:
             if not isinstance(v, int) or v < 0:
                 raise ValueError(f"Invalid var id {v} in layer {ly.id}")
 
-def validate_wrapper_graph(layers: List["Layer"]) -> None:
+def validate_wrapper_graph(layers: list["Layer"]) -> None:
     """Hard assertions for the wrapper layout."""
     if not layers:
         raise ValueError("Empty graph")
@@ -220,8 +220,8 @@ def validate_conset_ops(conset) -> None:
                 "and exporter handling if intentional."
             )
 
-def create_layer(id: int, kind: str, params: Dict[str, Any],
-                 in_vars: List[int], out_vars: List[int]) -> "Layer":
+def create_layer(id: int, kind: str, params: dict[str, Any],
+                 in_vars: list[int], out_vars: list[int]) -> "Layer":
     """Create and validate a layer."""
     try:
         from .core import Layer
@@ -249,39 +249,52 @@ if __name__ == "__main__":
         
     from act.back_end.core import Layer
     from act.back_end.layer_schema import LayerKind
-    from typing import List
-    layers: List[Layer] = []
+    from act.front_end.specs import OutKind, OutputSpec
+    from act.util.device_manager import get_default_device, get_default_dtype
+
+    device, dtype = get_default_device(), get_default_dtype()
+    input_shape = (1, 1, 2, 2)
+    input_vars = list(range(4))
+    flat_vars = list(range(4, 8))
+    output_vars = list(range(8, 10))
+    layers: list[Layer] = []
 
     # INPUT
     layers.append(create_layer(
             id=0, kind=LayerKind.INPUT.value,
-            params={},
-            in_vars=[0], out_vars=[0],
+            params={"shape": input_shape, "dtype": str(dtype)},
+            in_vars=[], out_vars=input_vars,
     ))
     # SPEC (directly after INPUT - no adapters)
-    lb_tensor = torch.full((1,3,32,32), -1.0)
-    ub_tensor = torch.full((1,3,32,32), 1.0)
+    lb_tensor = torch.full(input_shape, -1.0, device=device, dtype=dtype)
+    ub_tensor = torch.full(input_shape, 1.0, device=device, dtype=dtype)
     layers.append(create_layer(
             id=1, kind=LayerKind.INPUT_SPEC.value,
             params={"kind": InKind.BOX, "lb": lb_tensor, "ub": ub_tensor},
-            in_vars=[0], out_vars=[0],
+            in_vars=input_vars, out_vars=input_vars,
     ))
     # Model toy
     layers.append(create_layer(
             id=2, kind=LayerKind.FLATTEN.value,
-            params={},
-            in_vars=[0], out_vars=[1],
+            params={"input_shape": input_shape, "output_shape": (1, 4)},
+            in_vars=input_vars, out_vars=flat_vars,
     ))
-    W, b = torch.randn(10, 3072), torch.randn(10)
+    weight = torch.zeros((2, 4), device=device, dtype=dtype)
+    bias = torch.zeros(2, device=device, dtype=dtype)
     layers.append(create_layer(
             id=3, kind=LayerKind.DENSE.value,
-            params={"W": W, "b": b},
-            in_vars=[1], out_vars=[2],
+            params={"weight": weight, "bias": bias, "in_features": 4, "out_features": 2},
+            in_vars=flat_vars, out_vars=output_vars,
     ))
+    output_spec = OutputSpec(
+        kind=OutKind.LINEAR_LE,
+        c=torch.ones(2, device=device, dtype=dtype),
+        d=torch.ones(1, device=device, dtype=dtype),
+    )
     layers.append(create_layer(
             id=4, kind=LayerKind.ASSERT.value,
-            params={},
-            in_vars=[2], out_vars=[2],
+            params=output_spec.encode_linear(B=1, n_out=2, device=device, dtype=dtype),
+            in_vars=output_vars, out_vars=output_vars,
     ))
 
     validate_graph(layers)
