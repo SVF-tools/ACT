@@ -45,7 +45,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -72,25 +72,25 @@ from act.util.device_manager import get_default_device, get_default_dtype
 
 @dataclass
 class BranchingScores:
-    flat: Optional[torch.Tensor] = None
-    per_layer: Optional[Dict[int, torch.Tensor]] = None
-    intercept_per_layer: Optional[Dict[int, torch.Tensor]] = None
-    input_fallback: Optional[torch.Tensor] = None
+    flat: torch.Tensor | None = None
+    per_layer: dict[int, torch.Tensor] | None = None
+    intercept_per_layer: dict[int, torch.Tensor] | None = None
+    input_fallback: torch.Tensor | None = None
     """Width-masked input-axis scores kept alongside neuron scores, so a lane
     with no splittable neuron falls back to a *wide* input dimension instead of
     a hard-coded dim 0 (zero width on any sparse-perturbation benchmark)."""
-    babsr_per_layer: Optional[Dict[int, torch.Tensor]] = None
+    babsr_per_layer: dict[int, torch.Tensor] | None = None
     """Original candidates retained when FSB replaces scores with measured gains."""
 
 
 @dataclass
 class SplitDecision:
     kind: str
-    input_axis: Optional[torch.Tensor | int] = None
+    input_axis: torch.Tensor | int | None = None
     fanout: int = 2
-    layer_id: Optional[torch.Tensor] = None
-    neuron_idx: Optional[torch.Tensor] = None
-    lane_mask: Optional[torch.Tensor] = None
+    layer_id: torch.Tensor | None = None
+    neuron_idx: torch.Tensor | None = None
+    lane_mask: torch.Tensor | None = None
     """Scored lanes covered by a neuron-only decision; tensors contain kept rows."""
 
     def input_axes(self, batch: SubproblemBatch) -> torch.Tensor:
@@ -194,7 +194,7 @@ class BranchingStrategy(ABC):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | BranchingScores:
         """Score every candidate split dimension.
 
@@ -273,7 +273,7 @@ class RandomBranching(BranchingStrategy):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         N, D = batch.batch_size, batch.input_dim
         device = batch.lb.device
@@ -311,7 +311,7 @@ class InputBranching(BranchingStrategy):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         widths = batch.widths()
         scores = widths.masked_fill(widths <= 0, float("-inf"))
@@ -352,16 +352,16 @@ class BaBSRBranching(BranchingStrategy):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
         *,
-        bounds_dict: Optional[Dict[int, Bounds]] = None,
-        nu_per_layer: Optional[Dict[int, torch.Tensor]] = None,
+        bounds_dict: dict[int, Bounds] | None = None,
+        nu_per_layer: dict[int, torch.Tensor] | None = None,
     ) -> BranchingScores:
         if bounds_dict is None or nu_per_layer is None:
             return BranchingScores(flat=self._baseline_scores(batch, unstable_mask, net))
 
-        per_layer: Dict[int, torch.Tensor] = {}
-        intercept_per_layer: Dict[int, torch.Tensor] = {}
+        per_layer: dict[int, torch.Tensor] = {}
+        intercept_per_layer: dict[int, torch.Tensor] = {}
         for lid, bounds in bounds_dict.items():
             if self.neuron_only and _layer_kind_upper(net.by_id[lid]) != LayerKind.RELU.value:
                 continue
@@ -414,8 +414,8 @@ class BaBSRBranching(BranchingStrategy):
     def _baseline_scores(
         self,
         batch: SubproblemBatch,
-        unstable_mask: Optional[torch.Tensor] = None,
-        net: Optional[Net] = None,
+        unstable_mask: torch.Tensor | None = None,
+        net: Net | None = None,
     ) -> torch.Tensor:
         widths = batch.ub - batch.lb
 
@@ -481,7 +481,7 @@ class BaBSRBranching(BranchingStrategy):
         decisions_neuron = torch.zeros(N, dtype=torch.long, device=device)
 
         for n in range(N):
-            best_lid: Optional[int] = None
+            best_lid: int | None = None
             best_idx = 0
             best_val = float("-inf")
             for lid, score in per_layer.items():
@@ -499,7 +499,7 @@ class BaBSRBranching(BranchingStrategy):
 
             intercept = scores.intercept_per_layer
             if intercept is not None and self.icp_score_counter < 2:
-                ic_lid: Optional[int] = None
+                ic_lid: int | None = None
                 ic_idx = 0
                 ic_val = float("-inf")
                 for lid, score in intercept.items():
@@ -540,9 +540,9 @@ class BaBSRBranching(BranchingStrategy):
         layers = torch.zeros(n_lanes, dtype=torch.long, device=sample.device)
         neurons = torch.zeros_like(layers)
         primary = _lane_argmax(per_layer, n_lanes)
-        tables: Dict[int, tuple[list[Optional[int]], list[int], list[float]]] = {}
+        tables: dict[int, tuple[list[int | None], list[int], list[float]]] = {}
 
-        def choice(table: Dict[int, torch.Tensor], lane: int) -> tuple[Optional[int], int]:
+        def choice(table: dict[int, torch.Tensor], lane: int) -> tuple[int | None, int]:
             """Read one lane from a table summarized at most once per wave."""
             lids, indices, _ = tables.setdefault(id(table), _lane_argmax(table, n_lanes))
             return lids[lane], indices[lane]
@@ -578,8 +578,8 @@ class BaBSRBranching(BranchingStrategy):
 
 
 def _lane_argmax(
-    per_layer: Dict[int, torch.Tensor], lanes: int,
-) -> tuple[list[Optional[int]], list[int], list[float]]:
+    per_layer: dict[int, torch.Tensor], lanes: int,
+) -> tuple[list[int | None], list[int], list[float]]:
     """Each lane's best finite candidate, including zero and negative scores.
 
     One host transfer for the whole table. Ties keep the earliest layer and
@@ -607,7 +607,7 @@ def witness_relu_preactivations(
     witness_input: torch.Tensor,
     input_shape: tuple[int, ...],
     dual_config: DualConfig,
-) -> Optional[Dict[int, torch.Tensor]]:
+) -> dict[int, torch.Tensor] | None:
     """Return concrete per-ReLU pre-activations at a dual witness."""
     if witness_input.numel() == 0:
         return None
@@ -671,11 +671,11 @@ class WitnessResidualBranching(BaBSRBranching):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
         *,
-        bounds_dict: Optional[Dict[int, Bounds]] = None,
-        nu_per_layer: Optional[Dict[int, torch.Tensor]] = None,
-        witness_preact_per_layer: Optional[Dict[int, torch.Tensor]] = None,
+        bounds_dict: dict[int, Bounds] | None = None,
+        nu_per_layer: dict[int, torch.Tensor] | None = None,
+        witness_preact_per_layer: dict[int, torch.Tensor] | None = None,
     ) -> BranchingScores:
         if bounds_dict is None or witness_preact_per_layer is None:
             self.fallback_count += int(batch.batch_size)
@@ -687,7 +687,7 @@ class WitnessResidualBranching(BaBSRBranching):
                 nu_per_layer=nu_per_layer,
             )
 
-        per_layer: Dict[int, torch.Tensor] = {}
+        per_layer: dict[int, torch.Tensor] = {}
         for lid, bounds in bounds_dict.items():
             z_raw = witness_preact_per_layer.get(lid)
             if z_raw is None:
@@ -745,10 +745,10 @@ class WitnessResidualBranching(BaBSRBranching):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor],
-        bounds_dict: Dict[int, Bounds],
-        nu_per_layer: Optional[Dict[int, torch.Tensor]],
-        witness_scores: Dict[int, torch.Tensor],
+        unstable_mask: torch.Tensor | None,
+        bounds_dict: dict[int, Bounds],
+        nu_per_layer: dict[int, torch.Tensor] | None,
+        witness_scores: dict[int, torch.Tensor],
     ) -> None:
         if nu_per_layer is None:
             return
@@ -770,8 +770,8 @@ class WitnessResidualBranching(BaBSRBranching):
         self.different_from_babsr_count += int(differ.sum().item())
 
     def _best_pairs(
-        self, scores: Dict[int, torch.Tensor]
-    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        self, scores: dict[int, torch.Tensor]
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Argmax over the concatenated (layer, neuron) axis, one row per lane.
 
         Returns ``([K, 2]`` tensor of ``(layer_id, neuron_idx)``, ``[K]`` validity
@@ -800,14 +800,14 @@ class WitnessResidualBranching(BaBSRBranching):
 
 def _assert_witness_residual_decision_unstable(
     decision: SplitDecision,
-    bounds_dict: Optional[Dict[int, Bounds]],
+    bounds_dict: dict[int, Bounds] | None,
 ) -> None:
     """Check that every non-fallback witness decision splits an unstable ReLU."""
     if decision.kind != "neuron":
         return
     layer_ids = decision.layer_id
     neuron_indices = decision.neuron_idx
-    violation: Optional[str] = None
+    violation: str | None = None
     if layer_ids is None or neuron_indices is None:
         violation = (
             f"neuron decision missing tensors (has_layers={layer_ids is not None}, "
@@ -875,7 +875,7 @@ def _preact_bias_of(net: Net, lid: int) -> torch.Tensor:
     return torch.zeros(n_neurons, dtype=dtype, device=device)
 
 
-def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) -> Optional[torch.Tensor]:
+def _perturbed_embedding_input_mask(net: Net | None, batch: SubproblemBatch) -> torch.Tensor | None:
     """Expand one root sample's canonical token mask over its coordinates."""
     if net is None or net.input_geometry is None:
         return None
@@ -903,10 +903,10 @@ class FSBBranching(BaBSRBranching):
         self,
         batch: SubproblemBatch,
         net: Net,
-        unstable_mask: Optional[torch.Tensor] = None,
+        unstable_mask: torch.Tensor | None = None,
         *,
-        bounds_dict: Optional[Dict[int, Bounds]] = None,
-        nu_per_layer: Optional[Dict[int, torch.Tensor]] = None,
+        bounds_dict: dict[int, Bounds] | None = None,
+        nu_per_layer: dict[int, torch.Tensor] | None = None,
     ) -> BranchingScores:
         bsr = super().compute_scores(
             batch,
@@ -918,32 +918,14 @@ class FSBBranching(BaBSRBranching):
         if bsr.per_layer is None or not bsr.per_layer:
             return bsr
 
-        hypothesis_list: List[Dict[int, torch.Tensor]] = []
-        candidate_metadata: List[Tuple[int, torch.Tensor]] = []
-        candidate_validity: List[torch.Tensor] = []
+        hypothesis_list: list[dict[int, torch.Tensor]] = []
+        candidate_metadata: list[tuple[int, torch.Tensor]] = []
+        candidate_validity: list[torch.Tensor] = []
         topk = 3
-        for lid, score in bsr.per_layer.items():
-            if self.neuron_only:
-                score = score.masked_fill(~torch.isfinite(score), float("-inf"))
-            k = min(topk, score.shape[-1])
-            if k > 0:
-                top_values, top_idx = score.topk(k, dim=-1)
-                for idx in range(top_idx.shape[-1]):
-                    if not bool(torch.isfinite(top_values[:, idx]).any().item()):
-                        continue
-                    neuron_per_lane = top_idx[:, idx]
-                    valid = torch.isfinite(top_values[:, idx])
-                    candidate_validity.append(valid)
-                    hypothesis_list.append(
-                        self._clone_split_signs_with_hypothesis(
-                            batch, lid,
-                            neuron_per_lane.masked_fill(~valid, -1) if self.neuron_only else neuron_per_lane,
-                            net,
-                        )
-                    )
-                    candidate_metadata.append((lid, neuron_per_lane))
-        if bsr.intercept_per_layer is not None:
-            for lid, score in bsr.intercept_per_layer.items():
+        for scores in (bsr.per_layer, bsr.intercept_per_layer):
+            if scores is None:
+                continue
+            for lid, score in scores.items():
                 if self.neuron_only:
                     score = score.masked_fill(~torch.isfinite(score), float("-inf"))
                 k = min(topk, score.shape[-1])
@@ -997,7 +979,7 @@ class FSBBranching(BaBSRBranching):
             return bsr
 
         best_cand_idx = improvements.argmax(dim=0)
-        final_per_layer: Dict[int, torch.Tensor] = {}
+        final_per_layer: dict[int, torch.Tensor] = {}
         for lane in range(N):
             ci = int(best_cand_idx[lane].item())
             lid, neuron_tensor = candidate_metadata[ci]
@@ -1022,8 +1004,8 @@ class FSBBranching(BaBSRBranching):
     def _evaluate_hypotheses(
         self,
         net: Net,
-        bounds_dict: Optional[Dict[int, Bounds]],
-        split_signs: List[Dict[int, torch.Tensor]],
+        bounds_dict: dict[int, Bounds] | None,
+        split_signs: list[dict[int, torch.Tensor]],
     ) -> BoundResult:
         if bounds_dict is None:
             raise ValueError("FSB hypothesis evaluation requires bounds_dict")
@@ -1041,7 +1023,7 @@ class FSBBranching(BaBSRBranching):
     def _zero_objective(
         self,
         net: Net,
-        bounds_dict: Dict[int, Bounds],
+        bounds_dict: dict[int, Bounds],
     ) -> torch.Tensor:
         assert_layers = [
             layer for layer in net.layers if layer.kind == LayerKind.ASSERT.value
@@ -1062,9 +1044,9 @@ class FSBBranching(BaBSRBranching):
         lid: int,
         neuron_idx_per_lane: torch.Tensor,
         net: Net,
-    ) -> Dict[int, torch.Tensor]:
+    ) -> dict[int, torch.Tensor]:
         # This is a one-sided +1 scoring hypothesis, not a partition into children.
-        hypo: Dict[int, torch.Tensor] = {}
+        hypo: dict[int, torch.Tensor] = {}
         if batch.split_signs is not None:
             for key, value in batch.split_signs.items():
                 hypo[key] = value.clone()
