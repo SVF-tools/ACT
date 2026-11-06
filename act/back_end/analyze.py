@@ -13,6 +13,7 @@
 #===---------------------------------------------------------------------===#
 
 import torch
+from act.pipeline.gui import common_gui as _gui
 from act.pipeline.gui import verifier_gui as _obs
 from collections import deque
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ class AnalyzeCache:
     globalC: ConSet
 
 
-@_obs.observed_phase("analyze")
+@_gui.observed_phase("analyze")
 @torch.no_grad()
 def analyze(
     net: Net,
@@ -117,7 +118,7 @@ def analyze(
         seeds = [entry_id]
 
     tf = get_transfer_function()
-    if _obs.enabled:
+    if _gui.enabled:
         from act.back_end.hybridz_tf import HybridzTF
         domain = "hybridz" if isinstance(tf, HybridzTF) else "interval"
         versions = {}
@@ -126,9 +127,9 @@ def analyze(
             if layer.kind in (LayerKind.INPUT.value, LayerKind.CONSTANT.value):
                 bounds = before[lid].bounds
                 versions[lid] = 0
-                _obs.emit(_obs.LayerBounds(
+                _gui.emit(_obs.LayerBounds(
                     _obs.RecordKey(domain, "forward", lid, "out", 0),
-                    layer.kind, bounds.lb, bounds.ub, _obs.now_ns(),
+                    layer.kind, bounds.lb, bounds.ub,
                 ))
     single_pass = bool(getattr(tf, "topological_single_pass", False))
     WL = deque(get_topo_order(net) if single_pass else seeds)
@@ -166,20 +167,20 @@ def analyze(
             for con in out_fact.cons: globalC.replace(con)
             if not single_pass:
                 for sid in net.succs.get(lid, []): WL.append(sid)
-            if _obs.enabled:
+            if _gui.enabled:
                 versions[lid] = versions.get(lid, 0) + 1
                 bounds = after[lid].bounds
                 key = _obs.RecordKey(domain, "forward", lid, "out", versions[lid])
-                _obs.emit(_obs.LayerBounds(
-                    key, layer.kind, bounds.lb, bounds.ub, _obs.now_ns(),
+                _gui.emit(_obs.LayerBounds(
+                    key, layer.kind, bounds.lb, bounds.ub,
                 ))
                 if layer.kind == LayerKind.RELU.value and _obs.wants_relaxation():
-                    _obs.emit(_obs.DESCRIBERS[domain](key, before[lid].bounds, bounds, tf=tf))
-        elif _obs.enabled:
+                    _gui.emit(_obs.DESCRIBERS[domain](key, before[lid].bounds, bounds, tf=tf))
+        elif _gui.enabled:
             bounds = after[lid].bounds
-            _obs.emit(_obs.LayerBounds(
+            _gui.emit(_obs.LayerBounds(
                 _obs.RecordKey(domain, "forward", lid, "out", versions.get(lid, 0)),
-                layer.kind, bounds.lb, bounds.ub, _obs.now_ns(), changed=False,
+                layer.kind, bounds.lb, bounds.ub, changed=False,
             ))
 
     return before, after, globalC

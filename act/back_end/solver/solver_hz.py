@@ -5,7 +5,7 @@ import time
 from collections.abc import Iterable
 
 import torch
-from act.pipeline.gui import verifier_gui as _obs
+from act.pipeline.gui import common_gui as _gui
 from dataclasses import dataclass, replace
 from typing import Optional, TYPE_CHECKING
 from act.back_end.core import Bounds
@@ -2640,7 +2640,7 @@ class HZSolver(Solver):
         full = torch.from_numpy(value.reshape(input_shape).copy())
         return full[lane].clone()
 
-    @_obs.observed_phase("HZSolver.evaluate_spec")
+    @_gui.observed_phase("HZSolver.evaluate_spec")
     def evaluate_spec(
         self,
         output_hz: "HZono | SparseHZono | None",

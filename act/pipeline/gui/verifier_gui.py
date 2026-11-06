@@ -8,16 +8,13 @@
 #
 # Purpose:
 #   Read-only observation of bound propagation, layer by layer and neuron by
-#   neuron, while verification runs. Consumers (e.g. ACT-GUI) register a sink
-#   with ``observe(sink)``; instrumented engine sites emit records to it.
-#
-#   Cost model: with no sink registered, an instrumented hot path reads the
-#   module attribute ``enabled`` and does nothing else; phase decorators call
-#   straight through. Records reference live engine tensors (no copies); they
-#   are valid only during the sink call, and a sink copies what it keeps.
-#   A sink that raises is detached and logged once; verification continues.
-#   ReLU relaxation descriptions are dispatched by domain (``DESCRIBERS``)
-#   outside the numerical kernels and run only when a sink asks for them.
+#   neuron, while verification runs. Records are delivered through the shared
+#   ``common_gui`` channel (``observe``/``emit``/``enabled``); instrumented
+#   engine sites build them only while a sink is registered. ReLU relaxation
+#   descriptions are dispatched by domain (``DESCRIBERS``) outside the
+#   numerical kernels and run only when a sink sets ``wants_relaxation``.
+#   ``verification_options()`` lists the verify_once settings a GUI may tune,
+#   in the same ``Option`` form as ``fuzzer_gui.fuzzing_options()``.
 #
 #   Record identity (``RecordKey``) is shared by every producer so that later
 #   producers (BaB nodes, backward refinement) reuse the same model:
@@ -39,20 +36,13 @@
 
 from __future__ import annotations
 
-import functools
-import logging
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, List, Mapping, Optional, Protocol, Tuple, TypeVar, Union, cast
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional, Tuple
 
 import torch
 
-logger = logging.getLogger(__name__)
-
-# The only symbol hot paths read. True iff at least one sink is registered.
-enabled: bool = False
-_SINKS: List["Sink"] = []
+from act.pipeline.gui.common_gui import Option, OptionDefault, Record, wants
 
 DOMAINS = ("interval", "hybridz", "dual")
 PASSES = ("forward", "backward", "refine")
@@ -73,27 +63,17 @@ class RecordKey:
 
 
 @dataclass(frozen=True)
-class PhaseEvent:
-    """Start/end/error of an instrumented function (``observed_phase``)."""
-    phase: str
-    status: str  # "start" | "end" | "error"
-    t_ns: int
-    meta: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class LayerBounds:
+class LayerBounds(Record):
     """Per-neuron box of one layer as committed by the producer. lb/ub: [B, ...]."""
     key: RecordKey
     kind: str
     lb: torch.Tensor
     ub: torch.Tensor
-    t_ns: int
     changed: bool = True  # analyze(): False when the worklist re-evaluated the layer without a change
 
 
 @dataclass(frozen=True)
-class Relaxation:
+class Relaxation(Record):
     """How the producer's domain over-approximates one activation layer, per neuron. Tensors [B, n].
 
     status: int8, 1 = stable active (pre_lb >= 0), 0 = stable inactive (pre_ub <= 0), -1 = unstable.
@@ -112,7 +92,7 @@ class Relaxation:
 
 
 @dataclass(frozen=True)
-class DualBackward:
+class DualBackward(Record):
     """Dual backward pass data at one ReLU layer.
 
     alpha: lower-envelope slope, [B, M, n] (per spec row) or [B, n]; meaningful for unstable neurons only.
@@ -126,7 +106,7 @@ class DualBackward:
 
 
 @dataclass(frozen=True)
-class SpecBound:
+class SpecBound(Record):
     """Dual backward result at the output: per lane, per spec row. key.layer_id is the ASSERT layer."""
     key: RecordKey
     margins: torch.Tensor
@@ -135,82 +115,8 @@ class SpecBound:
     stop_reason: str
 
 
-Record = Union[PhaseEvent, LayerBounds, Relaxation, DualBackward, SpecBound]
-
-
-class Sink(Protocol):
-    """Receives records. ``wants_relaxation`` (optional attribute, default False) asks producers to
-    compute ``Relaxation`` records, which cost extra work and are skipped otherwise."""
-
-    def __call__(self, record: Record) -> None: ...
-
-
-def now_ns() -> int:
-    return time.perf_counter_ns()
-
-
 def wants_relaxation() -> bool:
-    return enabled and any(getattr(s, "wants_relaxation", False) for s in _SINKS)
-
-
-def _refresh() -> None:
-    global enabled
-    enabled = bool(_SINKS)
-
-
-@contextmanager
-def observe(sink: Sink) -> Iterator[Sink]:
-    """Register ``sink`` for the duration of the block. Nestable; sinks are called in registration order."""
-    _SINKS.append(sink)
-    _refresh()
-    try:
-        yield sink
-    finally:
-        try:
-            _SINKS.remove(sink)
-        except ValueError:
-            pass  # already detached after an error
-        _refresh()
-
-
-def emit(record: Record) -> None:
-    """Deliver ``record`` to every sink. A sink that raises is detached; verification is never affected."""
-    for sink in tuple(_SINKS):
-        try:
-            with torch.no_grad():
-                sink(record)
-        except Exception:  # noqa: BLE001 - observer isolation, see module docstring
-            logger.warning("act.pipeline.gui.verifier_gui: detaching sink %r after it raised", sink, exc_info=True)
-            try:
-                _SINKS.remove(sink)
-            except ValueError:
-                pass
-            _refresh()
-
-
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-def observed_phase(name: str) -> Callable[[F], F]:
-    """Emit PhaseEvent start/end/error around a function. Calls straight through when nothing observes."""
-
-    def deco(fn: F) -> F:
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if not enabled:
-                return fn(*args, **kwargs)
-            emit(PhaseEvent(name, "start", now_ns()))
-            try:
-                result = fn(*args, **kwargs)
-            except BaseException as exc:
-                emit(PhaseEvent(name, "error", now_ns(), {"error": type(exc).__name__}))
-                raise
-            emit(PhaseEvent(name, "end", now_ns()))
-            return result
-
-        return cast(F, wrapper)
-
-    return deco
+    return wants("wants_relaxation")
 
 
 def relu_status(pre_lb: torch.Tensor, pre_ub: torch.Tensor) -> torch.Tensor:
@@ -239,13 +145,21 @@ def describe_hybridz(key: RecordKey, pre: Any, post: Any, *, tf: Any) -> Relaxat
     )
 
 
+def dual_relu_box(pre: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The [B, n] pre-activation box the dual backward pass used (its repaired upper bound if any)."""
+    return pre.lb.flatten(1), pre.__dict__.get("_repaired_ub", pre.ub.flatten(1))
+
+
+def chord_slope(lb: torch.Tensor, ub: torch.Tensor) -> torch.Tensor:
+    return ub / (ub - lb).clamp(min=1e-12)
+
+
 def describe_dual(key: RecordKey, pre: Any, post: Any = None, *,
                   alpha: Optional[torch.Tensor] = None, **_: Any) -> Relaxation:
-    lb = pre.lb.flatten(1)
-    ub = pre.__dict__.get("_repaired_ub", pre.ub.flatten(1))
+    lb, ub = dual_relu_box(pre)
     status = relu_status(lb, ub)
     unstable = (lb < 0) & (ub > 0)
-    chord = ub / (ub - lb).clamp(min=1e-12)
+    chord = chord_slope(lb, ub)
     upper = torch.where(unstable, chord, (lb >= 0).to(lb))
     upper = torch.where(ub <= 0, torch.zeros_like(upper), upper)
     intercept = torch.where(unstable, -upper * lb, torch.zeros_like(lb))
@@ -267,8 +181,41 @@ DESCRIBERS: Mapping[str, Callable[..., Relaxation]] = {
 }
 
 
+# verify_once keywords; "dual_config.<field>" names a DualConfig field.
+VERIFICATION_OPTIONS: Tuple[Option, ...] = (
+    Option("dual_iters", "int", False, "alpha optimization iterations; 0 keeps the fixed chord slopes", minimum=0),
+    Option("dual_refresh_forward", "bool", False, "recompute forward bounds from the current alpha each iteration"),
+    Option("dual_config.lr_alpha", "float", False, "Adam learning rate for alpha", minimum=0.0,
+           exclusive_minimum=True),
+    Option("dual_config.lr_beta", "float", False, "Adam learning rate for split multipliers", minimum=0.0,
+           exclusive_minimum=True),
+    Option("dual_config.lr_decay", "float", False, "learning-rate decay per iteration", minimum=0.0,
+           maximum=1.0, exclusive_minimum=True),
+    Option("dual_config.per_class_alpha", "bool", False, "separate alpha per output class"),
+    Option("dual_config.stagnation_patience", "int", False, "non-improving iterations before stopping; 0 disables",
+           minimum=0),
+    Option("dual_config.stagnation_tol", "float", False, "bound improvement that resets stagnation", minimum=0.0),
+    Option("dual_config.stop_when_verified", "bool", False, "stop once every lane is certified"),
+    Option("dual_config.max_time", "float", False, "optimization time limit in seconds; 0 disables", minimum=0.0),
+    Option("dual_config.forward_lin_max_perturbed", "int", False,
+           "perturbed input dims up to which forward bounds stay linear", minimum=0),
+    Option("hybridz_tolerance", "float", False, "MILP feasibility and specification tolerance", minimum=0.0,
+           exclusive_minimum=True),
+)
+
+
+def verification_options(config_path: Optional[str | Path] = None) -> Tuple[OptionDefault, ...]:
+    """Every tunable verify_once option with its default (backend YAML for DualConfig and HybridZ fields)."""
+    from act.config.config import BackendConfig
+
+    backend = BackendConfig.from_yaml(config_path)
+    defaults: dict[str, Any] = {"dual_iters": 0, "dual_refresh_forward": False,
+                                "hybridz_tolerance": backend.hybridz.tolerance}
+    defaults.update({f"dual_config.{name}": value for name, value in vars(backend.dual).items()})
+    return tuple(OptionDefault(o, defaults[o.name]) for o in VERIFICATION_OPTIONS)
+
+
 __all__: Tuple[str, ...] = (
-    "enabled", "RecordKey", "PhaseEvent", "LayerBounds", "Relaxation", "DualBackward", "SpecBound", "Record",
-    "Sink", "observe", "emit", "observed_phase", "wants_relaxation", "relu_status", "now_ns",
-    "DESCRIBERS", "DOMAINS", "PASSES", "STAGES", "ORIGINS",
+    "RecordKey", "LayerBounds", "Relaxation", "DualBackward", "SpecBound", "wants_relaxation", "relu_status",
+    "DESCRIBERS", "DOMAINS", "PASSES", "STAGES", "ORIGINS", "VERIFICATION_OPTIONS", "verification_options",
 )

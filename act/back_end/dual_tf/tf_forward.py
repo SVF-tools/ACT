@@ -27,6 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 
 import torch
+from act.pipeline.gui import common_gui as _gui
 from act.pipeline.gui import verifier_gui as _obs
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, cast
@@ -719,9 +720,9 @@ def _observe_forward(layer, bounds, post_activation):
         else "out"
     )
     lb, ub = bounds.lb, bounds.ub
-    _obs.emit(_obs.LayerBounds(
+    _gui.emit(_obs.LayerBounds(
         _obs.RecordKey("dual", "forward", layer.id, stage),
-        layer.kind, lb, ub, _obs.now_ns(),
+        layer.kind, lb, ub,
     ))
 
 
@@ -783,7 +784,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         # A lane-dependent layer parameter broadcasts the "single" lane back out.
         if all(bounds.lb.shape[0] == 1 for bounds in shared[0].values()):
             published = _broadcast_forward_lanes(*shared, B, geometry)
-            if _obs.enabled and not _observer_shared:
+            if _gui.enabled and not _observer_shared:
                 for lid, bounds in published[0].items():
                     _observe_forward(net.by_id[lid], bounds, post_activation)
             return published
@@ -814,7 +815,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
 
     for lid in topo_order:
         if lid in bounds_dict:
-            if _obs.enabled and not _observer_shared:
+            if _gui.enabled and not _observer_shared:
                 _observe_forward(by_id[lid], bounds_dict[lid], post_activation)
             continue
         layer = by_id[lid]
@@ -835,7 +836,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                     bounds_dict, box_state, lin_state, frame_dict,
                     lid, stored, out, lin, frame,
                 )
-                if _obs.enabled and not _observer_shared:
+                if _gui.enabled and not _observer_shared:
                     _observe_forward(layer, stored, post_activation)
                 continue
             if kind not in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
@@ -851,7 +852,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 entry_lin,
                 entry_frame,
             )
-            if _obs.enabled and not _observer_shared:
+            if _gui.enabled and not _observer_shared:
                 _observe_forward(layer, entry_box, post_activation)
             continue
 
@@ -873,7 +874,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         )
         _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
                              lid, stored, out, lin, frame)
-        if _obs.enabled and not _observer_shared:
+        if _gui.enabled and not _observer_shared:
             _observe_forward(layer, stored, post_activation)
 
     if prefix_cache is not None and not prefix_cache._bounds:

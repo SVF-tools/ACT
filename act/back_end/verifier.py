@@ -48,7 +48,7 @@ from __future__ import annotations
 from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, Tuple, Literal, overload
 
 import torch
-from act.pipeline.gui import verifier_gui as _obs
+from act.pipeline.gui import common_gui as _gui
 import copy
 
 # ACT backend imports
@@ -60,6 +60,7 @@ from act.back_end.utils import validate_constraints
 
 if TYPE_CHECKING:
     from act.back_end.analyze import AnalyzeCache
+    from act.config.config import DualConfig
 
 # Front-end enums (kinds)
 from act.front_end.specs import InKind, OutKind, OutputSpec
@@ -465,6 +466,8 @@ def verify_once(
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[False] = False,
     dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult]:
@@ -478,13 +481,15 @@ def verify_once(
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[True],
     dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
     ...
 
 
-@_obs.observed_phase("verify_once")
+@_gui.observed_phase("verify_once")
 @torch.no_grad()
 def verify_once(
     net,
@@ -492,6 +497,8 @@ def verify_once(
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: bool = False,
     dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult] | Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
@@ -527,8 +534,14 @@ def verify_once(
             dual path.
         timelimit: optional HybridZ verdict-solver wall-clock limit in seconds.
         hybridz_tolerance: optional HybridZ MILP feasibility/spec tolerance.
-        dual_iters: optional dual alpha iterations over fixed forward bounds; zero
-            preserves the fixed-slope single-pass default.
+        dual_iters: optional dual alpha iterations; zero preserves the
+            fixed-slope single-pass default.
+        dual_config: optional optimizer policy of those iterations (learning
+            rates, decay, per-class alpha, stagnation/time stops, forward
+            linear cap); ``None`` keeps DualSolver's built-in defaults.
+        dual_refresh_forward: recompute the forward pre-activation bounds from
+            the current alpha on every iteration; false keeps the initial
+            forward bounds fixed and optimizes alpha only.
 
     Returns:
         ``List[VerifyResult]`` of length ``B`` (one per input lane), or
@@ -585,7 +598,10 @@ def verify_once(
         num_classes = len(output_ids)
         # DualSolver is now self-contained: no tf parameter, evaluate_spec
         # computes its own pre-activation forward bounds internally from the net.
-        solver = DualSolver(n_iters=dual_iters)
+        solver = DualSolver(
+            n_iters=dual_iters, config=dual_config,
+            refresh_forward=dual_refresh_forward,
+        )
         result = solver.evaluate_spec(
             net,
             out_spec,
