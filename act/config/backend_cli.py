@@ -25,7 +25,8 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, List, NamedTuple, Optional, Union, get_args, get_origin, get_type_hints
+from types import UnionType
+from typing import Any, NamedTuple, Union, get_args, get_origin, get_type_hints
 
 from act.config.config import ConfigError, GurobiConfig, TorchLPConfig, VALID_BERT_METHODS, VALID_BOUNDINGS, VALID_ROOT_BOUNDS_REUSE, VALID_SOLVER_TIERS, _BACKEND_SUBCONFIG_PREFIX, _VALID_SOLVERS
 from act.front_end.specs import OutKind
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 def _strip_optional(tp: Any) -> Any:
     origin = get_origin(tp)
-    if origin is Union:
+    if origin in (Union, UnionType):
         args = [arg for arg in get_args(tp) if arg is not type(None)]
         if len(args) == 1:
             return args[0]
@@ -52,11 +53,11 @@ def _parse_config_value(tp: Any):
     origin = get_origin(base)
     if base in (int, float, str):
         return base
-    if origin is Union and get_args(base) == (int, str):
-        def _parse_batch_size(raw: str) -> Union[int, str]:
+    if origin in (Union, UnionType) and get_args(base) == (int, str):
+        def _parse_batch_size(raw: str) -> int | str:
             return "auto" if raw == "auto" else int(raw)
         return _parse_batch_size
-    if origin in (list, List):
+    if origin is list:
         def _parse_list(raw: str) -> list[Any]:
             if raw.strip().startswith("["):
                 value = json.loads(raw)
@@ -68,8 +69,17 @@ def _parse_config_value(tp: Any):
     return str
 
 
-def _add_dataclass_config_args(parser: argparse.ArgumentParser) -> None:
-    """Expose all BackendConfig dataclass fields without hand-maintained drift."""
+def _add_dataclass_config_args(
+    parser: argparse.ArgumentParser,
+    bab_group: argparse._ArgumentGroup | None = None,
+    bab_helps: dict[str, str] | None = None,
+) -> None:
+    """Expose all BackendConfig dataclass fields without hand-maintained drift.
+
+    With ``bab_helps`` (BaBConfig field -> help text, in flag order) only those
+    typed --bab-* flags are added, to ``bab_group``: the pipeline CLI shares
+    its BaB flags this way.
+    """
     from act.config.config import BackendConfig, BaBConfig, DualConfig, GenerationConfig, GurobiConfig, HybridZConfig, TorchLPConfig
 
     existing_options = {
@@ -78,14 +88,16 @@ def _add_dataclass_config_args(parser: argparse.ArgumentParser) -> None:
         for option in action.option_strings
     }
     # Dests _collect_backend_overrides reads. A key aliased to a differently
-    # spelled explicit flag (bab_max_nodes -> --bab-max-subproblems) is absent,
+    # spelled explicit flag (bab_enabled -> --bab) is absent,
     # so a generated flag for it would set a dest nothing ever reads.
     read_dests = {attr for _, attr, *_ in _BACKEND_OVERRIDE_SPEC}
 
     def add_group(cls: type[Any], title: str, flag_prefix: str, dest_prefix: str, skip: set[str]) -> None:
-        group = parser.add_argument_group(title)
+        group = parser.add_argument_group(title) if bab_group is None else bab_group
         type_hints = get_type_hints(cls)
-        for fld in fields(cls):
+        cls_fields = {fld.name: fld for fld in fields(cls)}
+        selected = cls_fields if bab_helps is None else bab_helps
+        for fld in (cls_fields[name] for name in selected):
             if fld.name in skip:
                 continue
             flag = f"--{flag_prefix}{fld.name.replace('_', '-')}"
@@ -94,7 +106,9 @@ def _add_dataclass_config_args(parser: argparse.ArgumentParser) -> None:
                 continue
             field_type = type_hints.get(fld.name, fld.type)
             base = _strip_optional(field_type)
-            help_text = f"Override config field {cls.__name__}.{fld.name} (default: from config.yaml)"
+            help_text = (bab_helps or {}).get(
+                fld.name, f"Override config field {cls.__name__}.{fld.name} (default: from config.yaml)"
+            )
             if flag in existing_options:
                 no_flag = f"--no-{flag[2:]}"
                 if base is bool and no_flag not in existing_options:
@@ -127,6 +141,9 @@ def _add_dataclass_config_args(parser: argparse.ArgumentParser) -> None:
                 )
                 existing_options.add(flag)
 
+    if bab_helps is not None:
+        add_group(BaBConfig, "", "bab-", "bab_", set())
+        return
     add_group(
         BackendConfig,
         "Backend Config Overrides (generated)",
@@ -171,8 +188,8 @@ class _SkipUnsupported(NamedTuple):
 
 def _make_solver(
     solver_name: str,
-    torchlp_config: Optional[TorchLPConfig] = None,
-    gurobi_config: Optional[GurobiConfig] = None,
+    torchlp_config: TorchLPConfig | None = None,
+    gurobi_config: GurobiConfig | None = None,
 ):
     """LP-cascade solver factory (gurobi / torchlp / auto). Dual is routed
     separately via ``is_dual_solver_active`` since it implements
@@ -236,10 +253,10 @@ def _resolve_bab_config(
 def _verify_net(
     net: Any,
     backend_cfg,
-    explicit_bab_fields: Optional[set[str]] = None,
+    explicit_bab_fields: set[str] | None = None,
     *,
-    deadline: Optional[float] = None,
-) -> tuple[list[Any], Optional[_SkipUnsupported], Optional[int]]:
+    deadline: float | None = None,
+) -> tuple[list[Any], _SkipUnsupported | None, int | None]:
     """[BATCHED-API] Verify one already-constructed Net via the refinement cascade.
 
     Named BaB presets yield to fields pinned by CLI flags. All stages share
@@ -322,7 +339,7 @@ def _verify_net(
         hz_timeout = min(backend_cfg.hybridz.timeout or remaining, remaining)
         hz_tolerance = backend_cfg.hybridz.tolerance
     try:
-        results: List[Any] = list(
+        results: list[Any] = list(
             verify_once(
                 net=net,
                 timelimit=hz_timeout,
@@ -440,8 +457,8 @@ def _verify_net(
 def _verify_one_net(
     net_path: str,
     backend_cfg,
-    explicit_bab_fields: Optional[set[str]] = None,
-) -> tuple[list[Any], Optional[_SkipUnsupported], Optional[int]]:
+    explicit_bab_fields: set[str] | None = None,
+) -> tuple[list[Any], _SkipUnsupported | None, int | None]:
     """Load one serialized Net and verify it through the shared cascade."""
     from act.back_end.serialization.serialization import load_net_from_file
 
@@ -504,8 +521,8 @@ def run_vnnlib_verification(args, backend_cfg):
 def _report_verification_results(
     label: str,
     results: list[Any],
-    err: Optional[_SkipUnsupported],
-    n_layers: Optional[int],
+    err: _SkipUnsupported | None,
+    n_layers: int | None,
     backend_cfg: Any,
 ) -> int:
     """Report shared Net-verification results and return the CLI exit status."""
@@ -747,7 +764,7 @@ def run_diff_nets(args) -> int:
     for i in range(n_common):
         lyr_a = net_a.layers[i]
         lyr_b = net_b.layers[i]
-        diffs: List[str] = []
+        diffs: list[str] = []
         if lyr_a.kind != lyr_b.kind:
             diffs.append(f"kind: {lyr_a.kind!r} -> {lyr_b.kind!r}")
         if len(lyr_a.in_vars) != len(lyr_b.in_vars):
@@ -1044,10 +1061,11 @@ Exit status (--verify):
         help="Maximum BaB tree depth (default: from config.yaml)",
     )
     verify_group.add_argument(
+        "--bab-max-nodes",
         "--bab-max-subproblems",
         type=int,
         default=None,
-        dest="bab_max_subproblems",
+        dest="bab_max_nodes",
         help="Maximum number of BaB subproblems (default: from config.yaml)",
     )
     verify_group.add_argument(
@@ -1075,10 +1093,11 @@ Exit status (--verify):
         ),
     )
     verify_group.add_argument(
+        "--bab-branching-method",
         "--bab-branching",
         type=str,
         default=None,
-        dest="bab_branching",
+        dest="bab_branching_method",
         help=(
             "Branching strategy: which neuron or input axis to split. "
             "Neuron branching (babsr/fsb/gain) requires "
@@ -1255,18 +1274,12 @@ Exit status (--verify):
 
 # (override_key, args_attr, env_var, env_cast, cli_check)
 # cli_check="user_set" for flags with non-None defaults (--device/--dtype/--registry-mode)
-_BACKEND_ALIAS_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
+_BACKEND_ALIAS_OVERRIDE_SPEC: list[tuple[str, str, str | None, Any, str]] = [
     ("solver",               "solver",              "ACT_SOLVER",     None, "not_none"),
     ("device",               "device",              "ACT_DEVICE",     None, "user_set"),
     ("dtype",                "dtype",               "ACT_DTYPE",      None, "user_set"),
     ("verbose",              "verbose",             None,             None, "user_set"),
-    ("timeout",              "timeout",             None,             None, "not_none"),
-    ("method",               "method",              None,             None, "not_none"),
     ("bab_enabled",          "bab",                 None,             None, "not_none"),
-    ("bab_max_depth",        "bab_max_depth",       None,             None, "not_none"),
-    ("bab_max_nodes",        "bab_max_subproblems", None,             None, "not_none"),
-    ("bab_branching_method", "bab_branching",       None,             None, "not_none"),
-    ("bab_llm_probe_backend", "bab_llm_probe_backend",  None,             None, "not_none"),
     ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
     ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),
     ("gen_base_seed",        "base_seed",           "ACT_GEN_SEED",   int,  "not_none"),
@@ -1276,7 +1289,7 @@ _BACKEND_ALIAS_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
 ]
 
 
-def _build_backend_override_spec() -> list[tuple[str, str, Optional[str], Any, str]]:
+def _build_backend_override_spec() -> list[tuple[str, str, str | None, Any, str]]:
     spec = list(_BACKEND_ALIAS_OVERRIDE_SPEC)
     aliased_keys = {key for key, *_ in spec}
     for key in sorted(_backend_override_keys_from_dataclasses() - aliased_keys):
@@ -1322,10 +1335,10 @@ def _run_cli_cascade_smoke() -> int:
         print(f"  PASS  {label}")
 
     def _build_tiny_net(B: int = 1, n_in: int = 4, n_out: int = 2) -> Net:
-        layers: List[Any] = []
+        layers: list[Any] = []
         nv = 0
 
-        def alloc(n: int) -> List[int]:
+        def alloc(n: int) -> list[int]:
             nonlocal nv
             vs = list(range(nv, nv + n))
             nv += n
@@ -1407,12 +1420,14 @@ def _run_cli_cascade_smoke() -> int:
         flags = [
             "--bab-frontier-mem-safety", "0.4", "--no-bab-frontier-offload",
             "--bab-intermediate-refine-max-tensor-mib", "32",
+            "--hz-timeout", "2.5",
         ]
         args = parser.parse_args(flags)
         cfg = BackendConfig.from_yaml(**_collect_backend_overrides(args, lambda flag: flag in flags))
         assert cfg.bab.frontier_mem_safety == 0.4
         assert not cfg.bab.frontier_offload
         assert cfg.bab.intermediate_refine_max_tensor_mib == 32
+        assert cfg.hybridz.timeout == 2.5
         for value in (0, -1, True, 1.5, "invalid", "2"):
             try:
                 BackendConfig.from_yaml(bab_max_batch_size=value)

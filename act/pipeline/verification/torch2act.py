@@ -47,7 +47,7 @@
 from __future__ import annotations
 import logging
 import operator
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Union, cast
+from typing import Any, ClassVar, cast
 import torch
 import torch.nn as nn
 import torch.fx as fx
@@ -105,9 +105,9 @@ class _LayerGraphBuilder:
     _ONNX_SHAPE_DTYPE: ClassVar[torch.dtype] = torch.int64
     
     def __init__(
-        self, model: nn.Module, input_shape: Tuple[int, ...],
+        self, model: nn.Module, input_shape: tuple[int, ...],
         dtype: torch.dtype = torch.float64,
-        sample_input: Optional[torch.Tensor] = None,
+        sample_input: torch.Tensor | None = None,
     ):
         self.model = model
         self.input_shape = input_shape
@@ -121,48 +121,48 @@ class _LayerGraphBuilder:
         self.sample_input = sample_input
         
         # Layer building state
-        self.layers: List[Layer] = []
+        self.layers: list[Layer] = []
         self.next_var = 0
-        self.prev_out: List[int] = []
-        self.shape: Tuple[int, ...] = input_shape
+        self.prev_out: list[int] = []
+        self.shape: tuple[int, ...] = input_shape
         
         # Graph tracking (populated by FX tracing)
-        self.node_outputs: Dict[str, List[int]] = {}
-        self.node_shapes: Dict[str, Tuple[int, ...]] = {}
-        self.node_to_layer_id: Dict[str, int] = {}
-        self.graph_edges: Dict[str, List[str]] = {}
-        self.modules: Dict[str, nn.Module] = {}
+        self.node_outputs: dict[str, list[int]] = {}
+        self.node_shapes: dict[str, tuple[int, ...]] = {}
+        self.node_to_layer_id: dict[str, int] = {}
+        self.graph_edges: dict[str, list[str]] = {}
+        self.modules: dict[str, nn.Module] = {}
         
         # torch.fx specific
-        self.fx_graph: Optional[fx.Graph] = None
-        self.traced_model: Optional[fx.GraphModule] = None
-        self._manual_preds: Optional[Dict[int, List[int]]] = None
-        self._manual_succs: Optional[Dict[int, List[int]]] = None
+        self.fx_graph: fx.Graph | None = None
+        self.traced_model: fx.GraphModule | None = None
+        self._manual_preds: dict[int, list[int]] | None = None
+        self._manual_succs: dict[int, list[int]] | None = None
 
         # Explicit predecessor edges for FX-path layers whose true data source
         # differs from their FX-arg node. Split decomposes into N sibling SLICEs
         # that all read the split's input, but each getitem child's FX arg is
         # the split node (mapped to the LAST chunk), so graph-edge resolution
         # would mis-wire them. _build_preds_succs honours this override.
-        self._fx_pred_override: Dict[int, List[int]] = {}
+        self._fx_pred_override: dict[int, list[int]] = {}
 
         # Head layer of each node converted into a chain of layers (BatchNorm
         # -> SCALE + BIAS). node_to_layer_id maps a node to its LAST layer so
         # successors read its output; incoming FX edges must enter the head,
         # otherwise the layers in between are bypassed. See _record_chain_head.
-        self._node_first_layer_id: Dict[str, int] = {}
+        self._node_first_layer_id: dict[str, int] = {}
 
         # Compile-time constants (e.g. OnnxShape values) that must NOT enter
         # the runtime IR. Resolved by ``_resolve_constant_tensor`` BEFORE any
         # placeholder/sample_input fallback — this is what stops shape chains
         # from baking sample-local bounds into a globally-quantified ACT Net.
-        self._compile_time_values: Dict[str, torch.Tensor] = {}
+        self._compile_time_values: dict[str, torch.Tensor] = {}
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
     
-    def build_layer_graph(self) -> Tuple[List[Layer], Dict[int, List[int]], Dict[int, List[int]]]:
+    def build_layer_graph(self) -> tuple[list[Layer], dict[int, list[int]], dict[int, list[int]]]:
         """
         Build ACT layer graph from the model.
 
@@ -196,18 +196,18 @@ class _LayerGraphBuilder:
     # Helper Methods
     # -------------------------------------------------------------------------
     
-    def _alloc_ids(self, n: int) -> List[int]:
+    def _alloc_ids(self, n: int) -> list[int]:
         """Allocate n consecutive variable IDs."""
         ids = list(range(self.next_var, self.next_var + n))
         self.next_var += n
         return ids
     
-    def _same_size_forward(self) -> List[int]:
+    def _same_size_forward(self) -> list[int]:
         """Allocate same number of output vars as current prev_out."""
         return self._alloc_ids(len(self.prev_out))
     
-    def _add_layer(self, kind: str, params: Dict[str, Any],
-                   in_vars: List[int], out_vars: List[int]) -> int:
+    def _add_layer(self, kind: str, params: dict[str, Any],
+                   in_vars: list[int], out_vars: list[int]) -> int:
         """Add a layer and return its ID."""
         layer = create_layer(
             id=len(self.layers),
@@ -222,10 +222,10 @@ class _LayerGraphBuilder:
     def _add_manual_layer(
         self,
         kind: str,
-        params: Dict[str, Any],
-        in_vars: List[int],
-        out_vars: List[int],
-        pred_ids: List[int],
+        params: dict[str, Any],
+        in_vars: list[int],
+        out_vars: list[int],
+        pred_ids: list[int],
     ) -> int:
         """Add a layer and explicit predecessor edges for manual graph mapping."""
         layer_id = self._add_layer(kind, params, in_vars, out_vars)
@@ -261,11 +261,7 @@ class _LayerGraphBuilder:
         ):
             return False
 
-        self._manual_preds = {}
-        self._manual_succs = {}
-        current_vars = self.prev_out
-        current_shape = self.shape
-
+        current_vars, current_shape = self._begin_manual_graph()
         patch_vars, patch_shape, patch_id = self._add_manual_conv2d(
             patch_proj, current_vars, current_shape, []
         )
@@ -339,16 +335,26 @@ class _LayerGraphBuilder:
         head_vars, head_shape, head_id = self._add_manual_dense(
             head, cls_flat_vars, (1, int(block_shape[-1])), [reshape_id]
         )
+        return self._finish_manual_graph(head_vars, head_shape)
 
-        self.prev_out = head_vars
-        self.shape = head_shape
+    def _begin_manual_graph(self) -> tuple[list[int], tuple[int, ...]]:
+        """Start a manual transformer mapping: fresh edge maps, current input."""
+        self._manual_preds = {}
+        self._manual_succs = {}
+        return self.prev_out, self.shape
+
+    def _finish_manual_graph(self, out_vars: list[int], out_shape: tuple[int, ...]) -> bool:
+        """Publish the mapped output and close the edge maps as a checked DAG."""
+        assert self._manual_preds is not None and self._manual_succs is not None
+        self.prev_out = out_vars
+        self.shape = out_shape
         n_layers = len(self.layers)
         self._manual_preds = {i: self._manual_preds.get(i, []) for i in range(n_layers)}
         self._manual_succs = {i: self._manual_succs.get(i, []) for i in range(n_layers)}
         _assert_dag(self._manual_preds, self._manual_succs, n_layers)
         return True
 
-    def _add_manual_constant(self, value: torch.Tensor, shape: Tuple[int, ...]) -> Tuple[List[int], int]:
+    def _add_manual_constant(self, value: torch.Tensor, shape: tuple[int, ...]) -> tuple[list[int], int]:
         """Add a fixed tensor source layer for parameters used as graph operands."""
         flat = value.detach().clone().to(self.dtype).reshape(-1)
         out_vars = self._alloc_ids(int(flat.numel()) or 1)
@@ -362,10 +368,10 @@ class _LayerGraphBuilder:
     def _add_manual_conv2d(
         self,
         mod: nn.Conv2d,
-        in_vars: List[int],
-        in_shape: Tuple[int, ...],
-        pred_ids: List[int],
-    ) -> Tuple[List[int], Tuple[int, ...], int]:
+        in_vars: list[int],
+        in_shape: tuple[int, ...],
+        pred_ids: list[int],
+    ) -> tuple[list[int], tuple[int, ...], int]:
         """Add a Conv2d layer preserving PyTorch convolution parameters."""
         if len(in_shape) != 4:
             raise ValueError(f"ViT patch embedding requires 4D input, got {in_shape}.")
@@ -378,7 +384,7 @@ class _LayerGraphBuilder:
         out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
         out_shape = (1, int(mod.out_channels), int(out_h), int(out_w))
         out_vars = self._alloc_ids(_prod(out_shape) or 1)
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "weight": mod.weight.detach(),
             "input_shape": in_shape, "output_shape": out_shape,
             "kernel_size": kernel_size, "stride": stride,
@@ -408,10 +414,7 @@ class _LayerGraphBuilder:
         ):
             return False
 
-        self._manual_preds = {}
-        self._manual_succs = {}
-        current_vars = self.prev_out
-        current_shape = self.shape
+        current_vars, current_shape = self._begin_manual_graph()
         anchor_vars = self._alloc_ids(len(current_vars))
         anchor_id = self._add_manual_layer(
             LayerKind.RESHAPE.value,
@@ -421,7 +424,7 @@ class _LayerGraphBuilder:
             [],
         )
         current_vars = anchor_vars
-        current_layer_ids: List[int] = [anchor_id]
+        current_layer_ids: list[int] = [anchor_id]
 
         if isinstance(input_norm, nn.Module):
             current_vars, input_norm_id = self._add_manual_layernorm(
@@ -489,17 +492,11 @@ class _LayerGraphBuilder:
             )
             current_layer_ids = [dense_id]
 
-        self.prev_out = current_vars
-        self.shape = current_shape
-        n_layers = len(self.layers)
-        self._manual_preds = {i: self._manual_preds.get(i, []) for i in range(n_layers)}
-        self._manual_succs = {i: self._manual_succs.get(i, []) for i in range(n_layers)}
-        _assert_dag(self._manual_preds, self._manual_succs, n_layers)
-        return True
+        return self._finish_manual_graph(current_vars, current_shape)
 
-    def _find_bert_encoder_blocks(self, model: nn.Module) -> List[nn.Module]:
+    def _find_bert_encoder_blocks(self, model: nn.Module) -> list[nn.Module]:
         """Return explicit BERT BertLayer modules when present."""
-        candidates: List[Any] = []
+        candidates: list[Any] = []
         encoder = getattr(model, "encoder", None)
         if encoder is not None:
             candidates.append(getattr(encoder, "layer", None))
@@ -537,10 +534,10 @@ class _LayerGraphBuilder:
     def _build_bert_block(
         self,
         block: nn.Module,
-        input_vars: List[int],
-        input_shape: Tuple[int, ...],
-        input_layer_ids: List[int],
-    ) -> Tuple[List[int], Tuple[int, ...], List[int]]:
+        input_vars: list[int],
+        input_shape: tuple[int, ...],
+        input_layer_ids: list[int],
+    ) -> tuple[list[int], tuple[int, ...], list[int]]:
         if not input_shape:
             raise ValueError("Transformer block mapping requires a non-empty input shape.")
         block_any = cast(Any, block)
@@ -558,7 +555,7 @@ class _LayerGraphBuilder:
                 f"Transformer attention dimensions require {num_heads} * {head_dim} == {hidden_size}."
             )
 
-        score_rows: Dict[Tuple[int, int], int] = {}
+        score_rows: dict[tuple[int, int], int] = {}
         for pos in range(seq_len):
             for head in range(num_heads):
                 q_vars = self._alloc_ids(head_dim)
@@ -572,8 +569,8 @@ class _LayerGraphBuilder:
                     q_vars,
                     input_layer_ids,
                 )
-                row_score_ids: List[int] = []
-                row_score_vars: List[int] = []
+                row_score_ids: list[int] = []
+                row_score_vars: list[int] = []
                 for key_pos in range(seq_len):
                     k_vars = self._alloc_ids(head_dim)
                     k_id = self._add_manual_layer(
@@ -630,8 +627,8 @@ class _LayerGraphBuilder:
                 )
                 score_rows[pos, head] = prob_id
 
-        context_ids: List[int] = []
-        context_vars: List[int] = []
+        context_ids: list[int] = []
+        context_vars: list[int] = []
         for pos in range(seq_len):
             for head in range(num_heads):
                 prob_id = score_rows[pos, head]
@@ -729,14 +726,14 @@ class _LayerGraphBuilder:
         self,
         role: str,
         projection: nn.Linear,
-        position: Optional[int],
-        feature: Optional[int],
-        head: Optional[int],
+        position: int | None,
+        feature: int | None,
+        head: int | None,
         num_heads: int,
         head_dim: int,
-        input_shape: Tuple[int, ...],
-        output_shape: Tuple[int, ...],
-    ) -> Dict[str, Any]:
+        input_shape: tuple[int, ...],
+        output_shape: tuple[int, ...],
+    ) -> dict[str, Any]:
         weight = projection.weight.detach()
         bias = projection.bias.detach() if projection.bias is not None else None
         if head is not None:
@@ -749,7 +746,7 @@ class _LayerGraphBuilder:
             weight = weight[start:stop]
             if bias is not None:
                 bias = bias[start:stop]
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "role": role,
             "weight": weight,
             "hidden_size": int(projection.in_features),
@@ -770,10 +767,10 @@ class _LayerGraphBuilder:
     def _add_manual_dense(
         self,
         mod: nn.Linear,
-        in_vars: List[int],
-        in_shape: Tuple[int, ...],
-        pred_ids: List[int],
-    ) -> Tuple[List[int], Tuple[int, ...], int]:
+        in_vars: list[int],
+        in_shape: tuple[int, ...],
+        pred_ids: list[int],
+    ) -> tuple[list[int], tuple[int, ...], int]:
         in_features = int(mod.in_features)
         out_features = int(mod.out_features)
         if len(in_vars) == in_features:
@@ -808,10 +805,10 @@ class _LayerGraphBuilder:
     def _add_manual_layernorm(
         self,
         mod: nn.Module,
-        in_vars: List[int],
-        in_shape: Tuple[int, ...],
-        pred_ids: List[int],
-    ) -> Tuple[List[int], int]:
+        in_vars: list[int],
+        in_shape: tuple[int, ...],
+        pred_ids: list[int],
+    ) -> tuple[list[int], int]:
         gamma = getattr(mod, "weight").detach()
         beta = getattr(mod, "bias").detach()
         eps = float(getattr(mod, "variance_epsilon", getattr(mod, "eps", 1e-5)))
@@ -838,7 +835,7 @@ class _LayerGraphBuilder:
         name = getattr(act, "__name__", "").lower()
         return "gelu" in name
     
-    def _register_node(self, name: str, layer_id: Optional[int] = None) -> None:
+    def _register_node(self, name: str, layer_id: int | None = None) -> None:
         """Register node's output vars, shape, and layer mapping."""
         self.node_outputs[name] = self.prev_out.copy()
         self.node_shapes[name] = self.shape
@@ -875,7 +872,7 @@ class _LayerGraphBuilder:
         self.shape = self.node_shapes[node_name]
         return True
 
-    def _resolve_constant_tensor(self, node_name: str) -> Optional[torch.Tensor]:
+    def _resolve_constant_tensor(self, node_name: str) -> torch.Tensor | None:
         """Return the tensor value of a get_attr fx node or compile-time stashed value."""
         cached = self._compile_time_values.get(node_name)
         if cached is not None:
@@ -903,7 +900,7 @@ class _LayerGraphBuilder:
             return None
         return None
 
-    def _resolve_slice_input_to_int_list(self, node_name: str) -> Optional[List[int]]:
+    def _resolve_slice_input_to_int_list(self, node_name: str) -> list[int] | None:
         """Read an OnnxSlice positional input (starts/ends/axes/steps) as an int list.
 
         Resolves in three escalating tiers:
@@ -933,7 +930,7 @@ class _LayerGraphBuilder:
 
     def _evaluate_constant_subgraph(
         self, node_name: str, *, allow_sample: bool = True,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Evaluate constant operands, optionally allowing a sample-derived value.
 
         Static Gather/Split metadata cannot depend on an input whose value
@@ -961,7 +958,7 @@ class _LayerGraphBuilder:
         sub = self.modules.get(str(target_node.target))
         if sub is None:
             return None
-        arg_vals: List[Any] = []
+        arg_vals: list[Any] = []
         for a in target_node.args:
             if isinstance(a, fx.Node):
                 v = self._evaluate_constant_subgraph(a.name, allow_sample=allow_sample)
@@ -1024,7 +1021,7 @@ class _LayerGraphBuilder:
         if self.fx_graph is None:
             return
         for node in self.fx_graph.nodes:
-            edge_preds: List[str] = []
+            edge_preds: list[str] = []
             for arg in node.args:
                 if isinstance(arg, fx.Node):
                     edge_preds.append(arg.name)
@@ -1189,7 +1186,7 @@ class _LayerGraphBuilder:
     # Graph Structure Building
     # -------------------------------------------------------------------------
     
-    def _build_preds_succs(self) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
+    def _build_preds_succs(self) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
         """Build preds and succs dictionaries, validating DAG property.
         
         Uses a hybrid approach:
@@ -1205,11 +1202,11 @@ class _LayerGraphBuilder:
         mapped_layer_ids = set(lid for lid in self.node_to_layer_id.values() if lid >= 0)
         mapped_layer_ids.update(self._node_first_layer_id.values())
         
-        preds: Dict[int, List[int]] = {i: [] for i in range(n_layers)}
-        succs: Dict[int, List[int]] = {i: [] for i in range(n_layers)}
+        preds: dict[int, list[int]] = {i: [] for i in range(n_layers)}
+        succs: dict[int, list[int]] = {i: [] for i in range(n_layers)}
         
         # Track layers that take input directly from the placeholder (network input)
-        takes_input_from_placeholder: Set[int] = set()
+        takes_input_from_placeholder: set[int] = set()
         
         # First, build FX graph edges for mapped layers
         for node_name, pred_names in self.graph_edges.items():
@@ -1342,7 +1339,7 @@ class _LayerGraphBuilder:
         
         raise NotImplementedError(f"Unsupported module: {type(mod).__name__}")
 
-    def _layer_kind_for_module(self, mod: nn.Module) -> Optional[str]:
+    def _layer_kind_for_module(self, mod: nn.Module) -> str | None:
         """Resolve an ACT layer kind from the canonical Torch mapping.
 
         Exact type matching handles overlapping module hierarchies first; the
@@ -1361,7 +1358,7 @@ class _LayerGraphBuilder:
     # Layer Conversion - Specific Converters
     # -------------------------------------------------------------------------
     
-    def _resolve_int_arg(self, value: Any) -> Optional[int]:
+    def _resolve_int_arg(self, value: Any) -> int | None:
         """Resolve FX literal integer arguments produced by shape metadata nodes."""
         if isinstance(value, int):
             return int(value)
@@ -1378,9 +1375,9 @@ class _LayerGraphBuilder:
                 return int(const.reshape(-1)[0].item())
         return None
 
-    def _normalize_target_shape(self, raw_shape: Tuple[Any, ...]) -> Tuple[int, ...]:
+    def _normalize_target_shape(self, raw_shape: tuple[Any, ...]) -> tuple[int, ...]:
         """Resolve reshape/expand dimensions against the current ACT shape."""
-        shape: List[int] = []
+        shape: list[int] = []
         for index, dim_value in enumerate(raw_shape):
             dim = self._resolve_int_arg(dim_value)
             if dim is None:
@@ -1394,7 +1391,7 @@ class _LayerGraphBuilder:
             shape[shape.index(-1)] = _prod(self.shape) // known
         return tuple(shape)
 
-    def _create_reshape_method_layer(self, node: fx.Node) -> List[int]:
+    def _create_reshape_method_layer(self, node: fx.Node) -> list[int]:
         """Create a RESHAPE/FLATTEN layer for tensor shape methods."""
         method_name = str(node.target)
         if method_name == 'flatten':
@@ -1441,7 +1438,7 @@ class _LayerGraphBuilder:
         self._register_node(node.name, layer_id)
         return out_vars
 
-    def _create_transpose_method_layer(self, node: fx.Node) -> List[int]:
+    def _create_transpose_method_layer(self, node: fx.Node) -> list[int]:
         """Create a TRANSPOSE layer for tensor transpose/permute methods."""
         rank = len(self.shape)
         input_shape_t = tuple(self.shape)
@@ -1475,7 +1472,7 @@ class _LayerGraphBuilder:
         self._register_node(node.name, layer_id)
         return out_vars
 
-    def _create_expand_method_layer(self, node: fx.Node) -> List[int]:
+    def _create_expand_method_layer(self, node: fx.Node) -> list[int]:
         """Create an EXPAND layer for tensor broadcast expansion."""
         raw_shape = tuple(node.args[1:])
         if len(raw_shape) == 1 and isinstance(raw_shape[0], (list, tuple)):
@@ -1496,8 +1493,8 @@ class _LayerGraphBuilder:
         self._register_node(node.name, layer_id)
         return out_vars
 
-    def _create_flatten_layer(self, node_name: Optional[str] = None,
-                               start_dim: int = 1, end_dim: int = -1) -> List[int]:
+    def _create_flatten_layer(self, node_name: str | None = None,
+                               start_dim: int = 1, end_dim: int = -1) -> list[int]:
         """Create FLATTEN layer, optionally register node."""
         out_vars = self._same_size_forward()
         output_shape = (1, _prod(self.shape[1:]))
@@ -1653,7 +1650,7 @@ class _LayerGraphBuilder:
         self.shape = output_shape
         self.prev_out = out_vars
 
-    def _convert_pool2d(self, mod: Union[nn.MaxPool2d, nn.AvgPool2d]) -> None:
+    def _convert_pool2d(self, mod: nn.MaxPool2d | nn.AvgPool2d) -> None:
         """Convert MaxPool2d or AvgPool2d."""
         if len(self.shape) != 4:
             raise ValueError(f"Pool2d requires 4D input shape, got {len(self.shape)}D")
@@ -1778,7 +1775,7 @@ class _LayerGraphBuilder:
         self._add_layer("BIAS", bias_params, self.prev_out, out_bias)
         self.prev_out = out_bias
     
-    def _convert_rnn_family(self, mod: Union[nn.RNN, nn.LSTM, nn.GRU], kind: LayerKind) -> None:
+    def _convert_rnn_family(self, mod: nn.RNN | nn.LSTM | nn.GRU, kind: LayerKind) -> None:
         """Convert single-layer nn.RNN / nn.LSTM / nn.GRU.
         """
         if int(mod.num_layers) != 1:
@@ -1794,7 +1791,7 @@ class _LayerGraphBuilder:
         out_feat = int(mod.hidden_size) * directions
         output_shape = (batch, seq_len, out_feat) if batch_first else (seq_len, batch, out_feat)
 
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "input_size": int(mod.input_size), "hidden_size": int(mod.hidden_size),
             "num_layers": 1, "bidirectional": bool(mod.bidirectional), "batch_first": batch_first,
             "input_shape": self.shape, "output_shape": output_shape,
@@ -1814,7 +1811,7 @@ class _LayerGraphBuilder:
         self.prev_out = out_vars
 
     def _convert_activation(self, mod: nn.Module, kind: LayerKind,
-                           extra_params: Optional[Dict[str, Any]] = None) -> None:
+                           extra_params: dict[str, Any] | None = None) -> None:
         """Convert activation function."""
         out_vars = self._same_size_forward()
 
@@ -1875,8 +1872,8 @@ class _LayerGraphBuilder:
         raise NotImplementedError(f"Cannot resolve constant operand: {val}")
 
     def _broadcast_operand(
-        self, node: fx.Node, output_shape: Tuple[int, ...],
-    ) -> Tuple[List[int], Optional[int]]:
+        self, node: fx.Node, output_shape: tuple[int, ...],
+    ) -> tuple[list[int], int | None]:
         """Align one variable through existing RESHAPE/EXPAND layers."""
         source_shape = self.node_shapes[node.name]
         variables = self.node_outputs[node.name]
@@ -2231,10 +2228,10 @@ del _cls_name, _fn
 
 def build_act(
     model: nn.Module,
-    input_shape: Tuple[int, ...],
+    input_shape: tuple[int, ...],
     dtype: torch.dtype = torch.float64,
-    sample_input: Optional[torch.Tensor] = None,
-) -> Tuple[List[Layer], Dict[int, List[int]], Dict[int, List[int]]]:
+    sample_input: torch.Tensor | None = None,
+) -> tuple[list[Layer], dict[int, list[int]], dict[int, list[int]]]:
     """
     Build ACT layer graph from a PyTorch model.
 
@@ -2271,7 +2268,7 @@ class TorchToACT:
     """
     _WRAPPER_TYPES = ("InputLayer", "InputSpecLayer", "OutputSpecLayer")
 
-    def __init__(self, wrapped: nn.Module, sample_input: Optional[torch.Tensor] = None):
+    def __init__(self, wrapped: nn.Module, sample_input: torch.Tensor | None = None):
         if not isinstance(wrapped, nn.Module):
             raise TypeError("TorchToACT expects an nn.Module.")
 
@@ -2306,15 +2303,15 @@ class TorchToACT:
         self.sample_input = sample_input
 
         # State
-        self.layers: List[Layer] = []
-        self.prev_out: List[int] = []
-        self.shape: Tuple[int, ...] = tuple(int(s) for s in shape)
-        self._body_shape: Tuple[int, ...] = self.shape
-        self._model_preds: Dict[int, List[int]] = {}
-        self._model_succs: Dict[int, List[int]] = {}
+        self.layers: list[Layer] = []
+        self.prev_out: list[int] = []
+        self.shape: tuple[int, ...] = tuple(int(s) for s in shape)
+        self._body_shape: tuple[int, ...] = self.shape
+        self._model_preds: dict[int, list[int]] = {}
+        self._model_succs: dict[int, list[int]] = {}
         self._wrapper_offset: int = 0
     
-    def _validate_wrapper(self, mods: List[nn.Module]) -> None:
+    def _validate_wrapper(self, mods: list[nn.Module]) -> None:
         """Validate wrapper layer structure."""
         type_names = [type(m).__name__ for m in mods]
         if "InputSpecLayer" not in type_names:
@@ -2422,18 +2419,18 @@ class TorchToACT:
         self._model_succs = {k + offset: [v + offset for v in vals] for k, vals in model_succs.items()}
         self._wrapper_offset = offset
     
-    def _find_inner_model(self) -> Optional[nn.Module]:
+    def _find_inner_model(self) -> nn.Module | None:
         """Find actual model inside wrapper (skip wrapper layers)."""
         for mod in self.m.children():
             if type(mod).__name__ not in self._WRAPPER_TYPES:
                 return mod
         return None
     
-    def _build_layer_graph(self) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
+    def _build_layer_graph(self) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
         """Build layer graph combining wrapper and model layers."""
         n = len(self.layers)
-        preds: Dict[int, List[int]] = {i: [] for i in range(n)}
-        succs: Dict[int, List[int]] = {i: [] for i in range(n)}
+        preds: dict[int, list[int]] = {i: [] for i in range(n)}
+        succs: dict[int, list[int]] = {i: [] for i in range(n)}
         
         # Copy model graph
         for lid, ps in self._model_preds.items():
@@ -2473,7 +2470,7 @@ class TorchToACT:
         # to INPUT_SPEC (latest-id producer), never INPUT id 0 -- the dual
         # backward harvests ν only at _find_input_layer_id==INPUT_SPEC, so
         # routing to INPUT would silently drop the term and yield an unsound bound.
-        producer: Dict[int, int] = {}
+        producer: dict[int, int] = {}
         for layer in self.layers:
             for v in layer.out_vars:
                 if v not in producer or layer.id > producer[v]:

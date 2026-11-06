@@ -19,13 +19,14 @@ import argparse
 from contextlib import contextmanager
 import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 import sys
 import torch
 
 from act.util.cli_utils import add_device_args, initialize_from_args
 from act.util.format_utils import rule
 from act.config.config import VALID_BOUNDINGS, VALID_SOLVER_TIERS
+from act.config.backend_cli import _add_dataclass_config_args
 
 logger = logging.getLogger(__name__)
 from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
@@ -34,6 +35,7 @@ from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
 from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.model_synthesis import synthesize_models_and_seeds_from_specs
+from act.front_end.spec_creator_base import SpecTuple
 from act.config.frontend_cli import (
     print_unified_list, print_unified_search, print_unified_info,
     handle_unified_download, print_list_downloads,
@@ -316,7 +318,7 @@ def cmd_fuzz(args) -> int:
     print(f"STEP 1: Loading Data-Model Pairs")
     print(f"{rule()}\n")
 
-    spec_results = []
+    spec_results: list[SpecTuple] = []
     try:
         if creator == "vnnlib":
             spec_creator = VNNLibSpecCreator()
@@ -428,7 +430,7 @@ def cmd_fuzz(args) -> int:
 
     try:
         wrapped_models, synthesized_seeds = synthesize_models_and_seeds_from_specs(
-            cast(Any, spec_results), cd_group="shape"
+            spec_results, cd_group="shape"
         )
     except Exception as e:
         print(f"❌ Model synthesis failed: {e}")
@@ -609,65 +611,60 @@ def _verify_and_validate_cell(
         )
 
 
-def _run_vnnlib_verify(args) -> bool:
-    """Drive ``verify_once`` over a VNNLIB benchmark end-to-end.
-
-    Bridges the front-end load → ACT-Net path that ``act.back_end --verify
-    --network`` does not provide: ``VNNLibSpecCreator`` →
-    ``synthesize_models_from_specs`` → ``TorchToACT`` → ``verify_once``.
-
-    Single-mode per invocation, matching the ``act.back_end --verify`` CLI
-    contract. Multi-mode sweeps are the caller's job. Dual ignores
-    ``--tf-modes``; the standalone HybridZ solver selects HybridzTF.
-    """
-    from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
-    from act.front_end.model_synthesis import synthesize_models_from_specs
-    from act.pipeline.verification.torch2act import TorchToACT
-    from act.back_end.transfer_functions import (
-        set_solver_mode,
-        set_transfer_function_mode,
-    )
-
-    if not args.category:
-        raise ValueError("--verify vnnlib requires --category (e.g. --category acasxu_2023)")
-
-    solver = (args.solvers or ["torchlp"])[0]
-    tf_mode = _effective_tf_modes(solver, args.tf_modes)[0]
+def _apply_verify_mode(solver: str, tf_mode: str) -> str:
+    """Set the solver mode (and the TF mode unless dual); return the cell's mode label."""
+    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
 
     set_solver_mode(solver)
     if solver != "dual":
         set_transfer_function_mode(tf_mode)
-    label = solver if solver == "dual" else f"{tf_mode}/{solver}"
-    print(f"[vnnlib] category={args.category} max_instances={args.max_instances} mode={label}")
+    return solver if solver == "dual" else f"{tf_mode}/{solver}"
 
-    spec_results = VNNLibSpecCreator().create_specs_for_data_model_pairs(
-        categories=[args.category], max_instances=args.max_instances,
-    )
-    if not spec_results:
-        raise RuntimeError(f"VNNLibSpecCreator produced no spec_results for category={args.category!r}")
 
-    if getattr(args, "merge_split_relus", False):
-        from act.front_end.model_synthesis import merge_split_relus
+def _select_verify_mode(args) -> tuple[str, str, str]:
+    """Apply the FIRST --solvers entry and its first effective TF mode.
 
-        merged_results = []
-        for sr in spec_results:
-            merged_model, n_merged = merge_split_relus(sr[2])
-            if n_merged:
-                print(f"[merge] fused {n_merged} split-ReLU neurons in {sr[1]}")
-                sr = tuple(merged_model if i == 2 else v for i, v in enumerate(sr))
-            merged_results.append(sr)
-        spec_results = merged_results
+    Single-mode per invocation, matching the ``act.back_end --verify`` CLI
+    contract; returns ``(solver, tf_mode, label)``.
+    """
+    solver = (args.solvers or ["torchlp"])[0]
+    tf_mode = _effective_tf_modes(solver, args.tf_modes)[0]
+    return solver, tf_mode, _apply_verify_mode(solver, tf_mode)
+
+
+def _wrap_spec_results(spec_results: list[SpecTuple]) -> dict[tuple[str, str, str, str], torch.nn.Module]:
+    """Synthesize the VerifiableModels of ``spec_results``; raise when there are none."""
+    from act.front_end.model_synthesis import synthesize_models_from_specs
 
     wrapped = synthesize_models_from_specs(spec_results)
     if not wrapped:
         raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
+    return wrapped
+
+
+def _validation_failed(args, validator, errors_seen: bool = False) -> bool:
+    """Driver result: the validator's verdict under --validate-soundness, else errors seen."""
+    if args.validate_soundness:
+        assert validator is not None
+        return validator.overall_failed(args.ignore_errors)
+    return False if args.ignore_errors else errors_seen
+
+
+def _verify_wrapped(args, wrapped, solver: str, tf_mode: str, bab_cells: bool = False) -> bool:
+    """Shared driver tail: convert each wrapped model to an ACT Net and verify it.
+
+    ``bab_cells`` (the VNNLIB ``--bab`` hook) runs ``verify_bab_batched`` on
+    every cell instead of ``verify_once`` and skips soundness validation.
+    Returns whether validation failed.
+    """
+    from act.pipeline.verification.torch2act import TorchToACT
 
     per_neuron_config = _per_neuron_config(args)
     validator = _build_validator(args) if args.validate_soundness else None
     for mid, vm in wrapped.items():
         tag = "/".join(str(p) for p in mid)
         net = TorchToACT(vm).run()
-        if getattr(args, "bab", False):
+        if bab_cells:
             if args.validate_soundness:
                 print("⚠️  --validate-soundness is not yet supported with --bab; skipping validation")
             status = _run_bab_on_net(net, args)
@@ -684,11 +681,49 @@ def _run_vnnlib_verify(args) -> bool:
                 tf_mode=tf_mode,
                 per_neuron_config=per_neuron_config,
             )
+    return _validation_failed(args, validator)
 
-    if args.validate_soundness:
-        assert validator is not None
-        return validator.overall_failed(args.ignore_errors)
-    return False
+
+def _run_vnnlib_verify(args) -> bool:
+    """Drive ``verify_once`` over a VNNLIB benchmark end-to-end.
+
+    Bridges the front-end load → ACT-Net path that ``act.back_end --verify
+    --network`` does not provide: ``VNNLibSpecCreator`` →
+    ``synthesize_models_from_specs`` → ``TorchToACT`` → ``verify_once``.
+
+    Single-mode per invocation, matching the ``act.back_end --verify`` CLI
+    contract. Multi-mode sweeps are the caller's job. Dual ignores
+    ``--tf-modes``; the standalone HybridZ solver selects HybridzTF.
+    """
+    from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
+
+    if not args.category:
+        raise ValueError("--verify vnnlib requires --category (e.g. --category acasxu_2023)")
+
+    solver, tf_mode, label = _select_verify_mode(args)
+    print(f"[vnnlib] category={args.category} max_instances={args.max_instances} mode={label}")
+
+    spec_results = VNNLibSpecCreator().create_specs_for_data_model_pairs(
+        categories=[args.category], max_instances=args.max_instances,
+    )
+    if not spec_results:
+        raise RuntimeError(f"VNNLibSpecCreator produced no spec_results for category={args.category!r}")
+
+    if getattr(args, "merge_split_relus", False):
+        from act.front_end.model_synthesis import merge_split_relus
+
+        merged_results: list[SpecTuple] = []
+        for sr in spec_results:
+            merged_model, n_merged = merge_split_relus(sr[2])
+            if n_merged:
+                print(f"[merge] fused {n_merged} split-ReLU neurons in {sr[1]}")
+                sr = (sr[0], sr[1], merged_model, sr[3], sr[4])
+            merged_results.append(sr)
+        spec_results = merged_results
+
+    return _verify_wrapped(
+        args, _wrap_spec_results(spec_results), solver, tf_mode, bab_cells=getattr(args, "bab", False)
+    )
 
 
 @contextmanager
@@ -774,23 +809,12 @@ def _run_torchvision_verify(args) -> bool:
     avoid materializing the dense linear-bound matrix at high dims.
     """
     from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
-    from act.front_end.model_synthesis import synthesize_models_from_specs
     from act.pipeline.verification.torch2act import TorchToACT
-    from act.back_end.transfer_functions import (
-        set_solver_mode,
-        set_transfer_function_mode,
-    )
 
     if not args.dataset:
         raise ValueError("--verify torchvision requires --dataset (e.g. --dataset MNIST)")
 
-    solver = (args.solvers or ["torchlp"])[0]
-    tf_mode = _effective_tf_modes(solver, args.tf_modes)[0]
-
-    set_solver_mode(solver)
-    if solver != "dual":
-        set_transfer_function_mode(tf_mode)
-    label = solver if solver == "dual" else f"{tf_mode}/{solver}"
+    solver, tf_mode, label = _select_verify_mode(args)
     model_label = args.model or "<all>"
     print(
         f"[torchvision] dataset={args.dataset} model={model_label} "
@@ -808,10 +832,7 @@ def _run_torchvision_verify(args) -> bool:
             f"dataset={args.dataset!r}, model={args.model!r}"
         )
 
-    wrapped = synthesize_models_from_specs(spec_results)
-    if not wrapped:
-        raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
-
+    wrapped = _wrap_spec_results(spec_results)
     if getattr(args, "bab", False):
         if args.validate_soundness:
             print("⚠️  --validate-soundness is not yet supported with --bab; skipping validation")
@@ -827,33 +848,12 @@ def _run_torchvision_verify(args) -> bool:
         label = f"BaB[{args.bab_solver_tier}]"
         print(f"  {tag} (sample 0 / local-robustness): {label} → {status}")
         return False
-
-    per_neuron_config = _per_neuron_config(args)
-    validator = _build_validator(args) if args.validate_soundness else None
-    for mid, vm in wrapped.items():
-        tag = "/".join(str(p) for p in mid)
-        net = TorchToACT(vm).run()
-        _verify_and_validate_cell(
-            tag=tag,
-            model=vm,
-            net=net,
-            args=args,
-            validator=validator,
-            solver=solver,
-            tf_mode=tf_mode,
-            per_neuron_config=per_neuron_config,
-        )
-
-    if args.validate_soundness:
-        assert validator is not None
-        return validator.overall_failed(args.ignore_errors)
-    return False
+    return _verify_wrapped(args, wrapped, solver, tf_mode)
 
 
 def _run_netfactory_verify(args) -> bool:
     """Run verify_once over ModelFactory networks, optionally with validation."""
     from act.back_end.solver.solver_gurobi import is_gurobi_available
-    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
 
     validator = _build_validator(args)
     networks = args.networks.split(",") if args.networks else validator.factory.list_networks()
@@ -870,9 +870,7 @@ def _run_netfactory_verify(args) -> bool:
             for tf_mode in _effective_tf_modes(solver, args.tf_modes):
                 for batch_size in batch_sizes:
                     try:
-                        set_solver_mode(solver)
-                        if solver != "dual":
-                            set_transfer_function_mode(tf_mode)
+                        label = _apply_verify_mode(solver, tf_mode)
                         act_net = validator.factory.get_act_net(name)
                         act_net = validator._batchify_net(act_net, batch_size)
                         reason = validator.skip_reason(act_net, solver, tf_mode)
@@ -888,7 +886,6 @@ def _run_netfactory_verify(args) -> bool:
                         # lanes (false [soundness] FAILED).
                         from act.pipeline.verification.act2torch import ACTToTorch
                         model = ACTToTorch(act_net).run()
-                        label = solver if solver == "dual" else f"{tf_mode}/{solver}"
                         _verify_and_validate_cell(
                             tag=name,
                             model=model,
@@ -918,11 +915,7 @@ def _run_netfactory_verify(args) -> bool:
                             name, solver, tf_mode, batch_size, f"Outer exception: {str(e)}"
                         )
 
-    return (
-        validator.overall_failed(args.ignore_errors)
-        if args.validate_soundness
-        else (False if args.ignore_errors else errors_seen)
-    )
+    return _validation_failed(args, validator, errors_seen)
 
 
 def cmd_verify(target: str, args):
@@ -1197,20 +1190,20 @@ Exit statuses:
             "KKT multipliers."
         ),
     )
-    bab_group.add_argument(
-        "--bab-max-depth",
-        type=int,
-        default=None,
-        help="Maximum BaB tree depth (default: from config.yaml)",
-    )
+    # Typed --bab-* flags shared with the back-end CLI (BaBConfig field -> help).
+    _add_dataclass_config_args(parser, bab_group, {
+        "max_depth": "Maximum BaB tree depth (default: from config.yaml)",
+    })
     bab_group.add_argument(
         "--bab-max-nodes",
+        "--bab-max-subproblems",
         type=int,
         default=None,
         help="Maximum BaB nodes to expand (default: from config.yaml)",
     )
     bab_group.add_argument(
         "--bab-branching-method",
+        "--bab-branching",
         type=str,
         default=None,
         choices=["random", "babsr", "fsb", "gain", "width"],
@@ -1239,22 +1232,14 @@ Exit statuses:
             "Default: from config.yaml."
         ),
     )
-    bab_group.add_argument(
-        "--bab-top-k",
-        type=int,
-        default=None,
-        help=(
+    _add_dataclass_config_args(parser, bab_group, {
+        "top_k": (
             "Cap on subproblems popped per BaB wave, independent of the batch "
             "size; 0 = unbounded. Honoured by --bab-bounding "
             "depth_bound_blend/greedy/annealed/diverse_split_signs; rejected "
             "for random/mcts (default: from config.yaml)"
         ),
-    )
-    bab_group.add_argument(
-        "--bab-multi-split-levels",
-        type=int,
-        default=None,
-        help=(
+        "multi_split_levels": (
             "Neurons split jointly per branching step; each lane fans out into "
             "all 2^k sign combinations (verdict-boundary joint splitting). "
             "1 = single split. With --bab-multi-split-levels > 1 the k neurons "
@@ -1262,13 +1247,8 @@ Exit statuses:
             "--bab-branching-method. Requires --bab-solver-tier dual_alpha or "
             "dual_alpha_eta (default: from config.yaml)"
         ),
-    )
-    bab_group.add_argument(
-        "--bab-sa-cooling-rate",
-        type=float,
-        default=None,
-        help="Cooling rate for --bab-bounding annealed (default: from config.yaml)",
-    )
+        "sa_cooling_rate": "Cooling rate for --bab-bounding annealed (default: from config.yaml)",
+    })
     bab_group.add_argument(
         "--bab-per-class-alpha",
         type=str,
@@ -1285,18 +1265,10 @@ Exit statuses:
         default=None,
         help="Disable parent→child α/η incremental-start propagation (debugging / ablation).",
     )
-    bab_group.add_argument(
-        "--bab-frontier-cap",
-        type=int,
-        default=None,
-        help="Maximum pending BaB frontier leaves to retain; 0 disables eviction (default: from config.yaml)",
-    )
-    bab_group.add_argument(
-        "--bab-input-split-fanout",
-        type=int,
-        default=None,
-        help="Uniform fanout for input splits; 2 preserves binary splitting (default: from config.yaml)",
-    )
+    _add_dataclass_config_args(parser, bab_group, {
+        "frontier_cap": "Maximum pending BaB frontier leaves to retain; 0 disables eviction (default: from config.yaml)",
+        "input_split_fanout": "Uniform fanout for input splits; 2 preserves binary splitting (default: from config.yaml)",
+    })
     bab_group.add_argument(
         "--bab-provenance",
         action="store_true",

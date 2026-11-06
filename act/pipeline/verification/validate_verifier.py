@@ -125,7 +125,7 @@
 import copy
 import torch
 import logging
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Any
 
 from act.back_end.core import Net, Layer
 from act.pipeline.verification.model_factory import ModelFactory
@@ -169,7 +169,7 @@ class VerificationValidator:
                 f.write(f"{rule()}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
 
-    def _batchify_net(self, net: Net, target_B: Optional[int]) -> Net:
+    def _batchify_net(self, net: Net, target_B: int | None) -> Net:
         """Return a deep copy of ``net`` with INPUT/INPUT_SPEC/ASSERT tensors
         adjusted to ``target_B`` lanes along axis 0.
 
@@ -304,7 +304,7 @@ class VerificationValidator:
             else len(L.in_vars)
         )
 
-        high: Dict[str, Any] = {}
+        high: dict[str, Any] = {}
 
         if kind in ("TOP1_ROBUST", "MARGIN_ROBUST"):
             y_true = params.get("y_true")
@@ -379,7 +379,7 @@ class VerificationValidator:
 
     def _network_supported_by_mode(
         self, net: Net, tf_mode: str
-    ) -> Tuple[bool, List[str]]:
+    ) -> tuple[bool, list[str]]:
         """Return ``(is_supported, sorted_blocking_kinds)`` for the
         (network, tf_mode) pair.
 
@@ -410,8 +410,8 @@ class VerificationValidator:
         name: str,
         model: torch.nn.Module,
         max_random: int = 64,
-        act_net: Optional[Net] = None,
-    ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
+        act_net: Net | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]] | None:
         """
         Try to find a concrete counterexample via concrete execution.
         Returns (input_tensor, results_dict) if found, else None.
@@ -462,7 +462,7 @@ class VerificationValidator:
             dim = int(spec_lb.numel())
             geometry = act_net.input_geometry if act_net is not None else None
 
-            def _probe(x_flat: torch.Tensor, label: str) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
+            def _probe(x_flat: torch.Tensor, label: str) -> tuple[torch.Tensor, dict[str, Any]] | None:
                 x = (
                     x_flat.reshape(*input_shape)
                     if (input_shape and shape_prod == x_flat.numel())
@@ -514,14 +514,14 @@ class VerificationValidator:
         tag: str,
         model: torch.nn.Module,
         act_net: Net,
-        results: List[Any],
+        results: list[Any],
         solver: str,
         tf_mode: str = "interval",
-        facts: Optional[Dict[int, Any]] = None,
+        facts: dict[int, Any] | None = None,
         num_samples: int = 10,
-        per_neuron_config: Optional[PerNeuronCheckConfig] = None,
-        batch_size: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        per_neuron_config: PerNeuronCheckConfig | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
         """Run unified Level-1 and Level-2 validation after verification."""
         model = model.to(self.device, self.dtype).eval()
 
@@ -580,7 +580,7 @@ class VerificationValidator:
         act_net: Net,
         solver: str,
         tf_mode: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Return the capability skip reason for an unsupported (net, solver, tf_mode) cell."""
         if solver == "dual":
             from act.back_end.dual_tf.dual_tf import DualTF
@@ -616,47 +616,38 @@ class VerificationValidator:
         )
         return False if ignore_errors else failed
 
-    def _record(self, **fields) -> Dict[str, Any]:
+    def _record(self, **fields) -> dict[str, Any]:
         self.validation_results.append(fields)
         return fields
 
-    def record_skip(
-        self,
-        name: str,
-        solver: str,
-        tf_mode: str,
-        batch_size: Optional[int],
-        reason: str,
-    ) -> Dict[str, Any]:
-        record = self._record(
-            network=name,
-            solver=solver,
-            tf_mode=tf_mode,
-            batch_size=batch_size,
-            validation_type="counterexample",
-            validation_status="SKIPPED",
-            explanation=f"⏭️  SKIPPED: {reason}",
-        )
-        logger.info("\n  %s", record["explanation"])
-        return record
-
-    def record_error(
-        self,
-        name: str,
-        solver: str,
-        tf_mode: str,
-        batch_size: Optional[int],
-        error: str,
-    ) -> Dict[str, Any]:
+    def _counterexample_record(
+        self, name: str, solver: str, tf_mode: str, batch_size: int | None, **fields: Any,
+    ) -> dict[str, Any]:
         return self._record(
             network=name,
             solver=solver,
             tf_mode=tf_mode,
             batch_size=batch_size,
             validation_type="counterexample",
-            status="ERROR",
-            error=error,
-            concrete_counterexample=False,
+            **fields,
+        )
+
+    def record_skip(
+        self, name: str, solver: str, tf_mode: str, batch_size: int | None, reason: str,
+    ) -> dict[str, Any]:
+        record = self._counterexample_record(
+            name, solver, tf_mode, batch_size,
+            validation_status="SKIPPED", explanation=f"⏭️  SKIPPED: {reason}",
+        )
+        logger.info("\n  %s", record["explanation"])
+        return record
+
+    def record_error(
+        self, name: str, solver: str, tf_mode: str, batch_size: int | None, error: str,
+    ) -> dict[str, Any]:
+        return self._counterexample_record(
+            name, solver, tf_mode, batch_size,
+            status="ERROR", error=error, concrete_counterexample=False,
         )
 
     def _validate_bounds_for_hook(
@@ -667,15 +658,15 @@ class VerificationValidator:
         act_net: Net,
         solver: str,
         tf_mode: str,
-        facts: Optional[Dict[int, Any]],
+        facts: dict[int, Any] | None,
         num_samples: int,
-        per_neuron_config: Optional[PerNeuronCheckConfig],
-        batch_size: Optional[int],
-    ) -> Optional[Dict[str, Any]]:
+        per_neuron_config: PerNeuronCheckConfig | None,
+        batch_size: int | None,
+    ) -> dict[str, Any] | None:
         """Run Level-2 bounds validation for the unified hook."""
         record_tf_mode = "dual-forward" if solver == "dual" else tf_mode
 
-        def _bounds_record(**fields) -> Dict[str, Any]:
+        def _bounds_record(**fields) -> dict[str, Any]:
             return self._record(
                 network=tag,
                 tf_mode=record_tf_mode,
@@ -826,9 +817,9 @@ class VerificationValidator:
         self,
         network_name: str,
         solver_name: str,
-        concrete_counterexample: Optional[Tuple[torch.Tensor, Dict[str, Any]]],
+        concrete_counterexample: tuple[torch.Tensor, dict[str, Any]] | None,
         verifier_status: VerifyStatus,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Cross-validate concrete inference vs formal verification (Level 1).
 
@@ -900,7 +891,7 @@ class VerificationValidator:
 
         return result
 
-    def _compute_summary(self, validation_type: str) -> Dict[str, Any]:
+    def _compute_summary(self, validation_type: str) -> dict[str, Any]:
         """
         Compute validation summary statistics for specific validation type.
 
@@ -915,8 +906,8 @@ class VerificationValidator:
         return self._summarize_results(validation_type, results)
 
     def _summarize_results(
-        self, validation_type: str, results: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
+        self, validation_type: str, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         total = len(results)
 
         if total == 0:
@@ -977,7 +968,7 @@ class VerificationValidator:
         self._print_summary(summary)
         return summary
 
-    def _print_summary(self, summary: Dict[str, Any]):
+    def _print_summary(self, summary: dict[str, Any]):
         """Print validation summary for specific validation type."""
         validation_type = summary.get("validation_type", "unknown")
 
