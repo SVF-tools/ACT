@@ -253,6 +253,11 @@ class RandomBounding(BoundingStrategy):
     def __len__(self) -> int:
         return 0 if self._batch is None else self._batch.batch_size
 
+    def node_ids(self) -> list[int]:
+        """IDs currently pending in the pool, for progress observation."""
+        ids = None if self._batch is None else self._batch.node_id
+        return [] if ids is None else ids.detach().cpu().tolist()
+
     def _resident_batch(self) -> SubproblemBatch | None:
         return self._batch
 
@@ -464,6 +469,10 @@ class TopKBounding(BoundingStrategy):
             raise IndexError("view of empty pool")
         indices = torch.arange(self._lb.shape[0], device=self._lb.device)
         return self._build(indices)
+
+    def node_ids(self) -> list[int]:
+        """IDs currently pending in the pool, for progress observation."""
+        return [] if self._node_id is None else self._node_id.detach().cpu().tolist()
 
     def checkpoint(self) -> SubproblemBatch | None:
         """Retain resident references without copying the frontier payload."""
