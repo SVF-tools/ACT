@@ -38,8 +38,21 @@ Example:
 """
 
 # Core imports
-from act.pipeline.verification.model_factory import ModelFactory
-from act.pipeline.verification.torch2act import TorchToACT
+from importlib import import_module
+from typing import Any
+
+# Lazy exports: back-end modules import act.pipeline.gui on hot paths, and an
+# eager verification import here would close a back_end -> pipeline cycle.
+_EXPORTS = {
+    "ModelFactory": "act.pipeline.verification.model_factory",
+    "TorchToACT": "act.pipeline.verification.torch2act",
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(import_module(_EXPORTS[name]), name)
 
 __all__ = [
     # Core model factory and conversion

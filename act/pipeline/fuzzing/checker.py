@@ -15,6 +15,7 @@ import time
 import torch
 
 from act.front_end.specs import OutKind, OutputSpec
+from act.util.counterexample import output_violations
 
 if TYPE_CHECKING:
     from act.pipeline.fuzzing.corpus import FuzzingSeed
@@ -157,8 +158,8 @@ class PropertyChecker:
                 f"({inputs.shape[0]},), got {tuple(input_satisfied.shape)}"
             )
         
-        violations_mask, severity = self.spec.violation(
-            outputs, rows=seeds.original_index
+        violations_mask, severity = output_violations(
+            outputs, self.spec, rows=seeds.original_index
         )
         rejected_mask = violations_mask & ~input_satisfied
         rejected_count = int(rejected_mask.sum().item())

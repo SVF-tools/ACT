@@ -19,6 +19,8 @@ import torch
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.util.device_manager import get_default_device
 
+SELECTION_STRATEGIES = ("energy", "random")
+
 
 class FuzzingSeed:
     """
@@ -118,6 +120,8 @@ class SeedCorpus:
             initial_seeds: Initial seeds from spec creators
             strategy: Selection strategy ("energy" or "random")
         """
+        if strategy not in SELECTION_STRATEGIES:
+            raise ValueError(f"Unknown seed selection strategy: {strategy}. Valid options: {list(SELECTION_STRATEGIES)}")
         self.strategy = strategy
         self.seen_hashes: set[tuple[int, int]] = set()
         self._device = get_default_device()

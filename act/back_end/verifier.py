@@ -48,16 +48,19 @@ from __future__ import annotations
 from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, Tuple, Literal, overload
 
 import torch
+from act.pipeline.gui import verifier_gui as _obs
 import copy
 
 # ACT backend imports
 from act.back_end.core import Bounds, Con, ConSet, Fact, Net
+from act.util.counterexample import validate_counterexamples
 from act.back_end.solver.solver_base import Solver, SolveStatus, BatchLPSolution
 from act.back_end.layer_schema import LayerKind
 from act.back_end.utils import validate_constraints
 
 if TYPE_CHECKING:
     from act.back_end.analyze import AnalyzeCache
+    from act.config.config import DualConfig
 
 # Front-end enums (kinds)
 from act.front_end.specs import InKind, OutKind, OutputSpec
@@ -363,8 +366,6 @@ def verify_lp_batched(
     this function decodes each solver lane to a ``VerifyResult`` and validates
     SAT candidates concretely before reporting FALSIFIED.
     """
-    import importlib
-
     _, seed_bounds, batch_size = _setup_verify_context(net)
     if seed_bounds.ub.dim() < 2:
         raise ValueError(
@@ -392,7 +393,6 @@ def verify_lp_batched(
     input_ids = get_input_ids(net)
     input_index = torch.tensor(input_ids, device=solution.x.device, dtype=torch.long)
     x_candidates = solution.x.index_select(1, input_index).reshape_as(seed_bounds.lb)
-    assert_layer = get_assert_layer(net)
 
     sat_mask = torch.tensor(
         [status in (SolveStatus.SAT, "FEASIBLE") for status in solution.statuses],
@@ -401,21 +401,9 @@ def verify_lp_batched(
     )
     violations = torch.zeros(batch_size, device=x_candidates.device, dtype=torch.bool)
     if bool(sat_mask.any().item()):
-        violation_module = importlib.import_module("act.back_end.bab.violation")
         # Keep the original lane layout through model and ASSERT evaluation;
         # selecting SAT inputs alone loses per-sample targets and input specs.
-        checked = violation_module.check_violations_batched(
-            net, x_candidates, assert_layer,
-        )
-        in_region = violation_module._check_input_specs_batched(
-            x_candidates, gather_input_spec_layers(net)
-        )
-        if checked.shape != (batch_size,):
-            raise ValueError(
-                f"verify_lp_batched: check_violations_batched returned "
-                f"shape={tuple(checked.shape)} expected ({batch_size},)"
-            )
-        violations = checked.to(device=x_candidates.device, dtype=torch.bool) & in_region & sat_mask
+        violations = validate_counterexamples(net, x_candidates) & sat_mask
 
     results: List[VerifyResult] = []
     x_cpu = x_candidates.detach().cpu()
@@ -477,6 +465,9 @@ def verify_once(
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[False] = False,
+    dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult]:
@@ -489,18 +480,25 @@ def verify_once(
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: Literal[True],
+    dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
     ...
 
 
+@_obs.observed_phase("verify_once")
 @torch.no_grad()
 def verify_once(
     net,
     *,
     model_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     collect_facts: bool = False,
+    dual_iters: int = 0,
+    dual_config: Optional["DualConfig"] = None,
+    dual_refresh_forward: bool = False,
     timelimit: Optional[float] = None,
     hybridz_tolerance: Optional[float] = None,
 ) -> List[VerifyResult] | Tuple[List[VerifyResult], Optional[Dict[int, Any]]]:
@@ -527,14 +525,23 @@ def verify_once(
             and whose INPUT_SPEC layers carry already-batchified
             ``[B, *input_shape]`` lb/ub.
         model_fn: optional callable mapping ``x: [B, *input_shape] ->
-            [B, n_out]`` for concrete falsification. If omitted, the
-            FALSIFIED status is never produced (FALSIFIED requires evidence).
+            [B, n_out]`` for concrete candidate validation. Without it,
+            dual witnesses use ACT's reconstructed model and interval
+            verification does not generate a centre candidate.
         collect_facts: when true, return the verifier results together with
             the fact map used by validation: analyze() ``after`` facts for the
             interval/hybridz path, or dual pre-activation forward bounds for the
             dual path.
         timelimit: optional HybridZ verdict-solver wall-clock limit in seconds.
         hybridz_tolerance: optional HybridZ MILP feasibility/spec tolerance.
+        dual_iters: optional dual alpha iterations; zero preserves the
+            fixed-slope single-pass default.
+        dual_config: optional optimizer policy of those iterations (learning
+            rates, decay, per-class alpha, stagnation/time stops, forward
+            linear cap); ``None`` keeps DualSolver's built-in defaults.
+        dual_refresh_forward: recompute the forward pre-activation bounds from
+            the current alpha on every iteration; false keeps the initial
+            forward bounds fixed and optimizes alpha only.
 
     Returns:
         ``List[VerifyResult]`` of length ``B`` (one per input lane), or
@@ -587,17 +594,40 @@ def verify_once(
 
     if is_dual:
         from act.back_end.solver.solver_dual import DualSolver
+        assert out_spec is not None
         num_classes = len(output_ids)
         # DualSolver is now self-contained: no tf parameter, evaluate_spec
         # computes its own pre-activation forward bounds internally from the net.
-        solver = DualSolver()
+        solver = DualSolver(
+            n_iters=dual_iters, config=dual_config,
+            refresh_forward=dual_refresh_forward,
+        )
         result = solver.evaluate_spec(
             net,
             out_spec,
             num_classes=num_classes,
             collect_bounds=collect_facts,
+            return_witness=True,
         )
-        results = result.to_verify_results()
+        candidates = None
+        falsified = None
+        candidate_metadata = None
+        unresolved = ~result.certified & result.active_mask.any(dim=1)
+        if result.witness is not None and bool(unresolved.any()):
+            # Candidate ranking belongs to dual; inactive specification rows
+            # must never displace a participating row.
+            rows = result.slack.masked_fill(~result.active_mask, float("inf")).argmin(1)
+            candidates = result.witness[
+                torch.arange(B, device=result.witness.device), rows
+            ].reshape_as(seed_bounds.lb)
+            falsified = validate_counterexamples(net, candidates, model_fn=model_fn) & unresolved
+            candidate_metadata = [
+                {"source": "dual_witness", "spec_row": row} for row in rows.tolist()
+            ]
+        results = result.to_verify_results(
+            counterexamples=candidates, falsified=falsified,
+            counterexample_metadata=candidate_metadata,
+        )
         if collect_facts:
             return results, solver.last_forward_bounds
         return results
@@ -727,29 +757,7 @@ def verify_once(
     counterexamples: List[Optional[torch.Tensor]] = [None] * B
     if model_fn is not None:
         x_center = 0.5 * (seed_bounds.lb + seed_bounds.ub)
-        y_concrete = model_fn(x_center)
-        if y_concrete.dim() != 2 or y_concrete.shape != (B, n_out):
-            raise ValueError(
-                f"verify_once: model_fn returned shape "
-                f"{tuple(y_concrete.shape)}, expected ({B}, {n_out})"
-            )
-        y_concrete = y_concrete.to(device=device, dtype=dtype)
-        C_view = C.view(B, M, n_out)
-        concrete_violation = torch.einsum("bmn,bn->bm", C_view, y_concrete)
-        if is_unsafe_linear:
-            # Concrete y is in the UNSAFE polytope iff ALL rows c_i @ y <= d_i;
-            # that is the violation condition for UNSAFE_LINEAR.
-            falsified = (~certified) & (
-                (concrete_violation <= thresholds).all(dim=-1)
-            )
-        else:
-            # Closed unsafe sets include equality; LINEAR_LE/RANGE do not.
-            violation_rows = (
-                concrete_violation >= thresholds
-                if kind in OutputSpec.CLOSED_KINDS
-                else concrete_violation > thresholds
-            )
-            falsified = (~certified) & violation_rows.any(dim=-1)
+        falsified = (~certified) & validate_counterexamples(net, x_center, model_fn=model_fn)
         if falsified.any():
             x_center_cpu = x_center.detach().cpu()
             # B1 (oracle-verified): single sync via .tolist() replaces B per-element .item() syncs.

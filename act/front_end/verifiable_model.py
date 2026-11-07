@@ -83,6 +83,7 @@ from act.front_end.specs import InputGeometry, InputSpec, OutputSpec, InKind, Ou
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.back_end.layer_schema import LayerKind, REGISTRY
 from act.back_end.layer_util import create_layer
+from act.util.counterexample import input_constraint_satisfied, output_violations
 
 
 class VerifiableModel(nn.Module):
@@ -554,12 +555,10 @@ class InputSpecLayer(nn.Module):
             ):
                 return (x, True, "⚠️ INPUT BOX: Missing lb/ub")
             
-            lb = self._gather_rows(lb_buffer, rows, batch_size, "lb")
-            ub = self._gather_rows(ub_buffer, rows, batch_size, "ub")
-
-            lb_ok = (x >= lb).reshape(batch_size, -1).all(dim=1)  # (batch,)
-            ub_ok = (x <= ub).reshape(batch_size, -1).all(dim=1)  # (batch,)
-            satisfied = lb_ok & ub_ok  # (batch,) bool tensor
+            satisfied = input_constraint_satisfied(x, self.kind, {
+                "lb": self._gather_rows(lb_buffer, rows, batch_size, "lb"),
+                "ub": self._gather_rows(ub_buffer, rows, batch_size, "ub"),
+            })
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT BOX: {n_ok}/{batch_size} satisfied"
             
@@ -577,14 +576,12 @@ class InputSpecLayer(nn.Module):
                 center_buffer, rows, batch_size, "center"
             )
             
-            # Per-sample L∞ distance
-            linf = (x - center).abs().reshape(batch_size, -1).max(dim=1)[0]  # (batch,)
-            
-            # Compare against per-sample eps threshold.
             eps = self._gather_rows(
                 eps_buffer, rows, batch_size, "eps"
-            ).reshape(batch_size)
-            satisfied = linf <= eps
+            ).reshape(batch_size, *([1] * (x.dim() - 1)))
+            satisfied = input_constraint_satisfied(
+                x, self.kind, {"lb": center - eps, "ub": center + eps}
+            )
             
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT L∞: {n_ok}/{batch_size} satisfied"
@@ -608,7 +605,7 @@ class InputSpecLayer(nn.Module):
                 self._gather_rows(mask_buffer, rows, batch_size, "perturbed_positions"),
                 float(norm_buffer.item()),
             )
-            satisfied = geometry.contains(x)
+            satisfied = input_constraint_satisfied(x, self.kind, {}, geometry=geometry)
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT LP_EMBEDDING: {n_ok}/{batch_size} satisfied"
             return (x, satisfied, explanation)
@@ -620,15 +617,12 @@ class InputSpecLayer(nn.Module):
             ):
                 return (x, True, "⚠️ INPUT LIN_POLY: Missing A/b")
             
-            x_flat = x.reshape(batch_size, -1)  # (batch, n_vars)
             if A_buffer.dim() == 3:
-                A = self._gather_rows(A_buffer, rows, batch_size, "A")
-                b = self._gather_rows(b_buffer, rows, batch_size, "b")
-                residuals = torch.bmm(A, x_flat.unsqueeze(-1)).squeeze(-1) - b
-            else:
-                residuals = x_flat @ A_buffer.T - b_buffer
-            max_viol = residuals.max(dim=1)[0]  # (batch,)
-            satisfied = max_viol <= 0
+                A_buffer = self._gather_rows(A_buffer, rows, batch_size, "A")
+                b_buffer = self._gather_rows(b_buffer, rows, batch_size, "b")
+            satisfied = input_constraint_satisfied(
+                x, self.kind, {"A": A_buffer, "b": b_buffer}
+            )
             
             # Unified explanation format (consistent across all batch sizes)
             n_ok = satisfied.sum().item()
@@ -726,7 +720,7 @@ class OutputSpecLayer(nn.Module):
             For batch=1 and batch>1: satisfied is (batch,) bool tensor
         """
         batch_size = y.shape[0]
-        violated, _severity = self.spec.violation(y)
+        violated, _severity = output_violations(y, self.spec)
         satisfied = ~violated
         n_ok = satisfied.sum().item()
         kind_label = self.spec.kind.removesuffix("_ROBUST")
