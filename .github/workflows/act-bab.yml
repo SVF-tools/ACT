@@ -368,6 +368,11 @@ jobs:
             --bab-bounding depth_bound_blend --bab-provenance \
             --bab-max-depth 3 --bab-max-nodes 10 --device cpu --dtype float64
 
+      - name: BaB — Per-wave progress events
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end.bab.test_bab_progress
+
       # Correctness invariants are asserted in act/back_end/bab/climb.py; a
       # violation raises "CLIMB invariant violated: ..." at the failing line.
       # Exit status 0 means every lane received a verdict. The generated net's
