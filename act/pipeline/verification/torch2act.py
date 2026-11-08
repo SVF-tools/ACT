@@ -1303,6 +1303,9 @@ class _LayerGraphBuilder:
         if kind == LayerKind.CONV2D.value and isinstance(mod, nn.Conv2d):
             self._convert_conv2d(mod)
             return
+        if kind == LayerKind.CONV3D.value and isinstance(mod, nn.Conv3d):
+            self._convert_conv3d(mod)
+            return
         if kind == LayerKind.CONVTRANSPOSE2D.value and isinstance(mod, nn.ConvTranspose2d):
             self._convert_conv_transpose2d(mod)
             return
@@ -1616,6 +1619,41 @@ class _LayerGraphBuilder:
             LayerKind.CONV2D.value, params,
             self.prev_out, out_vars
         )
+        self.shape = output_shape
+        self.prev_out = out_vars
+
+    def _convert_conv3d(self, mod: nn.Conv3d) -> None:
+        """Convert a channel-first nn.Conv3d over a per-lane (1, C, D, H, W) shape."""
+        if len(self.shape) != 5 or self.shape[0] != 1:
+            raise ValueError(f"Conv3d requires a per-lane (1, C, D, H, W) shape, got {self.shape}")
+        if isinstance(mod.padding, str) or mod.padding_mode != "zeros":
+            raise NotImplementedError("Conv3d string or nonzero padding is unsupported")
+        _, in_c, *spatial = (int(d) for d in self.shape)
+        if in_c != mod.in_channels or len(self.prev_out) != _prod(self.shape):
+            raise ValueError(f"Conv3d channels/variables disagree with shape {self.shape}")
+        kernel_size = tuple(int(d) for d in mod.kernel_size)
+        stride = tuple(int(d) for d in mod.stride)
+        padding = tuple(int(d) for d in mod.padding)
+        dilation = tuple(int(d) for d in mod.dilation)
+        out_spatial = tuple(
+            (n + 2 * p - d * (k - 1) - 1) // s + 1
+            for n, p, d, k, s in zip(spatial, padding, dilation, kernel_size, stride)
+        )
+        if any(n <= 0 for n in out_spatial):
+            raise ValueError(f"Conv3d input {self.shape} produces no output")
+        out_c = int(mod.out_channels)
+        output_shape = (1, out_c, *out_spatial)
+        params = {
+            "weight": mod.weight.detach(),
+            "input_shape": self.shape, "output_shape": output_shape,
+            "kernel_size": kernel_size, "stride": stride,
+            "padding": padding, "dilation": dilation,
+            "groups": int(mod.groups), "in_channels": in_c, "out_channels": out_c,
+        }
+        if mod.bias is not None:
+            params["bias"] = mod.bias.detach()
+        out_vars = self._alloc_ids(_prod(output_shape))
+        self._add_layer(LayerKind.CONV3D.value, params, self.prev_out, out_vars)
         self.shape = output_shape
         self.prev_out = out_vars
 
@@ -2218,7 +2256,8 @@ class _LayerGraphBuilder:
 # Bind ONNX handlers from utils.py onto the class. They live there only to keep
 # this file manageable; ``self`` inside each handler is a _LayerGraphBuilder.
 for _cls_name, _fn in ONNX_HANDLERS.items():
-    setattr(_LayerGraphBuilder, _fn.__name__, _fn)
+    # Keyed by onnx2torch class name, so one handler can serve several classes.
+    setattr(_LayerGraphBuilder, f"_convert_{_cls_name}", _fn)
 del _cls_name, _fn
 
 
