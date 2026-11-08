@@ -127,7 +127,7 @@ def check_output_violations(outputs: torch.Tensor, assert_layer: Layer) -> torch
     spec = OutputSpec(
         kind=params["kind"],
         c=params["C"].to(outputs).reshape(-1, rows, outputs.shape[1]),
-        d=params["thresholds"].to(outputs),
+        d=params["thresholds"].to(outputs), strict=params.get("strict"),
         y_true=params.get("y_true"), margin=params.get("margin"),
         lb=params.get("lb"), ub=params.get("ub"),
     )

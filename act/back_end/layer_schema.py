@@ -260,6 +260,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "lb",
             "ub",
             "d",
+            "strict",
             "y_true",
             "margin",
         ],
