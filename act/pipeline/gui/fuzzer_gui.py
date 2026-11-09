@@ -7,16 +7,16 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   The ACTFuzzer lifecycle for a GUI, built on the shared ``common_gui`` API:
+#   The ACTFuzzer lifecycle for a GUI, built on the shared ``act_gui`` API:
 #     options  - ``fuzzing_options()``: every tunable FuzzingConfig field
 #                (``FUZZING_OPTIONS``) as an ``OptionDefault`` with its
 #                pipeline.yaml default
 #     records  - FuzzStart, FuzzStep (one per fuzzed batch), FuzzConfigChange,
-#                FuzzEnd, delivered through the ``common_gui`` channel
+#                FuzzEnd, delivered through the ``act_gui`` channel
 #     control  - ``FuzzControl``, a ``RunControl`` over FUZZING_OPTIONS passed
 #                to ACTFuzzer: stop, pause/resume, and live config updates,
 #                applied between batches
-#   Without a sink the loop reads ``common_gui.enabled`` once per batch; without
+#   Without a sink the loop reads ``act_gui.enabled`` once per batch; without
 #   a control it never checks one. Results are unchanged by observation.
 #
 #===---------------------------------------------------------------------===#
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Tuple
 
 import torch
 
-from act.pipeline.gui.common_gui import OptionDefault, Record, RunControl
+from act.pipeline.gui.act_gui import OptionDefault, Record, RunControl
 
 if TYPE_CHECKING:  # ACTFuzzer imports these records, so the fuzzer module loads lazily here
     from act.pipeline.fuzzing.actfuzzer import FuzzingConfig, FuzzingReport

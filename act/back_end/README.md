@@ -189,7 +189,7 @@ This forms a **refinement loop**: false CEs drive further splitting → tighter 
 ### Propagation observation and counterexamples
 
 Engine hot paths build propagation records from `act.pipeline.gui.verifier_gui`
-and emit them through `act.pipeline.gui.common_gui` (see `act/pipeline/README.md`);
+and emit them through `act.pipeline.gui.act_gui` (see `act/pipeline/README.md`);
 with no sink registered they only read its `enabled` flag.
 
 `verify_once(..., dual_iters=0)` preserves the fixed dual default. A positive

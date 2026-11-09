@@ -9,7 +9,7 @@
 # Purpose:
 #   Read-only observation of bound propagation, layer by layer and neuron by
 #   neuron, while verification runs. Records are delivered through the shared
-#   ``common_gui`` channel (``observe``/``emit``/``enabled``); instrumented
+#   ``act_gui`` channel (``observe``/``emit``/``enabled``); instrumented
 #   engine sites build them only while a sink is registered. ReLU relaxation
 #   descriptions are dispatched by domain (``DESCRIBERS``) outside the
 #   numerical kernels and run only when a sink sets ``wants_relaxation``.
@@ -42,7 +42,7 @@ from typing import Any, Callable, Mapping, Optional, Tuple
 
 import torch
 
-from act.pipeline.gui.common_gui import Option, OptionDefault, Record, wants
+from act.pipeline.gui.act_gui import Option, OptionDefault, Record, wants
 
 DOMAINS = ("interval", "hybridz", "dual")
 PASSES = ("forward", "backward", "refine")

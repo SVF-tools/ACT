@@ -5,7 +5,7 @@ import time
 from collections.abc import Iterable
 
 import torch
-from act.pipeline.gui import common_gui as _gui
+from act.pipeline.gui import act_gui as _gui
 from dataclasses import dataclass, replace
 from typing import Optional, TYPE_CHECKING
 from act.back_end.core import Bounds

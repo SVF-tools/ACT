@@ -18,7 +18,7 @@ from typing import Any, TypeAlias, cast
 from collections.abc import Callable, Iterator
 
 import torch
-from act.pipeline.gui import common_gui as _gui
+from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui import verifier_gui as _obs
 from act.back_end.core import Bounds, Layer, Net, get_topo_order
 from act.back_end.layer_schema import LayerKind

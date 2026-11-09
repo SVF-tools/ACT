@@ -48,7 +48,7 @@ from __future__ import annotations
 from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, Tuple, Literal, overload
 
 import torch
-from act.pipeline.gui import common_gui as _gui
+from act.pipeline.gui import act_gui as _gui
 import copy
 
 # ACT backend imports

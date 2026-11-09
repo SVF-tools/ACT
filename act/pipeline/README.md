@@ -26,7 +26,7 @@ act/pipeline/
 │   ├── actfuzzer.py      # Main fuzzing engine
 │   └── ...
 ├── gui/                  # ACT-side support for ACT-GUI
-│   ├── common_gui.py     # Shared sink channel, record base, options, and run control
+│   ├── act_gui.py        # Shared sink channel, record base, options, and run control
 │   ├── verifier_gui.py   # Propagation records, ReLU describers, verify_once options
 │   └── fuzzer_gui.py     # ACTFuzzer options, lifecycle records, and FuzzControl
 └── log/                  # Centralized execution logs
@@ -112,7 +112,7 @@ A fast, GPU-accelerated fuzzer that uses:
 
 ### GUI support (`gui/`)
 All ACT code that exists for ACT-GUI lives here. Verification and fuzzing share one
-interface in `gui.common_gui`:
+interface in `gui.act_gui`:
 
 - **Channel**: `observe(sink)` registers a sink for a block, `emit(record)` delivers to every
   sink, and `observed_phase(name)` brackets a function with `PhaseEvent` start/end/error.
@@ -152,7 +152,7 @@ reports activation inputs as `pre` and other layers as `out`; dual backward reco
 
 Fuzzing results are unchanged by observation, and a run without a control never checks one.
 
-`python -m act.pipeline.gui` is the self-check of this contract (run in CI): both option
+`python -m act.pipeline.gui.act_gui` is the self-check of this contract (run in CI): both option
 tables, `verify_once` in every domain under a sink, and one fuzzing run through live
 update, pause, resume, and stop.
 

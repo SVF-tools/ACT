@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 
 import torch
-from act.pipeline.gui import common_gui as _gui
+from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui import verifier_gui as _obs
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, cast

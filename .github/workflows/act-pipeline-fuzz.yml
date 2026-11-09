@@ -153,7 +153,7 @@ jobs:
       - name: GUI support self-check (observe records, fuzzing lifecycle and control)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p -m act.pipeline.gui
+          coverage run -p -m act.pipeline.gui.act_gui
 
       - name: Combine coverage data
         if: always()

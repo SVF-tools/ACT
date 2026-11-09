@@ -30,8 +30,8 @@ from act.pipeline.fuzzing.mutations import MUTATION_STRATEGIES, PERTURB_MODES, M
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SELECTION_STRATEGIES, SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
-from act.pipeline.gui import common_gui as _gui
-from act.pipeline.gui.common_gui import Option, validate_changes
+from act.pipeline.gui import act_gui as _gui
+from act.pipeline.gui.act_gui import Option, validate_changes
 from act.pipeline.gui.fuzzer_gui import FuzzConfigChange, FuzzControl, FuzzEnd, FuzzStart, FuzzStep
 from act.util.path_config import get_pipeline_log_dir
 from act.util.device_manager import get_default_device
