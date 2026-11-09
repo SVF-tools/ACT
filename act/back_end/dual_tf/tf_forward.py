@@ -27,6 +27,8 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 
 import torch
+from act.pipeline.gui import act_gui as _gui
+from act.pipeline.gui import verifier_gui as _obs
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, cast
 
@@ -710,6 +712,20 @@ def _broadcast_forward_lanes(
     )), stats
 
 
+def _observe_forward(layer, bounds, post_activation):
+    """Expose the stored box without copying or changing its stage."""
+    from act.back_end.solver.solver_dual import DualSolver
+    stage = (
+        "pre" if not post_activation and layer.kind.upper() in DualSolver._PRE_ACTIVATION_BOUNDS_KINDS
+        else "out"
+    )
+    lb, ub = bounds.lb, bounds.ub
+    _gui.emit(_obs.LayerBounds(
+        _obs.RecordKey("dual", "forward", layer.id, stage),
+        layer.kind, lb, ub,
+    ))
+
+
 @torch.no_grad()
 def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
                            post_activation: bool = False,
@@ -718,6 +734,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                            prefix_cache: ForwardPrefixCache | None = None,
                            *,
                            _shared_geometry: InputGeometry | None = None,
+                           _observer_shared: bool = False,
                            ) -> tuple[Dict[int, Bounds], ForwardFrame | None, ForwardPassStats]:
     """Forward bounds, natively batched with singleton auto-promotion.
 
@@ -762,10 +779,15 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             _shared_geometry=None if geometry is None else replace(
                 geometry, center=geometry.center[:1], eps=geometry.eps[:1], mask=geometry.mask[:1],
             ),
+            _observer_shared=True,
         )
         # A lane-dependent layer parameter broadcasts the "single" lane back out.
         if all(bounds.lb.shape[0] == 1 for bounds in shared[0].values()):
-            return _broadcast_forward_lanes(*shared, B, geometry)
+            published = _broadcast_forward_lanes(*shared, B, geometry)
+            if _gui.enabled and not _observer_shared:
+                for lid, bounds in published[0].items():
+                    _observe_forward(net.by_id[lid], bounds, post_activation)
+            return published
 
     bounds_dict: Dict[int, Bounds] = {}
     box_state: Dict[int, Bounds] = {}
@@ -793,6 +815,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
 
     for lid in topo_order:
         if lid in bounds_dict:
+            if _gui.enabled and not _observer_shared:
+                _observe_forward(by_id[lid], bounds_dict[lid], post_activation)
             continue
         layer = by_id[lid]
         lid = layer.id
@@ -812,6 +836,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                     bounds_dict, box_state, lin_state, frame_dict,
                     lid, stored, out, lin, frame,
                 )
+                if _gui.enabled and not _observer_shared:
+                    _observe_forward(layer, stored, post_activation)
                 continue
             if kind not in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
                 raise ValueError(f"compute_forward_bounds: layer {lid} kind '{kind}' has no predecessors and is not INPUT / INPUT_SPEC")
@@ -826,6 +852,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 entry_lin,
                 entry_frame,
             )
+            if _gui.enabled and not _observer_shared:
+                _observe_forward(layer, entry_box, post_activation)
             continue
 
         missing = [pid for pid in preds if pid not in box_state or pid not in lin_state or pid not in frame_dict]
@@ -846,6 +874,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         )
         _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
                              lid, stored, out, lin, frame)
+        if _gui.enabled and not _observer_shared:
+            _observe_forward(layer, stored, post_activation)
 
     if prefix_cache is not None and not prefix_cache._bounds:
         stable = prefix_cache._independent

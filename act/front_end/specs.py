@@ -977,8 +977,7 @@ class OutputSpec:
         forward pass, decide per batch lane whether the property is broken and
         by how much. Comparisons are exact, with no epsilon tolerance, because
         a genuine forward pass that breaks the property *is* a counterexample.
-        (``bab.check_violations_batched`` deliberately keeps a tolerance — it
-        validates LP-solver candidates, where numerical slop is expected.)
+        Backend counterexample validation uses this same concrete decision.
 
         The magnitude comes from :meth:`severity`; this method adds only the
         decision. ``TOP1_ROBUST``, ``MARGIN_ROBUST`` and ``UNSAFE_LINEAR``
@@ -986,8 +985,7 @@ class OutputSpec:
         ``TOP1_ROBUST`` an exact tie already falsifies the strict
         ``z_t > z_j`` requirement, and ``MARGIN_ROBUST`` is the same
         requirement shifted by ``m`` — a separation of exactly ``m`` already
-        falsifies it. Both match ``bab.check_violations_batched`` and
-        ``encode_linear`` (whose ``thresholds`` are ``0`` and ``-m``
+        falsifies it. Both match ``encode_linear`` (whose ``thresholds`` are ``0`` and ``-m``
         respectively, certified iff the row max is strictly below the
         threshold). For ``UNSAFE_LINEAR``: its unsafe set is the *closed*
         polytope ``(C z <= d).all()``, so a lane sitting exactly on a face is

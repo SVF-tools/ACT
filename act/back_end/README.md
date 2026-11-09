@@ -186,6 +186,27 @@ This forms a **refinement loop**: false CEs drive further splitting → tighter 
 
 ## Performance Tips
 
+### Propagation observation and counterexamples
+
+Engine hot paths build propagation records from `act.pipeline.gui.verifier_gui`
+and emit them through `act.pipeline.gui.act_gui` (see `act/pipeline/README.md`);
+with no sink registered they only read its `enabled` flag.
+
+`verify_once(..., dual_iters=0)` preserves the fixed dual default. A positive
+budget optimizes alpha against the same forward bounds. The dual path also
+checks the dual witness of UNKNOWN lanes on the concrete model and reports
+FALSIFIED with that counterexample.
+
+`act/util/counterexample.py` is the only counterexample check in ACT.
+Candidates from fuzzing, dual, interval, hybridz, LP, MILP and BaB all go through it:
+`validate_counterexamples` checks input constraints, finite outputs, and the
+canonical `OutputSpec` boundary semantics together while preserving batch
+lanes; `box=` and `split_signs=` add a BaB node box and ReLU split phases.
+`VerifiableModel`'s input/output spec layers and the fuzzer's property checker
+use its `input_constraint_satisfied` and `output_violations`. Candidate
+selection and verdict assembly stay with the caller. Inference errors
+propagate rather than being reported as an ordinary inconclusive result.
+
 - Set a **global device** (CPU/GPU) and dtype up front.
 - Use `@torch.no_grad()` in analysis & CE validation.
 - Batch BaB nodes for large networks (optional extension).

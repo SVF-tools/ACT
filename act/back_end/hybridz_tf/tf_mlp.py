@@ -13,6 +13,8 @@
 # ===---------------------------------------------------------------------===#
 
 import torch
+from act.pipeline.gui import act_gui as _gui
+from act.pipeline.gui import verifier_gui as _obs
 import torch.nn.functional as F
 try:
     import numpy as np
@@ -531,6 +533,16 @@ def _sparse_apply_relu(L, hz: SparseHZono, input_bounds: Bounds, tf):
     if reservation is None:
         return None, "sparse_relu_size_limit"
     slots, n_cont, n_bin = reservation
+    if _obs.wants_relaxation():
+        pre = Bounds(
+            torch.as_tensor(lb, device=input_bounds.lb.device).reshape_as(input_bounds.lb),
+            torch.as_tensor(ub, device=input_bounds.ub.device).reshape_as(input_bounds.ub),
+        )
+        tf._observed_relu = (pre, {
+            "representation": "sparse",
+            "continuous_generators_added": n_cont - hz.n_cont,
+            "binary_generators_added": n_bin - hz.n_bin,
+        }, True)
     return sparse_hz_apply_relu_exact(hz, lb, ub, slots, n_cont, n_bin), None
 
 
@@ -806,6 +818,8 @@ def tf_scale(L, bounds, tf):
 
 def tf_relu(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
+    if _obs.wants_relaxation():
+        tf._observed_relu = (bounds, {"representation": "interval_fallback"}, False)
     fact = interval.tf_relu(L, bounds)
     if hz_in is not None:
         hz_out = hz_apply_relu(hz_in)
@@ -813,6 +827,17 @@ def tf_relu(L, bounds, tf):
             tf._hz_cache.pop(L.id, None)
         else:
             tf._hz_cache[L.id] = hz_out
+            if _obs.wants_relaxation():
+                pre = hz_compute_bounds(hz_in)
+                tf._observed_relu = (
+                    Bounds(pre.lb.reshape_as(bounds.lb), pre.ub.reshape_as(bounds.ub)),
+                    {
+                        "representation": "dense",
+                        "continuous_generators_added": hz_out.Gc.shape[1] - hz_in.Gc.shape[1],
+                        "binary_generators_added": hz_out.Gb.shape[1] - hz_in.Gb.shape[1],
+                    },
+                    True,
+                )
             return _hz_fact(fact, hz_out)
     return fact
 

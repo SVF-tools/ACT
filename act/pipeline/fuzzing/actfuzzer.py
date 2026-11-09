@@ -9,7 +9,7 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Dict, Optional, Tuple, Any, cast
 import os
 import time
@@ -26,10 +26,13 @@ from act.front_end.verifiable_model import (
     OutputSpecLayer,
     VerifiableModel,
 )
-from act.pipeline.fuzzing.mutations import MutationEngine
+from act.pipeline.fuzzing.mutations import MUTATION_STRATEGIES, PERTURB_MODES, MutationEngine
 from act.pipeline.fuzzing.coverage import CoverageTracker
-from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
+from act.pipeline.fuzzing.corpus import SELECTION_STRATEGIES, SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
+from act.pipeline.gui import act_gui as _gui
+from act.pipeline.gui.act_gui import Option, validate_changes
+from act.pipeline.gui.fuzzer_gui import FuzzConfigChange, FuzzControl, FuzzEnd, FuzzStart, FuzzStep
 from act.util.path_config import get_pipeline_log_dir
 from act.util.device_manager import get_default_device
 from act.util.format_utils import rule
@@ -153,6 +156,27 @@ class FuzzingConfig:
         return cls(**merged_config)
 
 
+FUZZING_OPTIONS: Tuple[Option, ...] = (
+    Option("max_iterations", "int", True, "maximum fuzzed samples", minimum=1),
+    Option("timeout_seconds", "float", True, "wall-clock budget; paused time does not count",
+                  minimum=0.0, exclusive_minimum=True),
+    Option("stop_on_first_violation", "bool", True, "stop at the first counterexample"),
+    Option("mutation_weights", "weights", True, "relative selection weight per mutation strategy",
+                  choices=MUTATION_STRATEGIES, minimum=0.0),
+    Option("perturb_mode", "choice", True, "how mutation perturbation sizes are computed",
+                  choices=PERTURB_MODES),
+    Option("perturb_scale", "float", True, "fraction of the feasible range per perturbation",
+                  minimum=0.0, maximum=1.0, exclusive_minimum=True),
+    Option("seed_selection_strategy", "choice", True, "how seeds are drawn from the corpus",
+                  choices=SELECTION_STRATEGIES),
+    Option("pgd_restarts", "int", True, "PGD random starts per mutation", minimum=1),
+    Option("pgd_restarts_binarized", "int", True, "PGD random starts on a binarized network", minimum=1),
+    Option("coverage_strategy", "choice", False, "coverage that guides seed energy",
+                  choices=tuple(CoverageTracker._REGISTRY)),
+    Option("activation_threshold", "float", False, "activation above which a neuron counts as covered"),
+)
+
+
 @dataclass
 class FuzzingReport:
     """
@@ -239,6 +263,7 @@ class ACTFuzzer:
         wrapped_model: nn.Module,
         initial_seeds: List[LabeledInputTensor],
         config: Optional[FuzzingConfig] = None,
+        control: Optional[FuzzControl] = None,
     ):
         """
         Initialize ACTFuzzer.
@@ -249,6 +274,8 @@ class ACTFuzzer:
                           sized for N VNNLib instances.
             initial_seeds: List of LabeledInputTensor from spec creators
             config: Fuzzing configuration (uses from_yaml() defaults if None)
+            control: Optional act.pipeline.gui.fuzzer_gui.FuzzControl; the loop applies its
+                stop, pause, and live config requests between batches
 
         Initialization Steps:
             1. Load config → from_yaml() or provided FuzzingConfig
@@ -260,6 +287,8 @@ class ACTFuzzer:
             7. Setup tracer → ExecutionTracer (if trace_level > 0)
         """
         self.config = config or FuzzingConfig.from_yaml()
+        self.control = control
+        self.stop_reason = ""
         self.device = get_default_device()
 
         assert not VerifiableModel.get_strict_mode(), (
@@ -399,9 +428,20 @@ class ACTFuzzer:
 
         self.start_time = time.time()
         iteration = 0
+        self.stop_reason = "max_iterations"
+        if _gui.enabled:
+            _gui.emit(FuzzStart(
+                config=self.config, weights=dict(self.mutation_engine.weights),
+                batch_size=batch_size, device=str(self.device), seed_count=len(self.seed_corpus),
+            ))
 
         while iteration < self.config.max_iterations:
+            if self.control is not None and self._apply_control(iteration):
+                self.stop_reason = "stopped"
+                print(f"✋ Stop requested after {iteration} iterations")
+                break
             if time.time() - self.start_time > self.config.timeout_seconds:
+                self.stop_reason = "timeout"
                 print(f"⏱️  Timeout reached after {iteration} iterations")
                 break
 
@@ -412,13 +452,60 @@ class ACTFuzzer:
             iteration += batch_size
 
             if self.config.stop_on_first_violation and self.counterexamples:
+                self.stop_reason = "first_violation"
                 print(f"✋ First counterexample at {time.time() - self.start_time:.3f}s; stopping")
                 break
 
             if iteration > 0 and iteration % self.config.report_interval < batch_size:
                 self._print_progress(iteration)
 
-        return self._generate_report()
+        report = self._generate_report()
+        if _gui.enabled:
+            _gui.emit(FuzzEnd(report=report, stop_reason=self.stop_reason))
+        return report
+
+    def update_config(self, **changes: Any) -> Dict[str, Any]:
+        """Change live FuzzingConfig fields (FUZZING_OPTIONS with live=True) of this fuzzer.
+
+        Every value is validated before any is applied. Returns the normalized
+        values; raises ValueError for an unknown, non-live, or invalid field.
+        """
+        applied = validate_changes(FUZZING_OPTIONS, changes, live_only=True)
+        config = replace(self.config, **applied)
+        if "mutation_weights" in applied:
+            self.mutation_engine.set_weights(config.mutation_weights)
+        if applied.keys() & {"perturb_mode", "perturb_scale"}:
+            self.mutation_engine.set_perturbation(config.perturb_mode, config.perturb_scale)
+        if applied.keys() & {"pgd_restarts", "pgd_restarts_binarized"}:
+            self.mutation_engine.set_pgd_restarts(config.pgd_restarts, config.pgd_restarts_binarized)
+        if "seed_selection_strategy" in applied:
+            self.seed_corpus.strategy = config.seed_selection_strategy
+        self.config = config
+        return applied
+
+    def _apply_control(self, iteration: int) -> bool:
+        """Apply pending control requests at a batch boundary; True when a stop was requested.
+
+        While paused, the loop waits for resume, stop, or a config change, and the
+        paused time is excluded from the timeout budget.
+        """
+        assert self.control is not None
+        while True:
+            changes = self.control.take_changes()
+            if changes:
+                try:
+                    applied, rejected = self.update_config(**changes), ""
+                except ValueError as exc:
+                    applied, rejected = {}, str(exc)
+                if _gui.enabled:
+                    _gui.emit(FuzzConfigChange(
+                        iteration=iteration, requested=changes, applied=applied, rejected=rejected,
+                    ))
+            if self.control.stop_requested:
+                return True
+            if not self.control.paused:
+                return False
+            self.start_time += self.control.wait_while_paused()
 
     def _fuzz_iteration(self, start_iteration: int, batch_size: int):
         """
@@ -522,6 +609,16 @@ class ACTFuzzer:
                     )
 
         self.iterations = start_iteration + batch_size
+        if _gui.enabled:
+            _gui.emit(FuzzStep(
+                iteration=self.iterations,
+                elapsed_s=time.time() - self.start_time,
+                strategy=self.mutation_engine.last_strategy,
+                seeds=seeds, inputs=inputs, violations=violation_mask,
+                counterexamples=tuple(counterexamples),
+                coverage=float(self.coverage_tracker.get_coverage()),
+                corpus_size=len(self.seed_corpus),
+            ))
 
     def _print_progress(self, iteration: int):
         """Print fuzzing progress with incremental counterexample count."""

@@ -250,7 +250,7 @@ def solve_milp(net: Net, config: BaBConfig, *, deadline: float) -> VerifyResult:
     stop_at = min(deadline, started + config.milp_timeout)
     if started >= stop_at:
         return finish("deadline")
-    from act.back_end.bab.violation import validate_terminal_candidates
+    from act.util.counterexample import validate_counterexamples
     from act.back_end.cons_exportor import export_terminal_problem
     from act.back_end.verifier import gather_input_spec_layers, seed_from_input_specs
 
@@ -299,7 +299,10 @@ def solve_milp(net: Net, config: BaBConfig, *, deadline: float) -> VerifyResult:
     if solver_status == "infeasible":
         return finish("infeasible", VerifyStatus.CERTIFIED)
     if candidate is not None:
-        if bool(validate_terminal_candidates(exported, candidate).all()):
+        if bool(validate_counterexamples(
+            exported.net, candidate, box=exported.input_bounds,
+            split_signs=exported.split_signs, tolerance=0.0,
+        ).all()):
             return finish("validated_incumbent", VerifyStatus.FALSIFIED, candidate)
         return finish("invalid_incumbent")
     return finish(solver_status)
