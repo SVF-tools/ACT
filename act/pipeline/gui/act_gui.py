@@ -7,9 +7,8 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   ACT-side support for ACT-GUI: observation and control of verification and
-#   fuzzing runs. This module is what verifier_gui and fuzzer_gui share, so both
-#   expose one interface:
+#   ACT-side support for ACT-GUI: observation and control of verification
+#   (including BaB) and fuzzing runs. GUI record producers share its interface:
 #     channel  - ``observe(sink)`` registers a sink, ``emit(record)`` delivers
 #                to every sink, and hot paths read the module attribute
 #                ``enabled`` (True iff a sink is registered) before building
@@ -25,17 +24,6 @@
 #                live option changes for a running engine, which applies them
 #                at its own safe points.
 #
-#   Cost model: with no sink registered, an instrumented hot path reads
-#   ``enabled`` and does nothing else; phase decorators call straight through.
-#   Records reference live engine tensors (no copies); they are valid only
-#   during the sink call, and a sink copies what it keeps. A sink that raises
-#   is detached and logged once; the engine run continues unchanged.
-#
-#   Self-check: ``python -m act.pipeline.gui.act_gui`` (run in CI) runs
-#   ``verify_once`` in every domain under a sink and drives one ACTFuzzer
-#   through its whole lifecycle with a FuzzControl, asserting the records a GUI
-#   reads and that observation leaves verification and fuzzing results unchanged.
-#
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
@@ -46,13 +34,9 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeVar, cast
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeVar, cast
 
 import torch
-
-if TYPE_CHECKING:
-    from act.pipeline.fuzzing.actfuzzer import ACTFuzzer
-    from act.pipeline.gui.fuzzer_gui import FuzzControl
 
 logger = logging.getLogger(__name__)
 
@@ -280,231 +264,26 @@ class RunControl:
         return time.monotonic() - start
 
 
-# ---------------------------------------------------------------------------
-# Self-check (``python -m act.pipeline.gui.act_gui``). Engine imports stay inside
-# the checks: verifier, solver, and fuzzer modules import this module at load time.
-# ---------------------------------------------------------------------------
-
-
-class _Recorder(list[object]):
-    wants_relaxation = True
-
-    def __call__(self, record) -> None:
-        self.append(record)
-
-
-def _relu_net(factory, bound: float):
-    """Active, inactive, unstable, and zero ReLU neurons; outputs must stay in [-bound, bound]."""
-    from act.back_end.net_factory import _lt_assert_range, _lt_input
-
-    return factory.create_network(f"gui_relu_{bound}", {"layers": _lt_input([2, 4], -1., 1.) + [
-        {"kind": "DENSE", "params": {"in_features": 4, "out_features": 4,
-                                     "weight": torch.diag(torch.tensor([1., 1., 1., 0.])),
-                                     "bias": torch.tensor([2., -2., 0., 0.])}},
-        {"kind": "RELU", "params": {}},
-        {"kind": "DENSE", "params": {"in_features": 4, "out_features": 2,
-                                     "weight": torch.tensor([[1., -1., 1., -1.], [-1., 1., -1., 1.]]),
-                                     "bias": torch.zeros(2)}},
-        _lt_assert_range([-bound, -bound], [bound, bound]),
-    ]})
-
-
-def _run(net, domain: str, sink=None, **kwargs):
-    from contextlib import nullcontext
-
-    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
-    from act.back_end.verifier import verify_once
-
-    set_transfer_function_mode("hybridz" if domain == "hybridz" else "interval")
-    set_solver_mode(domain if domain in ("dual", "hybridz") else None)
-    with nullcontext() if sink is None else observe(sink):
-        return [r.status for r in verify_once(net, **kwargs)]
-
-
-def _check_options() -> None:
-    from act.config.config import DualConfig
-    from act.pipeline.gui import verifier_gui as obs
-    from act.pipeline.gui.fuzzer_gui import FuzzControl
-
-    options = {o.option.name: o for o in obs.verification_options()}
-    assert not any(o.option.live for o in options.values()) and options["hybridz_tolerance"].default > 0
-    dual_fields = {name.split(".", 1)[1] for name in options if name.startswith("dual_config.")}
-    assert dual_fields <= set(DualConfig.__dataclass_fields__), dual_fields
-    assert validate_changes(obs.VERIFICATION_OPTIONS, {"dual_iters": 2}) == {"dual_iters": 2}
-    for bad in ({"dual_iters": -1}, {"unknown": 1}):
-        try:
-            validate_changes(obs.VERIFICATION_OPTIONS, bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"accepted {bad}")
-    control = FuzzControl()
-    assert isinstance(control, RunControl)
-    try:
-        control.update(coverage_strategy="neuron")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a non-live option changed during a run")
-
-
-def _check_observe(factory) -> None:
-    from act.back_end.solver.solver_dual import DualSolver
-    from act.back_end.transfer_functions import set_transfer_function_mode
-    from act.front_end.specs import OutKind, OutputSpec
-    from act.pipeline.gui import verifier_gui as obs
-
-    net = _relu_net(factory, 10.0)
-    for domain, form, kwargs in (("interval", "box", {}), ("hybridz", None, {}),
-                                 ("dual", "linear", {"dual_iters": 2})):
-        sink = _Recorder()
-        assert _run(net, domain, sink, **kwargs) == _run(net, domain, **kwargs), domain
-        kinds = {type(r).__name__ for r in sink}
-        assert {"PhaseEvent", "LayerBounds", "Relaxation"} <= kinds, (domain, kinds)
-        relaxations = [r for r in sink if isinstance(r, obs.Relaxation)]
-        assert all(r.status.dtype == torch.int8 for r in relaxations)
-        assert form is None or any(r.form == form for r in relaxations), domain
-        if domain == "dual":
-            backward = [r for r in sink if isinstance(r, obs.DualBackward)]
-            assert backward and all(r.alpha_optimized for r in backward)
-            assert any(isinstance(r, obs.SpecBound) for r in sink)
-
-    # The chunked dual path reports the same per-layer alpha records.
-    set_transfer_function_mode("interval")
-    sink = _Recorder()
-    spec = OutputSpec(kind=OutKind.RANGE, lb=torch.full((2,), -10.0), ub=torch.full((2,), 10.0))
-    with observe(sink):
-        DualSolver(n_iters=1).evaluate_spec(net, spec, chunk_size=1)
-    assert any(isinstance(r, obs.DualBackward) for r in sink)
-
-    def failing(record) -> None:
-        raise RuntimeError("sink failure")
-    with observe(failing):
-        _run(net, "interval")
-        assert not enabled, "a failing sink is detached"
-    assert not enabled and not obs.wants_relaxation()
-
-
-def _fuzzer_for(net, control: Optional["FuzzControl"] = None, max_iterations: int = 40) -> "ACTFuzzer":
-    import random
-    import tempfile
-    from pathlib import Path
-
-    import numpy as np
-
-    from act.front_end.spec_creator_base import LabeledInputTensor
-    from act.front_end.verifiable_model import InputLayer
-    from act.pipeline.fuzzing.actfuzzer import ACTFuzzer, FuzzingConfig
-    from act.pipeline.verification.act2torch import ACTToTorch
-
-    model = ACTToTorch(net).run()
-    rows = next(c for c in model.children() if isinstance(c, InputLayer)).input_tensor
-    seeds = [LabeledInputTensor(tensor=rows[i:i + 1].clone(), label=None) for i in range(rows.shape[0])]
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    cfg = FuzzingConfig.from_yaml(max_iterations=max_iterations, timeout_seconds=120.0,
-                                  save_counterexamples=False, output_dir=Path(tempfile.mkdtemp()),
-                                  report_interval=10_000, verbose=0, trace_level=0)
-    return ACTFuzzer(wrapped_model=model, initial_seeds=seeds, config=cfg, control=control)
-
-
-def _check_fuzzing(factory) -> None:
-    from act.front_end.verifiable_model import VerifiableModel
-    from act.pipeline.gui.fuzzer_gui import (
-        FuzzConfigChange, FuzzControl, FuzzEnd, FuzzStart, FuzzStep, fuzzing_options,
-    )
-
-    options = {o.option.name: o for o in fuzzing_options()}
-    assert options["perturb_scale"].option.live and not options["coverage_strategy"].option.live
-    net = _relu_net(factory, 0.5)
-    VerifiableModel.set_strict_mode(False)
-
-    plain = _fuzzer_for(net).fuzz()
-    sink = _Recorder()
-    with observe(sink):
-        observed = _fuzzer_for(net).fuzz()
-    assert [ce.input.tolist() for ce in observed.counterexamples] == [ce.input.tolist() for ce in plain.counterexamples]
-    steps = [r for r in sink if isinstance(r, FuzzStep)]
-    start, end = sink[0], sink[-1]
-    assert isinstance(start, FuzzStart) and isinstance(end, FuzzEnd)
-    assert end.stop_reason == "max_iterations" and steps[-1].iteration == observed.total_iterations
-    assert sum(len(s.counterexamples) for s in steps) == len(observed.counterexamples)
-
-    for bad in ({"coverage_strategy": "BestInputCov"}, {"perturb_scale": 2.0}, {"mutation_weights": {"x": 1}},
-                {"max_iterations": 0}, {"stop_on_first_violation": "yes"}, {"pgd_restarts": 1.5}):
-        try:
-            FuzzControl().update(**bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"accepted {bad}")
-
-    # Live update after batch 3, then a paused update applied without running a batch, then stop.
-    control, sink = FuzzControl(), _Recorder()
-    paused, applied = threading.Event(), threading.Event()
-    batches: List[FuzzStep] = []
-
-    def drive(record) -> None:
-        sink.append(record)
-        if isinstance(record, FuzzStep):
-            batches.append(record)
-            if len(batches) == 3:
-                control.update(mutation_weights={"random": 1.0}, perturb_scale=0.3,
-                               seed_selection_strategy="random", pgd_restarts=2)
-            if len(batches) == 6:
-                control.pause()
-                paused.set()
-        if isinstance(record, FuzzConfigChange) and paused.is_set():
-            applied.set()
-
-    def observed_fuzz():
-        with observe(drive):
-            return fuzzer.fuzz()
-
-    fuzzer = _fuzzer_for(net, control, max_iterations=10_000)
-    result: Dict[str, object] = {}
-    worker = threading.Thread(target=lambda: result.update(report=observed_fuzz()))
-    worker.start()
-    assert paused.wait(60)
-    control.update(perturb_mode="adaptive_perdim")
-    assert applied.wait(60) and control.paused
-    batches_while_paused = len(batches)
-    control.resume()
-    control.request_stop()
-    worker.join(60)
-    changes = [r for r in sink if isinstance(r, FuzzConfigChange)]
-    assert [c.iteration for c in changes] == [batches[2].iteration, batches[5].iteration]
-    assert not any(c.rejected for c in changes) and batches_while_paused == 6
-    assert fuzzer.stop_reason == "stopped" and result["report"] is not None
-    assert {s.strategy for s in batches[3:]} <= {"random"}
-    assert fuzzer.mutation_engine.perturb_mode == "adaptive_perdim" and fuzzer.seed_corpus.strategy == "random"
-    try:
-        fuzzer.update_config(activation_threshold=0.5)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a non-live field changed")
-
-
 def _self_check() -> None:
-    import tempfile
+    """Check the shared sink channel without starting a verifier or fuzzer."""
+    from unittest.mock import patch
 
-    from act.back_end.net_factory import NetFactory
-    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
-    from act.util.device_manager import initialize_device
+    records: list[Record] = []
+    with observe(records.append):
+        assert enabled
+        emit(Record())
+    assert len(records) == 1 and not enabled
 
-    initialize_device("cpu", "float64")
-    torch.set_num_threads(1)
-    with tempfile.TemporaryDirectory() as tmp:
-        factory = NetFactory({"common": {"output_dir": tmp, "base_seed": 42, "num_instances": 1,
-                                         "name_prefix": "gui", "write_manifest": False}})
-        try:
-            _check_options()
-            _check_observe(factory)
-            _check_fuzzing(factory)
-        finally:
-            set_solver_mode(None)
-            set_transfer_function_mode("interval")
-    print("act.pipeline.gui.act_gui self-check passed")
+    def failing(record: Record) -> None:
+        raise RuntimeError("sink failure")
+
+    with patch.object(logger, "warning") as warning:
+        with observe(failing):
+            emit(Record())
+            assert not enabled, "a failing sink is detached"
+    assert warning.call_count == 1 and warning.call_args.kwargs["exc_info"] is True
+    assert not enabled and not wants("wants_relaxation")
+    print("shared GUI observation self-check passed")
 
 
 __all__: Tuple[str, ...] = (
@@ -512,9 +291,9 @@ __all__: Tuple[str, ...] = (
     "Option", "OptionDefault", "validate_changes", "RunControl",
 )
 
+
 if __name__ == "__main__":
-    # Run in the imported module: under ``-m`` this file is also ``__main__``, and
-    # engine code emits to the sinks of act.pipeline.gui.act_gui, not of __main__.
+    # Use the canonical module because observe() stores sinks there.
     from act.pipeline.gui import act_gui
 
     act_gui._self_check()

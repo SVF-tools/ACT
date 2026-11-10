@@ -44,7 +44,8 @@ from act.back_end.bab.node import (
     tensor_storage_bytes,
 )
 from act.back_end.bab.climb import ClimbSession
-from act.back_end.bab.progress_events import BaBProgressEmitter
+from act.pipeline.gui import act_gui as _gui
+from act.pipeline.gui.bab_gui import BaBProgressEmitter
 from act.back_end.bab.frontier_memory import (
     FrontierMemoryPlanner, allow_per_class_alpha, allow_warm_state,
     auto_initial_batch, auto_recalibrate_batch,
@@ -518,7 +519,7 @@ def verify_bab_batched(
     run_started = _monotonic()
     if config is None:
         config = BaBConfig()
-    progress_emitter = BaBProgressEmitter(on_progress) if on_progress is not None else None
+    progress_emitter = BaBProgressEmitter(on_progress) if (on_progress is not None or _gui.enabled) else None
     budget_s = time_budget_s if time_budget_s is not None else 300.0
     if not math.isfinite(budget_s) or budget_s < 0.0:
         raise ValueError(
@@ -627,7 +628,7 @@ def verify_bab_batched(
 
     # Progress events need stable IDs even when the configured search does not.
     provenance = (
-        on_progress is not None
+        progress_emitter is not None
         or config.provenance_enabled
         or (climb is not None and config.climb_merge_enabled)
         or isinstance(pool, MCTSBounding)
@@ -1295,6 +1296,14 @@ def verify_bab_batched(
                                         k_actual, _pool_before, n_unsat, branched_lanes,
                                         lane, batch_max_depth,
                                     ))
+                                if progress_emitter is not None:
+                                    progress_emitter.finish_terminal(
+                                        wave=iteration, status=VerifyStatus.FALSIFIED.name,
+                                        reason="terminal_lp", frontier_size=len(pool),
+                                        node_id=int(batch.node_id[lane]) if batch.node_id is not None else None,
+                                        parent_id=int(batch.parent_id[lane]) if batch.parent_id is not None else None,
+                                        depth=int(batch.depths[lane]),
+                                    )
                                 return VerifyResult(
                                     VerifyStatus.FALSIFIED,
                                     counterexample=terminal_result.witnesses[local].detach().cpu().clone(),
@@ -1730,10 +1739,27 @@ def verify_bab_batched(
             },
         )
 
+    incomplete_reason = (
+        "budget_exhausted_with_unproven_subboxes"
+        if pool_remaining > 0 and (exhausted_time or exhausted_nodes)
+        else "out_of_memory"
+        if any_oom_exhausted
+        else "frontier_memory_eviction"
+        if planner.evicted_nodes
+        else "frontier_cap_eviction"
+        if any_dropped_frontier_cap
+        else "terminal_lp_unproved_retirement"
+        if any_retired_terminal
+        else "climb_retired_without_relu_candidate"
+        if any_retired_no_relu_candidate
+        else "max_depth_unproved_retirement"
+        if any_dropped_max_depth
+        else "budget_exhausted_with_unproven_subboxes"
+    )
     if progress_emitter is not None:
         progress_emitter.finish_terminal(
             wave=iteration, status=VerifyStatus.UNKNOWN.name,
-            reason="search_incomplete", frontier_size=pool_remaining,
+            reason=incomplete_reason, frontier_size=pool_remaining,
         )
     return VerifyResult(
         VerifyStatus.UNKNOWN,
@@ -1747,23 +1773,7 @@ def verify_bab_batched(
             "nodes_minted": node_counter,
             "any_dropped_frontier_cap": any_dropped_frontier_cap,
             "unrequeued_oom_nodes": pending_oom_nodes,
-            "reason": (
-                "budget_exhausted_with_unproven_subboxes"
-                if pool_remaining > 0 and (exhausted_time or exhausted_nodes)
-                else "out_of_memory"
-                if any_oom_exhausted
-                else "frontier_memory_eviction"
-                if planner.evicted_nodes
-                else "frontier_cap_eviction"
-                if any_dropped_frontier_cap
-                else "terminal_lp_unproved_retirement"
-                if any_retired_terminal
-                else "climb_retired_without_relu_candidate"
-                if any_retired_no_relu_candidate
-                else "max_depth_unproved_retirement"
-                if any_dropped_max_depth
-                else "budget_exhausted_with_unproven_subboxes"
-            ),
+            "reason": incomplete_reason,
             **_branching_metadata(),
         },
     )

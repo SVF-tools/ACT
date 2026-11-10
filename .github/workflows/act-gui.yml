@@ -1,0 +1,63 @@
+name: ACT GUI Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  TF_ENABLE_ONEDNN_OPTS: "0"
+  ACT_CI_MODE: "true"
+
+jobs:
+  gui-tests:
+    name: GUI Observation Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install coverage torch torchvision onnx onnx2torch "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil "transformers>=4.57.3,<5" scikit-learn
+
+      - name: Check GUI observation and control
+        run: |
+          coverage run -p -m act.pipeline.gui.act_gui
+          coverage run -p -m act.pipeline.gui.verifier_gui
+          coverage run -p -m act.pipeline.gui.fuzzer_gui
+          coverage run -p -m act.pipeline.gui.bab_gui
+
+      - name: Combine coverage data
+        if: always()
+        run: |
+          cd ${{ github.workspace }}
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: gui
+          name: gui
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
