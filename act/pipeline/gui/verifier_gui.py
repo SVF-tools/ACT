@@ -42,6 +42,7 @@ from typing import Any, Callable, Mapping, Optional, Tuple
 
 import torch
 
+from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui.act_gui import Option, OptionDefault, Record, wants
 
 DOMAINS = ("interval", "hybridz", "dual")
@@ -219,3 +220,89 @@ __all__: Tuple[str, ...] = (
     "RecordKey", "LayerBounds", "Relaxation", "DualBackward", "SpecBound", "wants_relaxation", "relu_status",
     "DESCRIBERS", "DOMAINS", "PASSES", "STAGES", "ORIGINS", "VERIFICATION_OPTIONS", "verification_options",
 )
+
+
+# Self-check: python -m act.pipeline.gui.verifier_gui
+def _run(net, domain: str, sink=None, **kwargs):
+    from contextlib import nullcontext
+
+    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
+    from act.back_end.verifier import verify_once
+
+    set_transfer_function_mode("hybridz" if domain == "hybridz" else "interval")
+    set_solver_mode(domain if domain in ("dual", "hybridz") else None)
+    with nullcontext() if sink is None else _gui.observe(sink):
+        return [r.status for r in verify_once(net, **kwargs)]
+
+
+def _check_options() -> None:
+    from act.config.config import DualConfig
+    from act.pipeline.gui import verifier_gui as obs
+
+    options = {o.option.name: o for o in obs.verification_options()}
+    assert not any(o.option.live for o in options.values()) and options["hybridz_tolerance"].default > 0
+    dual_fields = {name.split(".", 1)[1] for name in options if name.startswith("dual_config.")}
+    assert dual_fields <= set(DualConfig.__dataclass_fields__), dual_fields
+    assert _gui.validate_changes(obs.VERIFICATION_OPTIONS, {"dual_iters": 2}) == {"dual_iters": 2}
+    for bad in ({"dual_iters": -1}, {"unknown": 1}):
+        try:
+            _gui.validate_changes(obs.VERIFICATION_OPTIONS, bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+
+def _check_observe(factory) -> None:
+    from act.back_end.solver.solver_dual import DualSolver
+    from act.back_end.transfer_functions import set_transfer_function_mode
+    from act.front_end.specs import OutKind, OutputSpec
+    from act.pipeline.gui import verifier_gui as obs
+
+    from act.pipeline.gui.self_check_support import Recorder, make_relu_net
+
+    net = make_relu_net(factory, 10.0)
+    for domain, form, kwargs in (("interval", "box", {}), ("hybridz", None, {}),
+                                 ("dual", "linear", {"dual_iters": 2})):
+        sink = Recorder()
+        assert _run(net, domain, sink, **kwargs) == _run(net, domain, **kwargs), domain
+        kinds = {type(r).__name__ for r in sink}
+        assert {"PhaseEvent", "LayerBounds", "Relaxation"} <= kinds, (domain, kinds)
+        relaxations = [r for r in sink if isinstance(r, obs.Relaxation)]
+        assert all(r.status.dtype == torch.int8 for r in relaxations)
+        assert form is None or any(r.form == form for r in relaxations), domain
+        if domain == "dual":
+            backward = [r for r in sink if isinstance(r, obs.DualBackward)]
+            assert backward and all(r.alpha_optimized for r in backward)
+            assert any(isinstance(r, obs.SpecBound) for r in sink)
+
+    # The chunked dual path reports the same per-layer alpha records.
+    set_transfer_function_mode("interval")
+    sink = Recorder()
+    spec = OutputSpec(kind=OutKind.RANGE, lb=torch.full((2,), -10.0), ub=torch.full((2,), 10.0))
+    with _gui.observe(sink):
+        DualSolver(n_iters=1).evaluate_spec(net, spec, chunk_size=1)
+    assert any(isinstance(r, obs.DualBackward) for r in sink)
+
+
+def _self_check() -> None:
+    import tempfile
+    from act.back_end.transfer_functions import set_solver_mode, set_transfer_function_mode
+    from act.pipeline.gui.self_check_support import make_factory
+    from act.util.device_manager import initialize_device
+
+    initialize_device("cpu", "float64")
+    torch.set_num_threads(1)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            _check_options()
+            _check_observe(make_factory(tmp))
+        finally:
+            set_solver_mode(None)
+            set_transfer_function_mode("interval")
+    print("verifier GUI self-check passed")
+
+
+if __name__ == "__main__":
+    from act.pipeline.gui import verifier_gui
+
+    verifier_gui._self_check()
