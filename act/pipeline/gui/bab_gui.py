@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
-from act.back_end.bab.node import SubproblemBatch
-from act.back_end.core import Bounds
-from act.back_end.solver.solver_base import BatchLPSolution, SolveStatus
+from act.back_end.solver.solver_base import SolveStatus
 from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui.act_gui import Record
+
+if TYPE_CHECKING:
+    # act.back_end.bab imports this module (bab.py), so importing it here would make
+    # ``import act.pipeline.gui.bab_gui`` circular; these names are annotations only.
+    from act.back_end.bab.node import SubproblemBatch
+    from act.back_end.core import Bounds
+    from act.back_end.solver.solver_base import BatchLPSolution
 
 
 @dataclass(frozen=True)

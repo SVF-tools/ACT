@@ -38,6 +38,7 @@ jobs:
 
       - name: Check GUI observation and control
         run: |
+          python -c "import act.pipeline.gui.bab_gui"  # importable before act.back_end.bab
           coverage run -p -m act.pipeline.gui.act_gui
           coverage run -p -m act.pipeline.gui.verifier_gui
           coverage run -p -m act.pipeline.gui.fuzzer_gui
