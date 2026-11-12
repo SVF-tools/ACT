@@ -360,6 +360,7 @@ def _solve_dual_batch(
         margin=fields.get("margin"),
         c=fields.get("c"),
         d=fields.get("d"),
+        strict=fields.get("strict"),
         lb=fields.get("lb"),
         ub=fields.get("ub"),
     )

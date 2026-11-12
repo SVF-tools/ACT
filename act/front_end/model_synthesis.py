@@ -249,8 +249,15 @@ def _merge_specs_to_batch(
             d_vec = d_all[0]
     else:
         c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
+    strict = None
+    if out_kind == OutKind.UNSAFE_LINEAR and any(s.strict is not None for s in out_specs):
+        strict = torch.stack([
+            s.strict.reshape(-1) if s.strict is not None
+            else torch.zeros_like(s.d, dtype=torch.bool).reshape(-1)
+            for s in out_specs
+        ])
     out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
-    batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
+    batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub, strict=strict)
     
     return batched_lt, batched_in, batched_out
 

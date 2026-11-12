@@ -142,7 +142,7 @@ def slice_net_to_sample(net: Net, sample_idx: int) -> Net:
         m_rows = m_raw
     else:
         raise ValueError(f"ASSERT M must be int or tensor, got {m_raw!r}")
-    for key in ("y_true", "margin", "c", "d", "lb", "ub"):
+    for key in ("y_true", "margin", "c", "d", "strict", "lb", "ub"):
         val = assert_layer.params.get(key)
         if val is not None:
             assert_layer.params[key] = _slice_first_dim(val, sample_idx, B)
@@ -586,6 +586,7 @@ def verify_once(
             kind=assert_layer.params.get("kind"),
             c=_unbatch(assert_layer.params.get("c")),
             d=_unbatch(assert_layer.params.get("d")),
+            strict=_unbatch(assert_layer.params.get("strict")),
             y_true=assert_layer.params.get("y_true"),
             margin=_unbatch(assert_layer.params.get("margin")),
             lb=_unbatch(assert_layer.params.get("lb")),

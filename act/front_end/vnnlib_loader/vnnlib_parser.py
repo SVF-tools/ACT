@@ -319,7 +319,8 @@ def extract_label_from_vnnlib(vnnlib_path: Path) -> Optional[int]:
 
 _X_RE = re.compile(r"X_(\d+)")
 _Y_RE = re.compile(r"Y_(\d+)")
-_Ineq = Tuple[List[float], List[float], float]
+_LinearExpr = Tuple[List[float], List[float], float]
+_Ineq = Tuple[List[float], List[float], float, bool]
 _Query = List[_Ineq]
 
 
@@ -419,12 +420,12 @@ def _queries_from_rewritten(
         x_ineqs: _Query = []
         y_ineqs: _Query = []
         skip = False
-        for xc, yc, d in q:
+        for xc, yc, d, strict in q:
             if any(v != 0 for v in yc):
-                y_ineqs.append((xc, yc, d))
+                y_ineqs.append((xc, yc, d, strict))
             elif any(v != 0 for v in xc):
-                x_ineqs.append((xc, yc, d))
-            elif d < 0:
+                x_ineqs.append((xc, yc, d, strict))
+            elif d < 0 or (strict and d == 0):
                 logger.debug(f"Infeasible constant constraint: 0 <= {d}")
                 skip = True
                 break
@@ -581,10 +582,6 @@ def _normalize_vnnlib_2_body(body: Any) -> Any:
         return body
     op = body[0]
     children = [_normalize_vnnlib_2_body(child) for child in body[1:]]
-    if op == "<" and len(children) == 2:
-        return ["<=", children[0], children[1]]
-    if op == ">" and len(children) == 2:
-        return [">=", children[0], children[1]]
     if op in ("=", "==") and len(children) == 2:
         return ["and", ["<=", children[0], children[1]], [">=", children[0], children[1]]]
     return [op] + children
@@ -645,7 +642,7 @@ def _extract_input_bounds(
         if not (isinstance(body, list) and len(body) == 3):
             continue
         op, left, right = body
-        if op not in ("<=", ">="):
+        if op not in ("<", ">", "<=", ">="):
             continue
         x_is_left = isinstance(left, str) and bool(_X_RE.fullmatch(left))
         x_is_right = isinstance(right, str) and bool(_X_RE.fullmatch(right))
@@ -663,7 +660,7 @@ def _extract_input_bounds(
         # (>= X val)  -> X >= val   (lower)
         # (<= val X)  -> val <= X   -> X >= val (lower)
         # (>= val X)  -> val >= X   -> X <= val (upper)
-        tighten_upper = (op == "<=" and x_is_left) or (op == ">=" and not x_is_left)
+        tighten_upper = (op in ("<", "<=") and x_is_left) or (op in (">", ">=") and not x_is_left)
         if tighten_upper:
             bounds[idx][1] = min(bounds[idx][1], val)
         else:
@@ -759,7 +756,7 @@ def _parse_all_forms(text: str) -> List[Any]:
 # -------------------------------------------------------------------------
 
 
-def _parse_linear_atom(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
+def _parse_linear_atom(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_LinearExpr]:
     if not isinstance(expr, str):
         return None
     xm = _X_RE.fullmatch(expr)
@@ -784,7 +781,7 @@ def _parse_linear_atom(expr: Any, num_inputs: int, num_outputs: int) -> Optional
         return None
 
 
-def _parse_linear_expr(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
+def _parse_linear_expr(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_LinearExpr]:
     atom = _parse_linear_atom(expr, num_inputs, num_outputs)
     if atom is not None:
         return atom
@@ -849,10 +846,10 @@ def _parse_inequality(op: str, lhs: Any, rhs: Any, num_inputs: int, num_outputs:
     xc = [a - b for a, b in zip(lxc, rxc)]
     yc = [a - b for a, b in zip(lyc, ryc)]
     d = rd - ld
-    if op == "<=":
-        return xc, yc, d
-    if op == ">=":
-        return [-v for v in xc], [-v for v in yc], -d
+    if op in ("<", "<="):
+        return xc, yc, d, op == "<"
+    if op in (">", ">="):
+        return [-v for v in xc], [-v for v in yc], -d, op == ">"
     return None
 
 
@@ -872,7 +869,7 @@ def _is_simple_x_bound(body: Any) -> bool:
     if not (isinstance(body, list) and len(body) == 3):
         return False
     op = body[0]
-    if op not in ("<=", ">="):
+    if op not in ("<", ">", "<=", ">="):
         return False
     left, right = body[1], body[2]
     if not (isinstance(left, str) and isinstance(right, str)):
@@ -914,7 +911,7 @@ def _process_body(body: Any, num_inputs: int, num_outputs: int) -> Optional[List
                 continue
             all_q.extend(sub)
         return all_q if all_q else None
-    if op in ("<=", ">=") and len(body) == 3:
+    if op in ("<", ">", "<=", ">=") and len(body) == 3:
         ineq = _parse_inequality(op, body[1], body[2], num_inputs, num_outputs)
         if ineq is None:
             return None
@@ -956,7 +953,7 @@ def _build_input_spec(
     ub_vals = [bounds_dict.get(i, (float('-inf'), float('inf')))[1] for i in range(num_inputs)]
     lb_tensor = torch.tensor(lb_vals)
     ub_tensor = torch.tensor(ub_vals)
-    for xc, _yc, d in extra_x_ineqs:
+    for xc, _yc, d, _strict in extra_x_ineqs:
         nonzero = [(i, v) for i, v in enumerate(xc) if v != 0]
         if len(nonzero) == 1:
             idx, coef = nonzero[0]
@@ -1000,12 +997,14 @@ def _build_output_specs(
     """
     rows_c: List[List[float]] = []
     rows_d: List[float] = []
+    rows_strict: List[bool] = []
     spans: List[Tuple[int, int]] = []
     for ineqs in per_query_ineqs:
         start = len(rows_c)
-        for _xc, yc, d in ineqs:
+        for _xc, yc, d, strict in ineqs:
             rows_c.append(list(yc))
             rows_d.append(float(d))
+            rows_strict.append(strict)
         spans.append((start, len(rows_c)))
 
     if not rows_c:
@@ -1013,12 +1012,14 @@ def _build_output_specs(
 
     c_all = torch.tensor(rows_c)
     d_all = torch.tensor(rows_d)
+    strict_all = torch.tensor(rows_strict, dtype=torch.bool) if any(rows_strict) else None
     return [
         _build_trivial_output_spec(num_outputs, true_label) if start == stop
         else OutputSpec(
             kind=OutKind.UNSAFE_LINEAR,
             c=c_all[start:stop],
             d=d_all[start:stop],
+            strict=strict_all[start:stop] if strict_all is not None else None,
         )
         for start, stop in spans
     ]
@@ -1060,6 +1061,8 @@ def _try_promote_to_top1(
     covered = set()
     for _, out_spec in queries:
         if out_spec.kind != OutKind.UNSAFE_LINEAR:
+            return None
+        if out_spec.strict is not None and bool(out_spec.strict.any()):
             return None
         c_mat = out_spec.c
         d_vec = out_spec.d

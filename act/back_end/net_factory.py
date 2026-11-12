@@ -1234,7 +1234,7 @@ class NetFactory:
         ``C`` / ``thresholds`` / ``M`` (verify_once).
         """
         kwargs = {
-            k: params[k] for k in ("y_true", "margin", "c", "d", "lb", "ub")
+            k: params[k] for k in ("y_true", "margin", "c", "d", "strict", "lb", "ub")
             if k in params
         }
         spec = OutputSpec(kind=params["kind"], **kwargs)

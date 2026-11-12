@@ -1053,6 +1053,8 @@ class ACTToTorch:
             )
         if "d" in output_params:
             output_spec_dict["d"] = _to_target_float_tensor(output_params["d"])
+        if "strict" in output_params:
+            output_spec_dict["strict"] = _to_target_tensor(output_params["strict"])
         for param_key in ["c", "lb", "ub"]:
             if param_key in output_params:
                 output_spec_dict[param_key] = _to_target_float_tensor(

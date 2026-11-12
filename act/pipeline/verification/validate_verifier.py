@@ -343,6 +343,9 @@ class VerificationValidator:
                 high["c"] = c[0].contiguous()
             if torch.is_tensor(d) and d.dim() == 2:
                 high["d"] = d[0].contiguous()
+            strict = params.get("strict")
+            if torch.is_tensor(strict):
+                high["strict"] = strict[0] if strict.dim() == 2 else strict
 
         else:
             return
