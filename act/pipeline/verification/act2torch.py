@@ -451,13 +451,20 @@ def _reshape(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) ->
     target = layer.params.get("target_shape") or layer.params.get("output_shape")
     if target is None:
         return inputs[0]
+    x, target = inputs[0], tuple(int(d) for d in target)
     input_shape = layer.params.get("input_shape")
-    if input_shape is not None and (int(input_shape[0]) != 1 or int(target[0]) != 1):
-        # A fixed-shape ONNX leading dimension belongs to the model,
-        # not to the verifier's independent sample lanes.
-        return inputs[0].reshape(tuple(int(d) for d in target))
+    if input_shape is not None and (int(input_shape[0]) != 1 or target[0] != 1):
+        # A fixed-shape ONNX leading dimension belongs to the model, not to
+        # the verifier's lanes: each lane holds one ``input_shape`` sample.
+        # Several lanes ride on an extra leading axis (see _axis_shift),
+        # which a unit model batch absorbs.
+        per_lane = torch.Size(int(d) for d in input_shape).numel()
+        lanes = x.numel() // per_lane if per_lane > 0 else 1
+        if lanes > 1:
+            return x.reshape(lanes, *(target[1:] if target[0] == 1 else target))
+        return x.reshape(target)
     # Native templates carry one conceptual lane; preserve the live B.
-    return inputs[0].reshape(inputs[0].shape[0], *target[1:])
+    return x.reshape(x.shape[0], *target[1:])
 
 
 def _constant(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
