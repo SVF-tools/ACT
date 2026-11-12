@@ -312,8 +312,19 @@ def _convert_OnnxReduceStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
     # OnnxReduceStaticAxes uses public ``axes`` / ``keepdims`` (different from
     # OnnxReduceSumStaticAxes which uses private ``_axes`` / ``_keepdims``).
     axes_attr = getattr(mod, 'axes', None) or list(range(len(self.shape)))
-    keepdims = bool(getattr(mod, 'keepdims', True))
-    norm_axes = _normalize_axes(axes_attr, len(self.shape))
+    _emit_mean(self, node, axes_attr, bool(getattr(mod, 'keepdims', True)))
+
+
+def _convert_OnnxGlobalAveragePool(self, mod: nn.Module, node: fx.Node) -> None:
+    """GlobalAveragePool: mean over every spatial axis (2..), keeping them as size 1."""
+    if not self._get_predecessor_state(node):
+        raise ValueError(f"GlobalAveragePool: missing predecessor for {node.name}")
+    _emit_mean(self, node, list(range(2, len(self.shape))), True)
+
+
+def _emit_mean(self, node: fx.Node, axes: list[int], keepdims: bool) -> None:
+    """Emit one MEAN layer reducing ``axes`` of the current shape."""
+    norm_axes = _normalize_axes(axes, len(self.shape))
     output_shape = _reduce_output_shape(self.shape, norm_axes, keepdims)
     out_vars = self._alloc_ids(_prod(output_shape) or 1)
     layer_id = self._add_layer(
@@ -488,9 +499,9 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
         )
     output_shape = tuple(self.shape[:-1]) + (out_features,)
     out_vars = self._alloc_ids(_prod(output_shape) or out_features)
-    # DENSE concretizes against the FLAT var vector, so a batched
-    # (..., M, K) @ (K, N) that shares W across M tokens must become a
-    # block-diagonal weight (token_count copies of W.T) — exact, not relaxed.
+    # A batched (..., M, K) @ (K, N) shares W across the M tokens: emit a
+    # token-wise DENSE (as nn.Linear does) instead of a block-diagonal weight,
+    # whose size grows with the square of the token count.
     weight_t = W.t().contiguous().detach().clone().to(self.dtype)
     n_in_vars = len(self.prev_out)
     if n_in_vars % in_features != 0:
@@ -498,15 +509,11 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
             f"OnnxMatMul at {node.name}: flat input var count {n_in_vars} "
             f"is not a multiple of weight in_features {in_features}"
         )
-    token_count = n_in_vars // in_features
-    weight_mat = torch.block_diag(*([weight_t] * token_count)) if token_count > 1 else weight_t
-    layer_id = self._add_layer(
-        LayerKind.DENSE.value,
-        {"weight": weight_mat,
-         "in_features": int(weight_mat.shape[1]), "out_features": int(weight_mat.shape[0]),
-         "input_shape": self.shape, "output_shape": output_shape},
-        self.prev_out, out_vars,
-    )
+    params = {"weight": weight_t, "in_features": in_features, "out_features": out_features,
+              "input_shape": self.shape, "output_shape": output_shape}
+    if n_in_vars // in_features > 1:
+        params["token_wise"] = True
+    layer_id = self._add_layer(LayerKind.DENSE.value, params, self.prev_out, out_vars)
     self.prev_out = out_vars
     self.shape = output_shape
     self._register_node(node.name, layer_id)
@@ -993,8 +1000,13 @@ def _convert_OnnxQuantizeLinear(self, mod: nn.Module, node: fx.Node) -> None:
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxQuantizeLinear: missing predecessor for {node.name}")
     out_vars = self._same_size_forward()
-    scale = _flat_broadcast_param(getattr(mod, "scale"), self.shape, getattr(mod, "axis", None), self.dtype)
-    zero_point = _flat_broadcast_param(getattr(mod, "zero_point"), self.shape, getattr(mod, "axis", None), self.dtype)
+    # Per-tensor parameters stay one element (every QUANTIZE consumer broadcasts
+    # them); expanding them would store two activation-sized tensors per layer.
+    scale, zero_point = (
+        param.detach().clone().to(dtype=self.dtype).reshape(1) if param.numel() == 1
+        else _flat_broadcast_param(param, self.shape, getattr(mod, "axis", None), self.dtype)
+        for param in (getattr(mod, "scale"), getattr(mod, "zero_point"))
+    )
     layer_id = self._add_layer(
         LayerKind.QUANTIZE.value,
         {"scale": scale, "zero_point": zero_point,
@@ -1207,6 +1219,8 @@ ONNX_HANDLERS = {
     'OnnxNeg': _convert_OnnxNeg,
     'OnnxPow': _convert_OnnxPow,
     'OnnxReduceStaticAxes': _convert_OnnxReduceStaticAxes,
+    'OnnxGlobalAveragePool': _convert_OnnxGlobalAveragePool,
+    'OnnxGlobalAveragePoolWithKnownInputShape': _convert_OnnxGlobalAveragePool,
     'OnnxReduceSumStaticAxes': _convert_OnnxReduceSumStaticAxes,
     'OnnxReshape': _convert_OnnxReshape,
     'OnnxResize': _convert_OnnxResize,

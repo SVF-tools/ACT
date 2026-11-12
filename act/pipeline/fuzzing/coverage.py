@@ -41,8 +41,9 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
+import heapq
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
@@ -100,6 +101,11 @@ class CoverageStrategy(ABC):
 
     def get_covered_neurons(self) -> Set[NeuronId]:
         raise NotImplementedError
+
+    def summarize_uncovered(self, limit: int) -> Tuple[int, List[NeuronId]]:
+        """Number of uncovered neurons and the first ``limit`` of them in sorted order."""
+        uncovered = self.get_uncovered_neurons()
+        return len(uncovered), heapq.nsmallest(limit, uncovered)
 
 
 def _activation_to_neuron_matrix(activation: torch.Tensor) -> torch.Tensor:
@@ -304,6 +310,18 @@ class GlobalCov(CoverageStrategy):
                 result.add((layer_name, int(idx)))
         return result
 
+    def summarize_uncovered(self, limit: int) -> Tuple[int, List[NeuronId]]:
+        # Masks stay tensors: one Python tuple per uncovered neuron does not scale to
+        # networks with millions of neurons.
+        count = self._total_neurons() - self._total_covered()
+        sample: List[NeuronId] = []
+        for layer_name in sorted(self._covered_masks):
+            if len(sample) >= limit:
+                break
+            idx = (~self._covered_masks[layer_name]).nonzero(as_tuple=True)[0][: limit - len(sample)]
+            sample.extend((layer_name, int(i)) for i in idx.tolist())
+        return count, sample
+
     def get_covered_neurons(self) -> Set[NeuronId]:
         result: Set[NeuronId] = set()
         for layer_name, mask in self._covered_masks.items():
@@ -393,6 +411,10 @@ class CoverageTracker:
     def get_uncovered_neurons(self, strategy: Optional[str] = None) -> Set[NeuronId]:
         s = strategy if strategy is not None else self.strategy
         return self._get_strategy(s).get_uncovered_neurons()
+
+    def summarize_uncovered(self, limit: int, strategy: Optional[str] = None) -> Tuple[int, List[NeuronId]]:
+        s = strategy if strategy is not None else self.strategy
+        return self._get_strategy(s).summarize_uncovered(limit)
 
     def get_covered_neurons(self, strategy: Optional[str] = None) -> Set[NeuronId]:
         s = strategy if strategy is not None else self.strategy

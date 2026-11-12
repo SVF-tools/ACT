@@ -114,13 +114,12 @@ def tf_dense(L: Layer, Bin: Bounds) -> Fact:
         else:
             assert isinstance(bias, torch.Tensor)
             bias = bias.to(device=Bin.lb.device, dtype=Bin.lb.dtype)
-        lower = Bin.lb.reshape(batch, tokens, in_features)
-        upper = Bin.ub.reshape(batch, tokens, in_features)
-        positive, negative = weight.clamp(min=0), weight.clamp(max=0)
-        box = Bounds(
-            (lower @ positive.T + upper @ negative.T + bias).reshape(batch, -1),
-            (upper @ positive.T + lower @ negative.T + bias).reshape(batch, -1),
+        # One affine map per token; affine_bounds keeps 0 * inf = 0 for unbounded inputs.
+        token_box = affine_bounds(
+            weight.clamp(min=0), weight.clamp(max=0), bias,
+            Bounds(Bin.lb.reshape(batch * tokens, in_features), Bin.ub.reshape(batch * tokens, in_features)),
         )
+        box = Bounds(token_box.lb.reshape(batch, -1), token_box.ub.reshape(batch, -1))
         return _fact(L, box, "EQ", {
             "tag": f"dense:{L.id}", "W": weight, "b": bias,
             "token_wise": True, "token_count": tokens,

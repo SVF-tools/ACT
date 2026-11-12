@@ -17,14 +17,16 @@ from __future__ import annotations
 import json
 import base64
 import io
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import numpy as np
 import torch
 
 from act.back_end.core import Layer, Net
 from act.front_end.spec_creator_base import LabeledInputTensor
 
-SERIALIZATION_VERSION = "2.0"
+SERIALIZATION_VERSION = "2.1"
+# 2.1 stores layer variable ids as [start, stop) runs; 2.0 files (plain id lists) still load.
+_READABLE_VERSIONS = {"2.0", SERIALIZATION_VERSION}
 _VALUE_TAG = "__act_type__"
 _TENSOR_KEYS = frozenset({"data", "dtype", "shape"})
 
@@ -147,6 +149,24 @@ def _decode_value(value: Any, target_device: Optional[str]) -> Any:
     raise TypeError(f"Unsupported JSON metadata value {type(value).__name__}")
 
 
+def _encode_vars(ids: List[int]) -> Dict[str, List[List[int]]]:
+    """Encode variable ids as ``[start, stop)`` runs; ids are allocated sequentially,
+    so a layer's list is a few runs even when it holds millions of ids."""
+    runs: List[List[int]] = []
+    for var in ids:
+        if runs and runs[-1][1] == var:
+            runs[-1][1] = var + 1
+        else:
+            runs.append([var, var + 1])
+    return {"runs": runs}
+
+
+def _decode_vars(value: Any) -> List[int]:
+    if isinstance(value, list):  # format 2.0
+        return value
+    return [var for start, stop in value["runs"] for var in range(start, stop)]
+
+
 class LayerSerializer:
     """Handles Layer serialization/deserialization."""
     
@@ -157,8 +177,8 @@ class LayerSerializer:
             "id": layer.id,
             "kind": layer.kind,
             "params": _encode_value(layer.params),
-            "in_vars": layer.in_vars,
-            "out_vars": layer.out_vars,
+            "in_vars": _encode_vars(layer.in_vars),
+            "out_vars": _encode_vars(layer.out_vars),
             "cache": _encode_value(layer.cache),
         }
     
@@ -173,8 +193,8 @@ class LayerSerializer:
             id=layer_dict["id"],
             kind=layer_dict["kind"],
             params=params_decoded,
-            in_vars=layer_dict["in_vars"],
-            out_vars=layer_dict["out_vars"],
+            in_vars=_decode_vars(layer_dict["in_vars"]),
+            out_vars=_decode_vars(layer_dict["out_vars"]),
             cache=cache_decoded
         )
 
@@ -204,8 +224,10 @@ class NetSerializer:
     def deserialize_net(net_dict: Dict[str, Any], target_device: Optional[str] = None) -> Net:
         """Convert JSON dictionary to Net object."""
         format_version = net_dict.get("format_version", "unknown")
-        if format_version != SERIALIZATION_VERSION:
-            raise ValueError(f"Unsupported format version: {format_version}. Expected {SERIALIZATION_VERSION}")
+        if format_version not in _READABLE_VERSIONS:
+            raise ValueError(
+                f"Unsupported format version: {format_version}. Expected one of {sorted(_READABLE_VERSIONS)}"
+            )
         
         act_net = net_dict["act_net"]
         

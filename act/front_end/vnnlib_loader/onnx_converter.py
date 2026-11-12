@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from onnx import ModelProto
+    from onnx import GraphProto, ModelProto, ValueInfoProto
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +76,12 @@ def _register_qdq_converters() -> None:
 
     class OnnxQuantizeLinear(_OnnxQdqBase):
         def forward(self, x, scale=None, zero_point=None):
+            # ONNX semantics: the integer code, held in x's float dtype. The
+            # following DequantizeLinear maps it back to s * (code - zp); torch2act
+            # fuses a matching Q/DQ pair into one real-valued QUANTIZE layer.
             s = _reshape_axis_param(cast(torch.Tensor, self.scale).to(device=x.device, dtype=x.dtype), x, self.axis)
             zp = _reshape_axis_param(cast(torch.Tensor, self.zero_point).to(device=x.device, dtype=x.dtype), x, self.axis)
-            return s * torch.clamp(torch.round(x / s), min=float(self.qmin) - zp, max=float(self.qmax) - zp)
+            return torch.clamp(torch.round(x / s) + zp, min=float(self.qmin), max=float(self.qmax))
 
     class OnnxDequantizeLinear(_OnnxQdqBase):
         def forward(self, q, scale=None, zero_point=None):
@@ -216,6 +219,80 @@ def _ensure_unique_node_names(onnx_model: ModelProto) -> ModelProto:
     return onnx_model
 
 
+PACKED_INPUT_NAME = "act_packed_input"
+
+
+def _data_inputs(graph: GraphProto) -> list[ValueInfoProto]:
+    """Graph inputs that are fed at run time (IR < 4 models also list initializers)."""
+    initializers = {init.name for init in graph.initializer}
+    return [inp for inp in graph.input if inp.name not in initializers]
+
+
+def pack_onnx_inputs(onnx_model: ModelProto) -> ModelProto:
+    """Replace several data inputs with one flat input ``[batch, sum(numel)]``.
+
+    ACT verifies one input tensor per network, so a network with inputs
+    ``x_1 .. x_k`` becomes ``f(Slice/Reshape(p))`` over their row-major
+    concatenation ``p`` in graph-input order -- the order in which VNNLIB 2.0
+    declares them (see ``vnnlib_parser._input_layout``). The rewrite is exact:
+    the original graph runs unchanged on the reconstructed tensors.
+    Single-input models are returned untouched.
+    """
+    import numpy as np
+    from onnx import helper, numpy_helper
+
+    graph = onnx_model.graph
+    inputs = _data_inputs(graph)
+    if len(inputs) < 2:
+        return onnx_model
+    elem_types = {inp.type.tensor_type.elem_type for inp in inputs}
+    if len(elem_types) != 1:
+        raise ONNXConversionError("multi-input ONNX model mixes input element types")
+    batch_dims, row_shapes = [], []
+    for inp in inputs:
+        dims = list(inp.type.tensor_type.shape.dim)
+        if len(dims) < 2 or any(d.dim_value <= 0 for d in dims[1:]):
+            raise ONNXConversionError(
+                f"multi-input ONNX model needs a batch axis and static row shape; "
+                f"input {inp.name!r} has shape {_extract_shape_from_tensor(inp)}"
+            )
+        batch_dims.append(dims[0].dim_value)
+        row_shapes.append([int(d.dim_value) for d in dims[1:]])
+    if len(set(batch_dims)) != 1:
+        raise ONNXConversionError(f"multi-input ONNX model has differing batch extents {batch_dims}")
+
+    nodes, constants, offset = [], [], 0
+    for index, (inp, row_shape) in enumerate(zip(inputs, row_shapes)):
+        size = int(np.prod(row_shape))
+        prefix = f"{PACKED_INPUT_NAME}_{index}"
+        constants += [
+            numpy_helper.from_array(np.array([offset], np.int64), f"{prefix}_start"),
+            numpy_helper.from_array(np.array([offset + size], np.int64), f"{prefix}_end"),
+            numpy_helper.from_array(np.array([1], np.int64), f"{prefix}_axis"),
+            numpy_helper.from_array(np.array([-1, *row_shape], np.int64), f"{prefix}_shape"),
+        ]
+        nodes += [
+            helper.make_node("Slice", [PACKED_INPUT_NAME, f"{prefix}_start", f"{prefix}_end", f"{prefix}_axis"],
+                             [f"{prefix}_flat"], name=f"{prefix}_slice"),
+            helper.make_node("Reshape", [f"{prefix}_flat", f"{prefix}_shape"], [inp.name],
+                             name=f"{prefix}_reshape"),
+        ]
+        offset += size
+    packed = helper.make_tensor_value_info(
+        PACKED_INPUT_NAME, elem_types.pop(),
+        [batch_dims[0] or inputs[0].type.tensor_type.shape.dim[0].dim_param or "batch", offset],
+    )
+    for inp in inputs:
+        graph.input.remove(inp)
+    graph.input.insert(0, packed)
+    graph.initializer.extend(constants)
+    original_nodes = list(graph.node)
+    del graph.node[:]
+    graph.node.extend(nodes + original_nodes)
+    logger.info("Packed %d ONNX inputs into one [batch, %d] input", len(inputs), offset)
+    return onnx_model
+
+
 def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
     """Apply the same opset and graph preparation on main and raw retry."""
     try:
@@ -230,7 +307,7 @@ def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
             onnx_model = version_converter.convert_version(onnx_model, 13)
     except Exception as exc:
         logger.warning("Opset upgrade failed (%s), proceeding with original opset", exc)
-    return _ensure_unique_node_names(_preprocess_onnx_for_onnx2torch(onnx_model))
+    return _ensure_unique_node_names(_preprocess_onnx_for_onnx2torch(pack_onnx_inputs(onnx_model)))
 
 
 def convert_onnx_to_pytorch(
@@ -360,12 +437,13 @@ def get_onnx_input_shape(onnx_path: Path) -> Tuple[int, ...]:
         onnx_model = onnx.load(str(onnx_path))
         graph = onnx_model.graph
         
-        if not graph.input:
+        data_inputs = _data_inputs(graph)
+        if not data_inputs:
             raise ONNXConversionError("ONNX model has no inputs")
-        
-        # Get first input tensor
-        input_tensor = graph.input[0]
-        shape = _extract_shape_from_tensor(input_tensor)
+        if len(data_inputs) > 1:
+            # Converted models take the packed input built by pack_onnx_inputs.
+            data_inputs = _data_inputs(pack_onnx_inputs(onnx_model).graph)
+        shape = _extract_shape_from_tensor(data_inputs[0])
         
         # Handle batch dimension - keep original, but normalize dynamic batch
         if not shape:

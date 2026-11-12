@@ -37,84 +37,6 @@ class UnsupportedSpecError(ValueError):
     pass
 
 
-_DECLARE_NETWORK_RE = re.compile(r"\(\s*declare-network\s+([A-Za-z_]\w*)\b")
-_DECLARE_INPUT_RE = re.compile(
-    r"\(\s*declare-input\s+([A-Za-z_]\w*)\s+\S+\s+\[([^\]]+)\]\s*\)",
-    re.MULTILINE,
-)
-_ASSERT_RE = re.compile(r"\(\s*assert\b")
-
-
-def _declaration_prefix(vnnlib_path: Path) -> str:
-    """Read only the declarations preceding the first VNNLIB assertion."""
-    lines: List[str] = []
-    try:
-        with open(vnnlib_path, "r") as source:
-            for line in source:
-                assert_match = _ASSERT_RE.search(line)
-                lines.append(line if assert_match is None else line[:assert_match.start()])
-                if assert_match is not None:
-                    break
-    except OSError as exc:
-        raise VNNLibParseError(f"Failed to read {vnnlib_path}: {exc}") from exc
-    return "".join(lines)
-
-
-def _network_declaration_blocks(prefix: str) -> List[Tuple[str, str]]:
-    """Return complete ``declare-network`` forms from a declaration prefix."""
-    uncommented = re.sub(r";[^\n]*", "", prefix)
-    blocks: List[Tuple[str, str]] = []
-    for match in _DECLARE_NETWORK_RE.finditer(uncommented):
-        depth = 0
-        for index in range(match.start(), len(uncommented)):
-            char = uncommented[index]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    blocks.append((match.group(1), uncommented[match.start():index + 1]))
-                    break
-    return blocks
-
-
-def reject_multi_input_vnnlib(vnnlib_path: Path) -> None:
-    """Reject VNNLIB 2.0 networks declaring multiple input tensors.
-
-    The scan stops at the first assertion, so even very large properties are
-    rejected without tokenizing or constructing their assertion AST. Separate
-    one-input ``declare-network`` blocks remain supported for isomorphic specs.
-    Legacy VNNLIB 1.0 ``declare-const X_i`` declarations denote one flat input
-    tensor and therefore do not trigger this check.
-    """
-    prefix = _declaration_prefix(vnnlib_path)
-    network_blocks = _network_declaration_blocks(prefix)
-    if not network_blocks:
-        network_blocks = [("<unnamed>", prefix)]
-
-    for network_name, block in network_blocks:
-        declarations = []
-        for match in _DECLARE_INPUT_RE.finditer(block):
-            raw_shape = match.group(2)
-            try:
-                shape = tuple(int(part.strip()) for part in raw_shape.split(",") if part.strip())
-            except ValueError as exc:
-                raise VNNLibParseError(
-                    f"Invalid VNNLIB 2.0 declare-input shape: {raw_shape}"
-                ) from exc
-            declarations.append((match.group(1), shape))
-
-        if len(declarations) > 1:
-            rendered = ", ".join(
-                f"{name} [{', '.join(str(dim) for dim in shape)}]"
-                for name, shape in declarations
-            )
-            raise UnsupportedSpecError(
-                f"{vnnlib_path}: multiple input tensors are unsupported; "
-                f"network {network_name!r} declares {len(declarations)} inputs: {rendered}"
-            )
-
-
 # -------------------------------------------------------------------------
 # Public API
 # -------------------------------------------------------------------------
@@ -146,8 +68,6 @@ def parse_vnnlib_to_tensors(
     if not vnnlib_path.exists():
         raise VNNLibParseError(f"VNNLIB file not found: {vnnlib_path}")
 
-    reject_multi_input_vnnlib(vnnlib_path)
-    
     try:
         with open(vnnlib_path, 'r') as f:
             content = f.read()
@@ -160,11 +80,7 @@ def parse_vnnlib_to_tensors(
                     raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
                 content, num_inputs, num_outputs, _f_in_shape = _isomorphic_multinet_rewrite(content)
             else:
-                in_name, _in_dtype, in_shape = _extract_vnnlib_2_decl(content, "input")
-                out_name, _out_dtype, out_shape = _extract_vnnlib_2_decl(content, "output")
-                num_inputs = _numel(in_shape)
-                num_outputs = _numel(out_shape)
-                content = _rewrite_vnnlib_2_bracket_vars(content, in_name, in_shape, out_name, out_shape)
+                content, num_inputs, num_outputs = _single_network_rewrite(content)
         else:
             raise UnsupportedSpecError(
                 f"{vnnlib_path.name}: VNNLIB 1.0 flat format is no longer supported "
@@ -176,12 +92,7 @@ def parse_vnnlib_to_tensors(
         # Constraints inside (or ...) branches must not be intersected here —
         # that would produce empty boxes for disjunctive-input properties
         # (e.g. ACAS Xu prop_5..10).
-        forms = _parse_all_forms(content)
-        simple_bodies = [
-            f[1] for f in forms
-            if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"
-            and _is_simple_x_bound(f[1])
-        ]
+        simple_bodies = [b for b in _assert_conjuncts(_parse_all_forms(content)) if _is_simple_x_bound(b)]
         input_bounds = _extract_input_bounds(simple_bodies, num_inputs)
         
         # Create input tensor from bounds center
@@ -336,7 +247,6 @@ def parse_vnnlib_2_0(
     """Parse VNNLIB 2.0 by ravel-rewriting bracket variables to legacy names."""
     if not vnnlib_path.exists():
         raise VNNLibParseError(f"VNNLIB file not found: {vnnlib_path}")
-    reject_multi_input_vnnlib(vnnlib_path)
     try:
         with open(vnnlib_path, 'r') as f:
             content = f.read()
@@ -348,26 +258,17 @@ def parse_vnnlib_2_0(
             return _parse_vnnlib_2_0_isomorphic(content, labeled_tensor)
         raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
 
-    input_name, _input_dtype, input_shape = _extract_vnnlib_2_decl(content, "input")
-    output_name, _output_dtype, output_shape = _extract_vnnlib_2_decl(content, "output")
-    num_inputs = _numel(input_shape)
-    num_outputs = _numel(output_shape)
-    tensor_shape = tuple(labeled_tensor.tensor.shape) if labeled_tensor is not None else tuple(input_shape)
+    inputs = _extract_all_vnnlib_2_decls(content, "input")
+    rewritten, num_inputs, num_outputs = _single_network_rewrite(content)
+    default_shape = inputs[0][1] if len(inputs) == 1 else (1, num_inputs)
+    tensor_shape = tuple(labeled_tensor.tensor.shape) if labeled_tensor is not None else tuple(default_shape)
     tensor_numel = _numel(tensor_shape)
     if tensor_numel != num_inputs:
         raise VNNLibParseError(
-            f"VNNLIB 2.0 declared input shape {input_shape} has {num_inputs} elements, "
+            f"VNNLIB 2.0 declared inputs {[shape for _, shape in inputs]} have {num_inputs} elements, "
             f"but model/sample input shape {tensor_shape} has {tensor_numel}"
         )
     true_label = labeled_tensor.label if labeled_tensor is not None else None
-
-    rewritten = _rewrite_vnnlib_2_bracket_vars(
-        content,
-        input_name=input_name,
-        input_shape=input_shape,
-        output_name=output_name,
-        output_shape=output_shape,
-    )
     return _queries_from_rewritten(
         rewritten, num_inputs, num_outputs, tensor_shape, true_label, vnnlib_path.name
     )
@@ -390,8 +291,7 @@ def _queries_from_rewritten(
     except Exception as e:
         raise VNNLibParseError(f"S-expression parse failed: {e}") from e
 
-    asserts = [f for f in forms if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"]
-    assert_bodies = [_normalize_vnnlib_2_body(f[1]) for f in asserts]
+    assert_bodies = _assert_conjuncts(forms)
     for body in assert_bodies:
         if _contains_non_affine(body, num_inputs, num_outputs):
             raise UnsupportedSpecError("nonlinear VNNLIB 2.0 assertion not supported")
@@ -495,6 +395,30 @@ def _isomorphic_multinet_rewrite(content: str) -> Tuple[str, int, int, Tuple[int
         f_out_name: ("Y", f_out_shape, 0),
         g_out_name: ("Y", g_out_shape, f_out_numel),
     }
+    return _rewrite_bracket_vars(content, name_map), num_inputs, num_outputs, f_in_shape
+
+
+def _single_network_rewrite(content: str) -> Tuple[str, int, int]:
+    """Flatten a one-network file to ``X_n``/``Y_n``; returns (rewritten, num_inputs, num_outputs).
+
+    Several ``declare-input`` tensors are concatenated row-major in declaration
+    order, matching the packed input ``onnx_converter.pack_onnx_inputs`` builds
+    from the ONNX graph inputs (VNNLIB 2.0 declares inputs in graph order).
+    Several outputs concatenate the same way.
+    """
+    name_map: Dict[str, Tuple[str, Tuple[int, ...], int]] = {}
+    totals: Dict[str, int] = {}
+    for io_kind, prefix in (("input", "X"), ("output", "Y")):
+        base = 0
+        for name, shape in _extract_all_vnnlib_2_decls(content, io_kind):
+            name_map[name] = (prefix, shape, base)
+            base += _numel(shape)
+        totals[prefix] = base
+    return _rewrite_bracket_vars(content, name_map), totals["X"], totals["Y"]
+
+
+def _rewrite_bracket_vars(content: str, name_map: Dict[str, Tuple[str, Tuple[int, ...], int]]) -> str:
+    """Rewrite ``name[i,..]`` to ``<prefix>_<base + ravel(i,..)>`` for every name in ``name_map``."""
     var_re = re.compile(r"\b([A-Za-z_]\w*)\s*\[([^\]]+)\]")
 
     def repl(m: "re.Match[str]") -> str:
@@ -505,7 +429,7 @@ def _isomorphic_multinet_rewrite(content: str) -> Tuple[str, int, int, Tuple[int
         idx = tuple(int(p.strip()) for p in m.group(2).split(",") if p.strip())
         return f"{prefix}_{base + _ravel_c_order(idx, shape)}"
 
-    return var_re.sub(repl, content), num_inputs, num_outputs, f_in_shape
+    return var_re.sub(repl, content)
 
 
 def _parse_vnnlib_2_0_isomorphic(
@@ -556,25 +480,27 @@ def _ravel_c_order(indices: Tuple[int, ...], shape: Tuple[int, ...]) -> int:
     return flat
 
 
-def _rewrite_vnnlib_2_bracket_vars(
-    content: str,
-    input_name: str,
-    input_shape: Tuple[int, ...],
-    output_name: str,
-    output_shape: Tuple[int, ...],
-) -> str:
-    var_re = re.compile(r"\b([A-Za-z_]\w*)\s*\[([^\]]+)\]")
+def _assert_conjuncts(forms: List[Any]) -> List[Any]:
+    """Normalized bodies of the top-level asserts, with top-level ``and`` split.
 
-    def repl(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if name not in (input_name, output_name):
-            return match.group(0)
-        indices = tuple(int(part.strip()) for part in match.group(2).split(",") if part.strip())
-        if name == input_name:
-            return f"X_{_ravel_c_order(indices, input_shape)}"
-        return f"Y_{_ravel_c_order(indices, output_shape)}"
-
-    return var_re.sub(repl, content)
+    Asserts are conjunctive, so ``(assert (and a b))`` equals ``(assert a)
+    (assert b)``. Splitting lets per-variable box bounds written as
+    ``(and (>= X_i lo) (<= X_i hi))`` take the fast simple-bound path and
+    set the input center, instead of entering query expansion as one
+    complex assertion each.
+    """
+    bodies: List[Any] = []
+    pending = [
+        _normalize_vnnlib_2_body(f[1]) for f in reversed(forms)
+        if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"
+    ]
+    while pending:
+        body = pending.pop()
+        if isinstance(body, list) and body and body[0] == "and":
+            pending.extend(reversed(body[1:]))
+        else:
+            bodies.append(body)
+    return bodies
 
 
 def _normalize_vnnlib_2_body(body: Any) -> Any:
@@ -1141,6 +1067,8 @@ def extract_vnnlib_2_io_decls(vnnlib_path):
     if "(vnnlib-version" not in content and "(declare-network" not in content:
         return None
     if len(re.findall(r"\(\s*declare-network\b", content)) >= 2:
+        return None
+    if len(re.findall(r"\(\s*declare-input\b", content)) >= 2:
         return None
     try:
         return (_extract_vnnlib_2_decl(content, "input"),
