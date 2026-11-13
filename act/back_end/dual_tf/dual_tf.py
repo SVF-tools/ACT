@@ -17,10 +17,10 @@ from act.back_end.core import Bounds, Layer
 from act.back_end.layer_schema import LayerKind
 from .tf_mlp import (
     backward_dense, backward_relu, backward_bias, backward_scale,
-    backward_bn, backward_identity, backward_mean, backward_reduce_sum, backward_sign,
+    backward_bn, backward_identity, backward_mean, backward_reduce_sum, backward_step,
     forward_dense, forward_relu, forward_bias, forward_scale,
     forward_bn, forward_lrelu, forward_identity, forward_reshape, forward_mean,
-    forward_reduce_sum, forward_sign,
+    forward_reduce_sum, forward_step,
 )
 from .tf_cnn import (
     backward_conv1d, forward_conv1d,
@@ -569,7 +569,8 @@ class DualTF:
         (LayerKind.ATT_MIX.value, forward_attention, backward_attention),
         (LayerKind.MATMUL.value, forward_matmul, backward_matmul),
         (LayerKind.MUL.value, forward_mul, backward_mul),
-        (LayerKind.SIGN.value, forward_sign, backward_sign),
+        (LayerKind.SIGN.value, forward_step, backward_step),
+        (LayerKind.ROUND.value, forward_step, backward_step),
         (LayerKind.MHA_SPLIT.value, forward_mha_split, backward_mha_split),
         (LayerKind.MHA_JOIN.value, forward_concat, backward_concat),
         (LayerKind.MASK_ADD.value, _unsupported_forward, _unsupported_backward),

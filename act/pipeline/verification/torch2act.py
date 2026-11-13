@@ -1666,16 +1666,18 @@ class _LayerGraphBuilder:
 
         _, in_c, in_h, in_w = (int(d) for d in self.shape)
         out_c = int(mod.out_channels)
+        ks = tuple(int(d) for d in _normalize_tuple(mod.kernel_size))
         st = tuple(int(d) for d in _normalize_tuple(mod.stride))
         pad = tuple(int(d) for d in _normalize_tuple(mod.padding, (0, 0)))
         dil = tuple(int(d) for d in _normalize_tuple(mod.dilation))
         op = tuple(int(d) for d in _normalize_tuple(mod.output_padding, (0, 0)))
-        out_h = (in_h - 1) * st[0] - 2 * pad[0] + dil[0] * (mod.kernel_size[0] - 1) + op[0] + 1
-        out_w = (in_w - 1) * st[1] - 2 * pad[1] + dil[1] * (mod.kernel_size[1] - 1) + op[1] + 1
+        out_h = (in_h - 1) * st[0] - 2 * pad[0] + dil[0] * (ks[0] - 1) + op[0] + 1
+        out_w = (in_w - 1) * st[1] - 2 * pad[1] + dil[1] * (ks[1] - 1) + op[1] + 1
         output_shape = (1, out_c, out_h, out_w)
 
         params = {
             "weight": weight,
+            "in_channels": in_c, "out_channels": out_c, "kernel_size": ks,
             "stride": st, "padding": pad, "dilation": dil, "groups": mod.groups,
             "output_padding": op,
             "input_shape": self.shape, "output_shape": output_shape,

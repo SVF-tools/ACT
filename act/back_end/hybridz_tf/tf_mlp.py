@@ -1023,9 +1023,9 @@ def tf_constant(L, bounds, tf):
     return interval.tf_constant(L, bounds)
 
 
-def tf_sign(L, bounds, tf):
+def tf_step(L, bounds, tf):
     tf._hz_cache.pop(L.id, None)
-    return interval.tf_sign(L, bounds)
+    return interval.tf_step(L, bounds)
 
 
 def tf_compare(L, bounds, tf):

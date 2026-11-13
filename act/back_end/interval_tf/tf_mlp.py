@@ -18,6 +18,7 @@ import math
 from typing import Any
 from collections.abc import Mapping
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
+from act.back_end.layer_schema import step_function
 from act.back_end.utils import affine_bounds, four_corner_envelope, pwl_meta
 
 
@@ -302,11 +303,10 @@ def tf_constant(L: Layer, Bin: Bounds) -> Fact:
     C.replace(Con("EQ", tuple(L.out_vars), {"tag": f"constant:{L.id}", "value": val}))
     return Fact(Bout, C)
 
-def tf_sign(L: Layer, Bin: Bounds) -> Fact:
-    l, u = Bin.lb, Bin.ub
-    lb = torch.sign(l)
-    ub = torch.sign(u)
-    B = Bounds(lb, ub)
+def tf_step(L: Layer, Bin: Bounds) -> Fact:
+    """SIGN / ROUND: monotone non-decreasing steps, so the box is exactly [f(lb), f(ub)]."""
+    f = step_function(L.kind, L.params)
+    B = Bounds(f(Bin.lb), f(Bin.ub))
     C = ConSet(); C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
@@ -589,11 +589,6 @@ def _transpose_flat_indices(
         raise ValueError(f"transpose layer {L.id} requires input_shape")
     input_shape = tuple(int(d) for d in input_shape)
     perm = tuple(int(d) for d in perm)
-    if not input_shape or input_shape[0] != 1:
-        raise ValueError(
-            f"transpose layer {L.id}: input_shape must have a singleton batch "
-            f"dimension, got {input_shape}"
-        )
     if math.prod(input_shape) != n:
         raise ValueError(
             f"transpose layer {L.id}: input_shape {input_shape} has "
@@ -601,10 +596,6 @@ def _transpose_flat_indices(
         )
     if sorted(perm) != list(range(len(input_shape))):
         raise ValueError(f"transpose layer {L.id}: invalid permutation {perm}")
-    if perm[0] != 0:
-        raise ValueError(
-            f"transpose layer {L.id}: batch-axis permutation is unsupported: {perm}"
-        )
     return torch.arange(n, device=device).reshape(input_shape).permute(*perm).reshape(-1)
 
 
@@ -625,12 +616,10 @@ def tf_transpose(L: Layer, Bin: Bounds) -> Fact:
                 f"transpose layer {L.id}: expected {width} input/output variables, "
                 f"got {len(L.in_vars)}/{len(L.out_vars)}"
             )
-        if Bin.lb.ndim == len(perm):
-            if tuple(Bin.lb.shape[1:]) != input_shape[1:]:
-                raise ValueError(
-                    f"transpose layer {L.id}: bounds shape {tuple(Bin.lb.shape)} "
-                    f"does not match input_shape {input_shape}"
-                )
+        # Bounds laid out as [lanes, *input_shape[1:]] permute in place when the
+        # leading (batch) axis stays first; any other per-lane shape, e.g. an
+        # unbatched (n, 1) column, permutes its flattened lane coordinates.
+        if Bin.lb.ndim == len(perm) and perm[0] == 0 and tuple(Bin.lb.shape[1:]) == input_shape[1:]:
             B = Bounds(
                 Bin.lb.permute(*perm).contiguous(),
                 Bin.ub.permute(*perm).contiguous(),

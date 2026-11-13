@@ -506,11 +506,6 @@ def _emit_transpose(
             raise ValueError("transpose: input_shape is required when perm is set")
         input_shape = tuple(int(v) for v in input_shape_raw)
         perm = tuple(int(v) for v in perm_raw)
-        if not input_shape or input_shape[0] != 1:
-            raise ValueError(
-                f"transpose: input_shape must have a singleton batch dimension, "
-                f"got {input_shape}"
-            )
         if int(np.prod(input_shape)) != n:
             raise ValueError(
                 f"transpose: input_shape {input_shape} has "
@@ -518,10 +513,6 @@ def _emit_transpose(
             )
         if sorted(perm) != list(range(len(input_shape))):
             raise ValueError(f"transpose: invalid permutation {perm}")
-        if perm[0] != 0:
-            raise ValueError(
-                f"transpose: batch-axis permutation is unsupported: {perm}"
-            )
         idx = (
             torch.arange(n, device=device)
             .reshape(input_shape)
