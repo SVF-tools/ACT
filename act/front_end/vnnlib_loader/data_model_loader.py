@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Sequence, Tuple
 import ast
 import os
 import logging
@@ -36,8 +36,13 @@ from act.front_end.vnnlib_loader.onnx_converter import (
     ONNXConversionError
 )
 from act.front_end.vnnlib_loader.vnnlib_parser import (
+    LiftedTerms,
+    MultiNetworkLayout,
+    lifted_output_terms,
+    multi_network_layout,
     parse_vnnlib_to_tensors,
     extract_label_from_vnnlib,
+    UnsupportedSpecError,
     VNNLibParseError
 )
 from act.front_end.spec_creator_base import LabeledInputTensor
@@ -94,22 +99,110 @@ def _read_instance_rows(instances_file: Path) -> List[Tuple[str, str, str]]:
     return [(row[0], row[1], row[2]) for row in rows if len(row) >= 3]
 
 
-class _CombinedDualModel(nn.Module):
-    """Run two networks on a SHARED input and concatenate outputs as [f(x); g(x)].
+class _MultiNetworkModel(nn.Module):
+    """Run the networks of a multi-network VNN-LIB 2.0 spec on one combined input.
 
-    Used for isomorphic-equivalence specs; the concat order matches the parser's
-    Y_f -> Y_<j>, Y_g -> Y_<numel(Y_f)+j> indexing.
+    Each network reads its positions of the combined input (``layout.input_index``)
+    through a fixed 0/1 selection, a bias-free Linear that ACT lowers to an exact
+    DENSE layer; when every network reads the whole input (isomorphic-to) the input
+    is passed through unchanged. Outputs concatenate as ``[f(x_f); g(x_g); ...]``,
+    matching the parser's Y numbering.
     """
 
-    def __init__(self, model_f: nn.Module, model_g: nn.Module):
+    def __init__(self, models: Sequence[nn.Module], layout: MultiNetworkLayout):
         super().__init__()
-        self.model_f = model_f
-        self.model_g = model_g
+        self.models = nn.ModuleList(models)
+        # Per-lane shape of each network input (declared shapes lead with batch 1).
+        self.lane_shapes = [s[1:] if len(s) > 1 and s[0] == 1 else s for s in layout.input_shapes]
+        # nn.Flatten modules (not Tensor.flatten), so per-layer soundness checks can
+        # hook every FLATTEN the conversion emits.
+        self.flatten_input = nn.Flatten()
+        self.flatten_outputs = nn.ModuleList(nn.Flatten() for _ in models)
+        self.selectors = nn.ModuleList()
+        if not layout.shared_input:
+            for index in layout.input_index:
+                selector = nn.Linear(layout.num_inputs, len(index), bias=False)
+                weight = torch.zeros(len(index), layout.num_inputs)
+                weight[torch.arange(len(index)), torch.tensor(index)] = 1.0
+                selector.weight = nn.Parameter(weight, requires_grad=False)
+                self.selectors.append(selector)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        yf = self.model_f(x)
-        yg = self.model_g(x)
-        return torch.cat([yf.flatten(1), yg.flatten(1)], dim=1)
+        if not self.selectors:
+            outputs = [model(x) for model in self.models]
+        else:
+            flat = self.flatten_input(x)
+            outputs = [
+                model(selector(flat).reshape(-1, *shape))
+                for model, selector, shape in zip(self.models, self.selectors, self.lane_shapes)
+            ]
+        return torch.cat([flatten(out) for flatten, out in zip(self.flatten_outputs, outputs)], dim=1)
+
+
+def _multi_network_model(models: Sequence[nn.Module], vnnlib_path: Path) -> Tuple[nn.Module, Tuple[int, ...]]:
+    """Combine the converted networks of a multi-network instance; returns (model, input shape)."""
+    layout = multi_network_layout(vnnlib_path)
+    if layout is None or len(layout.names) != len(models):
+        declared = 1 if layout is None else len(layout.names)
+        raise UnsupportedSpecError(
+            f"{Path(vnnlib_path).name} declares {declared} network(s), "
+            f"but the instance gives {len(models)} ONNX models"
+        )
+    return _MultiNetworkModel(models, layout).eval(), layout.input_shape
+
+
+def build_multi_network_model(
+    onnx_paths: Sequence[Path], vnnlib_path: Path,
+) -> Tuple[nn.Module, Tuple[int, ...]]:
+    """Convert one ONNX file per network declared by ``vnnlib_path`` (in declaration
+    order) and combine them; returns (model, input shape of the combined model)."""
+    models = [convert_onnx_to_pytorch(Path(p), simplify=True).eval() for p in onnx_paths]
+    return _multi_network_model(models, Path(vnnlib_path))
+
+
+class _LiftedTermsModel(nn.Module):
+    """Append a property's :class:`LiftedTerms` to the model outputs: ``[f(x) ; t_1 ; ...]``.
+
+    Factor ``p`` of every term is read from ``[x ; f(x)]`` by a fixed 0/1
+    selection (a Linear that ACT lowers to an exact DENSE; a term with fewer
+    factors reads the constant 1 there), and the factors multiply elementwise,
+    so verification bounds each product and a counterexample evaluates it exactly.
+    """
+
+    def __init__(self, model: nn.Module, lifted: LiftedTerms):
+        super().__init__()
+        self.model = model
+        self.flatten_input, self.flatten_output = nn.Flatten(), nn.Flatten()  # hookable, as in _MultiNetworkModel
+        width = lifted.num_inputs + lifted.num_outputs
+        self.factors = nn.ModuleList()
+        for position in range(max(len(term) for term in lifted.terms)):
+            weight = torch.zeros(len(lifted.terms), width)
+            bias = torch.zeros(len(lifted.terms))
+            for row, term in enumerate(lifted.terms):
+                if position < len(term):
+                    kind, index = term[position]
+                    weight[row, index if kind == "X" else lifted.num_inputs + index] = 1.0
+                else:
+                    bias[row] = 1.0
+            factor = nn.Linear(width, len(lifted.terms))
+            factor.weight = nn.Parameter(weight, requires_grad=False)
+            factor.bias = nn.Parameter(bias, requires_grad=False)
+            self.factors.append(factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        outputs = self.flatten_output(self.model(x))
+        variables = torch.cat([self.flatten_input(x), outputs], dim=1)
+        lifted = self.factors[0](variables)
+        for factor in self.factors[1:]:
+            lifted = lifted * factor(variables)
+        return torch.cat([outputs, lifted], dim=1)
+
+
+def lift_spec_terms(model: nn.Module, vnnlib_path: Path) -> nn.Module:
+    """The model whose outputs the property's rows read: ``model`` itself, or ``model``
+    followed by the property's lifted terms (products of variables, inputs of output rows)."""
+    lifted = lifted_output_terms(Path(vnnlib_path))
+    return _LiftedTermsModel(model, lifted).eval() if lifted.terms else model
 
 
 def download_vnnlib_category(
@@ -510,10 +603,9 @@ def load_vnnlib_pair(
     # many instances of one model skips it for all but the first.
     if 'model' in onnx_cache:
         logger.info("[1/3] Reusing already-converted PyTorch model...")
-        model = onnx_cache['model']
-        pytorch_model = onnx_cache.get('model_f', model)
+        pytorch_model = onnx_cache['model']
         pytorch_model_g = onnx_cache.get('model_g')
-        model.eval()
+        pytorch_model.eval()
         logger.info(f"  ✓ Model reused successfully")
     else:
         logger.info("[1/3] Converting ONNX model to PyTorch...")
@@ -533,18 +625,19 @@ def load_vnnlib_pair(
             except ONNXConversionError as e:
                 raise RuntimeError(f"Second ONNX conversion failed: {e}")
         
-        model = (
-            pytorch_model if pytorch_model_g is None
-            else _CombinedDualModel(pytorch_model, pytorch_model_g)
-        )
-        onnx_cache['model'] = model
+        onnx_cache['model'] = pytorch_model
         if pytorch_model_g is not None:
-            onnx_cache['model_f'] = pytorch_model
             onnx_cache['model_g'] = pytorch_model_g
     
     # Get input shape from ONNX
     logger.info("[2/3] Extracting input shape...")
-    if 'input_shape' in onnx_cache:
+    model = pytorch_model
+    if pytorch_model_g is not None:
+        # The combined model depends on how this property ties the networks'
+        # inputs, so it is assembled per instance from the cached networks.
+        model, input_shape = _multi_network_model([pytorch_model, pytorch_model_g], vnnlib_path)
+        logger.info(f"  ✓ Combined input shape: {input_shape}")
+    elif 'input_shape' in onnx_cache:
         input_shape = onnx_cache['input_shape']
         logger.info(f"  ✓ Input shape (reused): {input_shape}")
     else:
@@ -561,8 +654,9 @@ def load_vnnlib_pair(
     # Parse VNNLIB to get input tensor
     logger.info("[3/3] Parsing VNNLIB specification...")
     input_tensor, vnnlib_metadata = _parse_vnnlib_with_shape_probe(
-        vnnlib_path, pytorch_model, input_shape
+        vnnlib_path, model, input_shape
     )
+    model = lift_spec_terms(model, vnnlib_path)
     logger.info(
         f"  ✓ Parsed VNNLIB: {vnnlib_metadata['num_inputs']} inputs, "
         f"{vnnlib_metadata['num_outputs']} outputs"

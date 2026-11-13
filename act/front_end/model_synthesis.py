@@ -198,6 +198,10 @@ def _merge_specs_to_batch(
         eps = torch.stack(eps_values).reshape(center.shape[0], *([1] * (center.ndim - 1)))
         p_norm = torch.stack(p_norm_values)
         perturbed_positions = torch.cat(position_masks, dim=0)
+    elif in_kind == InKind.LIN_POLY:
+        # Grouped one lane at a time (see synthesize_models_and_seeds_from_specs).
+        (spec,) = in_specs
+        lb, ub, center, eps = spec.lb, spec.ub, None, None
     else:
         raise NotImplementedError(f"Batching for {in_kind} not implemented")
     
@@ -222,6 +226,8 @@ def _merge_specs_to_batch(
             p_norm=p_norm,
             perturbed_positions=perturbed_positions,
         )
+    elif in_kind == InKind.LIN_POLY:
+        batched_in = in_specs[0]
     else:
         batched_in = InputSpec(kind=in_kind, lb=lb, ub=ub, center=center, eps=eps)
     def _batch_attr(attr):
@@ -384,7 +390,8 @@ def synthesize_models_and_seeds_from_specs(
                     d_sig,
                 )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
-            if _is_fixed_model_input(lt, in_spec):
+            # A LIN_POLY lane keeps its own polytope A x <= b, so it is never merged.
+            if _is_fixed_model_input(lt, in_spec) or in_spec.kind == InKind.LIN_POLY:
                 gkey += (result_index, idx)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     

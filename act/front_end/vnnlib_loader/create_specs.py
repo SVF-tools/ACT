@@ -268,29 +268,41 @@ class VNNLibSpecCreator(BaseSpecCreator):
 
 def create_specs_from_paths(onnx_path, vnnlib_path, category: str = "custom"):
     """Build one spec_result from an arbitrary (onnx, vnnlib) pair (ONNX->torch,
-    input-shape probe, VNNLIB parse+validate). Raises SystemExit on missing or
-    invalid inputs. This is the single-instance entry point used by the
-    VNN-COMP harness runner (act_run_instance.py)."""
+    input-shape probe, VNNLIB parse+validate). ``onnx_path`` may instead list one
+    ONNX file per network of a multi-network spec, in declaration order. Raises
+    SystemExit on missing or invalid inputs. This is the single-instance entry
+    point used by the VNN-COMP harness runner (act_run_instance.py)."""
     import torch as _torch
 
     from act.front_end.spec_creator_base import LabeledInputTensor
-    from act.front_end.vnnlib_loader.data_model_loader import _parse_vnnlib_with_shape_probe
+    from act.front_end.vnnlib_loader.data_model_loader import (
+        _parse_vnnlib_with_shape_probe, build_multi_network_model, lift_spec_terms,
+    )
     from act.front_end.vnnlib_loader.onnx_converter import convert_onnx_to_pytorch, get_onnx_input_shape
     from act.front_end.vnnlib_loader.vnnlib_parser import extract_label_from_vnnlib
 
-    onnx_p, vnnlib_p = Path(onnx_path), Path(vnnlib_path)
-    if not onnx_p.exists():
-        raise SystemExit(f"ONNX not found: {onnx_p}")
+    onnx_paths = [Path(p) for p in onnx_path] if isinstance(onnx_path, (list, tuple)) else [Path(onnx_path)]
+    onnx_p, vnnlib_p = onnx_paths[0], Path(vnnlib_path)
+    for path in onnx_paths:
+        if not path.exists():
+            raise SystemExit(f"ONNX not found: {path}")
     if not vnnlib_p.exists():
         raise SystemExit(f"VNNLIB not found: {vnnlib_p}")
-    model = convert_onnx_to_pytorch(onnx_p, simplify=True)
-    model.eval()
-    try:
-        input_shape = get_onnx_input_shape(onnx_p)
-    except Exception:
-        input_shape = None
+    if len(onnx_paths) > 1:
+        try:
+            model, input_shape = build_multi_network_model(onnx_paths, vnnlib_p)
+        except (UnsupportedSpecError, VNNLibParseError) as exc:
+            raise SystemExit(f"Unsupported/invalid VNNLIB spec for {vnnlib_p.name}: {exc}")
+    else:
+        model = convert_onnx_to_pytorch(onnx_p, simplify=True)
+        model.eval()
+        try:
+            input_shape = get_onnx_input_shape(onnx_p)
+        except Exception:
+            input_shape = None
     try:
         input_tensor, _meta = _parse_vnnlib_with_shape_probe(vnnlib_p, model, input_shape)
+        model = lift_spec_terms(model, vnnlib_p)
     except (UnsupportedSpecError, VNNLibParseError) as exc:
         raise SystemExit(f"Unsupported/invalid VNNLIB spec for {vnnlib_p.name}: {exc}")
     lbl = extract_label_from_vnnlib(vnnlib_p)

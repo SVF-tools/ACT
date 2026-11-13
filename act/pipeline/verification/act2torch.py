@@ -871,13 +871,11 @@ class ACTToTorch:
 
         # Multiple INPUT_SPEC layers are allowed (the verifier handles each
         # spec independently via add_all_input_specs). The PyTorch model
-        # only needs ONE spec for concrete input-satisfaction checks in
-        # find_concrete_counterexample; pick the BOX/LINF_BALL seed using
-        # the same priority as seed_from_input_specs. LIN_POLY refinements
-        # are kept on the ACT Net for the symbolic verifier path; at the
-        # concrete inference level they are not enforced (any sampled x
-        # outside the polytope simply fails to be a true counterexample to
-        # the joint spec, which is benign for soundness).
+        # carries ONE spec for concrete input-satisfaction checks; pick the
+        # BOX/LINF_BALL seed using the same priority as seed_from_input_specs.
+        # LIN_POLY layers next to a BOX seed are folded into that spec below,
+        # so concrete checks (and the fuzzer's projection) enforce A·x <= b
+        # as the verifier does.
         seed_spec_act = next(
             (L for L in input_spec_acts
              if L.params.get("kind") in ("BOX", "LINF_BALL", "LP_EMBEDDING")),
@@ -925,6 +923,15 @@ class ACTToTorch:
                 input_spec_dict[param_key] = _to_target_float_tensor(
                     input_spec_params[param_key]
                 )
+        poly_acts = [L for L in input_spec_acts if L.params.get("kind") == "LIN_POLY"]
+        if poly_acts and input_spec_kind == InKind.BOX:
+            input_spec_dict["kind"] = InKind.LIN_POLY
+            input_spec_dict["A"] = torch.cat(
+                [_to_target_float_tensor(L.params["A"]) for L in poly_acts], dim=-2
+            )
+            input_spec_dict["b"] = torch.cat(
+                [_to_target_float_tensor(L.params["b"]) for L in poly_acts], dim=-1
+            )
         input_spec_mod = InputSpecLayer(InputSpec(**input_spec_dict))
 
         body_ids = {layer.id for layer in body_acts}

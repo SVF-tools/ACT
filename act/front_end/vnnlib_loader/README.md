@@ -681,6 +681,27 @@ VNNLIB supports complex disjunctive properties:
 ```
 
 Each disjunct becomes a separate verification query (split into multiple specs).
+`(== a b)` is `a <= b` and `a >= b`; `(!= a b)` is `(or (< a b) (> a b))`. A construct
+ACT cannot encode exactly raises `UnsupportedSpecError`: no conjunct or disjunct is dropped.
+
+### Relations, Products and Several Networks
+
+- A constraint linear in the inputs alone constrains the input domain: a single-variable
+  one tightens the BOX; one relating several inputs (e.g. `X[0] >= X[5]`) also tightens
+  it and stays a `LIN_POLY` row `A x <= b` over that box.
+- Any other constraint (it mentions an output, or a product of variables such as
+  `(>= (* X[0] 200) (* X[1] X[1]))`) is checked on the model outputs: its terms other
+  than a single `Y_j` become extra model outputs and the constraint a linear
+  `UNSAFE_LINEAR` row over `[Y ; terms]`. `lifted_output_terms(vnnlib)` lists those
+  terms; `create_specs_from_paths` and `load_vnnlib_pair` append them to the model
+  (`lift_spec_terms`), so bound propagation bounds each product (`MUL`) and a
+  counterexample evaluates it exactly. Example: adaptive_cruise_control_non_linear_2026.
+- A file with several `declare-network` blocks (VNN-COMP lists their ONNX files as
+  `[(role, path), ...]` in `instances.csv`) is checked on one combined model: inputs
+  tied by a top-level equality share a position (`multi_network_layout`), the outputs
+  concatenate in declaration order. Pass one ONNX path per network, in order, to
+  `create_specs_from_paths` or `build_multi_network_model`. Examples:
+  isomorphic_acasxu_2026, monotonic_acasxu_2026.
 
 ### Counterexample / Result Format
 
