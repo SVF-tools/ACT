@@ -105,6 +105,12 @@ CI runs across both precisions and all tiers. The relevant workflows:
 
 Reproduce the relevant ones locally (the `python -m act.*` commands above) before opening a PR. In your PR, state **what you ran and what the result was**.
 
+For VNN-COMP changes, update the [operator, model, and property support
+tables](vnncomp/README.md) in the same PR. This applies to ONNX conversion, layer
+semantics, transfer functions, specification parsing/synthesis, counterexample
+handling, and the competition runner. Record the tested scope and restrictions;
+do not equate loading or catalogue membership with verification support.
+
 ## Pull request expectations
 
 - **Branch and target `main`.** ACT integrates into a single branch — there's no separate `dev` branch. Work on a short-lived topic branch (e.g. `fix/...`, `feat/...`) and open your PR against `main`.
