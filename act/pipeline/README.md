@@ -29,7 +29,8 @@ act/pipeline/
 │   ├── act_gui.py        # Shared sink channel, record base, options, and run control
 │   ├── verifier_gui.py   # Propagation records, ReLU describers, verify_once options
 │   ├── bab_gui.py        # BaB wave and terminal search records
-│   └── fuzzer_gui.py     # ACTFuzzer options, lifecycle records, and FuzzControl
+│   ├── fuzzer_gui.py     # ACTFuzzer options, lifecycle records, and FuzzControl
+│   └── provenance_gui.py # Input provenance queries and offline SafeNLP reconstruction
 └── log/                  # Centralized execution logs
 ```
 
@@ -158,6 +159,17 @@ The GUI modules each have a self-check entrypoint: `python -m act.pipeline.gui.a
 checks the shared channel; `python -m act.pipeline.gui.verifier_gui` checks propagation
 records; `python -m act.pipeline.gui.fuzzer_gui` checks fuzzing records and live control;
 and `python -m act.pipeline.gui.bab_gui` checks BaB wave and terminal records.
+
+`gui.provenance_gui` keeps NLP input provenance in one module: `input_provenance`
+reads the source sentence and perturbations recorded for a property, while
+`nearest_inputs` ranks known sentences near an input-space point. It checks the
+property's recorded hash and never decodes a counterexample into text.
+The same module rebuilds the SafeNLP sidecar offline from the published safeNLP
+boxes and ANTONIO data and generator. Run
+`python -m act.pipeline.gui.provenance_gui --help` for the build inputs, or
+`python -m act.pipeline.gui.provenance_gui --self-check` to check both the reader
+and reconstruction helpers. Running the module without arguments also runs both
+self-checks. Encoder and dataset packages are loaded only when rebuilding data.
 
 ## Logging and Diagnostics
 
