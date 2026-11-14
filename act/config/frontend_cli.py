@@ -476,7 +476,7 @@ Examples:
   python -m act.front_end --search cifar         # Finds: CIFAR10, CIFAR100, cifar100_2024
   python -m act.front_end --search imagenet      # Finds: ImageNet (TorchVision)
   python -m act.front_end --search yolo          # Finds: yolo_2023 (VNNLIB)
-  python -m act.front_end --search transformer   # Finds: vit_2023, safenlp_2024 (VNNLIB)
+  python -m act.front_end --search transformer   # Finds: vit_2023 (VNNLIB)
   python -m act.front_end --search acas          # Finds: acasxu_2023 (VNNLIB)
   python -m act.front_end --search resnet        # Finds: resnet* (VNNLIB categories)
   

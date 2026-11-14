@@ -144,7 +144,7 @@ The framework supports 34 categories from VNN-COMP 2022-2026 (VNNLIB 2.0 format)
 | Category              | Architecture        | Year | Description                          |
 |-----------------------|---------------------|------|--------------------------------------|
 | **vit_2023**          | Vision Transformer  | 2023 | ViT robustness verification          |
-| **safenlp_2024**      | Transformer         | 2024 | NLP transformer safety properties    |
+| **safenlp_2024**      | MLP on embeddings   | 2024 | Sentence classification robustness  |
 
 ### Specialized Domains (11 categories)
 

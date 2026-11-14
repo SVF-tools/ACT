@@ -164,11 +164,11 @@ CATEGORY_MAPPING: Dict[str, Dict] = {
     },
     "safenlp_2024": {
         "type": "nlp",
-        "description": "Safe NLP model verification",
-        "models": "Transformer-based language models",
-        "properties": "Safety and fairness properties for NLP",
-        "input_dim": "Token sequences",
-        "output_dim": "Token sequences",
+        "description": "Sentence classification robustness on sentence embeddings (Medical safety, R-U-A-Robot)",
+        "models": "30-128-2 ReLU MLPs on 30-d PCA-reduced all-MiniLM-L6-v2 sentence embeddings",
+        "properties": "Every embedding in a box spanned by perturbed versions of a positive sentence keeps class 0",
+        "input_dim": 30,
+        "output_dim": 2,
         "year": 2024,
     },
     "sat_relu": {
