@@ -92,6 +92,8 @@ PERTURB_MODES = ("adaptive_scalar", "adaptive_perdim", "fixed")
 MUTATION_STRATEGIES = ("gradient", "pgd", "activation", "boundary", "random")
 
 SIGN_STE_TIGHT_EPS = 0.1
+# Alternating half-space/box sweeps that pull LIN_POLY mutations back toward feasibility.
+POLYTOPE_PROJECTION_SWEEPS = 20
 SIGN_STE_LOOSE_EPS = 5.0
 
 # A distance in pre-activation units, not a numerical tolerance: it says how
@@ -1068,7 +1070,8 @@ class MutationEngine:
             preserving the L∞ distance invariant across mutation chains.
         
         **LIN_POLY (InKind.LIN_POLY)**:
-            Not yet implemented — returns tensor unchanged.
+            Pulls points toward A·x <= b and into the polytope's enclosing box
+            (see ``_project_polytope``).
         
         Args:
             tensor: Mutated input tensor [B, ...] to project
@@ -1092,23 +1095,7 @@ class MutationEngine:
                 lb = self.input_spec.lb.to(tensor.device)
                 ub = self.input_spec.ub.to(tensor.device)
             
-            # bounds: use seeds.original_index to gather correct bounds
-            if lb.shape[0] > 1 and seeds is not None:
-                indices = seeds.original_index.to(lb.device)
-                assert bool((indices < lb.shape[0]).all()), (
-                    f"original_index out of range for InputSpec bounds: "
-                    f"max={int(indices.max().item())} >= {lb.shape[0]} rows"
-                )
-                lb = lb[indices]  # (B, ...) vectorized gather
-                ub = ub[indices]
-            elif lb.shape[0] == 1 and B > 1:
-                lb = lb.expand(B, *lb.shape[1:])
-                ub = ub.expand(B, *ub.shape[1:])
-            else:
-                lb = lb[:B]
-                ub = ub[:B]
-            
-            return torch.clamp(tensor, lb, ub)
+            return torch.clamp(tensor, self._lane_rows(lb, B, seeds), self._lane_rows(ub, B, seeds))
         
         elif self.input_spec.kind == InKind.LINF_BALL:
             eps = self.input_spec.eps
@@ -1135,10 +1122,57 @@ class MutationEngine:
             )
         
         elif self.input_spec.kind == InKind.LIN_POLY:
-            # TODO: Implement quadratic programming projection
-            return tensor
+            return self._project_polytope(tensor, seeds)
         
         return tensor
+
+    @staticmethod
+    def _lane_rows(value: torch.Tensor, B: int, seeds: 'Optional[FuzzingSeed]') -> torch.Tensor:
+        """Rows of a batched InputSpec tensor for B mutated lanes, by each seed's origin."""
+        if value.shape[0] > 1 and seeds is not None:
+            indices = seeds.original_index.to(value.device)
+            assert bool((indices < value.shape[0]).all()), (
+                f"original_index out of range for InputSpec bounds: "
+                f"max={int(indices.max().item())} >= {value.shape[0]} rows"
+            )
+            return value[indices]  # (B, ...) vectorized gather
+        if value.shape[0] == 1 and B > 1:
+            return value.expand(B, *value.shape[1:])
+        return value[:B]
+
+    def _project_polytope(self, tensor: torch.Tensor, seeds: 'Optional[FuzzingSeed]') -> torch.Tensor:
+        """Pull points toward ``A·x <= b`` and into the polytope's enclosing box, if any.
+
+        Alternating projections onto each violated half-space and the box. This
+        is not the Euclidean projection, but every step only moves a point toward
+        feasibility; a point still outside after the sweeps fails the exact
+        InputSpecLayer check and never becomes a counterexample.
+        """
+        spec = self.input_spec
+        assert spec is not None and spec.A is not None and spec.b is not None
+        B = tensor.shape[0]
+        coef = spec.A.to(device=tensor.device, dtype=tensor.dtype)
+        rhs = spec.b.to(device=tensor.device, dtype=tensor.dtype)
+        if coef.dim() == 3:  # per-lane rows [N, m, n]
+            coef, rhs = self._lane_rows(coef, B, seeds), self._lane_rows(rhs, B, seeds)
+        box = None
+        if spec.lb is not None and spec.ub is not None:
+            box = tuple(
+                self._lane_rows(bound.to(tensor), B, seeds).reshape(B, -1)
+                for bound in (spec.lb, spec.ub)
+            )
+        x = tensor.reshape(B, -1)
+        for _sweep in range(POLYTOPE_PROJECTION_SWEEPS):
+            if box is not None:
+                x = torch.minimum(torch.maximum(x, box[0]), box[1])
+            for i in range(coef.shape[-2]):
+                row = coef[..., i, :]
+                excess = (x * row).sum(-1) - rhs[..., i]
+                step = excess.clamp_min(0) / (row * row).sum(-1).clamp_min(1e-12)
+                x = x - step.unsqueeze(-1) * row
+        if box is not None:
+            x = torch.minimum(torch.maximum(x, box[0]), box[1])
+        return x.reshape(tensor.shape)
     
     def get_activation_map(self) -> Dict[str, torch.Tensor]:
         """Get activations from last inference."""

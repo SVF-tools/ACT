@@ -151,7 +151,7 @@ def _broadcast_constant(
 
 import torch.fx as fx
 import torch.nn as nn
-from act.back_end.layer_schema import LayerKind
+from act.back_end.layer_schema import LayerKind, ROUNDING_FUNCTIONS
 
 def _convert_OnnxNeg(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxNeg: y = -x. Emitted as SCALE with a = -1."""
@@ -751,7 +751,11 @@ def _convert_OnnxResize(self, mod: nn.Module, node: fx.Node) -> None:
     sizes_t: torch.Tensor | None = None
     for a in args[1:]:
         t = self._resolve_constant_tensor(a.name)
-        if t is None or t.numel() == 0:
+        if t is None:
+            t = self._evaluate_constant_subgraph(a.name)
+        # scales/sizes hold one entry per input axis; roi holds two (start, end),
+        # so dtype alone cannot tell a float roi from float scales.
+        if t is None or t.numel() != len(self.shape):
             continue
         if t.dtype.is_floating_point and scales_t is None:
             scales_t = t
@@ -768,6 +772,15 @@ def _convert_OnnxResize(self, mod: nn.Module, node: fx.Node) -> None:
         size_param = tuple(int(x) for x in sizes_t.tolist())
     else:
         raise ValueError(f"OnnxResize at {node.name}: cannot resolve scales or sizes")
+    # ONNX scales/sizes cover every axis; UPSAMPLE (F.interpolate) resizes the
+    # spatial axes only, so batch and channels must stay as they are.
+    if len(output_shape) < 3 or tuple(output_shape[:2]) != tuple(self.shape[:2]):
+        raise NotImplementedError(
+            f"OnnxResize at {node.name}: resizing batch or channel axes is unsupported "
+            f"({tuple(self.shape)} -> {output_shape})"
+        )
+    scale_factor = scale_factor[2:] if scale_factor is not None else None
+    size_param = size_param[2:] if size_param is not None else None
     params: dict[str, Any] = {
         "mode": str(getattr(mod, 'onnx_mode', 'nearest')),
         "input_shape": self.shape,
@@ -930,7 +943,7 @@ def _convert_OnnxSqueezeDynamicAxes(self, mod: nn.Module, node: fx.Node) -> None
     out_vars = self._same_size_forward()
     layer_id = self._add_layer(
         LayerKind.SQUEEZE.value,
-        {"dims": list(axes)},
+        {"dims": list(axes), "input_shape": tuple(self.shape), "output_shape": output_shape},
         self.prev_out, out_vars,
     )
     self.prev_out = out_vars
@@ -964,13 +977,13 @@ def _convert_OnnxWhere(self, mod: nn.Module, node: fx.Node) -> None:
     self.shape = output_shape
     self._register_node(node.name, layer_id)
 
-def _convert_unary_same_shape(self, node: fx.Node, kind: LayerKind, op_name: str) -> None:
+def _convert_unary_same_shape(self, node: fx.Node, kind: LayerKind, op_name: str, **params: Any) -> None:
     if not self._get_predecessor_state(node):
         raise ValueError(f"{op_name}: missing predecessor for {node.name}")
     out_vars = self._same_size_forward()
     layer_id = self._add_layer(
         kind.value,
-        {"input_shape": self.shape, "output_shape": self.shape},
+        {**params, "input_shape": self.shape, "output_shape": self.shape},
         self.prev_out, out_vars,
     )
     self.prev_out = out_vars
@@ -1083,6 +1096,13 @@ def _convert_OnnxSin(self, mod: nn.Module, node: fx.Node) -> None:
 def _convert_OnnxCos(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxCos: y = cos(x), dedicated onnx2torch module route."""
     _convert_unary_same_shape(self, node, LayerKind.COS, "OnnxCos")
+
+def _convert_OnnxRound(self, mod: nn.Module, node: fx.Node) -> None:
+    """OnnxRound (ONNX Floor / Ceil / Round): element-wise ROUND with the matching mode."""
+    mode = next((m for m, f in ROUNDING_FUNCTIONS.items() if f is mod.round_function), None)
+    if mode is None:
+        raise NotImplementedError(f"OnnxRound at {node.name}: unsupported rounding {mod.round_function}")
+    _convert_unary_same_shape(self, node, LayerKind.ROUND, "OnnxRound", mode=mode)
 
 def _convert_OnnxFunction(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxFunction: dispatch by inner-function name for supported unary ops."""
@@ -1224,6 +1244,7 @@ ONNX_HANDLERS = {
     'OnnxReduceSumStaticAxes': _convert_OnnxReduceSumStaticAxes,
     'OnnxReshape': _convert_OnnxReshape,
     'OnnxResize': _convert_OnnxResize,
+    'OnnxRound': _convert_OnnxRound,
     'OnnxScatterND': _convert_OnnxScatterND,
     'OnnxShape': _convert_OnnxShape,
     'OnnxSlice': _convert_OnnxSlice,

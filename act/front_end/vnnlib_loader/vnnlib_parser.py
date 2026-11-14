@@ -13,9 +13,11 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, TYPE_CHECKING
+from typing import Dict, Iterator, List, Tuple, Optional, Any, TYPE_CHECKING
 import logging
+import math
 import torch
 import re
 
@@ -75,10 +77,9 @@ def parse_vnnlib_to_tensors(
         # VNNLIB 2.0 (declare-network) uses bracket vars X[i,..]/Y[j,..]; rewrite
         # them to flat X_n/Y_n so the shared bound-extraction logic below applies.
         if "(vnnlib-version" in content or "(declare-network" in content:
-            if len(re.findall(r"\(\s*declare-network\b", content)) >= 2:
-                if "isomorphic-to" not in content:
-                    raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
-                content, num_inputs, num_outputs, _f_in_shape = _isomorphic_multinet_rewrite(content)
+            if len(_network_blocks(content)) >= 2:
+                content, layout = _multinet_rewrite(content)
+                num_inputs, num_outputs = layout.num_inputs, layout.num_outputs
             else:
                 content, num_inputs, num_outputs = _single_network_rewrite(content)
         else:
@@ -92,8 +93,14 @@ def parse_vnnlib_to_tensors(
         # Constraints inside (or ...) branches must not be intersected here —
         # that would produce empty boxes for disjunctive-input properties
         # (e.g. ACAS Xu prop_5..10).
-        simple_bodies = [b for b in _assert_conjuncts(_parse_all_forms(content)) if _is_simple_x_bound(b)]
+        conjuncts = _assert_conjuncts(_parse_all_forms(content))
+        simple_bodies = [b for b in conjuncts if _is_simple_x_bound(b)]
         input_bounds = _extract_input_bounds(simple_bodies, num_inputs)
+        # Relations between inputs (e.g. across the networks of a multi-network
+        # file) also bound inputs that have no simple bound of their own.
+        input_bounds = _tighten_bounds(
+            input_bounds, _top_level_input_rows(conjuncts, num_inputs, num_outputs)
+        )
         
         # Create input tensor from bounds center
         input_values = []
@@ -162,8 +169,10 @@ def parse_vnnlib_queries(
       - Multiple top-level ``(assert ...)`` forms are conjunctive (implicit AND).
       - ``(or ...)`` inside an assert expands to multiple queries
         (Cartesian product across all asserts).
-      - Inequalities involving only X are folded into the input BOX.
-      - Inequalities involving Y become rows of an UNSAFE_LINEAR OutputSpec.
+      - Inequalities linear in X alone are folded into the input BOX / LIN_POLY.
+      - The others become rows of an UNSAFE_LINEAR OutputSpec over the outputs,
+        followed by the products and inputs of :func:`lifted_output_terms`
+        (the model must append those terms to its outputs).
       - When ``labeled_tensor.label`` is provided and queries match the
         classification pattern (one row Y_true - Y_j <= 0 for each j != true), the
         result collapses to a single TOP1_ROBUST OutputSpec.
@@ -230,9 +239,12 @@ def extract_label_from_vnnlib(vnnlib_path: Path) -> Optional[int]:
 
 _X_RE = re.compile(r"X_(\d+)")
 _Y_RE = re.compile(r"Y_(\d+)")
-_LinearExpr = Tuple[List[float], List[float], float]
 _Ineq = Tuple[List[float], List[float], float, bool]
 _Query = List[_Ineq]
+# A monomial is the sorted tuple of its variables, e.g. ("X_1", "X_1"); () is the constant term.
+_Monomial = Tuple[str, ...]
+_Poly = Dict[_Monomial, float]
+_COMPARISONS = ("<", ">", "<=", ">=")
 
 
 # -------------------------------------------------------------------------
@@ -253,10 +265,8 @@ def parse_vnnlib_2_0(
     except Exception as e:
         raise VNNLibParseError(f"Failed to read {vnnlib_path}: {e}") from e
 
-    if len(re.findall(r"\(\s*declare-network\b", content)) >= 2:
-        if "isomorphic-to" in content:
-            return _parse_vnnlib_2_0_isomorphic(content, labeled_tensor)
-        raise UnsupportedSpecError("multi-network (equal-to/monotonic) not yet supported")
+    if len(_network_blocks(content)) >= 2:
+        return _parse_vnnlib_2_0_multinet(content, labeled_tensor)
 
     inputs = _extract_all_vnnlib_2_decls(content, "input")
     rewritten, num_inputs, num_outputs = _single_network_rewrite(content)
@@ -292,10 +302,6 @@ def _queries_from_rewritten(
         raise VNNLibParseError(f"S-expression parse failed: {e}") from e
 
     assert_bodies = _assert_conjuncts(forms)
-    for body in assert_bodies:
-        if _contains_non_affine(body, num_inputs, num_outputs):
-            raise UnsupportedSpecError("nonlinear VNNLIB 2.0 assertion not supported")
-
     simple_assert_bodies = [f for f in assert_bodies if _is_simple_x_bound(f)]
     complex_assert_bodies = [f for f in assert_bodies if not _is_simple_x_bound(f)]
     bounds_dict = _extract_input_bounds(simple_assert_bodies, num_inputs)
@@ -306,14 +312,15 @@ def _queries_from_rewritten(
         logger.info(f"Parsed {name}: 1 query(ies) [vnnlib 2.0 input-only]")
         return [(base_in_spec, out_spec)]
 
-    per_assert: List[List[_Query]] = []
-    for body in complex_assert_bodies:
-        qs = _process_body(body, num_inputs, num_outputs)
-        if qs is None:
-            raise UnsupportedSpecError(f"unsupported VNNLIB 2.0 assertion: {body}")
-        per_assert.append(qs)
-
-    complex_queries = _combine_conjunctive_queries(per_assert)
+    # Products of variables, and inputs next to outputs, become extra model
+    # outputs (lifted_output_terms); their constraints are linear rows over them.
+    lifted = {
+        term: num_outputs + k
+        for k, term in enumerate(_lifted_terms(complex_assert_bodies, num_inputs, num_outputs))
+    }
+    complex_queries = _combine_conjunctive_queries(
+        [_process_body(body, num_inputs, num_outputs, lifted) for body in complex_assert_bodies]
+    )
     in_specs: List[InputSpec] = []
     per_query_y_ineqs: List[_Query] = []
     for q in complex_queries:
@@ -331,21 +338,24 @@ def _queries_from_rewritten(
                 break
         if skip:
             continue
-        in_specs.append(
-            _build_input_spec(num_inputs, tensor_shape, bounds_dict, x_ineqs)
-            if x_ineqs else base_in_spec
-        )
+        in_spec = _build_input_spec(num_inputs, tensor_shape, bounds_dict, x_ineqs) if x_ineqs else base_in_spec
+        lb, ub = in_spec.lb, in_spec.ub
+        if lb is not None and ub is not None and bool((lb > ub).any()):
+            logger.debug("Query with an empty input box dropped: no input satisfies its input rows")
+            continue
+        in_specs.append(in_spec)
         per_query_y_ineqs.append(y_ineqs)
 
-    out_specs = _build_output_specs(per_query_y_ineqs, num_outputs, true_label)
+    out_specs = _build_output_specs(per_query_y_ineqs, num_outputs + len(lifted), true_label)
     results: List[Tuple[InputSpec, OutputSpec]] = list(zip(in_specs, out_specs))
 
-    if true_label is not None:
+    # Classification promotion reads rows over the network outputs alone.
+    if true_label is not None and not lifted:
         promoted = _try_promote_to_top1(results, num_outputs, true_label)
         if promoted is not None:
             results = [promoted]
 
-    if len(results) > 1:
+    if len(results) > 1 and not lifted:
         promoted = _try_promote_to_top1_unlabeled(results, num_outputs)
         if promoted is not None:
             results = [promoted]
@@ -371,31 +381,155 @@ def _extract_all_vnnlib_2_decls(content: str, io_kind: str) -> List[Tuple[str, T
     return decls
 
 
-def _isomorphic_multinet_rewrite(content: str) -> Tuple[str, int, int, Tuple[int, ...]]:
-    """Flatten an isomorphic (f,g) dual-network file to one variable namespace.
+@dataclass(frozen=True)
+class MultiNetworkLayout:
+    """How the networks of a multi-network VNN-LIB 2.0 file read one combined input.
 
-    Inputs X_f/X_g are SHARED (tied by ``(== X_f[i] X_g[i])``) so both map to the
-    same X_<flat>; outputs concatenate as [Y_f ; Y_g], i.e. Y_f[j]->Y_<flat>,
-    Y_g[j]->Y_<numel(Y_f)+flat>. The self-equality link asserts collapse to the
-    trivial ``0<=0`` and are ignored downstream. Returns
-    (rewritten, num_inputs, num_outputs_concat, f_input_shape).
+    The combined input holds every distinct input scalar once: scalars tied by a
+    top-level equality between two inputs (e.g. ``(== X_f[i] X_g[i])``) share a
+    position. ``input_index[k][i]`` is the position of the i-th row-major scalar
+    of network ``k``'s input. Outputs concatenate in declaration order,
+    ``[Y_f ; Y_g ; ...]``.
     """
-    inputs = _extract_all_vnnlib_2_decls(content, "input")
-    outputs = _extract_all_vnnlib_2_decls(content, "output")
-    if len(inputs) < 2 or len(outputs) < 2:
-        raise UnsupportedSpecError("isomorphic spec requires two networks")
-    (f_in_name, f_in_shape), (g_in_name, g_in_shape) = inputs[0], inputs[1]
-    (f_out_name, f_out_shape), (g_out_name, g_out_shape) = outputs[0], outputs[1]
-    f_out_numel = _numel(f_out_shape)
-    num_inputs = _numel(f_in_shape)
-    num_outputs = f_out_numel + _numel(g_out_shape)
-    name_map = {
-        f_in_name: ("X", f_in_shape, 0),
-        g_in_name: ("X", g_in_shape, 0),
-        f_out_name: ("Y", f_out_shape, 0),
-        g_out_name: ("Y", g_out_shape, f_out_numel),
-    }
-    return _rewrite_bracket_vars(content, name_map), num_inputs, num_outputs, f_in_shape
+
+    names: Tuple[str, ...]
+    input_shapes: Tuple[Tuple[int, ...], ...]
+    input_index: Tuple[Tuple[int, ...], ...]
+    num_inputs: int
+    num_outputs: int
+
+    @property
+    def shared_input(self) -> bool:
+        """Whether every network reads the whole combined input as is (e.g. isomorphic-to)."""
+        whole = tuple(range(self.num_inputs))
+        return all(index == whole for index in self.input_index) and len(set(self.input_shapes)) == 1
+
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        """Shape of the combined input: a shared input keeps the networks' own shape."""
+        return self.input_shapes[0] if self.shared_input else (1, self.num_inputs)
+
+
+def multi_network_layout(vnnlib_path: Path) -> Optional[MultiNetworkLayout]:
+    """Layout of a multi-network VNN-LIB 2.0 file, or None when it declares one network."""
+    content = Path(vnnlib_path).read_text()
+    if len(_network_blocks(content)) < 2:
+        return None
+    return _multinet_rewrite(content)[1]
+
+
+@dataclass(frozen=True)
+class LiftedTerms:
+    """Terms ACT appends to the model outputs to check a property, in column order.
+
+    A constraint with a product of variables (e.g. ``(>= (* X[0] 200) (* X[1] X[1]))``),
+    or one relating inputs to outputs, is checked as a linear row over the
+    network outputs followed by these terms. Each term is a product of factors
+    ``("X", i)`` / ``("Y", j)`` over the flat (combined) input of ``num_inputs``
+    scalars and output of ``num_outputs`` scalars; an input of such a constraint
+    is a one-factor term. ``terms`` is empty when every constraint is linear in
+    the outputs, or in the inputs alone.
+    """
+
+    terms: Tuple[Tuple[Tuple[str, int], ...], ...]
+    num_inputs: int
+    num_outputs: int
+
+
+def lifted_output_terms(vnnlib_path: Path) -> LiftedTerms:
+    """The :class:`LiftedTerms` of a VNN-LIB 2.0 property."""
+    content = Path(vnnlib_path).read_text()
+    if len(_network_blocks(content)) >= 2:
+        flat, layout = _multinet_rewrite(content)
+        num_inputs, num_outputs = layout.num_inputs, layout.num_outputs
+    else:
+        flat, num_inputs, num_outputs = _single_network_rewrite(content)
+    bodies = [b for b in _assert_conjuncts(_parse_all_forms(flat)) if not _is_simple_x_bound(b)]
+    terms = tuple(
+        tuple((token[0], int(token[2:])) for token in term)
+        for term in _lifted_terms(bodies, num_inputs, num_outputs)
+    )
+    return LiftedTerms(terms, num_inputs, num_outputs)
+
+
+_DECLARE_NETWORK_RE = re.compile(r"\(\s*declare-network\s+([A-Za-z_]\w*)")
+
+
+def _network_blocks(content: str) -> List[Tuple[str, str]]:
+    """``(name, text)`` of every ``(declare-network ...)`` block, in declaration order."""
+    text = re.sub(r";[^\n]*", "", content)
+    blocks: List[Tuple[str, str]] = []
+    for match in _DECLARE_NETWORK_RE.finditer(text):
+        depth, end = 0, match.start()
+        for end in range(match.start(), len(text)):
+            depth += {"(": 1, ")": -1}.get(text[end], 0)
+            if depth == 0:
+                break
+        blocks.append((match.group(1), text[match.start():end + 1]))
+    return blocks
+
+
+def _multinet_rewrite(content: str) -> Tuple[str, MultiNetworkLayout]:
+    """Flatten a multi-network file to ``X_n``/``Y_n`` over the combined input and output.
+
+    Each network declares one input and its outputs. Inputs are numbered network
+    by network, then scalars tied by a top-level equality between two inputs
+    merge into one position; the tie then reads ``X_k == X_k`` and drops out as
+    a trivial row. Any other relation between inputs (e.g. ``X_f[0] >= X_g[0]``
+    in a monotonicity property) stays a constraint on the combined input.
+    """
+    name_map: Dict[str, Tuple[str, Tuple[int, ...], int]] = {}
+    names: List[str] = []
+    shapes: List[Tuple[int, ...]] = []
+    spans: List[range] = []
+    num_x = num_y = 0
+    for name, block in _network_blocks(content):
+        inputs = _extract_all_vnnlib_2_decls(block, "input")
+        if len(inputs) != 1:
+            raise UnsupportedSpecError(
+                f"network {name} declares {len(inputs)} inputs; multi-network files need one input per network"
+            )
+        in_name, in_shape = inputs[0]
+        name_map[in_name] = ("X", in_shape, num_x)
+        names.append(name)
+        shapes.append(in_shape)
+        spans.append(range(num_x, num_x + _numel(in_shape)))
+        num_x += _numel(in_shape)
+        for out_name, out_shape in _extract_all_vnnlib_2_decls(block, "output"):
+            name_map[out_name] = ("Y", out_shape, num_y)
+            num_y += _numel(out_shape)
+    flat = _rewrite_bracket_vars(content, name_map)
+
+    parent = list(range(num_x))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # (i, j) means X_i <= X_j holds in every query; both directions tie them.
+    below = set()
+    for body in _assert_conjuncts(_parse_all_forms(flat)):
+        if isinstance(body, list) and len(body) == 3 and body[0] in ("<=", ">="):
+            lhs, rhs = (_X_RE.fullmatch(t) if isinstance(t, str) else None for t in body[1:])
+            if lhs and rhs:
+                i, j = int(lhs.group(1)), int(rhs.group(1))
+                below.add((i, j) if body[0] == "<=" else (j, i))
+    for i, j in below:
+        if (j, i) in below:
+            parent[find(i)] = find(j)
+    position: Dict[int, int] = {}
+    index = [position.setdefault(find(i), len(position)) for i in range(num_x)]
+    rewritten = re.sub(r"\bX_(\d+)\b", lambda m: f"X_{index[int(m.group(1))]}", flat)
+    layout = MultiNetworkLayout(
+        names=tuple(names),
+        input_shapes=tuple(shapes),
+        input_index=tuple(tuple(index[i] for i in span) for span in spans),
+        num_inputs=len(position),
+        num_outputs=num_y,
+    )
+    return rewritten, layout
 
 
 def _single_network_rewrite(content: str) -> Tuple[str, int, int]:
@@ -432,19 +566,22 @@ def _rewrite_bracket_vars(content: str, name_map: Dict[str, Tuple[str, Tuple[int
     return var_re.sub(repl, content)
 
 
-def _parse_vnnlib_2_0_isomorphic(
+def _parse_vnnlib_2_0_multinet(
     content: str,
     labeled_tensor: Optional['LabeledInputTensor'] = None,
 ) -> List[Tuple[InputSpec, OutputSpec]]:
-    """Isomorphic equivalence: verify f and g (shared input) agree; specs are
-    built over the concatenated output [Y_f ; Y_g] of the combined model."""
-    rewritten, num_inputs, num_outputs, f_in_shape = _isomorphic_multinet_rewrite(content)
-    tensor_shape = tuple(labeled_tensor.tensor.shape) if labeled_tensor is not None else tuple(f_in_shape)
-    if _numel(tensor_shape) != num_inputs:
+    """Several networks (equal-to, isomorphic-to, ...): queries over the combined
+    input and the concatenated output ``[Y_f ; Y_g ; ...]`` of the combined model."""
+    rewritten, layout = _multinet_rewrite(content)
+    tensor_shape = tuple(labeled_tensor.tensor.shape) if labeled_tensor is not None else layout.input_shape
+    if _numel(tensor_shape) != layout.num_inputs:
         raise VNNLibParseError(
-            f"isomorphic input shape {f_in_shape} ({num_inputs} elems) != sample {tensor_shape}"
+            f"multi-network combined input has {layout.num_inputs} elements, "
+            f"but the sample shape {tensor_shape} has {_numel(tensor_shape)}"
         )
-    return _queries_from_rewritten(rewritten, num_inputs, num_outputs, tensor_shape, None, "isomorphic")
+    return _queries_from_rewritten(
+        rewritten, layout.num_inputs, layout.num_outputs, tensor_shape, None, "multi-network"
+    )
 
 
 def _extract_vnnlib_2_decl(content: str, io_kind: str) -> Tuple[str, str, Tuple[int, ...]]:
@@ -510,41 +647,9 @@ def _normalize_vnnlib_2_body(body: Any) -> Any:
     children = [_normalize_vnnlib_2_body(child) for child in body[1:]]
     if op in ("=", "==") and len(children) == 2:
         return ["and", ["<=", children[0], children[1]], [">=", children[0], children[1]]]
+    if op in ("!=", "distinct") and len(children) == 2:
+        return ["or", ["<", children[0], children[1]], [">", children[0], children[1]]]
     return [op] + children
-
-
-def _contains_non_affine(expr: Any, num_inputs: int, num_outputs: int) -> bool:
-    if not isinstance(expr, list) or not expr:
-        return False
-    op = expr[0]
-    if op == "*":
-        non_const = sum(
-            1 for sub in expr[1:]
-            if not _is_constant_linear_expr(sub, num_inputs, num_outputs)
-        )
-        if non_const >= 2:
-            return True
-    if op == "/" and len(expr) >= 3:
-        for denom in expr[2:]:
-            if not _is_constant_linear_expr(denom, num_inputs, num_outputs):
-                return True
-    if op in ("^", "pow") and len(expr) == 3:
-        base_const = _is_constant_linear_expr(expr[1], num_inputs, num_outputs)
-        try:
-            exponent = float(expr[2])
-        except (TypeError, ValueError):
-            exponent = None
-        if not base_const and exponent != 1.0:
-            return True
-    return any(_contains_non_affine(sub, num_inputs, num_outputs) for sub in expr[1:])
-
-
-def _is_constant_linear_expr(expr: Any, num_inputs: int, num_outputs: int) -> bool:
-    parsed = _parse_linear_expr(expr, num_inputs, num_outputs)
-    if parsed is None:
-        return False
-    xc, yc, _d = parsed
-    return all(v == 0 for v in xc) and all(v == 0 for v in yc)
 
 
 # -------------------------------------------------------------------------
@@ -682,101 +787,123 @@ def _parse_all_forms(text: str) -> List[Any]:
 # -------------------------------------------------------------------------
 
 
-def _parse_linear_atom(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_LinearExpr]:
-    if not isinstance(expr, str):
-        return None
-    xm = _X_RE.fullmatch(expr)
-    if xm:
-        idx = int(xm.group(1))
-        if idx >= num_inputs:
-            return None
-        xc = [0.0] * num_inputs
-        xc[idx] = 1.0
-        return xc, [0.0] * num_outputs, 0.0
-    ym = _Y_RE.fullmatch(expr)
-    if ym:
-        idx = int(ym.group(1))
-        if idx >= num_outputs:
-            return None
-        yc = [0.0] * num_outputs
-        yc[idx] = 1.0
-        return [0.0] * num_inputs, yc, 0.0
-    try:
-        return [0.0] * num_inputs, [0.0] * num_outputs, float(expr)
-    except (ValueError, TypeError):
-        return None
+def _poly_add(*polys: _Poly) -> _Poly:
+    out: _Poly = {}
+    for poly in polys:
+        for mono, coef in poly.items():
+            out[mono] = out.get(mono, 0.0) + coef
+    return {mono: coef for mono, coef in out.items() if coef != 0.0}
 
 
-def _parse_linear_expr(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_LinearExpr]:
-    atom = _parse_linear_atom(expr, num_inputs, num_outputs)
-    if atom is not None:
-        return atom
-    if not isinstance(expr, list) or not expr:
+def _poly_scale(poly: _Poly, factor: float) -> _Poly:
+    return {mono: coef * factor for mono, coef in poly.items() if coef * factor != 0.0}
+
+
+def _poly_mul(a: _Poly, b: _Poly) -> _Poly:
+    out: _Poly = {}
+    for ma, ca in a.items():
+        for mb, cb in b.items():
+            mono = tuple(sorted(ma + mb))
+            out[mono] = out.get(mono, 0.0) + ca * cb
+    return {mono: coef for mono, coef in out.items() if coef != 0.0}
+
+
+def _parse_poly(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_Poly]:
+    """Expand an arithmetic expression into a polynomial over ``X_i`` / ``Y_j``.
+
+    Numbers, variables, n-ary ``+`` and ``*``, unary and n-ary ``-``, division
+    by a constant and non-negative integer powers expand exactly; anything else
+    (e.g. division by a variable) gives None.
+    """
+    if isinstance(expr, str):
+        match = _X_RE.fullmatch(expr) or _Y_RE.fullmatch(expr)
+        if match:
+            bound = num_inputs if expr.startswith("X") else num_outputs
+            return {(expr,): 1.0} if int(match.group(1)) < bound else None
+        try:
+            return {(): float(expr)}
+        except ValueError:
+            return None
+    if not (isinstance(expr, list) and len(expr) >= 2):
         return None
     op = expr[0]
+    parsed = [_parse_poly(arg, num_inputs, num_outputs) for arg in expr[1:]]
+    args: List[_Poly] = [arg for arg in parsed if arg is not None]
+    if len(args) != len(parsed):
+        return None
     if op == "+":
-        xc = [0.0] * num_inputs
-        yc = [0.0] * num_outputs
-        const = 0.0
-        for sub in expr[1:]:
-            r = _parse_linear_expr(sub, num_inputs, num_outputs)
-            if r is None:
-                return None
-            sxc, syc, sd = r
-            xc = [a + b for a, b in zip(xc, sxc)]
-            yc = [a + b for a, b in zip(yc, syc)]
-            const += sd
-        return xc, yc, const
+        return _poly_add(*args)
     if op == "-":
-        if len(expr) == 2:
-            r = _parse_linear_expr(expr[1], num_inputs, num_outputs)
-            if r is None:
-                return None
-            sxc, syc, sd = r
-            return [-a for a in sxc], [-a for a in syc], -sd
-        if len(expr) == 3:
-            a = _parse_linear_expr(expr[1], num_inputs, num_outputs)
-            b = _parse_linear_expr(expr[2], num_inputs, num_outputs)
-            if a is None or b is None:
-                return None
-            axc, ayc, ad = a
-            bxc, byc, bd = b
-            return (
-                [x - y for x, y in zip(axc, bxc)],
-                [x - y for x, y in zip(ayc, byc)],
-                ad - bd,
-            )
-    if op == "*" and len(expr) == 3:
-        a = _parse_linear_expr(expr[1], num_inputs, num_outputs)
-        b = _parse_linear_expr(expr[2], num_inputs, num_outputs)
-        if a is None or b is None:
-            return None
-        axc, ayc, ad = a
-        bxc, byc, bd = b
-        a_is_const = all(v == 0 for v in axc) and all(v == 0 for v in ayc)
-        b_is_const = all(v == 0 for v in bxc) and all(v == 0 for v in byc)
-        if a_is_const:
-            return [ad * v for v in bxc], [ad * v for v in byc], ad * bd
-        if b_is_const:
-            return [bd * v for v in axc], [bd * v for v in ayc], ad * bd
+        if len(args) == 1:
+            return _poly_scale(args[0], -1.0)
+        return _poly_add(args[0], *(_poly_scale(arg, -1.0) for arg in args[1:]))
+    if op == "*":
+        product: _Poly = {(): 1.0}
+        for arg in args:
+            product = _poly_mul(product, arg)
+        return product
+    if op == "/" and len(args) >= 2 and all(set(arg) <= {()} for arg in args[1:]):
+        denominator = math.prod(arg.get((), 0.0) for arg in args[1:])
+        return _poly_scale(args[0], 1.0 / denominator) if denominator != 0.0 else None
+    if op in ("^", "pow") and len(args) == 2 and set(args[1]) <= {()}:
+        exponent = args[1].get((), 0.0)
+        if exponent >= 0 and float(exponent).is_integer():
+            power: _Poly = {(): 1.0}
+            for _ in range(int(exponent)):
+                power = _poly_mul(power, args[0])
+            return power
     return None
 
 
-def _parse_inequality(op: str, lhs: Any, rhs: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
-    l = _parse_linear_expr(lhs, num_inputs, num_outputs)
-    r = _parse_linear_expr(rhs, num_inputs, num_outputs)
-    if l is None or r is None:
+def _comparison_poly(lhs: Any, rhs: Any, num_inputs: int, num_outputs: int) -> Optional[_Poly]:
+    """``lhs - rhs`` as a polynomial, or None when either side does not expand."""
+    left = _parse_poly(lhs, num_inputs, num_outputs)
+    right = _parse_poly(rhs, num_inputs, num_outputs)
+    return None if left is None or right is None else _poly_add(left, _poly_scale(right, -1.0))
+
+
+def _is_input_poly(poly: _Poly) -> bool:
+    """Whether a constraint polynomial is linear in the inputs alone."""
+    return all(not mono or (len(mono) == 1 and mono[0].startswith("X")) for mono in poly)
+
+
+def _is_output_term(mono: _Monomial) -> bool:
+    return len(mono) == 1 and mono[0].startswith("Y")
+
+
+def _parse_inequality(
+    op: str, lhs: Any, rhs: Any, num_inputs: int, num_outputs: int,
+    lifted: Optional[Dict[_Monomial, int]] = None,
+) -> Optional[_Ineq]:
+    """``op(lhs, rhs)`` as a row ``xc·x + yc·y <= d`` (strict for ``<`` and ``>``).
+
+    A comparison linear in the inputs alone keeps its input coefficients ``xc``.
+    Any other is a row over the outputs: ``yc`` has a column per output and one
+    per lifted term (``lifted`` maps a term to its column), and ``xc`` is zero.
+    None when the comparison does not expand or needs a term that is not lifted.
+    """
+    poly = _comparison_poly(lhs, rhs, num_inputs, num_outputs)
+    if poly is None or op not in _COMPARISONS:
         return None
-    lxc, lyc, ld = l
-    rxc, ryc, rd = r
-    xc = [a - b for a, b in zip(lxc, rxc)]
-    yc = [a - b for a, b in zip(lyc, ryc)]
-    d = rd - ld
+    lifted = lifted or {}
+    xc = [0.0] * num_inputs
+    yc = [0.0] * (num_outputs + len(lifted))
+    input_row = _is_input_poly(poly)
+    for mono, coef in poly.items():
+        if not mono:
+            continue
+        if input_row:
+            xc[int(mono[0][2:])] += coef
+        elif _is_output_term(mono):
+            yc[int(mono[0][2:])] += coef
+        elif mono in lifted:
+            yc[lifted[mono]] += coef
+        else:
+            return None
+    d = -poly.get((), 0.0)
     if op in ("<", "<="):
         return xc, yc, d, op == "<"
-    if op in (">", ">="):
-        return [-v for v in xc], [-v for v in yc], -d, op == ">"
-    return None
+    return [-v for v in xc], [-v for v in yc], -d, op == ">"
 
 
 # -------------------------------------------------------------------------
@@ -812,37 +939,25 @@ def _is_simple_x_bound(body: Any) -> bool:
         return False
 
 
-def _process_body(body: Any, num_inputs: int, num_outputs: int) -> Optional[List[_Query]]:
-    if not (isinstance(body, list) and body):
-        return None
-    op = body[0]
-    if op == "and":
-        subs = [_process_body(c, num_inputs, num_outputs) for c in body[1:]]
-        subs = [s for s in subs if s is not None]
-        if not subs:
-            return [[]]
-        combined = [[]]
-        for sq in subs:
-            new_combined = []
-            for base in combined:
-                for q in sq:
-                    new_combined.append(base + q)
-            combined = new_combined
-        return combined
-    if op == "or":
-        all_q = []
-        for d in body[1:]:
-            sub = _process_body(d, num_inputs, num_outputs)
-            if sub is None:
-                continue
-            all_q.extend(sub)
-        return all_q if all_q else None
-    if op in ("<", ">", "<=", ">=") and len(body) == 3:
-        ineq = _parse_inequality(op, body[1], body[2], num_inputs, num_outputs)
-        if ineq is None:
-            return None
-        return [[ineq]]
-    return None
+def _process_body(
+    body: Any, num_inputs: int, num_outputs: int,
+    lifted: Optional[Dict[_Monomial, int]] = None,
+) -> List[_Query]:
+    """DNF of an assertion body: one query (a conjunction of rows) per disjunct.
+
+    Raises UnsupportedSpecError on anything it cannot encode exactly: dropping
+    a conjunct or a disjunct would change the property.
+    """
+    if isinstance(body, list) and body and body[0] in ("and", "or"):
+        subs = [_process_body(child, num_inputs, num_outputs, lifted) for child in body[1:]]
+        if body[0] == "or":
+            return [query for sub in subs for query in sub]
+        return _combine_conjunctive_queries(subs)
+    if isinstance(body, list) and len(body) == 3 and body[0] in _COMPARISONS:
+        ineq = _parse_inequality(body[0], body[1], body[2], num_inputs, num_outputs, lifted)
+        if ineq is not None:
+            return [[ineq]]
+    raise UnsupportedSpecError(f"unsupported VNNLIB 2.0 assertion: {str(body)[:300]}")
 
 
 def _combine_conjunctive_queries(qs: List[List[_Query]]) -> List[_Query]:
@@ -867,13 +982,15 @@ def _build_input_spec(
     bounds_dict: Dict[int, Tuple[float, float]],
     extra_x_ineqs: _Query,
 ) -> InputSpec:
-    """Build an InputSpec BOX from regex-extracted base bounds + optional tightening.
+    """Build an InputSpec from regex-extracted base bounds + the query's own X rows.
 
     ``bounds_dict`` is the output of :func:`_extract_input_bounds` — fast regex
-    per-variable (lb, ub) pairs. ``extra_x_ineqs`` is a (typically empty) list of
-    single-variable X inequalities from complex asserts (e.g. disjunctive X ranges)
-    that further refine the BOX for one particular query. Multi-variable X
-    constraints cannot be represented as a BOX and are silently ignored.
+    per-variable (lb, ub) pairs. ``extra_x_ineqs`` holds the X-only inequalities
+    of one query (from complex asserts, e.g. disjunctive X ranges).
+    Single-variable rows refine the BOX. Rows relating several inputs (e.g.
+    ``X_f[0] >= X_g[0]`` across the networks of a multi-network file) are no box:
+    they tighten it and stay a LIN_POLY polytope ``A x <= b`` over that
+    enclosing box.
     """
     lb_vals = [bounds_dict.get(i, (float('-inf'), float('inf')))[0] for i in range(num_inputs)]
     ub_vals = [bounds_dict.get(i, (float('-inf'), float('inf')))[1] for i in range(num_inputs)]
@@ -888,10 +1005,114 @@ def _build_input_spec(
                 ub_tensor[idx] = bound
             elif coef < 0 and bound > lb_tensor[idx].item():
                 lb_tensor[idx] = bound
+    rows = [(xc, d) for xc, _yc, d, _strict in extra_x_ineqs if sum(v != 0 for v in xc) > 1]
+    if rows:
+        box = _tighten_bounds(
+            {i: (float(lb_tensor[i]), float(ub_tensor[i])) for i in range(num_inputs)}, rows
+        )
+        lb_tensor = torch.tensor([box[i][0] for i in range(num_inputs)])
+        ub_tensor = torch.tensor([box[i][1] for i in range(num_inputs)])
     if input_shape is not None:
         lb_tensor = lb_tensor.view(*input_shape)
         ub_tensor = ub_tensor.view(*input_shape)
-    return InputSpec(kind=InKind.BOX, lb=lb_tensor, ub=ub_tensor)
+    if not rows:
+        return InputSpec(kind=InKind.BOX, lb=lb_tensor, ub=ub_tensor)
+    return InputSpec(
+        kind=InKind.LIN_POLY, lb=lb_tensor, ub=ub_tensor,
+        A=torch.tensor([xc for xc, _d in rows]), b=torch.tensor([d for _xc, d in rows]),
+    )
+
+
+def _comparisons(body: Any) -> Iterator[List[Any]]:
+    """The comparisons of an and/or assertion body, depth first."""
+    if isinstance(body, list) and body and body[0] in ("and", "or"):
+        for child in body[1:]:
+            yield from _comparisons(child)
+    elif isinstance(body, list) and len(body) == 3 and body[0] in _COMPARISONS:
+        yield body
+    else:
+        raise UnsupportedSpecError(f"unsupported VNNLIB 2.0 assertion: {str(body)[:300]}")
+
+
+def _input_only(body: Any, num_inputs: int, num_outputs: int) -> bool:
+    """Whether every comparison of an assertion body is linear in the inputs alone."""
+    for _op, lhs, rhs in _comparisons(body):
+        poly = _comparison_poly(lhs, rhs, num_inputs, num_outputs)
+        if poly is None or not _is_input_poly(poly):
+            return False
+    return True
+
+
+def _lifted_terms(bodies: List[Any], num_inputs: int, num_outputs: int) -> List[_Monomial]:
+    """Terms of the constraints checked on the outputs, other than a single output.
+
+    A comparison linear in the inputs alone constrains the input domain. Any
+    other comparison is checked on the model outputs, so each of its terms that
+    is not a single ``Y_j`` (an input, or a product of variables) becomes an
+    extra model output, in order of first appearance.
+    """
+    terms: Dict[_Monomial, None] = {}
+    for body in bodies:
+        for _op, lhs, rhs in _comparisons(body):
+            poly = _comparison_poly(lhs, rhs, num_inputs, num_outputs)
+            if poly is None or _is_input_poly(poly):
+                continue
+            for mono in poly:
+                if mono and not _is_output_term(mono):
+                    terms.setdefault(mono)
+    return list(terms)
+
+
+def _top_level_input_rows(
+    conjuncts: List[Any], num_inputs: int, num_outputs: int,
+) -> List[Tuple[List[float], float]]:
+    """``a·x <= d`` rows of the top-level asserts that relate several inputs.
+
+    Only conjunctive (single-query) asserts linear in the inputs alone qualify:
+    they hold in every query, so they may tighten the input box shared by all
+    queries.
+    """
+    rows: List[Tuple[List[float], float]] = []
+    for body in conjuncts:
+        if _is_simple_x_bound(body) or not _input_only(body, num_inputs, num_outputs):
+            continue
+        queries = _process_body(body, num_inputs, num_outputs)
+        if len(queries) == 1:
+            rows.extend((xc, d) for xc, _yc, d, _strict in queries[0] if sum(v != 0 for v in xc) > 1)
+    return rows
+
+
+def _tighten_bounds(
+    bounds: Dict[int, Tuple[float, float]], rows: List[Tuple[List[float], float]],
+) -> Dict[int, Tuple[float, float]]:
+    """Tighten per-variable bounds with linear rows ``a·x <= d`` (interval propagation).
+
+    A row bounds each of its variables by ``d`` minus the least value its other
+    terms take over the current bounds. Only points violating a row are cut, so
+    the box keeps enclosing the feasible set; a few sweeps reach the fixpoint for
+    the short relational rows VNN-LIB files carry.
+    """
+    if not rows:
+        return bounds
+    lo = {i: float(b[0]) for i, b in bounds.items()}
+    hi = {i: float(b[1]) for i, b in bounds.items()}
+    for _sweep in range(8):
+        changed = False
+        for coeffs, d in rows:
+            terms = [(j, a) for j, a in enumerate(coeffs) if a != 0]
+            least = {j: min(a * lo[j], a * hi[j]) for j, a in terms}
+            for j, a in terms:
+                rest = sum(v for k, v in least.items() if k != j)
+                if not math.isfinite(rest):
+                    continue
+                bound = (d - rest) / a
+                if a > 0 and bound < hi[j]:
+                    hi[j], changed = bound, True
+                elif a < 0 and bound > lo[j]:
+                    lo[j], changed = bound, True
+        if not changed:
+            break
+    return {i: (lo[i], hi[i]) for i in bounds}
 
 
 def _build_trivial_output_spec(num_outputs: int, true_label) -> OutputSpec:
@@ -1097,7 +1318,8 @@ def write_vnncomp_result(out_path, token: str, *, x=None, y=None,
             f.write(token + "\n")
             return
         xf = x.detach().cpu().flatten().tolist()
-        yf = y.detach().cpu().flatten().tolist()
+        # The declared outputs come first; lifted spec terms (lifted_output_terms) follow.
+        yf = y.detach().cpu().flatten().tolist()[:math.prod(int(d) for d in out_decl[2])]
         lines = ["sat"]
         lines += _assignment(in_decl[0], in_decl[1], in_decl[2], xf)
         lines += _assignment(out_decl[0], out_decl[1], out_decl[2], yf)

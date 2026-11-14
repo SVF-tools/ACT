@@ -62,7 +62,7 @@ InputLayer → InputSpecLayer → Model → OutputSpecLayer
 """
 
 from __future__ import annotations
-from typing import Dict, Any, override
+from typing import Callable, Dict, Any, override
 import enum
 
 # Import Layer from core to avoid circular import issues
@@ -137,6 +137,7 @@ class LayerKind(str, enum.Enum):
     MEAN = "MEAN"  # Reduction: y = x.mean(dim=..., keepdim=...)
     REDUCE_SUM = "REDUCE_SUM"  # Reduction: y = x.sum(dim=..., keepdim=...)
     SIGN = "SIGN"  # Element-wise sign: y = sign(x) ∈ {-1, 0, 1}
+    ROUND = "ROUND"  # Element-wise rounding: y = floor / ceil / round(x) by params["mode"]
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
     BIAS = "BIAS"  # Element-wise addition of constant: y = x + c
     CONSTANT = "CONSTANT"  # Materialise an ONNX initializer tensor as point-bounded vars
@@ -610,6 +611,11 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "params_required": [],
         "params_optional": ["input_shape", "output_shape"],
     },
+    LayerKind.ROUND.value: {
+        # mode: "floor" | "ceil" | "round" (ONNX Floor / Ceil / Round; round is half to even)
+        "params_required": ["mode"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
     LayerKind.SCALE.value: {
         "params_required": ["a"],
         "params_optional": [
@@ -694,7 +700,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SQUEEZE.value: {
         "params_required": [],
-        "params_optional": ["dims"],
+        "params_optional": ["dims", "input_shape", "output_shape"],
     },
     LayerKind.UNSQUEEZE.value: {
         "params_required": [],
@@ -1001,6 +1007,27 @@ ACT_TO_TORCH: dict[str, type[nn.Module]] = {
     LayerKind.SOFTMAX.value: nn.Softmax,
     LayerKind.MHA.value: nn.MultiheadAttention,
 }
+
+# Element-wise functions of the ROUND modes.
+ROUNDING_FUNCTIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "floor": torch.floor,
+    "ceil": torch.ceil,
+    "round": torch.round,
+}
+
+
+def step_function(kind: str, params: Dict[str, Any]) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Element-wise function of a monotone step layer (SIGN, ROUND).
+
+    Steps are piecewise constant and non-decreasing, so every abstract domain
+    bounds them by the exact box [f(lb), f(ub)] and act2torch runs f itself.
+    """
+    if kind == LayerKind.SIGN.value:
+        return torch.sign
+    if kind == LayerKind.ROUND.value:
+        return ROUNDING_FUNCTIONS[params["mode"]]
+    raise ValueError(f"{kind} is not a step layer")
+
 
 # Supported exporter op tags (base name before ":").
 SUPPORTED_EXPORT_OPS = {

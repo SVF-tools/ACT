@@ -79,7 +79,8 @@ def input_constraint_satisfied(
 
     ``params`` tensors are already aligned with the lanes (or broadcast):
     BOX/LINF_BALL use ``lb``/``ub``, LIN_POLY uses ``A`` ([m, n] or per-lane
-    [B, m, n]) and ``b``. An ``InputGeometry`` (LP_EMBEDDING, or a norm ball
+    [B, m, n]) and ``b``, plus ``lb``/``ub`` when the polytope carries its
+    enclosing box. An ``InputGeometry`` (LP_EMBEDDING, or a norm ball
     stored on an ACT layer) takes precedence over the box form.
     """
     if geometry is not None:
@@ -93,7 +94,11 @@ def input_constraint_satisfied(
         case InKind.LIN_POLY:
             a, b = params["A"].to(x), params["b"].to(x)
             lhs = torch.bmm(a, flat.unsqueeze(-1)).squeeze(-1) if a.dim() == 3 else flat @ a.T
-            return (lhs <= b).all(1)
+            inside = (lhs <= b).all(1)
+            if "lb" in params and "ub" in params:
+                lb, ub = params["lb"].to(x), params["ub"].to(x)
+                inside &= ((x >= lb - tolerance) & (x <= ub + tolerance)).reshape(lanes, -1).all(1)
+            return inside
         case _:
             raise NotImplementedError(f"Unsupported concrete input constraint: {kind}")
 

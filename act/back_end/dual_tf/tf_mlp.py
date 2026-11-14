@@ -22,6 +22,7 @@
 import torch
 from typing import Tuple, Optional, Dict, Any, List
 from act.back_end.core import Bounds
+from act.back_end.layer_schema import step_function
 
 from .tf_forward import (
     LinearBound, Frame, _align,
@@ -470,8 +471,8 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1,
     return v_out.view(BM, n), contrib
 
 
-# ---- SIGN ----
-def forward_sign(
+# ---- SIGN / ROUND (monotone steps) ----
+def forward_step(
     L: Any,
     parent_boxes: List[Bounds],
     parent_lins: List[LinearBound],
@@ -481,27 +482,26 @@ def forward_sign(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for SIGN (step function y = sign(x) in {-1, 0, 1}).
+    """Forward handler for the step layers SIGN and ROUND (floor / ceil / round).
 
-    sign is monotone non-decreasing, so the sound interval box is exactly
-    [sign(lb), sign(ub)]. The step has zero slope everywhere, so no linear
+    Steps are monotone non-decreasing, so the sound interval box is exactly
+    [f(lb), f(ub)]. A step has zero slope almost everywhere, so no linear
     plane is carried: the frame resets to identity over the new box (like the
     RELU no-linearisation branch).
     """
+    f = step_function(L.kind, L.params)
     pre = parent_boxes[0]
-    lb = torch.sign(pre.lb)
-    ub = torch.sign(pre.ub)
-    return _box_result(lb, ub, device, dtype)
+    return _box_result(f(pre.lb), f(pre.ub), device, dtype)
 
 
-def backward_sign(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+def backward_step(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
                   preds: List[int], M: int = 1, alpha=None
                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    """Relax SIGN by its stored constant output box."""
+    """Relax a SIGN / ROUND layer by its stored constant output box."""
     bounds = bounds_dict.get(L.id)
     if bounds is None:
-        raise ValueError(f"backward_sign: layer {L.id} missing bounds in bounds_dict")
-    assert len(preds) == 1, f"SIGN expects 1 predecessor, got {len(preds)}"
+        raise ValueError(f"backward_step: layer {L.id} missing bounds in bounds_dict")
+    assert len(preds) == 1, f"{L.kind} expects 1 predecessor, got {len(preds)}"
     nu_in, contrib = _dual_constant_box_backward(nu, bounds.lb, bounds.ub, M)
     return [nu_in], contrib
 

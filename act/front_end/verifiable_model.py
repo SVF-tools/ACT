@@ -493,14 +493,24 @@ class InputSpecLayer(nn.Module):
         (lb/ub/center carry the leading B dim from the wrapped tensors).
         """
         del B
-        layer = create_layer(
-            id=layer_id_start,
-            kind=LayerKind.INPUT_SPEC.value,
-            params=self._act_params(),
-            in_vars=in_vars,
-            out_vars=in_vars,
-        )
-        return [layer], in_vars
+        params = self._act_params()
+        specs = [params]
+        if self.kind == InKind.LIN_POLY and "lb" in params and "ub" in params:
+            # A polytope stored with its enclosing box: the BOX layer seeds the
+            # analysis (interval domains cannot use A·x <= b) and the LIN_POLY
+            # layer keeps the relations for LP back ends and counterexample checks.
+            specs = [{"kind": InKind.BOX, "lb": params.pop("lb"), "ub": params.pop("ub")}, params]
+        layers = [
+            create_layer(
+                id=layer_id_start + k,
+                kind=LayerKind.INPUT_SPEC.value,
+                params=spec,
+                in_vars=in_vars,
+                out_vars=in_vars,
+            )
+            for k, spec in enumerate(specs)
+        ]
+        return layers, in_vars
 
     @staticmethod
     def _gather_rows(
@@ -620,9 +630,11 @@ class InputSpecLayer(nn.Module):
             if A_buffer.dim() == 3:
                 A_buffer = self._gather_rows(A_buffer, rows, batch_size, "A")
                 b_buffer = self._gather_rows(b_buffer, rows, batch_size, "b")
-            satisfied = input_constraint_satisfied(
-                x, self.kind, {"A": A_buffer, "b": b_buffer}
-            )
+            params = {"A": A_buffer, "b": b_buffer}
+            if isinstance(self.lb, torch.Tensor) and isinstance(self.ub, torch.Tensor):
+                params["lb"] = self._gather_rows(self.lb, rows, batch_size, "lb")
+                params["ub"] = self._gather_rows(self.ub, rows, batch_size, "ub")
+            satisfied = input_constraint_satisfied(x, self.kind, params)
             
             # Unified explanation format (consistent across all batch sizes)
             n_ok = satisfied.sum().item()

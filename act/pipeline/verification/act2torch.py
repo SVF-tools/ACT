@@ -29,7 +29,7 @@ import logging
 
 from act.back_end.core import Net, Layer, Bounds, get_topo_order
 from act.back_end.interval_tf.tf_transformer import softmax_rowsize
-from act.back_end.layer_schema import ACT_TO_TORCH, LayerKind, REGISTRY
+from act.back_end.layer_schema import ACT_TO_TORCH, LayerKind, REGISTRY, step_function
 from act.util.device_manager import get_default_dtype, get_default_device
 
 logger = logging.getLogger(__name__)
@@ -442,8 +442,14 @@ def _unsqueeze(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) 
 def _squeeze(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
     dims = layer.params.get("dims") or []
     out = inputs[0]
+    input_shape = layer.params.get("input_shape")
+    shift = _axis_shift(input_shape, out) if input_shape is not None else 0
     for d in sorted(dims, reverse=True):
-        out = out.squeeze(d)
+        # Without a shift the stored axis 0 is the live sample-lane axis (template
+        # size 1): squeezing it would drop the lanes, so torch2act keeps it too.
+        if d + shift == 0:
+            continue
+        out = out.squeeze(d + shift)
     return out
 
 
@@ -663,7 +669,8 @@ _FUNCTIONAL_HANDLERS: dict[str, tuple[int, _Functional]] = {
     LayerKind.MAX.value: (_AT_LEAST_TWO, _fold(torch.maximum)),
     LayerKind.MIN.value: (_AT_LEAST_TWO, _fold(torch.minimum)),
     LayerKind.CONSTANT.value: (_UNCHECKED, _constant),
-    LayerKind.SIGN.value: (1, lambda g, layer, xs: torch.sign(xs[0])),
+    LayerKind.SIGN.value: (1, lambda g, layer, xs: step_function(layer.kind, layer.params)(xs[0])),
+    LayerKind.ROUND.value: (1, lambda g, layer, xs: step_function(layer.kind, layer.params)(xs[0])),
     LayerKind.REDUCE_SUM.value: (1, _reduce_sum),
     LayerKind.COMPARE.value: (
         2, lambda g, layer, xs: getattr(torch, layer.params["op"])(xs[0], xs[1]).to(xs[0].dtype)),
@@ -864,13 +871,11 @@ class ACTToTorch:
 
         # Multiple INPUT_SPEC layers are allowed (the verifier handles each
         # spec independently via add_all_input_specs). The PyTorch model
-        # only needs ONE spec for concrete input-satisfaction checks in
-        # find_concrete_counterexample; pick the BOX/LINF_BALL seed using
-        # the same priority as seed_from_input_specs. LIN_POLY refinements
-        # are kept on the ACT Net for the symbolic verifier path; at the
-        # concrete inference level they are not enforced (any sampled x
-        # outside the polytope simply fails to be a true counterexample to
-        # the joint spec, which is benign for soundness).
+        # carries ONE spec for concrete input-satisfaction checks; pick the
+        # BOX/LINF_BALL seed using the same priority as seed_from_input_specs.
+        # LIN_POLY layers next to a BOX seed are folded into that spec below,
+        # so concrete checks (and the fuzzer's projection) enforce A·x <= b
+        # as the verifier does.
         seed_spec_act = next(
             (L for L in input_spec_acts
              if L.params.get("kind") in ("BOX", "LINF_BALL", "LP_EMBEDDING")),
@@ -918,6 +923,15 @@ class ACTToTorch:
                 input_spec_dict[param_key] = _to_target_float_tensor(
                     input_spec_params[param_key]
                 )
+        poly_acts = [L for L in input_spec_acts if L.params.get("kind") == "LIN_POLY"]
+        if poly_acts and input_spec_kind == InKind.BOX:
+            input_spec_dict["kind"] = InKind.LIN_POLY
+            input_spec_dict["A"] = torch.cat(
+                [_to_target_float_tensor(L.params["A"]) for L in poly_acts], dim=-2
+            )
+            input_spec_dict["b"] = torch.cat(
+                [_to_target_float_tensor(L.params["b"]) for L in poly_acts], dim=-1
+            )
         input_spec_mod = InputSpecLayer(InputSpec(**input_spec_dict))
 
         body_ids = {layer.id for layer in body_acts}
@@ -1260,6 +1274,8 @@ class ACTToTorch:
                     kwargs[key] = params[key]
         if kind == LayerKind.GELU.value and "approximate" in params:
             kwargs["approximate"] = params["approximate"]
+        if kind == LayerKind.CONVTRANSPOSE2D.value and "output_padding" in params:
+            kwargs["output_padding"] = params["output_padding"]
 
         # Create module instance
         m = cls(*args, **kwargs)

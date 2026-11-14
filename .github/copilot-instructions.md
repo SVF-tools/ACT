@@ -93,10 +93,14 @@ conda activate act-py312
 - **Gurobi**: License required in `modules/gurobi/gurobi.lic` for MILP optimization
 
 ### VNNLIB Compatibility
-Full SMT-LIB format support with:
-- Variable extraction (`X_i`, `Y_j`, `X_hat_k`)
-- Constraint parsing (linear combinations, bounds)
-- Local vs. global property detection
+The maintained support matrix is [`vnncomp/README.md`](../vnncomp/README.md).
+Update its operator, model, and property rows in the same PR whenever ONNX
+conversion, layer/transfer semantics, VNNLIB parsing or synthesis, counterexample
+handling, or the competition runner changes. Include parameter/shape limits and
+dated verification evidence; distinguish conversion, verification, and witness
+export. Do not infer support from catalogue membership or handler registration.
+ACT accepts the supported VNNLIB 2.0 tensor-declaration syntax; unsupported
+expressions must be reported explicitly rather than silently omitted.
 
 ## Python Coding Standards
 

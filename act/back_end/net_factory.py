@@ -1580,7 +1580,7 @@ class NetFactory:
 #
 # Each spec below is a NetFactory.create_network()-consumable dict that
 # exercises exactly one of the LayerKinds emitted by torch2act for VNN-COMP
-# coverage (CONSTANT, SIGN, REDUCE_SUM, COMPARE, WHERE, MATMUL,
+# coverage (CONSTANT, SIGN, ROUND, REDUCE_SUM, COMPARE, WHERE, MATMUL,
 # ARG_EXTREMUM, UPSAMPLE, EXPAND, SCATTER_ND). NetFactory.generate() emits
 # them alongside the random benchmarks, so the existing CI steps
 # (--validate-soundness, --verify act2torch) iterate them with no extra
@@ -1739,6 +1739,14 @@ def _lt_spec_sign() -> Dict[str, Any]:
     return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
         {"kind": LayerKind.SIGN.value,
          "params": {"input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
+def _lt_spec_round() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.ROUND.value,
+         "params": {"mode": "floor", "input_shape": [1, 4], "output_shape": [1, 4]}},
         _lt_assert_le([1.0, 1.0, 1.0, 1.0], 5.0),
     ]}
 
@@ -2597,6 +2605,7 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}constant":      _lt_spec_constant,
     f"{LAYER_TESTING_NAME_PREFIX}add_dual":      _lt_spec_add_dual,
     f"{LAYER_TESTING_NAME_PREFIX}sign":          _lt_spec_sign,
+    f"{LAYER_TESTING_NAME_PREFIX}round":         _lt_spec_round,
     f"{LAYER_TESTING_NAME_PREFIX}reduce_sum":    _lt_spec_reduce_sum,
     f"{LAYER_TESTING_NAME_PREFIX}compare":       _lt_spec_compare,
     f"{LAYER_TESTING_NAME_PREFIX}where":         _lt_spec_where,

@@ -12,10 +12,10 @@
 #
 #===---------------------------------------------------------------------===#
 
+import heapq
 import torch
 from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui import verifier_gui as _obs
-from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, cast
 from act.back_end.core import Bounds, Fact, Net, ConSet, get_topo_order
@@ -132,9 +132,24 @@ def analyze(
                     layer.kind, bounds.lb, bounds.ub,
                 ))
     single_pass = bool(getattr(tf, "topological_single_pass", False))
-    WL = deque(get_topo_order(net) if single_pass else seeds)
+    # The worklist pops layers in topological order, so a merge point (ADD,
+    # CONCAT, ...) runs after every predecessor it can reach. In FIFO order a
+    # short branch could reach the merge first and pull the +/-inf placeholder of
+    # the longer branch; those infinite bounds reach later layers as NaN
+    # (inf - inf) before the longer branch arrives.
+    topo_index = {lid: i for i, lid in enumerate(get_topo_order(net))}
+    WL: list[Tuple[int, int]] = []
+    queued: set[int] = set()
+
+    def push(lid: int) -> None:
+        if lid not in queued:
+            queued.add(lid)
+            heapq.heappush(WL, (topo_index[lid], lid))
+
+    for lid in (get_topo_order(net) if single_pass else seeds):
+        push(lid)
     while WL:
-        lid = WL.popleft(); layer = net.by_id[lid]
+        _, lid = heapq.heappop(WL); queued.discard(lid); layer = net.by_id[lid]
 
         # merge predecessors into before[lid]
         if net.preds.get(lid):
@@ -166,7 +181,7 @@ def analyze(
             layer.cache["prev_tf_side_state"] = side_sig
             for con in out_fact.cons: globalC.replace(con)
             if not single_pass:
-                for sid in net.succs.get(lid, []): WL.append(sid)
+                for sid in net.succs.get(lid, []): push(sid)
             if _gui.enabled:
                 versions[lid] = versions.get(lid, 0) + 1
                 bounds = after[lid].bounds
