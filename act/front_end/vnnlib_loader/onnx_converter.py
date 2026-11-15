@@ -179,18 +179,25 @@ def _fold_dequantize_initializers(onnx_model):
 def _preprocess_onnx_for_onnx2torch(onnx_model):
     """Workarounds for onnx2torch quirks. Called on both main and retry paths.
 
-    1. Symbolic batch dim (vit_2023): set first ``dim_value=0`` → 1. Must
-       ``ClearField('dim_param')`` first since ``dim_value`` / ``dim_param``
-       are a protobuf oneof. Only normalise the first dim; leave variable
-       spatial dims alone so we don't mask real shape-concreteness errors.
+    1. Dynamic batch dim: set first ``dim_value=0`` → 1 only when no node
+       reads a tensor shape (``Shape``/``Size``), so the value cannot reach
+       the computation and onnxsim may use static shapes (e.g. MatMul + Add
+       → Gemm). Otherwise the dim stays symbolic: vit_2023 builds a Reshape
+       target from Shape -> Gather -> Concat, and a fixed 1 would be folded
+       into it, leaving a module that accepts batch 1 only.
+       ``ClearField('dim_param')`` comes first since ``dim_value`` /
+       ``dim_param`` are a protobuf oneof. Only the first dim is normalised;
+       variable spatial dims are left alone so we don't mask real
+       shape-concreteness errors.
     2. Empty Clip max input (cctsdb_yolo_2023): trim trailing empty input
        slots so onnx2torch's clip.py doesn't see them as present.
     """
-    for inp in onnx_model.graph.input:
-        dims = list(inp.type.tensor_type.shape.dim)
-        if dims and dims[0].dim_value == 0:
-            dims[0].ClearField('dim_param')
-            dims[0].dim_value = 1
+    if not any(node.op_type in ("Shape", "Size") for node in onnx_model.graph.node):
+        for inp in onnx_model.graph.input:
+            dims = list(inp.type.tensor_type.shape.dim)
+            if dims and dims[0].dim_value == 0:
+                dims[0].ClearField('dim_param')
+                dims[0].dim_value = 1
     for node in onnx_model.graph.node:
         if node.op_type == 'Clip':
             while len(node.input) > 1 and not node.input[-1]:
@@ -310,6 +317,40 @@ def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
     return _ensure_unique_node_names(_preprocess_onnx_for_onnx2torch(pack_onnx_inputs(onnx_model)))
 
 
+def _infer_shapes(onnx_model: ModelProto) -> ModelProto:
+    """Best-effort value shapes for onnx2torch, keeping symbolic dimensions.
+
+    onnx2torch reads ranks from ``value_info`` (BatchNormalization picks its
+    class from the input rank), and ONNX's own inference loses them behind
+    shape arithmetic on a symbolic dimension. Graphs with symbolic inputs
+    therefore use onnxruntime's symbolic shape inference. Its ``infer_shapes``
+    entry point writes the model to the working directory when inference is
+    incomplete, so its steps are run here and partial annotations are kept.
+    """
+    from onnx import shape_inference
+
+    if any(dim.dim_value <= 0 for inp in _data_inputs(onnx_model.graph)
+           for dim in inp.type.tensor_type.shape.dim):
+        try:
+            from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
+
+            inference = SymbolicShapeInference(
+                int_max=2**31 - 1, auto_merge=True, guess_output_rank=False, verbose=0,
+            )
+            inference._preprocess(onnx_model)
+            while inference.run_:
+                inference._infer_impl()
+            inference._update_output_from_vi()
+            return inference.out_mp_
+        except Exception as e:
+            logger.warning(f"Symbolic shape inference failed ({e}); using ONNX shape inference")
+    try:
+        return shape_inference.infer_shapes(onnx_model)
+    except Exception as e:
+        logger.warning(f"ONNX shape inference failed ({e}); proceeding without it")
+        return onnx_model
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -360,11 +401,7 @@ def convert_onnx_to_pytorch(
         # VNN-COMP ONNX files can leave intermediate values with ValueType.UNKNOWN
         # (nn4sys) or lose annotations during onnxsim simplification; without this
         # step onnx2torch raises "Got unexpected input value type".
-        try:
-            from onnx import shape_inference
-            onnx_model = shape_inference.infer_shapes(onnx_model)
-        except Exception as e:
-            logger.warning(f"ONNX shape inference failed ({e}); proceeding without it")
+        onnx_model = _infer_shapes(onnx_model)
 
         # Convert to PyTorch. Simplification occasionally leaves intermediate
         # values with ValueType.UNKNOWN (nn4sys); only retry-without-simplify
@@ -379,14 +416,7 @@ def convert_onnx_to_pytorch(
                     f"onnx2torch failed on simplified graph ({convert_err}); "
                     f"retrying with simplify=False"
                 )
-                raw_model = onnx.load(str(onnx_path))
-                raw_model = _prepare_onnx_for_conversion(raw_model)
-                try:
-                    from onnx import shape_inference
-                    raw_model = shape_inference.infer_shapes(raw_model)
-                except Exception as e:
-                    # Intentional: shape inference is best-effort; converter handles missing shapes downstream.
-                    logger.debug("suppressed: %s", e)
+                raw_model = _infer_shapes(_prepare_onnx_for_conversion(onnx.load(str(onnx_path))))
                 pytorch_model = convert(raw_model)
             else:
                 raise

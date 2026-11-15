@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil "transformers>=4.57.3,<5" scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch "onnxsim==0.6.5" onnxruntime tensorflow pandas numpy scipy pyyaml tqdm psutil "transformers>=4.57.3,<5" scikit-learn
 
       - name: Cache CIFAR-100 VNNLIB benchmark
         id: cifar100-cache
@@ -115,6 +115,24 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --fuzz --category traffic_signs_recognition_2023 --dtype float64 --max-instances 2 --timeout 30 --iterations 200
+
+      - name: Cache ViT VNNLIB benchmark
+        id: vit-cache
+        uses: actions/cache@v4
+        with:
+          path: data/vnnlib/vit_2023
+          key: vnnlib-vit-2023-v1
+
+      - name: Download ViT benchmark
+        if: steps.vit-cache.outputs.cache-hit != 'true'
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --download vit_2023
+
+      - name: Run fuzzing on several ViT instances in one batch (symbolic ONNX batch dimension)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --fuzz --category vit_2023 --max-instances 4 --timeout 30 --iterations 200
 
       - name: Run fuzzing with --category flag (safeNLP text benchmark, real FC+ReLU)
         run: |

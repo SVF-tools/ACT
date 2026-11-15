@@ -970,6 +970,24 @@ class _LayerGraphBuilder:
         with torch.no_grad():
             return sub(*arg_vals)
 
+    def _fold_compile_time_node(self, node: fx.Node) -> bool:
+        """Evaluate shape arithmetic at conversion time instead of emitting layers.
+
+        A verified lane has a fixed shape, so a node that reads a compile-time
+        value (an OnnxShape result or an earlier fold) and whose input cone is
+        constant is the same for every input, e.g. the Shape -> Gather ->
+        Unsqueeze -> Concat chain that builds a Reshape target from a symbolic
+        batch dimension. Its value joins ``_compile_time_values``, where
+        operand resolution finds it. Returns whether the node was folded.
+        """
+        if not any(isinstance(a, fx.Node) and a.name in self._compile_time_values for a in node.args):
+            return False
+        value = self._evaluate_constant_subgraph(node.name, allow_sample=False)
+        if not isinstance(value, torch.Tensor):
+            return False
+        self._compile_time_values[node.name] = value
+        return True
+
     def _ensure_constant_vars(self, node_name: str) -> bool:
         """Emit a CONSTANT layer for an ONNX initializer (consumed by Concat /
         Slice / MatMul as a registered var operand). False if not get_attr."""
@@ -1078,6 +1096,8 @@ class _LayerGraphBuilder:
         module = self.modules.get(node.target)
         if module is None:
             raise ValueError(f"Module '{node.target}' not found in traced model")
+        if self._fold_compile_time_node(node):
+            return
 
         if 'onnx2torch' in type(module).__module__ or (OnnxToTorchModule and isinstance(module, OnnxToTorchModule)):
             cls_name = type(module).__name__

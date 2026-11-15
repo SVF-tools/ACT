@@ -10,15 +10,20 @@ witness are different capabilities.** An implemented operator does not imply
 that every model containing it is supported or that verification will finish
 within a competition timeout.
 
-Last reviewed: **2026-11-13**, against `65952d7` plus the implementation commits
-`0ab1510`, `5afb3e2`, and `cb6c51a` in PR #139. Later changes must update this
-record in the same PR; see [Maintenance](#maintenance).
+Last reviewed: **2026-11-16**, against `b0afdc1` (PR #139 and PR #140 merged)
+plus the dynamic-batch conversion change for issue #141. Later changes must
+update this record in the same PR; see [Maintenance](#maintenance).
 
 ## Operator support
 
 These are ONNX-to-ACT conversion paths, including ONNX operators converted to
 native PyTorch modules. "Implemented" means that a lowering exists under the
 listed conditions, not unrestricted ONNX opset or abstract-domain coverage.
+
+A dynamic leading (batch) input dimension is fixed to 1 before simplification
+only when no node reads a tensor shape (`Shape`/`Size`). Otherwise it stays
+symbolic, onnxruntime's symbolic shape inference annotates the graph, and the
+converted PyTorch module accepts any batch size.
 
 Implementation owners:
 
@@ -56,10 +61,10 @@ Implementation owners:
 | `ArgMax`, `ArgMin` | Partial | Lowered to `ARG_EXTREMUM`; interval bounds enclose possible indices and can be loose. Check the chosen backend rather than inferring support from conversion alone. |
 | `Equal`, `Less`, `Greater`, `LessOrEqual`, `GreaterOrEqual`, `Where` | Implemented paths | Comparison and conditional-selection layers over compatible resolved shapes. Domain-specific precision and availability still apply. |
 | `QuantizeLinear`, `DequantizeLinear` | Restricted | Real-valued QDQ representation with supported scale/zero-point broadcasting. Dequantization folds constants, recognizes matching QDQ pairs, or emits scale/bias. Not a claim of arbitrary integer-kernel equivalence. |
-| `Constant`, `Shape` | Implemented | Constants retain integer shape metadata; `Shape` is evaluated from known shapes at conversion time. |
+| `Constant`, `Shape` | Implemented | Constants retain integer shape metadata; `Shape` is evaluated from the verified lane's shape at conversion time. Nodes computed only from such values (e.g. `Gather`/`Unsqueeze`/`Concat` building a `Reshape` target from a symbolic batch dimension) are folded during conversion and emit no layer. |
 | `Dropout` | Inference only | Evaluation-mode passthrough. Training-time stochastic dropout is not the verified behavior. |
 | `Cast` | Partial | Current lowering is a value passthrough. Do not rely on it to model value-changing float-to-integer truncation, notably dynamic patch/index construction. |
-| Input-dependent `Range`/shape/index construction, `If`/`Loop`/`Scan`, unregistered ONNX modules | Not covered | No general lowering is claimed. A supported static subgraph does not make an enclosing dynamic graph supported. |
+| Value-dependent `Range`/shape/index construction, `If`/`Loop`/`Scan`, unregistered ONNX modules | Not covered | No general lowering is claimed. A supported static subgraph does not make an enclosing dynamic graph supported. |
 
 Native PyTorch modules such as recurrent or attention layers have additional ACT
 paths. Their presence in the layer registry alone is not evidence that an ONNX
@@ -91,6 +96,7 @@ Two evidence scopes must remain distinct:
 | Coupled monotonic ACAS Xu (`monotonic_acasxu_2026`) | API/category checked | Branch category soundness and direct build/interval/fuzz checks passed. Example combined model: 6 inputs, 10 outputs; shared coordinates plus a retained `LIN_POLY` relation. The competition shell entry still accepts one ONNX path. |
 | Isomorphic ACAS Xu (`isomorphic_acasxu_2026`) | API/category checked | Branch category soundness and direct build/interval/fuzz checks passed. Example combined model: 5 inputs, 10 outputs. Multi-query aggregation and witness export depend on the caller; see the property table. |
 | Nonlinear ACC (`adaptive_cruise_control_non_linear_2026`) | Checked | Branch category soundness run passed. Deployment instances 1, 2, and 17 loaded and ran; 1 and 17 were `CERTIFIED`, 2 `UNKNOWN`. Polynomial terms become extra model outputs. |
+| Vision Transformers (`vit_2023`) | Checked | 2026-11-16 on `b0afdc1` plus the issue #141 change, CPU/float64. `pgd_2_3_16` and `ibp_3_3_8` keep their symbolic batch: the converted modules match ONNX Runtime at batch 1 and 3 (max abs difference ≤ 1.5e-6), and `--fuzz --max-instances 4` fuzzes four instances in one batch. `--verify vnnlib --max-instances 1` passed `--validate-soundness` for interval/torchlp, HybridZ TF/torchlp, the HybridZ solver, and dual; Level-2 bound alignment is skipped for this transformer lowering, as before. The ACT net keeps the Q/K/V projections as three `DENSE` layers (previously one `DENSE` and three `SLICE`s); interval output bounds and verdicts equal those of the batch-1 conversion. |
 | Patch-based YOLO (`cctsdb_yolo_2023`) | Blocked | Checked patch-1/patch-3 instances have a rank-1 input and value-dependent Cast/Slice/Range/ScatterND shapes. The static ACT graph cannot represent that path. Static `ScatterND` support does not remove this blocker. |
 | Other registered categories, CNN/ViT/recurrent exports | Not established by this record | [The category catalogue](../act/front_end/vnnlib_loader/category_mapping.py) controls discovery, not verified coverage. Add a dated model/property result here before claiming support. |
 
@@ -99,6 +105,14 @@ with ONNX Runtime at 16 input-box points per model and rechecked 8 generated
 counterexamples on their original ONNX models. Sampling of certified instances
 found no violation; sampling is supplementary evidence, not a certification
 proof or exhaustive operator validation.
+
+For the issue #141 change, the 71 local VNN-COMP models with a dynamic batch
+dimension and a listed instance (14 benchmarks) were rebuilt from their first
+instance on `b0afdc1` and on the branch. Only the two `vit_2023` models changed
+their ACT layers; interval verdicts and output bounds were unchanged for all 71.
+`smart_turn_multimodal_2026`, the other instance-backed model that reads tensor
+shapes, now also keeps its batch symbolic; its ACT net matched ONNX Runtime at
+the instance centre.
 
 ## Property and entry-point support
 
