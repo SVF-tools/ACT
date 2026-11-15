@@ -406,12 +406,31 @@ class ActGraphModule(nn.Module):
                 f"ActGraphModule: {kind} layer {layer.id} expects exactly {arity} "
                 f"input{'s' if arity > 1 else ''}, got {len(inputs)}."
             )
-        return handler(self, layer, inputs)
+        return _absorb_lanes(layer, handler(self, layer, inputs))
 
 
 # Input-count rule per functional kind: a positive int is an exact count.
 _UNCHECKED, _AT_LEAST_TWO = 0, -2
 _Functional = Callable[[ActGraphModule, Layer, list[torch.Tensor]], torch.Tensor]
+
+
+def _absorb_lanes(layer: Layer, out: torch.Tensor) -> torch.Tensor:
+    """Give every output stored with a unit leading dimension one lane layout.
+
+    An output stored as ``(1, *rest)`` lives as ``(B, *rest)``: the unit model
+    batch carries the lanes, as in _reshape. A handler that kept the lanes on
+    an extra leading axis (see _axis_shift) returns ``(B, 1, *rest)``; that unit
+    axis is folded. A stored ``(1,)`` keeps its value axis, ``(B, 1)``, so that
+    operands of a later elementwise layer always align lane by lane.
+    """
+    shape = layer.params.get("output_shape")
+    if not shape or int(shape[0]) != 1:
+        return out
+    if len(shape) == 1:
+        return out.unsqueeze(1) if out.dim() == 1 else out
+    if out.dim() == len(shape) + 1 and out.shape[1] == 1:
+        return out.squeeze(1)
+    return out
 
 
 def _fold(combine: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> _Functional:
@@ -428,6 +447,9 @@ def _transpose(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) 
     perm = layer.params.get("perm")
     if perm is None:
         return inputs[0]
+    # Same axis convention as SLICE (see _axis_shift): lanes stay in front.
+    if _axis_shift(layer.params.get("input_shape"), inputs[0]):
+        perm = [0, *(int(p) + 1 for p in perm)]
     return inputs[0].permute(*perm).contiguous()
 
 
@@ -501,6 +523,7 @@ def _arg_extremum(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor
     axis = int(layer.params.get("axis", 0))
     keepdims = bool(layer.params.get("keepdims", 0))
     fn = torch.argmax if op == "argmax" else torch.argmin
+    axis += _axis_shift(layer.params.get("input_shape"), inputs[0])
     return fn(inputs[0], dim=axis, keepdim=keepdims).to(inputs[0].dtype)
 
 
@@ -642,6 +665,10 @@ def _gather(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> 
     axis = int(layer.params.get("axis", 0))
     # Same axis convention as SLICE (see _axis_shift).
     shift = _axis_shift(layer.params.get("input_shape"), inputs[0])
+    if axis + shift == 0:
+        # Stored axis 0 is the unit model batch that carries the lanes (as in
+        # _squeeze): its only index selects every lane's own sample.
+        return inputs[0]
     idx = torch.as_tensor(indices, dtype=torch.long, device=inputs[0].device)
     return torch.index_select(inputs[0], dim=axis + shift, index=idx)
 

@@ -739,7 +739,7 @@ def sparse_hz_apply_layer(L, hz: SparseHZono, input_bounds: Bounds, result: Fact
                 aligned.append(sparse_hz_reframe_point(part, target))
             else:
                 return True, None, "incompatible_sparse_concat_frames"
-        return True, sparse_hz_concat(aligned), None
+        return True, sparse_hz_concat(aligned, batch_size=int(result.bounds.lb.shape[0])), None
     if k == "CONSTANT":
         return True, sparse_hz_from_bounds(result.bounds, frame_id=hz.frame_id), None
     if k in {"LRELU", "SIGMOID", "TANH", "MAXPOOL2D"}:
@@ -1311,7 +1311,8 @@ def tf_concat(L, bounds, tf):
         preds = tf._net.preds.get(L.id, [])
         parts = [tf._hz_cache.get(pid) for pid in preds]
         if all(p is not None for p in parts):
-            tf._hz_cache[L.id] = hz_concat(parts)
+            # Parts stack their lanes' values: concatenate lane by lane.
+            tf._hz_cache[L.id] = hz_concat(parts, batch_size=bounds.lb.shape[0])
         else:
             hz_in = None
             tf._hz_cache.pop(L.id, None)

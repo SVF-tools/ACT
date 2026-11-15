@@ -13,14 +13,18 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Tuple
+import itertools
 import logging
+import math
+import types
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from onnx import GraphProto, ModelProto, ValueInfoProto
+    from onnx import GraphProto, ModelProto, NodeProto, ValueInfoProto
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +304,232 @@ def pack_onnx_inputs(onnx_model: ModelProto) -> ModelProto:
     return onnx_model
 
 
+_INTEGER_TYPES = frozenset(range(2, 8)) | {12, 13}  # onnx.TensorProto (U)INT8..64
+MAX_INTEGER_INPUT_CASES = 1 << 16
+
+
+def _attribute(node, name: str, default=None):
+    from onnx import helper
+
+    return next((helper.get_attribute_value(a) for a in node.attribute if a.name == name), default)
+
+
+@dataclass(frozen=True)
+class IntegerInputCases:
+    """Input coordinates a network reads only through ``Cast`` to an integer type.
+
+    Such a coordinate takes the finitely many values ``trunc(lb) .. trunc(ub)``
+    in a bounded box, and the part of the network computed from these
+    coordinates alone (e.g. cctsdb_yolo_2023's patch mask, whose dynamic
+    Slice/Range/ScatterND shapes follow the patch position) is fixed once they
+    are. ``remainder`` is the network with that part cut off: its one input row
+    is the declared input, flattened, followed by the ``extra`` values of those
+    cut tensors, so every remaining shape is static. ``case_rows`` enumerates
+    the distinct cases of a box as input rows of ``remainder``.
+    """
+
+    coordinates: tuple[int, ...]
+    declared_shape: tuple[int, ...]
+    extra: int
+    remainder: "ModelProto"
+    region: "ModelProto"  # declared input -> the cut tensors, in remainder input order
+
+    @classmethod
+    def find(cls, model: "ModelProto") -> "IntegerInputCases | None":
+        """Cut ``model`` (prepared, shape-inferred) at its integer-cast inputs, if it has any."""
+        import numpy as np
+        from onnx import numpy_helper
+
+        graph = model.graph
+        inputs = _data_inputs(graph)
+        if len(inputs) != 1:
+            return None
+        x = inputs[0]
+        shape = [d.dim_value for d in x.type.tensor_type.shape.dim]
+        if not shape or any(d <= 0 for d in shape):
+            return None
+        consts = {t.name: numpy_helper.to_array(t) for t in graph.initializer}
+        for node in graph.node:
+            value = _attribute(node, "value") if node.op_type == "Constant" else None
+            if value is not None:
+                consts[node.output[0]] = numpy_helper.to_array(value)
+        consumers: dict[str, list[NodeProto]] = {}
+        for node in graph.node:
+            for name in node.input:
+                consumers.setdefault(name, []).append(node)
+        flat = np.arange(math.prod(shape)).reshape(shape)
+
+        def reads(node) -> set[int] | None:
+            """Flat input coordinates a constant-index Gather/Slice of the input reads."""
+            if node.op_type == "Gather" and node.input[1] in consts:
+                return set(np.take(flat, consts[node.input[1]], axis=_attribute(node, "axis", 0)).ravel().tolist())
+            args = list(node.input[1:]) + [""] * (5 - len(node.input))
+            if node.op_type == "Slice" and all(not a or a in consts for a in args):
+                starts, ends = consts[args[0]], consts[args[1]]
+                axes = consts[args[2]] if args[2] else range(len(starts))
+                steps = consts[args[3]] if args[3] else [1] * len(starts)
+                index = [slice(None)] * flat.ndim
+                for start, end, axis, step in zip(starts, ends, axes, steps):
+                    index[int(axis)] = slice(int(start), int(end), int(step))
+                return set(flat[tuple(index)].ravel().tolist())
+            return None
+
+        cast_only, other = [], set()
+        for node in consumers.get(x.name, []):
+            read = reads(node)
+            uses = consumers.get(node.output[0], [])
+            if (read is not None and node.op_type == "Gather" and uses
+                    and all(u.op_type == "Cast" and _attribute(u, "to") in _INTEGER_TYPES for u in uses)):
+                cast_only.append((node, read))
+            else:
+                other |= set(range(flat.size)) if read is None else read
+        cut = [(node, read) for node, read in cast_only if not read & other]
+        if not cut:
+            return None
+
+        # dyn: computed from the enumerated coordinates; dat: from the remaining input data.
+        # Shape/Size read no data, so a static shape does not carry data dependence.
+        removed = {id(node) for node, _ in cut}
+        dyn = {name for node, _ in cut for name in node.output}
+        dat: set[str] = set()
+        for node in graph.node:
+            if id(node) in removed:
+                continue
+            names = [n for n in node.input if n]
+            if x.name in names:
+                dat.update(node.output)
+                continue
+            if any(n in dyn for n in names):
+                dyn.update(node.output)
+            if node.op_type not in ("Shape", "Size") and any(n in dat for n in names):
+                dat.update(node.output)
+        region = removed | {id(n) for n in graph.node
+                            if any(o in dyn for o in n.output) and not any(o in dat for o in n.output)}
+        produced = {o for n in graph.node if id(n) in region for o in n.output}
+        outputs = {o.name for o in graph.output}
+        boundary = sorted({name for n in graph.node if id(n) not in region for name in n.input if name in produced}
+                          | (produced & outputs))
+        infos = {v.name: v for v in [*graph.value_info, *graph.output]}
+        elem_type = x.type.tensor_type.elem_type
+        boundary_shapes = []
+        for name in boundary:
+            info = infos.get(name)
+            dims = [d.dim_value for d in info.type.tensor_type.shape.dim] if info is not None else []
+            if info is None or info.type.tensor_type.elem_type != elem_type or any(d <= 0 for d in dims):
+                raise ONNXConversionError(
+                    f"tensor {name!r}, computed only from the integer-cast input coordinates "
+                    f"{sorted(set().union(*(r for _, r in cut)))}, reaches the network without a static "
+                    f"shape and the input's element type; ACT cannot enumerate these inputs")
+            boundary_shapes.append(dims)
+        return cls(
+            coordinates=tuple(sorted(set().union(*(r for _, r in cut)))),
+            declared_shape=tuple(shape),
+            extra=sum(math.prod(s) for s in boundary_shapes),
+            remainder=_remainder_model(model, x, region, boundary, boundary_shapes),
+            region=_region_model(model, x.name, boundary),
+        )
+
+    def case_rows(self, lb: torch.Tensor, ub: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Input-row bounds ``(lb, ub)`` of ``remainder`` for each distinct case of the box.
+
+        Each enumerated coordinate is fixed to a representative of its case,
+        ``clamp(v, lb, ub)`` (so that ``trunc`` gives ``v``); the other
+        coordinates keep their bounds, and the cut tensors follow as fixed
+        values. Cases whose cut tensors coincide share one row. A row's
+        leading ``prod(declared_shape)`` values are an input of the original
+        network.
+        """
+        import numpy as np
+        import onnxruntime as ort
+
+        lo = lb.detach().reshape(-1).cpu().double().numpy()
+        hi = ub.detach().reshape(-1).cpu().double().numpy()
+        coords = list(self.coordinates)
+        if not (np.isfinite(lo[coords]).all() and np.isfinite(hi[coords]).all()):
+            raise ONNXConversionError(f"integer-cast inputs {coords} need finite bounds to be enumerated")
+        ranges = [range(int(np.trunc(lo[i])), int(np.trunc(hi[i])) + 1) for i in coords]
+        count = math.prod(len(r) for r in ranges)
+        if count > MAX_INTEGER_INPUT_CASES:
+            raise ONNXConversionError(
+                f"integer-cast inputs {coords} span {count} cases (at most {MAX_INTEGER_INPUT_CASES})")
+        session = ort.InferenceSession(self.region.SerializeToString(), providers=["CPUExecutionProvider"])
+        feed = session.get_inputs()[0].name
+        center = ((lo + hi) / 2).astype(np.float32)
+        rows: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
+        for case in itertools.product(*ranges):
+            point = center.copy()
+            point[coords] = np.clip(np.asarray(case, dtype=np.float64), lo[coords], hi[coords])
+            values = session.run(None, {feed: point.reshape(self.declared_shape)})
+            fixed = np.concatenate([np.asarray(v, dtype=np.float64).reshape(-1) for v in values])
+            key = fixed.tobytes()
+            if key not in rows:
+                rows[key] = (point[coords].astype(np.float64), fixed)
+        out = []
+        for representative, fixed in rows.values():
+            row_lo, row_hi = lo.copy(), hi.copy()
+            row_lo[coords] = row_hi[coords] = representative
+            pair = [torch.as_tensor(np.concatenate([b, fixed]), dtype=lb.dtype, device=lb.device).reshape(1, -1)
+                    for b in (row_lo, row_hi)]
+            out.append((pair[0], pair[1]))
+        return out
+
+
+def _forward_lane_by_lane(module: nn.Module, x: torch.Tensor, *args):
+    """``forward`` of a converted graph that fixes one sample: run each lane of ``x`` alone.
+
+    Tracing (TorchToACT, merge_split_relus) reads the class-level graph forward, so
+    the analysed graph is unchanged; only eager batched calls loop.
+    """
+    forward = type(module).forward
+    if x.shape[0] == 1:
+        return forward(module, x, *args)
+    return torch.cat([forward(module, x[i:i + 1], *args) for i in range(x.shape[0])])
+
+
+def _region_model(model: "ModelProto", input_name: str, boundary: list[str]) -> "ModelProto":
+    from onnx.utils import Extractor
+
+    return Extractor(model).extract_model([input_name], boundary)
+
+
+def _remainder_model(model: "ModelProto", x: "ValueInfoProto", region: set[int], boundary: list[str],
+                     boundary_shapes: list[list[int]]) -> "ModelProto":
+    """``model`` without ``region``: the input and the boundary tensors come from one row."""
+    import numpy as np
+    from onnx import helper, numpy_helper
+
+    graph = model.graph
+    shape = [d.dim_value for d in x.type.tensor_type.shape.dim]
+    kept = [n for n in graph.node if id(n) not in region]
+    feeds = [(x.name, shape)] if any(x.name in n.input for n in kept) else []
+    feeds += list(zip(boundary, boundary_shapes))
+    nodes, constants, offset = [], [], 0
+    starts = {x.name: 0}
+    for name, dims in [(x.name, shape), *zip(boundary, boundary_shapes)]:
+        starts[name] = offset
+        offset += math.prod(dims)
+    for index, (name, dims) in enumerate(feeds):
+        prefix = f"{PACKED_INPUT_NAME}_case_{index}"
+        start = starts[name]
+        constants += [
+            numpy_helper.from_array(np.array([start], np.int64), f"{prefix}_start"),
+            numpy_helper.from_array(np.array([start + math.prod(dims)], np.int64), f"{prefix}_end"),
+            numpy_helper.from_array(np.array([1], np.int64), f"{prefix}_axis"),
+            numpy_helper.from_array(np.array(dims, np.int64), f"{prefix}_shape"),
+        ]
+        nodes += [
+            helper.make_node("Slice", [PACKED_INPUT_NAME, f"{prefix}_start", f"{prefix}_end", f"{prefix}_axis"],
+                             [f"{prefix}_flat"], name=f"{prefix}_slice"),
+            helper.make_node("Reshape", [f"{prefix}_flat", f"{prefix}_shape"], [name], name=f"{prefix}_reshape"),
+        ]
+    row = helper.make_tensor_value_info(PACKED_INPUT_NAME, x.type.tensor_type.elem_type, [1, offset])
+    remainder = helper.make_model(
+        helper.make_graph(nodes + kept, graph.name, [row], list(graph.output), [*graph.initializer, *constants]),
+        opset_imports=model.opset_import, ir_version=model.ir_version)
+    logger.info("Cut %d integer-cast-input nodes; the remainder reads one [1, %d] row", len(region), offset)
+    return remainder
+
+
 def _prepare_onnx_for_conversion(onnx_model: ModelProto) -> ModelProto:
     """Apply the same opset and graph preparation on main and raw retry."""
     try:
@@ -351,6 +581,27 @@ def _infer_shapes(onnx_model: ModelProto) -> ModelProto:
         return onnx_model
 
 
+def _simplify_and_infer(onnx_model: ModelProto, simplify: bool) -> ModelProto:
+    """Optionally simplify, then propagate types/shapes through the graph."""
+    if simplify:
+        try:
+            import onnxsim
+            logger.info("Simplifying ONNX model")
+            onnx_model, check = onnxsim.simplify(onnx_model)
+            if not check:
+                logger.warning("ONNX simplification check failed, using original model")
+            onnx_model = _ensure_unique_node_names(onnx_model)
+        except ImportError:
+            logger.warning("onnxsim not available, skipping simplification")
+        except Exception as e:
+            logger.warning(f"ONNX simplification failed: {e}, using original model")
+
+    # VNN-COMP ONNX files can leave intermediate values with ValueType.UNKNOWN
+    # (nn4sys) or lose annotations during onnxsim simplification; without this
+    # step onnx2torch raises "Got unexpected input value type".
+    return _infer_shapes(onnx_model)
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -368,6 +619,21 @@ def convert_onnx_to_pytorch(
     Raises:
         ONNXConversionError: If conversion fails
     """
+    return convert_onnx_instance(onnx_path, simplify, split_integer_inputs=False)[0]
+
+
+def convert_onnx_instance(
+    onnx_path: Path,
+    simplify: bool = True,
+    *,
+    split_integer_inputs: bool = True,
+) -> Tuple[nn.Module, IntegerInputCases | None]:
+    """Convert an ONNX model; with integer-cast inputs, convert the remainder network instead.
+
+    Returns the PyTorch module and, when ``split_integer_inputs`` found such
+    inputs, their :class:`IntegerInputCases`, whose ``case_rows`` give the
+    module's input rows. Raises ONNXConversionError if conversion fails.
+    """
     if not onnx_path.exists():
         raise ONNXConversionError(f"ONNX file not found: {onnx_path}")
     
@@ -381,27 +647,10 @@ def convert_onnx_to_pytorch(
         logger.info(f"Loading ONNX model from {onnx_path}")
         onnx_model = onnx.load(str(onnx_path))
         
-        onnx_model = _prepare_onnx_for_conversion(onnx_model)
-
-        # Optionally simplify
-        if simplify:
-            try:
-                import onnxsim
-                logger.info("Simplifying ONNX model")
-                onnx_model, check = onnxsim.simplify(onnx_model)
-                if not check:
-                    logger.warning("ONNX simplification check failed, using original model")
-                onnx_model = _ensure_unique_node_names(onnx_model)
-            except ImportError:
-                logger.warning("onnxsim not available, skipping simplification")
-            except Exception as e:
-                logger.warning(f"ONNX simplification failed: {e}, using original model")
-
-        # Propagate types/shapes through the graph after any earlier rewrites.
-        # VNN-COMP ONNX files can leave intermediate values with ValueType.UNKNOWN
-        # (nn4sys) or lose annotations during onnxsim simplification; without this
-        # step onnx2torch raises "Got unexpected input value type".
-        onnx_model = _infer_shapes(onnx_model)
+        onnx_model = _simplify_and_infer(_prepare_onnx_for_conversion(onnx_model), simplify)
+        cases = IntegerInputCases.find(onnx_model) if split_integer_inputs else None
+        if cases is not None:
+            onnx_model = _simplify_and_infer(_ensure_unique_node_names(cases.remainder), simplify)
 
         # Convert to PyTorch. Simplification occasionally leaves intermediate
         # values with ValueType.UNKNOWN (nn4sys); only retry-without-simplify
@@ -411,7 +660,7 @@ def convert_onnx_to_pytorch(
         try:
             pytorch_model = convert(onnx_model)
         except Exception as convert_err:
-            if simplify and "ValueType.UNKNOWN" in str(convert_err):
+            if simplify and cases is None and "ValueType.UNKNOWN" in str(convert_err):
                 logger.warning(
                     f"onnx2torch failed on simplified graph ({convert_err}); "
                     f"retrying with simplify=False"
@@ -421,6 +670,10 @@ def convert_onnx_to_pytorch(
             else:
                 raise
         pytorch_model.eval()
+        if cases is not None:
+            # The remainder keeps the original graph's one-sample shapes (cctsdb: a
+            # rank-1 input with no batch axis), while each case is one input lane.
+            pytorch_model.forward = types.MethodType(_forward_lane_by_lane, pytorch_model)
         
         # Convert model to match device_manager settings
         try:
@@ -435,7 +688,7 @@ def convert_onnx_to_pytorch(
             logger.warning(f"Could not apply device_manager settings: {e}")
         
         logger.info(f"Successfully converted ONNX model: {onnx_path.name}")
-        return pytorch_model
+        return pytorch_model, cases
         
     except ImportError as e:
         raise ONNXConversionError(

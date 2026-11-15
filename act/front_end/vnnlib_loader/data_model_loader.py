@@ -31,6 +31,7 @@ import torch.nn as nn
 from act.util.path_config import get_vnnlib_data_root
 from act.util.download_utils import UNAVAILABLE, is_source_unreachable
 from act.front_end.vnnlib_loader.onnx_converter import (
+    convert_onnx_instance,
     convert_onnx_to_pytorch,
     get_onnx_input_shape,
     ONNXConversionError
@@ -605,12 +606,15 @@ def load_vnnlib_pair(
         logger.info("[1/3] Reusing already-converted PyTorch model...")
         pytorch_model = onnx_cache['model']
         pytorch_model_g = onnx_cache.get('model_g')
+        integer_inputs = onnx_cache.get('integer_inputs')
         pytorch_model.eval()
         logger.info(f"  ✓ Model reused successfully")
     else:
         logger.info("[1/3] Converting ONNX model to PyTorch...")
         try:
-            pytorch_model = convert_onnx_to_pytorch(onnx_path, simplify=True)
+            # A multi-network property combines whole networks: no input is enumerated there.
+            pytorch_model, integer_inputs = convert_onnx_instance(
+                onnx_path, simplify=True, split_integer_inputs=onnx_path_g is None)
             pytorch_model.eval()
             logger.info(f"  ✓ Model converted successfully")
         except ONNXConversionError as e:
@@ -626,6 +630,7 @@ def load_vnnlib_pair(
                 raise RuntimeError(f"Second ONNX conversion failed: {e}")
         
         onnx_cache['model'] = pytorch_model
+        onnx_cache['integer_inputs'] = integer_inputs
         if pytorch_model_g is not None:
             onnx_cache['model_g'] = pytorch_model_g
     
@@ -675,7 +680,8 @@ def load_vnnlib_pair(
     
     logger.info(f"Successfully loaded VNNLIB instance from '{category}'")
     
-    result = {
+    result: Dict[str, Any] = {
+        'integer_inputs': integer_inputs,
         'model': model,
         'labeled_tensor': labeled_tensor,
         'vnnlib_metadata': vnnlib_metadata,

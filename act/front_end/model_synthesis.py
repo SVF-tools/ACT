@@ -26,6 +26,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.exit(1)
 
 import copy
+import dataclasses
 import torch
 import torch.fx as fx
 import torch.nn as nn
@@ -73,6 +74,32 @@ def _assert_same_center_shape(in_specs: List[InputSpec]) -> None:
     assert first_center is not None
     assert all(s.center is not None and s.center.shape == first_center.shape for s in in_specs), \
         f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+
+
+def _pad_unsafe_rows(out_specs: List[OutputSpec]) -> List[OutputSpec]:
+    """Give every UNSAFE_LINEAR lane the group's largest row count.
+
+    A lane's unsafe set is the conjunction of its rows, so repeating one of its
+    own rows leaves the set, its bounds and its witness ranking unchanged. This
+    lets disjunct queries with different row counts share one model.
+    """
+    rows = max(s.c.reshape(-1, s.c.shape[-1]).shape[0] for s in out_specs)
+    padded: List[OutputSpec] = []
+    for spec in out_specs:
+        c = spec.c.reshape(-1, spec.c.shape[-1])
+        extra = rows - c.shape[0]
+        if extra == 0:
+            padded.append(spec)
+            continue
+        d = spec.d.reshape(-1)
+        strict = None if spec.strict is None else spec.strict.reshape(-1)
+        padded.append(dataclasses.replace(
+            spec,
+            c=torch.cat([c, c[:1].expand(extra, -1)]),
+            d=torch.cat([d, d[:1].expand(extra)]),
+            strict=None if strict is None else torch.cat([strict, strict[:1].expand(extra)]),
+        ))
+    return padded
 
 
 def _merge_specs_to_batch(
@@ -234,6 +261,8 @@ def _merge_specs_to_batch(
         """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
         vals = [getattr(s, attr, None) for s in out_specs]
         return torch.stack(vals) if all(v is not None for v in vals) else None
+    if out_kind is OutKind.UNSAFE_LINEAR:
+        out_specs = _pad_unsafe_rows(out_specs)
     if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
         c_vec = out_specs[0].c
         if c_vec is not None:
@@ -378,17 +407,16 @@ def synthesize_models_and_seeds_from_specs(
                 merge_cd = (
                     cd_group == "shape" and out_spec.kind is OutKind.UNSAFE_LINEAR
                 )
-                if out_spec.d is None:
-                    d_sig: Any = None
-                elif merge_cd:
-                    d_sig = tuple(out_spec.d.shape)
+                if merge_cd:
+                    # Row counts may differ too: _pad_unsafe_rows aligns them.
+                    cd_sig = (int(out_spec.c.shape[-1]),)
                 else:
-                    d_sig = out_spec.d.detach().cpu().reshape(-1).numpy().tobytes()
-                cd_sig = (
-                    tuple(out_spec.c.shape),
-                    None if merge_cd else out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
-                    d_sig,
-                )
+                    cd_sig = (
+                        tuple(out_spec.c.shape),
+                        out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
+                        None if out_spec.d is None
+                        else out_spec.d.detach().cpu().reshape(-1).numpy().tobytes(),
+                    )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
             # A LIN_POLY lane keeps its own polytope A x <= b, so it is never merged.
             if _is_fixed_model_input(lt, in_spec) or in_spec.kind == InKind.LIN_POLY:
