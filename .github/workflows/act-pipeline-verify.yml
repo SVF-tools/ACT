@@ -121,8 +121,9 @@ jobs:
       - name: Verify TorchVision MNIST + simple_cnn (interval / hybridz / dual — TOP1_ROBUST + MARGIN_ROBUST spec coverage)
         run: |
           cd ${{ github.workspace }}
-          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
-            coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 $combo --device cpu --dtype float64
+          # Dual keeps one sample: with two, its 16-lane models peak at ~15 GB RSS on the 16 GB runner.
+          for combo in "--num-samples 2 --tf-modes interval --solvers torchlp" "--num-samples 2 --tf-modes hybridz --solvers torchlp" "--num-samples 1 --solvers dual"; do
+            coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn $combo --device cpu --dtype float64
           done
 
       # ─────────────────────────────────────────────────────────────────
