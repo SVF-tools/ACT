@@ -4,7 +4,8 @@ name: ACT Pipeline Verify Tests
 # One step per benchmark; each step iterates the (TF, Solver) combos it
 # supports. VNNLIB benchmarks (vnncomp2024 subset): acasxu_2023, dist_shift_2023,
 # safenlp_2024 run all three combos (interval/hybridz/dual); collins_rul_cnn_2022
-# runs dual only; vit_2023 (ViT) runs interval, hybridz, and dual.
+# runs dual only; vit_2023 (ViT) runs interval, hybridz, and dual; cctsdb_yolo_2023
+# runs interval over its enumerated integer-cast input cases.
 # TorchVision MNIST +
 # simple_cnn runs all three combos, exercising TOP1_ROBUST + MARGIN_ROBUST spec
 # kinds. Factory-network verification lives in the backend CIs.
@@ -62,11 +63,12 @@ jobs:
             benchmarks/safenlp_2024/2.0
             benchmarks/collins_rul_cnn_2022/2.0
             benchmarks/vit_2023/2.0
+            benchmarks/cctsdb_yolo_2023/2.0
 
       - name: Stage and decompress benchmarks into data/vnnlib
         run: |
           cd ${{ github.workspace }}
-          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 collins_rul_cnn_2022 vit_2023; do
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 collins_rul_cnn_2022 vit_2023 cctsdb_yolo_2023; do
             src="_vnncomp_benchmarks/benchmarks/$cat/2.0"
             dst="data/vnnlib/$cat"
             mkdir -p "$dst"
@@ -117,6 +119,13 @@ jobs:
           for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers hybridz" "--solvers dual"; do
             coverage run -p -m act.pipeline --verify vnnlib --category vit_2023 --max-instances 1 $combo --validate-soundness --device cpu --dtype float64
           done
+
+      - name: Verify cctsdb_yolo_2023 (integer-cast input cases, interval)
+        run: |
+          cd ${{ github.workspace }}
+          # No --validate-soundness: the remainder network runs lane by lane, so the Level-2
+          # bound check cannot align its hooks with the ACT layers.
+          coverage run -p -m act.pipeline --verify vnnlib --category cctsdb_yolo_2023 --max-instances 3 --tf-modes interval --solvers torchlp --device cpu --dtype float64
 
       - name: Verify TorchVision MNIST + simple_cnn (interval / hybridz / dual — TOP1_ROBUST + MARGIN_ROBUST spec coverage)
         run: |
