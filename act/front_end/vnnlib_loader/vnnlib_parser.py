@@ -1317,8 +1317,10 @@ def write_vnncomp_result(out_path, token: str, *, x=None, y=None,
                 or in_decl is None or out_decl is None):
             f.write(token + "\n")
             return
-        xf = x.detach().cpu().flatten().tolist()
-        # The declared outputs come first; lifted spec terms (lifted_output_terms) follow.
+        # The declared input comes first; enumerated integer-input cases append
+        # fixed values (IntegerInputCases). Likewise the declared outputs come
+        # first and lifted spec terms (lifted_output_terms) follow.
+        xf = x.detach().cpu().flatten().tolist()[:math.prod(int(d) for d in in_decl[2])]
         yf = y.detach().cpu().flatten().tolist()[:math.prod(int(d) for d in out_decl[2])]
         lines = ["sat"]
         lines += _assignment(in_decl[0], in_decl[1], in_decl[2], xf)

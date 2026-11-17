@@ -245,15 +245,36 @@ def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
 
 
 def tf_arg_extremum(L: Layer, Bin: Bounds) -> Fact:
+    """Index range of the elements that can still be the extremum along ``axis``.
+
+    For argmax, element i is a candidate iff ub_i >= max_j lb_j (argmin: lb_i <=
+    min_j ub_j); every reachable extremum is a candidate, so [first, last]
+    candidate index is sound under either tie rule, and exact on a point box
+    without ties.
+    """
     batch_size = Bin.lb.shape[0]
     in_shape = L.params.get("input_shape")
     axis = int(L.params.get("axis", 0))
-    if in_shape is not None and axis < 0:
-        axis += len(in_shape)
-    axis_dim = int(in_shape[axis]) if in_shape else 1
     n_out = len(L.out_vars)
-    lb = Bin.lb.new_zeros(batch_size, n_out)
-    ub = Bin.lb.new_full((batch_size, n_out), float(max(0, axis_dim - 1)))
+    if not in_shape or Bin.lb[0].numel() != math.prod(int(d) for d in in_shape):
+        axis_dim = int(in_shape[axis]) if in_shape else 1
+        lb = Bin.lb.new_zeros(batch_size, n_out)
+        ub = Bin.lb.new_full((batch_size, n_out), float(max(0, axis_dim - 1)))
+    else:
+        shape = (batch_size, *(int(d) for d in in_shape))
+        dim = (axis % len(in_shape)) + 1
+        x_lb, x_ub = Bin.lb.reshape(shape), Bin.ub.reshape(shape)
+        if L.params["op"] == "argmax":
+            candidate = x_ub >= x_lb.amax(dim=dim, keepdim=True)
+        else:
+            candidate = x_lb <= x_ub.amin(dim=dim, keepdim=True)
+        index_shape = [1] * len(shape)
+        index_shape[dim] = shape[dim]
+        index = torch.arange(shape[dim], device=Bin.lb.device).reshape(index_shape).expand(shape)
+        first = torch.where(candidate, index, shape[dim]).amin(dim=dim)
+        last = torch.where(candidate, index, -1).amax(dim=dim)
+        lb = first.reshape(batch_size, n_out).to(Bin.lb.dtype)
+        ub = last.reshape(batch_size, n_out).to(Bin.lb.dtype)
     Bout = Bounds(lb, ub)
     C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
     return Fact(Bout, C)

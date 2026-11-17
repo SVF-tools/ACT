@@ -52,7 +52,8 @@ def run_vnncomp_instance(args) -> None:
     initialize_device(args.device, args.dtype)
 
     from act.back_end.bab.bab import verify_bab_batched
-    from act.util.counterexample import clear_violation_check_module_cache
+    from act.back_end.verifier import verify_once
+    from act.util.counterexample import clear_violation_check_module_cache, concrete_forward
     from act.config.config import build_vnncomp_bab_config
     from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.front_end.vnnlib_loader.data_model_loader import load_vnncomp_instance
@@ -95,13 +96,22 @@ def run_vnncomp_instance(args) -> None:
     wrapped_models = list(instance.models)
     n_models = len(wrapped_models)
 
+    def lane_box(wrapped) -> tuple[torch.Tensor, torch.Tensor]:
+        """Input box of every spec lane of a synthesized model: ``[lanes, *input_shape]``."""
+        spec = wrapped.input_spec.spec
+        return spec.lb, spec.ub
+
     if args.fuzzing_seconds > 0 and remaining() > 1.0:
         per_model_fuzz = min(args.fuzzing_seconds, remaining() / n_models)
-        for wm in wrapped_models:
+        for wm, seeds in zip(wrapped_models, instance.seeds):
             if remaining() <= 1.0:
                 break
+            if torch.equal(*lane_box(wm)):
+                # Every lane is one point: nothing to search, the verification step checks it.
+                continue
+            # One seed per spec lane of this model (ACTFuzzer checks the alignment).
             ce, _ = pgd_preattack(
-                wm, instance.inputs, min(per_model_fuzz, remaining()), args.fuzzing_scale
+                wm, seeds, min(per_model_fuzz, remaining()), args.fuzzing_scale
             )
             if ce is not None:
                 x = ce.input if hasattr(ce, "input") else ce
@@ -123,6 +133,11 @@ def run_vnncomp_instance(args) -> None:
         margin deadline so budget_left() == remaining() and this path is
         byte-identical to the original single-model logic."""
         net = convert_model(wrapped)
+        if lane_box(wrapped)[0].shape[0] > 1:
+            # verify_bab_batched takes one root lane; a multi-lane disjunct (e.g. the
+            # enumerated cases of integer-cast inputs) gets the one-shot bound and the
+            # concrete center check on every lane.
+            return tuple(verify_once(net, model_fn=lambda x: concrete_forward(net, x)))
 
         def budget_left():
             return min(remaining(), deadline - time.monotonic())
@@ -173,7 +188,7 @@ def run_vnncomp_instance(args) -> None:
         if remaining() <= 1.0:
             break
         res = _verify_wrapped(wrapped_models[index], time.monotonic() + budget)
-        aggregate.record((res,))
+        aggregate.record(res if isinstance(res, tuple) else (res,))
         if aggregate.counterexample is not None:
             break
 
