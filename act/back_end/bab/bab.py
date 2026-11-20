@@ -21,7 +21,7 @@ import logging
 import math
 import time
 from functools import wraps
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 import torch
@@ -43,6 +43,7 @@ from act.back_end.bab.node import (
     split_neurons,
     tensor_storage_bytes,
 )
+from act.back_end.bab.wave import _BoundWave
 from act.back_end.bab.climb import ClimbSession
 from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui.bab_gui import BaBProgressEmitter
@@ -80,7 +81,7 @@ from act.back_end.core import Bounds, Layer, Net
 from act.back_end.dual_tf.tf_forward import compute_forward_bounds, refresh_bounds
 from act.back_end.layer_schema import LayerKind
 from act.util.counterexample import validate_counterexamples
-from act.back_end.solver.solver_base import BatchLPSolution, Solver, SolveStatus
+from act.back_end.solver.solver_base import Solver, SolveStatus
 from act.back_end.solver.solver_dual import (
     DualBatchResult,
     DualSolver,
@@ -102,60 +103,6 @@ from act.util.stats import VerifyStatus, VerifyResult
 log = logging.getLogger(__name__)
 
 _monotonic = time.monotonic
-
-
-@dataclass(frozen=True)
-class _BoundWave:
-    """Bind solve evidence to the lane order of the batch that produced it.
-
-    Construction shares existing objects. LP relations remain inside the
-    analyze/export/solve pipeline; all dual tiers retain DualBatchResult.
-    The wave's references are released at the loop's existing cleanup points.
-    """
-
-    batch: SubproblemBatch
-    result: Union[BatchLPSolution, DualBatchResult]
-
-    def __post_init__(self) -> None:
-        if len(self.solution.statuses) != self.batch.batch_size:
-            raise ValueError("bound result does not match the wave's lane count")
-
-    @property
-    def solution(self) -> BatchLPSolution:
-        if isinstance(self.result, DualBatchResult):
-            return self.result.lane_solution()
-        return self.result
-
-    @property
-    def dual_result(self) -> Optional[DualBatchResult]:
-        return self.result if isinstance(self.result, DualBatchResult) else None
-
-    @property
-    def bounds_dict(self) -> Optional[Dict[int, Bounds]]:
-        result = self.dual_result
-        return result.intermediate_bounds() if result is not None else None
-
-    @property
-    def witness_input(self) -> Optional[torch.Tensor]:
-        result = self.dual_result
-        return result.lane_witness_inputs() if result is not None else None
-
-    @property
-    def reference_bounds(self) -> Optional[Dict[int, Bounds]]:
-        result = self.dual_result
-        return result.reference_bounds if result is not None else None
-
-    def branching_state(
-        self, source_rows: torch.Tensor,
-    ) -> tuple[Optional[Dict[int, Bounds]], Optional[Dict[int, torch.Tensor]]]:
-        """Select bounds and packed sensitivities in this wave's coordinates."""
-        result = self.dual_result
-        if result is None:
-            return None, None
-        return slice_branching_state(
-            result.intermediate_bounds(), result.neuron_sensitivities(),
-            source_rows, self.batch.batch_size,
-        )
 
 
 def _build_bounding(
@@ -1150,7 +1097,7 @@ def verify_bab_batched(
             dual_attempt: Optional[DualBatchResult] = None
             if solver_tier == "lp":
                 solver = solver_factory()
-                wave = _BoundWave(
+                wave = _BoundWave.from_lp(
                     batch, setup_and_solve_batch(
                         net, batched_bounds, solver, timelimit=None,
                     ),
@@ -1197,7 +1144,7 @@ def verify_bab_batched(
                             k_actual, _pool_before, 0, 0, None, batch_max_depth,
                         ))
                     break
-                wave = _BoundWave(batch, dual_attempt)
+                wave = _BoundWave.from_dual(batch, dual_attempt)
                 dual_attempt = None
             else:
                 raise ValueError(
@@ -1273,8 +1220,8 @@ def verify_bab_batched(
                 dtype=torch.long,
             )
             if climb is not None:
-                assert wave.dual_result is not None
-                climb.learn(batch, wave.solution.statuses, wave.dual_result, k_actual)
+                assert wave.dual is not None
+                climb.learn(batch, wave.solution.statuses, wave.dual.result, k_actual)
                 processed += climb.bound_complements(
                     lambda candidate, cap: _solve_dual_batch(
                         net=net, assert_layer=assert_layer,
@@ -1307,7 +1254,8 @@ def verify_bab_batched(
                 if config.terminal_lp_enabled and unresolved.batch_size:
                     from act.back_end.solver.solver_torchlp import solve_terminal_batch
 
-                    terminal_bounds, terminal_nu = wave.branching_state(unresolved_idx)
+                    terminal_inputs = wave.for_branching(unresolved, unresolved_idx)
+                    terminal_bounds, terminal_nu = terminal_inputs.bounds, terminal_inputs.sensitivities
                     has_candidate = lanes_with_relu_candidates(
                         unresolved, terminal_bounds, terminal_nu,
                     )
@@ -1424,13 +1372,14 @@ def verify_bab_batched(
                         full_branch_idx = unresolved_idx.index_select(
                             0, branch_idx.to(unresolved_idx.device)
                         )
-                        bd_branch, nu_branch = wave.branching_state(full_branch_idx)
+                        branch_inputs = wave.for_branching(
+                            branch_batch, full_branch_idx,
+                            include_witness=_witness_residual_branching_active(config),
+                        )
+                        bd_branch, nu_branch = branch_inputs.bounds, branch_inputs.sensitivities
                         witness_preact_branch: Optional[Dict[int, torch.Tensor]] = None
-                        if _witness_residual_branching_active(config) and wave.witness_input is not None:
-                            witness_branch = wave.witness_input.index_select(
-                                0,
-                                full_branch_idx.to(wave.witness_input.device),
-                            )
+                        witness_branch = branch_inputs.witness_input
+                        if witness_branch is not None:
                             witness_preact_branch = witness_relu_preactivations(
                                 net,
                                 witness_branch,
@@ -1656,7 +1605,10 @@ def verify_bab_batched(
                 assert batch.node_id is not None
                 n_unstable = max(1, sum(
                     int(((b.lb < 0) & (b.ub > 0)).sum().item())
-                    for b in (wave.bounds_dict or {}).values()
+                    for b in (
+                        {} if wave.dual is None
+                        else wave.dual.result.intermediate_bounds() or {}
+                    ).values()
                 ) // k_actual)
                 pool.observe(
                     batch.node_id, node_lower_bound, wave.solution.statuses,
@@ -1671,7 +1623,7 @@ def verify_bab_batched(
             if progress_emitter is not None:
                 progress_emitter.finish_wave(
                     iteration, batch, wave.solution, node_lower_bound,
-                    wave.reference_bounds,
+                    wave.dual.result.reference_bounds if wave.dual is not None else None,
                     solver_tier, len(pool), pool.node_ids(),
                 )
 
@@ -1719,6 +1671,7 @@ def verify_bab_batched(
                 # when planning the next wave.
                 original_batch = batch = batched_bounds = wave = dual_attempt = None
                 unresolved = branch_batch = children = None
+                branch_inputs = terminal_inputs = None
                 terminal_batch = fallback_batch = fallback_children = incoming = None
                 extra_children = sources = terminal_result = None
                 bd_branch = nu_branch = witness_preact_branch = terminal_bounds = terminal_nu = None
@@ -1737,6 +1690,7 @@ def verify_bab_batched(
             pending_children.clear()
             batch = batched_bounds = wave = dual_attempt = None
             unresolved = branch_batch = children = None
+            branch_inputs = terminal_inputs = None
             terminal_batch = fallback_batch = fallback_children = incoming = None
             extra_children = sources = terminal_result = None
             bd_branch = nu_branch = witness_preact_branch = terminal_bounds = terminal_nu = None
