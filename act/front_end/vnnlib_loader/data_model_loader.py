@@ -19,6 +19,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Sequence, Tuple
 import ast
+import itertools
 import os
 import logging
 import csv
@@ -51,23 +52,27 @@ from act.front_end.spec_creator_base import LabeledInputTensor
 logger = logging.getLogger(__name__)
 
 
-# VNN-COMP GitHub repository base URLs (try multiple sources)
+# Base URLs laid out as <benchmark>/<version>/<file>, tried in order for every file:
+# the VNN-COMP 2026 GitHub repository, then the public share from which that
+# repository's setup.sh fetches the ONNX files too large for GitHub.
 VNNCOMP_REPO_URLS = os.environ.get(
     "ACT_VNNCOMP_REPO_URL",
-    "https://raw.githubusercontent.com/VNN-COMP/vnncomp2026_benchmarks/main/benchmarks",
+    "https://raw.githubusercontent.com/VNN-COMP/vnncomp2026_benchmarks/main/benchmarks,"
+    "https://rwth-aachen.sciebo.de/public.php/dav/files/gEMDMstBiSHAAAS",
 ).split(",")
 DEFAULT_BENCHMARK_VERSION = "2.0"
 
 
 def _unavailable_category(
-    category: str, category_dir: Path, created: bool, error: Exception
+    category: str, category_dir: Path, created: bool, errors: Sequence[Exception]
 ) -> Dict[str, Any]:
     """Remove the partial category this call created and report its source as unavailable."""
     if created:
         shutil.rmtree(category_dir)
+    outage = next(e for e in errors if is_source_unreachable(e))
     return {
         'status': UNAVAILABLE,
-        'message': f"Cannot reach the VNN-COMP source for '{category}': {error}",
+        'message': f"Cannot reach the VNN-COMP source for '{category}': {outage}",
     }
 
 
@@ -249,6 +254,8 @@ def download_vnnlib_category(
     onnx_dir = category_dir / "onnx"
     vnnlib_dir = category_dir / "vnnlib"
     instances_file = category_dir / "instances.csv"
+    # Becomes instances.csv only once every file it lists is in place (see the check below).
+    partial_instances_file = category_dir / "instances.csv.part"
     
     # Check if already exists
     if category_dir.exists() and instances_file.exists() and not force_redownload:
@@ -276,7 +283,7 @@ def download_vnnlib_category(
         logger.info(f"Trying: {instances_url}")
         
         try:
-            urllib.request.urlretrieve(instances_url, instances_file)
+            urllib.request.urlretrieve(instances_url, partial_instances_file)
             successful_base_url = base_url
             logger.info(f"✓ Successfully downloaded from {base_url}")
             break
@@ -286,8 +293,8 @@ def download_vnnlib_category(
             continue
     
     if successful_base_url is None:
-        if all(is_source_unreachable(e) for e in source_errors):
-            return _unavailable_category(category, category_dir, category_is_new, source_errors[-1])
+        if any(is_source_unreachable(e) for e in source_errors):
+            return _unavailable_category(category, category_dir, category_is_new, source_errors)
         return {
             'status': 'error',
             'message': f"Failed to download instances.csv from all sources. Tried {len(VNNCOMP_REPO_URLS)} repositories."
@@ -297,7 +304,7 @@ def download_vnnlib_category(
     instances: List[Dict[str, Any]] = []
     onnx_files: set[str] = set()
     vnnlib_files: set[str] = set()
-    for onnx_field, vnnlib_field, timeout in _read_instance_rows(instances_file):
+    for onnx_field, vnnlib_field, timeout in _read_instance_rows(partial_instances_file):
         onnx_entries = _parse_onnx_field(onnx_field)
         vnnlib_file = _normalize_rel_path(vnnlib_field)
         for _, onnx_file in onnx_entries:
@@ -311,7 +318,7 @@ def download_vnnlib_category(
     
     logger.info(f"Found {len(instances)} instances in category '{category}'")
     
-    # Download ONNX and VNNLIB files using the successful base URL
+    # Download ONNX and VNNLIB files, each from the first base URL that has it
     downloaded_onnx: set[str] = set()
     downloaded_vnnlib: set[str] = set()
     all_files: List[Tuple[str, set[str]]] = [(rel_path, downloaded_onnx) for rel_path in sorted(onnx_files)]
@@ -326,12 +333,12 @@ def download_vnnlib_category(
         file_errors: List[Exception] = []
         success = False
         
-        for extension in ['.gz', '']:
-            file_url = f"{successful_base_url}/{repo_prefix}/{rel_path}{extension}"
+        for base_url, extension in itertools.product(VNNCOMP_REPO_URLS, ['.gz', '']):
+            file_url = f"{base_url}/{repo_prefix}/{rel_path}{extension}"
             tried_urls.append(file_url)
             
             try:
-                logger.debug(f"[{idx}/{len(all_files)}] Trying {rel_path}{extension}")
+                logger.debug(f"[{idx}/{len(all_files)}] Trying {file_url}")
                 
                 if extension == '.gz':
                     # Download compressed file
@@ -358,10 +365,11 @@ def download_vnnlib_category(
                 file_errors.append(e)
                 continue
         
-        if not success and all(is_source_unreachable(e) for e in file_errors):
-            return _unavailable_category(category, category_dir, category_is_new, file_errors[-1])
+        if not success and any(is_source_unreachable(e) for e in file_errors):
+            return _unavailable_category(category, category_dir, category_is_new, file_errors)
         assert success, f"Failed to download {rel_path} from any of {tried_urls}"
     
+    partial_instances_file.replace(instances_file)
     logger.info(
         f"Successfully downloaded category '{category}': "
         f"{len(instances)} instances, {len(downloaded_onnx)} ONNX models, "
