@@ -105,6 +105,13 @@ def _read_instance_rows(instances_file: Path) -> List[Tuple[str, str, str]]:
     return [(row[0], row[1], row[2]) for row in rows if len(row) >= 3]
 
 
+def _listed_files(rows: Sequence[Tuple[str, str, str]]) -> Tuple[set[str], set[str]]:
+    """ONNX and VNNLIB paths, relative to the category directory, named by instances.csv rows."""
+    onnx_files = {path for onnx_field, _, _ in rows for _, path in _parse_onnx_field(onnx_field)}
+    vnnlib_files = {_normalize_rel_path(vnnlib_field) for _, vnnlib_field, _ in rows}
+    return onnx_files, vnnlib_files
+
+
 class _MultiNetworkModel(nn.Module):
     """Run the networks of a multi-network VNN-LIB 2.0 spec on one combined input.
 
@@ -257,8 +264,12 @@ def download_vnnlib_category(
     # Becomes instances.csv only once every file it lists is in place (see the check below).
     partial_instances_file = category_dir / "instances.csv.part"
     
-    # Check if already exists
-    if category_dir.exists() and instances_file.exists() and not force_redownload:
+    # Downloaded only if every file instances.csv names is present (a failed download by an
+    # older version left instances.csv in a partial category).
+    if instances_file.exists() and not force_redownload and all(
+        (category_dir / path).exists()
+        for path in itertools.chain(*_listed_files(_read_instance_rows(instances_file)))
+    ):
         logger.info(f"Category '{category}' already downloaded at {category_dir}")
         
         return {
@@ -301,20 +312,8 @@ def download_vnnlib_category(
         }
     
     # Parse instances.csv to get ONNX and VNNLIB files
-    instances: List[Dict[str, Any]] = []
-    onnx_files: set[str] = set()
-    vnnlib_files: set[str] = set()
-    for onnx_field, vnnlib_field, timeout in _read_instance_rows(partial_instances_file):
-        onnx_entries = _parse_onnx_field(onnx_field)
-        vnnlib_file = _normalize_rel_path(vnnlib_field)
-        for _, onnx_file in onnx_entries:
-            onnx_files.add(onnx_file)
-        vnnlib_files.add(vnnlib_file)
-        instances.append({
-            'onnx': onnx_entries,
-            'vnnlib': vnnlib_file,
-            'timeout': timeout
-        })
+    instances = _read_instance_rows(partial_instances_file)
+    onnx_files, vnnlib_files = _listed_files(instances)
     
     logger.info(f"Found {len(instances)} instances in category '{category}'")
     
