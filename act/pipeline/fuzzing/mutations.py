@@ -71,15 +71,16 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, cast
-import torch
-import torch.nn as nn
-import numpy as np
 
-from act.front_end.specs import InputSpec, InKind, OutKind, OutputSpec
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+
+import numpy as np
+import torch
+from torch import nn
+
+from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
 from act.front_end.verifiable_model import VerifiableModel
-from act.pipeline.fuzzing.checker import INPUT_FEASIBILITY_ATTR
 from act.util.device_manager import get_default_device
 
 if TYPE_CHECKING:
@@ -927,7 +928,7 @@ class MutationEngine:
                 module.register_forward_hook(make_hook(name))
 
     def _setup_feasibility_hooks(self) -> None:
-        """Carry lane rows and input feasibility through the fuzzer inference."""
+        """Carry lane rows through the fuzzer inference."""
         def inject_rows(module, args, kwargs):
             rows = self._pending_rows
             if rows is None:
@@ -939,28 +940,7 @@ class MutationEngine:
             kwargs["rows"] = rows
             return args, kwargs
 
-        def attach_feasibility(module, args, kwargs, output):
-            if not self._feasibility_forward_active:
-                return None
-            self._feasibility_forward_active = False
-            if not isinstance(output, dict):
-                raise RuntimeError(
-                    "VerifiableModel.forward must return input feasibility metadata"
-                )
-            model_output = output.get("output")
-            input_satisfied = output.get("input_satisfied_per_sample")
-            if not isinstance(model_output, torch.Tensor) or not isinstance(
-                input_satisfied, torch.Tensor
-            ):
-                raise RuntimeError(
-                    "VerifiableModel.forward did not return a per-sample input "
-                    "feasibility mask"
-                )
-            setattr(model_output, INPUT_FEASIBILITY_ATTR, input_satisfied)
-            return None
-
         self.model.register_forward_pre_hook(inject_rows, with_kwargs=True)
-        self.model.register_forward_hook(attach_feasibility, with_kwargs=True)
                 
     def mutate(self, seeds: 'FuzzingSeed') -> torch.Tensor:
         """

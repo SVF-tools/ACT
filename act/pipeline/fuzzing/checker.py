@@ -8,10 +8,12 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
+
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING, Optional, List, Tuple, cast
-import time
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, cast
+
 import torch
 
 from act.front_end.specs import OutKind, OutputSpec
@@ -127,8 +129,9 @@ class PropertyChecker:
         self,
         inputs: torch.Tensor,
         outputs: torch.Tensor,
-        seeds: 'FuzzingSeed'
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        seeds: FuzzingSeed,
+        input_satisfied: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[Counterexample]]:
         """
         Check B samples for violations in parallel.
         
@@ -143,12 +146,6 @@ class PropertyChecker:
         if self.spec is None:
             raise ValueError("PropertyChecker requires an OutputSpec")
 
-        input_satisfied = getattr(outputs, INPUT_FEASIBILITY_ATTR, None)
-        if not isinstance(input_satisfied, torch.Tensor):
-            raise RuntimeError(
-                "PropertyChecker requires lane-aware input feasibility metadata "
-                "from VerifiableModel.forward"
-            )
         input_satisfied = input_satisfied.to(
             device=outputs.device, dtype=torch.bool
         ).reshape(-1)
