@@ -9,33 +9,45 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field, replace
-from typing import List, Dict, Optional, Tuple, Any, cast
+
+import json
 import os
 import time
-import json
-import torch
-import torch.nn as nn
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-from act.front_end.specs import InputSpec, OutputSpec
+import torch
+from torch import nn
+
 from act.front_end.spec_creator_base import LabeledInputTensor
+from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.verifiable_model import (
     InputLayer,
     InputSpecLayer,
     OutputSpecLayer,
     VerifiableModel,
 )
-from act.pipeline.fuzzing.mutations import MUTATION_STRATEGIES, PERTURB_MODES, MutationEngine
-from act.pipeline.fuzzing.coverage import CoverageTracker
-from act.pipeline.fuzzing.corpus import SELECTION_STRATEGIES, SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
+from act.pipeline.fuzzing.corpus import SELECTION_STRATEGIES, FuzzingSeed, SeedCorpus
+from act.pipeline.fuzzing.coverage import CoverageTracker
+from act.pipeline.fuzzing.mutations import (
+    MUTATION_STRATEGIES,
+    PERTURB_MODES,
+    MutationEngine,
+)
 from act.pipeline.gui import act_gui as _gui
 from act.pipeline.gui.act_gui import Option, validate_changes
-from act.pipeline.gui.fuzzer_gui import FuzzConfigChange, FuzzControl, FuzzEnd, FuzzStart, FuzzStep
-from act.util.path_config import get_pipeline_log_dir
+from act.pipeline.gui.fuzzer_gui import (
+    FuzzConfigChange,
+    FuzzControl,
+    FuzzEnd,
+    FuzzStart,
+    FuzzStep,
+)
 from act.util.device_manager import get_default_device
 from act.util.format_utils import rule
+from act.util.path_config import get_pipeline_log_dir
 
 
 @dataclass

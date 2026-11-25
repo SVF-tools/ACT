@@ -23,9 +23,6 @@ if TYPE_CHECKING:
     from act.pipeline.fuzzing.corpus import FuzzingSeed
 
 
-INPUT_FEASIBILITY_ATTR = "_act_input_satisfied_per_sample"
-
-
 @dataclass
 class Counterexample:
     """

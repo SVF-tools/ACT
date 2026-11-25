@@ -73,16 +73,18 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+
 import math
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import torch
-import torch.nn as nn
-from typing import Dict, Any, Optional, List, Tuple, Union
+from torch import nn
 
 # Import ACT components
-from act.front_end.specs import InputGeometry, InputSpec, OutputSpec, InKind, OutKind
-from act.front_end.spec_creator_base import LabeledInputTensor
-from act.back_end.layer_schema import LayerKind, REGISTRY
+from act.back_end.layer_schema import REGISTRY, LayerKind
 from act.back_end.layer_util import create_layer
+from act.front_end.spec_creator_base import LabeledInputTensor
+from act.front_end.specs import InKind, InputGeometry, InputSpec, OutKind, OutputSpec
 from act.util.counterexample import input_constraint_satisfied, output_violations
 
 
