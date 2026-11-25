@@ -527,7 +527,7 @@ class ACTFuzzer:
         with torch.no_grad():
             output = self.model(inputs)
 
-        inputs_satisfied = output["inputs_satisfied_per_sample"]
+        input_satisfied = output["input_satisfied_per_sample"]
         outputs = output["output"] if isinstance(output, dict) else output
 
         # 4. violation check — returns (BoolTensor[B], List[Counterexample])
@@ -535,7 +535,7 @@ class ACTFuzzer:
             inputs=inputs,
             outputs=outputs,
             seeds=seeds,
-            inputs_satisfied=inputs_satisfied,
+            input_satisfied=input_satisfied,
         )
 
         # 5. coverage update — returns per-sample interestingness mask
