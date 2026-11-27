@@ -705,6 +705,7 @@ class MutationEngine:
         self.last_strategy: Optional[str] = None  # Track last mutation strategy for tracing
         self.last_gradients: Optional[Dict[str, torch.Tensor]] = None  # For Level 3 tracing: gradient capture
         self.last_loss: Optional[float] = None  # For Level 3 tracing: loss value capture
+        self._pending_rows: Optional[torch.Tensor] = None
         self._gradient_signal_checked = False
         
         # Setup hooks for activation capture
