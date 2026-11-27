@@ -8,12 +8,10 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, cast
-
+from typing import Any, TYPE_CHECKING, Optional, List, Tuple, cast
+import time
 import torch
 
 from act.front_end.specs import OutKind, OutputSpec
