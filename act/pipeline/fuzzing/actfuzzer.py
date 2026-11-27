@@ -260,7 +260,7 @@ class ACTFuzzer:
 
     def __init__(
         self,
-        wrapped_model: nn.Module,
+        wrapped_model: VerifiableModel,
         initial_seeds: List[LabeledInputTensor],
         config: Optional[FuzzingConfig] = None,
         control: Optional[FuzzControl] = None,
@@ -525,10 +525,10 @@ class ACTFuzzer:
 
         # 3. inference
         with torch.no_grad():
-            output = self.model(inputs)
+            output = self.model(inputs, rows=seeds.original_index)
 
         input_satisfied = output["input_satisfied_per_sample"]
-        outputs = output["output"] if isinstance(output, dict) else output
+        outputs = output["output"]
 
         # 4. violation check — returns (BoolTensor[B], List[Counterexample])
         violation_mask, counterexamples = self.property_checker.check(

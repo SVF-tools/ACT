@@ -706,12 +706,10 @@ class MutationEngine:
         self.last_gradients: Optional[Dict[str, torch.Tensor]] = None  # For Level 3 tracing: gradient capture
         self.last_loss: Optional[float] = None  # For Level 3 tracing: loss value capture
         self._pending_rows: Optional[torch.Tensor] = None
-        self._feasibility_forward_active = False
         self._gradient_signal_checked = False
         
         # Setup hooks for activation capture
         self._setup_hooks()
-        self._setup_feasibility_hooks()
     
     def set_weights(self, weights: Dict[str, float]) -> None:
         """Validate and normalize the strategy selection weights."""
@@ -926,21 +924,6 @@ class MutationEngine:
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.ReLU, nn.Linear, nn.Conv2d)):
                 module.register_forward_hook(make_hook(name))
-
-    def _setup_feasibility_hooks(self) -> None:
-        """Carry lane rows through the fuzzer inference."""
-        def inject_rows(module, args, kwargs):
-            rows = self._pending_rows
-            if rows is None:
-                return None
-            self._pending_rows = None
-            self._feasibility_forward_active = True
-            if "rows" in kwargs:
-                raise RuntimeError("Fuzzer inference rows were provided twice")
-            kwargs["rows"] = rows
-            return args, kwargs
-
-        self.model.register_forward_pre_hook(inject_rows, with_kwargs=True)
                 
     def mutate(self, seeds: 'FuzzingSeed') -> torch.Tensor:
         """
