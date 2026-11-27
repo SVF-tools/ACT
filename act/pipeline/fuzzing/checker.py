@@ -21,9 +21,6 @@ if TYPE_CHECKING:
     from act.pipeline.fuzzing.corpus import FuzzingSeed
 
 
-INPUT_FEASIBILITY_ATTR = "_act_input_satisfied_per_sample"
-
-
 @dataclass
 class Counterexample:
     """
@@ -126,14 +123,16 @@ class PropertyChecker:
     def check(
         self,
         inputs: torch.Tensor,
+        input_satisfied: torch.Tensor,
         outputs: torch.Tensor,
-        seeds: 'FuzzingSeed'
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        seeds: FuzzingSeed,
+    ) -> tuple[torch.Tensor, list[Counterexample]]:
         """
         Check B samples for violations in parallel.
         
         Args:
             inputs: Input tensors [B, C, H, W] or [B, D]
+            input_satisfied: Boolean mask [B] which shows which tensors satisfy input specs
             outputs: Model outputs [B, num_classes]
             seeds: FuzzingSeed batch with labels, original tensors, and indices
         
@@ -143,12 +142,6 @@ class PropertyChecker:
         if self.spec is None:
             raise ValueError("PropertyChecker requires an OutputSpec")
 
-        input_satisfied = getattr(outputs, INPUT_FEASIBILITY_ATTR, None)
-        if not isinstance(input_satisfied, torch.Tensor):
-            raise RuntimeError(
-                "PropertyChecker requires lane-aware input feasibility metadata "
-                "from VerifiableModel.forward"
-            )
         input_satisfied = input_satisfied.to(
             device=outputs.device, dtype=torch.bool
         ).reshape(-1)
