@@ -123,15 +123,16 @@ class PropertyChecker:
     def check(
         self,
         inputs: torch.Tensor,
+        input_satisfied: torch.Tensor,
         outputs: torch.Tensor,
         seeds: FuzzingSeed,
-        input_satisfied: torch.Tensor,
     ) -> tuple[torch.Tensor, list[Counterexample]]:
         """
         Check B samples for violations in parallel.
         
         Args:
             inputs: Input tensors [B, C, H, W] or [B, D]
+            input_satisfied: Boolean mask [B] which shows which tensors satisfy input specs
             outputs: Model outputs [B, num_classes]
             seeds: FuzzingSeed batch with labels, original tensors, and indices
         

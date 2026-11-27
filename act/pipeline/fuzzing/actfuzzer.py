@@ -533,9 +533,9 @@ class ACTFuzzer:
         # 4. violation check — returns (BoolTensor[B], List[Counterexample])
         violation_mask, counterexamples = self.property_checker.check(
             inputs=inputs,
+            input_satisfied=input_satisfied,
             outputs=outputs,
             seeds=seeds,
-            input_satisfied=input_satisfied,
         )
 
         # 5. coverage update — returns per-sample interestingness mask
